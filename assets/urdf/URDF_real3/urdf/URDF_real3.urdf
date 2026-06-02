@@ -1,0 +1,145 @@
+<?xml version='1.0' encoding='utf-8'?>
+<robot name="URDF_real3">
+  <link name="base_link">
+    <inertial>
+      <origin xyz="-8.33198532504195E-16 0.0230017621817816 -2.79852942215149E-16" rpy="0 0 0" />
+      <mass value="6545.82358910195" />
+      <inertia ixx="6700.7667181218" ixy="-3.51839189570617E-13" ixz="4.37150315946157E-13" iyy="11842.440662814" iyz="-1.24591630598305E-13" izz="5755.09381589007" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/base_link.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/base_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="swing_link">
+    <inertial>
+      <origin xyz="0.782866411585355 0.59799960284555 0.11656377394543" rpy="1.5708 0 3.14" />
+      <mass value="8299.35122427397" />
+      <inertia ixx="5473.90968491819" ixy="600.297974176368" ixz="1112.3842101734" iyy="12325.7729335349" iyz="-530.062198108685" izz="9136.61128333223" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5708 0 3.14" />
+      <geometry>
+        <mesh filename="../meshes/swing_link.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="1.5708 0 3.14" />
+      <geometry>
+        <mesh filename="../meshes/swing_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="swing" type="continuous">
+    <origin xyz="0 0 0.6" rpy="0 0 0" />
+    <parent link="base_link" />
+    <child link="swing_link" />
+    <axis xyz="0 0 1" />
+    <limit effort="1000000" velocity="1.0" />
+    <dynamics damping="10.0" friction="0.0" />
+  </joint>
+  <link name="boom_link">
+    <inertial>
+      <origin xyz="1.04793568156625E-08 -1.62931637782874 2.26396661057835" rpy="2.284 -1.5707 0.43" />
+      <mass value="4502.84104003996" />
+      <inertia ixx="11317.5439018729" ixy="3.10045387231925E-05" ixz="-0.000111286949140274" iyy="9139.77862656387" iyz="3667.22549978772" izz="2230.36270592873" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="2.284 -1.5707 0.43" />
+      <geometry>
+        <mesh filename="../meshes/boom_link.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="2.284 -1.5707 0.43" />
+      <geometry>
+        <mesh filename="../meshes/boom_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="boom" type="revolute">
+    <origin xyz="0.53 0 0.77" rpy="1.5707 0.0 0" />
+    <parent link="swing_link" />
+    <child link="boom_link" />
+    <axis xyz="0 0 1" />
+    <limit effort="1000000" velocity="1.0" lower="-1.5707" upper="1.5707" />
+    <dynamics damping="10.0" friction="0.0" />
+  </joint>
+  <link name="arm_link">
+    <inertial>
+      <origin xyz="-5.51010138386911E-13 0.250586060095889 0.911625562203973" rpy="0 1.5707 0" />
+      <mass value="2021.70905155499" />
+      <inertia ixx="1721.10884478239" ixy="-0.000442999200787283" ixz="-0.021208925944617" iyy="1625.40637407163" iyz="215.827193066607" izz="102.394331368054" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 1.5707 0" />
+      <geometry>
+        <mesh filename="../meshes/arm_link.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 1.5707 0" />
+      <geometry>
+        <mesh filename="../meshes/arm_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="arm" type="revolute">
+    <origin xyz="5.715 0 0" rpy="0 0 -0.0" />
+    <parent link="boom_link" />
+    <child link="arm_link" />
+    <axis xyz="0 0 1 " />
+    <limit effort="1000000" velocity="1.0" lower="-1.5707" upper="1.5707" />
+    <dynamics damping="10.0" friction="0.0" />
+  </joint>
+  <link name="bucket_link">
+    <inertial>
+      <origin xyz="1.12103615549738E-12 0.319002787659582 -0.621539782955361" rpy="0 1.5707 -2.52" />
+      <mass value="1537.39865114626" />
+      <inertia ixx="236.963188267403" ixy="6.87150681062366E-13" ixz="-1.2085308130199E-12" iyy="263.005172016286" iyz="32.5636959467828" izz="313.203572295113" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 1.5707 -2.1" />
+      <geometry>
+        <mesh filename="../meshes/bucket_link.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 1.5707 -2.1" />
+      <geometry>
+        <mesh filename="../meshes/bucket_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="bucket" type="revolute">
+    <origin xyz="2.95 0 0 " rpy="0 0 0.0" />
+    <parent link="arm_link" />
+    <child link="bucket_link" />
+    <axis xyz="0 0 1" />
+    <limit effort="1000000" velocity="1.0" lower="-1.5707" upper="1.5707" />
+    <dynamics damping="10.0" friction="0.0" />
+  </joint>
+</robot>

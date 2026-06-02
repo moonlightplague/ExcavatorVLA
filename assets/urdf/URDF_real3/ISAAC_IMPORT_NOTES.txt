@@ -1,0 +1,19 @@
+URDF_real3 Isaac-ready clean package
+
+Changes made from the uploaded package:
+1. Removed the duplicate older root-level URDF_real3.urdf.
+2. Kept and modified only urdf/URDF_real3.urdf.
+3. Replaced package://URDF_real3/meshes/... mesh references with relative ../meshes/... paths for easier Isaac Sim import.
+4. Fixed joints:
+   - swing: kept continuous, removed invalid lower/upper, set effort=1000000, velocity=1.0, damping=10.0.
+   - boom/arm/bucket: changed from continuous to revolute, set lower=-1.5707, upper=1.5707, effort=1000000, velocity=1.0, damping=10.0.
+5. Removed export.log because it is not needed for Isaac import.
+
+Recommended Isaac import settings for first test:
+- Fixed Base: enabled
+- Self Collision: disabled
+- Drive type: Force
+- boom/arm/bucket: Position drive
+- swing: Position or Velocity drive for testing
+
+Note: joint limits and drive values are safe placeholders for simulation testing, not verified real excavator specs.

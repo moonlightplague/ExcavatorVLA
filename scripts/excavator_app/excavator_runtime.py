@@ -1203,52 +1203,11 @@ def register_async_task(name, coro_or_task, replace=True):
 
 
 def find_robot_paths():
-    global stage
-    stage = omni.usd.get_context().get_stage()
-    if stage is None:
-        raise RuntimeError("No USD stage is open. 请先打开 URDF stage。")
-
     for prim in stage.Traverse():
         if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
             root = prim.GetPath().pathString
             base = prim.GetPath().GetParentPath().pathString
             return root, base
-
-    for prim in stage.Traverse():
-        base_link = prim.GetChild("base_link")
-        joints = prim.GetChild("joints")
-        if base_link.IsValid() and joints.IsValid():
-            try:
-                UsdPhysics.ArticulationRootAPI.Apply(base_link)
-                root = base_link.GetPath().pathString
-                base = prim.GetPath().pathString
-                info_print("[WARN] ArticulationRootAPI missing; applied fallback to", root)
-                return root, base
-            except Exception as e:
-                info_print("[WARN] Could not apply ArticulationRootAPI fallback:", type(e).__name__, e)
-
-    for prim in stage.Traverse():
-        if prim.GetName() != "base_link":
-            continue
-        parent = stage.GetPrimAtPath(prim.GetPath().GetParentPath())
-        if parent.IsValid() and parent.GetChild("joints").IsValid():
-            try:
-                UsdPhysics.ArticulationRootAPI.Apply(prim)
-                root = prim.GetPath().pathString
-                base = parent.GetPath().pathString
-                info_print("[WARN] ArticulationRootAPI missing; applied fallback to", root)
-                return root, base
-            except Exception as e:
-                info_print("[WARN] Could not apply ArticulationRootAPI fallback:", type(e).__name__, e)
-
-    prim_preview = []
-    for prim in stage.Traverse():
-        path = prim.GetPath().pathString
-        if len(prim_preview) < 30:
-            prim_preview.append(path)
-        if prim.GetName() in {"URDF_real3", "base_link", "joints"}:
-            info_print("[ROBOT PATH DEBUG] candidate prim", path, "type=", prim.GetTypeName(), "apis=", prim.GetAppliedSchemas())
-    info_print("[ROBOT PATH DEBUG] first prims:", prim_preview)
     raise RuntimeError("No ArticulationRootAPI found. 请先导入 URDF。")
 
 

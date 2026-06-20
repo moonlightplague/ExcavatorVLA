@@ -214,5 +214,28 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+# Local Isaac/runtime outputs
+backup/
+excavator_auto_dataset/
+logs/
+log/
+*.log
+*.jsonl.tmp
+
+# Local generated packages and old working copies
+*.zip
+excavator_code_package_*.zip
+source_backup_*.zip
+source_backup_before_git_*.zip
+source_backup_before_repo_sync_*.zip
+_ExcavatorVLA_sync/
+/excavator_app/
+/excavator_app_*/
+
+# Local assistant/editor state
+.vscode/
+.agents/
+.codex/
+
 # Streamlit
 .streamlit/secrets.toml

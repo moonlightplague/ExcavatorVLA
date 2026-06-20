@@ -3,26 +3,7 @@ import os
 import sys
 
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-PACKAGE_PARENT = os.path.dirname(APP_DIR)
-PROJECT_ROOT = os.path.dirname(PACKAGE_PARENT) if os.path.basename(PACKAGE_PARENT) == "scripts" else PACKAGE_PARENT
-
-
-def import_roots(root):
-    roots = [root, os.path.join(root, "scripts")]
-    out = []
-    for candidate in roots:
-        candidate = os.path.abspath(candidate)
-        if candidate not in out:
-            out.append(candidate)
-    return out
-
-
-def has_excavator_app(root):
-    return (
-        os.path.isfile(os.path.join(root, "scripts", "excavator_app", "bootstrap.py"))
-        or os.path.isfile(os.path.join(root, "excavator_app", "bootstrap.py"))
-    )
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def ensure_project_root(extra_root=None):
@@ -38,10 +19,8 @@ def ensure_project_root(extra_root=None):
         if not root:
             continue
         root = os.path.abspath(root)
-        if has_excavator_app(root):
-            for import_root in reversed(import_roots(root)):
-                if import_root not in sys.path:
-                    sys.path.insert(0, import_root)
+        if os.path.isfile(os.path.join(root, "excavator_app", "bootstrap.py")) and root not in sys.path:
+            sys.path.insert(0, root)
 
 
 def reload_runtime(module_name):

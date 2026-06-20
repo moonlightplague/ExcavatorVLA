@@ -1,7 +1,61 @@
 import os
+import json
 import shutil
 import sys
 from urllib.parse import unquote, urlparse
+
+
+CONFIG_FILE_NAME = "excavator_config.json"
+DEFAULT_PROJECT_ROOTS = [
+    "/isaac-sim/ExcavatorVLA",
+    "/root/isaacsim/ExcavatorVLA",
+]
+
+
+def _load_config():
+    candidates = []
+    for root in DEFAULT_PROJECT_ROOTS:
+        candidates.append(os.path.join(root, CONFIG_FILE_NAME))
+    try:
+        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_FILE_NAME))
+    except Exception:
+        pass
+    candidates.append(os.path.join(os.getcwd(), CONFIG_FILE_NAME))
+
+    seen = set()
+    for path in candidates:
+        path = os.path.abspath(path)
+        if path in seen:
+            continue
+        seen.add(path)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            print(f"[INFO] Loaded excavator config: {path}")
+            return config if isinstance(config, dict) else {}
+        except Exception as exc:
+            print(f"[WARN] Could not read excavator config {path}: {repr(exc)}")
+    return {}
+
+
+CONFIG = _load_config()
+
+
+def _config_text(key, default=""):
+    value = CONFIG.get(key, default)
+    return "" if value is None else str(value)
+
+
+def _truthy_model_source(value):
+    text = str(value).strip().lower()
+    return text not in {"0", "false", "no", "off", "original", "scene", "original-scene"}
+
+
+USE_ZSP_MODELS = _truthy_model_source(
+    os.environ.get("EXCAVATOR_USE_ZSP_MODELS", _config_text("model_source", "zsp"))
+)
 
 
 def _script_dir():
@@ -34,6 +88,18 @@ def _zsp_dir(root):
 
 def _zsp_stage_path(root):
     return os.path.join(_zsp_dir(root), "URDF_real3.usd")
+
+
+def _original_scene_path(root):
+    return os.path.join(root, "assets", "usd", "excavator_scene.usd")
+
+
+def _selected_stage_path(root):
+    return _zsp_stage_path(root) if USE_ZSP_MODELS else _original_scene_path(root)
+
+
+def _selected_model_label():
+    return "zsp" if USE_ZSP_MODELS else "original-scene"
 
 
 def _url_to_path(value):
@@ -108,10 +174,8 @@ def _stage_related_roots():
 
 def _known_repo_roots():
     roots = []
-    for root in [
-        "/isaac-sim/ExcavatorVLA",
-        "/root/isaacsim/ExcavatorVLA",
-    ]:
+    config_root = _config_text("project_root", "")
+    for root in [config_root] + DEFAULT_PROJECT_ROOTS:
         if os.path.isdir(root):
             roots.append(root)
     return roots
@@ -227,41 +291,48 @@ def _ensure_zsp_configuration_aliases(project_root):
             shutil.copy2(source, target)
 
 
-def _open_zsp_stage(project_root):
-    stage_path = _zsp_stage_path(project_root)
+def _pump_kit_updates(frame_count=5):
+    try:
+        import omni.kit.app
+
+        app = omni.kit.app.get_app()
+        for _ in range(max(0, int(frame_count))):
+            app.update()
+    except Exception:
+        pass
+
+
+def _open_selected_stage(project_root):
+    stage_path = _selected_stage_path(project_root)
     if not os.path.isfile(stage_path):
-        print(f"[WARN] ZSP stage not found: {stage_path}")
+        print(f"[WARN] Selected {_selected_model_label()} stage not found: {stage_path}")
         return
 
-    _ensure_zsp_configuration_aliases(project_root)
-    _normalize_zsp_layer_paths(project_root)
+    if USE_ZSP_MODELS:
+        _ensure_zsp_configuration_aliases(project_root)
+        _normalize_zsp_layer_paths(project_root)
 
     try:
         import omni.usd
 
         current_stage = _current_stage_file()
         if current_stage and os.path.abspath(current_stage) == os.path.abspath(stage_path):
+            print(f"[INFO] {_selected_model_label()} stage already open: {stage_path}")
             return
 
         opened = omni.usd.get_context().open_stage(stage_path)
         if opened is False:
-            print(f"[WARN] Isaac Sim did not report success opening ZSP stage: {stage_path}")
+            print(f"[WARN] Isaac Sim did not report success opening {_selected_model_label()} stage: {stage_path}")
         else:
-            print(f"[INFO] Opened ZSP stage: {stage_path}")
-        try:
-            import omni.kit.app
-
-            app = omni.kit.app.get_app()
-            for _ in range(5):
-                app.update()
-        except Exception:
-            pass
+            print(f"[INFO] Opened {_selected_model_label()} stage: {stage_path}")
+        _pump_kit_updates(5)
     except Exception as exc:
-        print(f"[WARN] Could not open ZSP stage {stage_path}: {repr(exc)}")
+        print(f"[WARN] Could not open {_selected_model_label()} stage {stage_path}: {repr(exc)}")
 
 
 PROJECT_ROOT = ensure_project_root()
-_open_zsp_stage(PROJECT_ROOT)
+print(f"[INFO] Excavator model source: {_selected_model_label()}")
+_open_selected_stage(PROJECT_ROOT)
 
 from excavator_app.bootstrap import run_excavator_with_sand
 

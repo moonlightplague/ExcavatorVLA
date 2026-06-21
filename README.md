@@ -10,8 +10,8 @@ Choose the model source in [excavator_config.json](excavator_config.json):
 
 ```json
 {
-	"model_source": "zsp",
-	"project_root": "/isaac-sim/ExcavatorVLA"
+    "model_source": "zsp",
+    "project_root": "/isaac-sim/ExcavatorVLA"
 }
 ```
 
@@ -31,10 +31,22 @@ You can also run `main.py` from the repository root; it forwards to `main_zsp.py
 
 Environment variables still work as temporary overrides: set `EXCAVATOR_PROJECT_ROOT` or `EXCAVATOR_USE_ZSP_MODELS` before running [main_zsp.py](main_zsp.py) if you do not want to edit the config file.
 
-The expected ZSP USD files are:
+## Standalone Bridge And GUI
 
-- [assets/zsp/URDF_real3.usd](assets/zsp/URDF_real3.usd)
-- [assets/zsp/URDF_real3_base.usd](assets/zsp/URDF_real3_base.usd)
-- [assets/zsp/URDF_real3_physics.usd](assets/zsp/URDF_real3_physics.usd)
-- [assets/zsp/URDF_real3_robot.usd](assets/zsp/URDF_real3_robot.usd)
-- [assets/zsp/URDF_real3_sensor.usd](assets/zsp/URDF_real3_sensor.usd)
+Use [run_excavator_standalone.py](run_excavator_standalone.py) to launch the original textured scene with the TCP bridge server. This bridge captures the excavator-mounted `front`, `left`, and `right` camera views from the active Isaac Sim viewport and sends them to GUI clients.
+
+Run the Isaac Sim bridge in one terminal:
+
+```bash
+cd /isaac-sim/ExcavatorVLA
+/isaac-sim/python.sh run_excavator_standalone.py
+```
+
+Then run the pygame teleoperation client in a second terminal:
+
+```bash
+cd /isaac-sim/ExcavatorVLA/scripts/bridge_test/
+python gui_client.py --host 127.0.0.1 --port 5555
+```
+
+The GUI client in [scripts/bridge_test/gui_client.py](scripts/bridge_test/gui_client.py) displays the three camera feeds side by side and still accepts the older single-RGB bridge response as a fallback.

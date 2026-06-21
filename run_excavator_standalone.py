@@ -28,7 +28,12 @@ ROBOT_PRIM_PATH = "/World/URDF_real3"
 # Use the existing working camera prim in the USD scene.
 # Do NOT use /front_camera here unless you really created that camera yourself.
 CAMERA_PARENT_PATH = "/World/URDF_real3/swing_link"
-CAMERA_PRIM_PATH = CAMERA_PARENT_PATH + "/Camera"
+CAMERA_PRIM_PATHS = {
+    "front": CAMERA_PARENT_PATH + "/Camera",
+    "left": CAMERA_PARENT_PATH + "/Camera_left",
+    "right": CAMERA_PARENT_PATH + "/Camera_right",
+}
+CAMERA_PRIM_PATH = CAMERA_PRIM_PATHS["front"]
 
 # TCP Bridge settings
 HOST = "0.0.0.0"
@@ -135,6 +140,33 @@ def capture_rgb_from_viewport(viewport, world, simulation_app, capture_viewport_
     return rgb
 
 
+def capture_rgb_from_cameras(viewport, camera_paths, world, simulation_app, capture_viewport_to_buffer, np_module,
+                             width=CAPTURE_WIDTH, height=CAPTURE_HEIGHT,
+                             wait_frames=CAPTURE_WAIT_FRAMES,
+                             settle_frames=2):
+    rgb_by_camera = {}
+
+    for camera_name, camera_path in camera_paths.items():
+        viewport.camera_path = camera_path
+
+        for _ in range(settle_frames):
+            world.step(render=True)
+            simulation_app.update()
+
+        rgb_by_camera[camera_name] = capture_rgb_from_viewport(
+            viewport=viewport,
+            world=world,
+            simulation_app=simulation_app,
+            capture_viewport_to_buffer=capture_viewport_to_buffer,
+            np_module=np_module,
+            width=width,
+            height=height,
+            wait_frames=wait_frames,
+        )
+
+    return rgb_by_camera
+
+
 def main():
     """Main entry point for standalone launch."""
 
@@ -182,7 +214,9 @@ def main():
     print("=" * 60)
     print(f"Scene USD: {SCENE_USD_PATH}")
     print(f"Robot Prim: {ROBOT_PRIM_PATH}")
-    print(f"Camera Prim for Viewport Capture: {CAMERA_PRIM_PATH}")
+    print("Camera Prims for Viewport Capture:")
+    for camera_name, camera_path in CAMERA_PRIM_PATHS.items():
+        print(f"  {camera_name}: {camera_path}")
     print(f"TCP Server: {HOST}:{PORT}")
     print("=" * 60)
 
@@ -337,17 +371,26 @@ def main():
         simulation_app.close()
         return
 
-    # Prefer the existing swing_link camera. If invalid, fall back to ViewCamera.
-    if stage.GetPrimAtPath(CAMERA_PRIM_PATH).IsValid():
-        viewport.camera_path = CAMERA_PRIM_PATH
-        active_capture_camera_path = CAMERA_PRIM_PATH
-    else:
-        print(f"[WARN] Camera prim not found: {CAMERA_PRIM_PATH}")
-        print(f"[WARN] Falling back to: {view_camera_path}")
-        viewport.camera_path = view_camera_path
-        active_capture_camera_path = view_camera_path
+    # Prefer excavator-mounted cameras. If none are valid, fall back to ViewCamera.
+    active_camera_paths = {}
+    for camera_name, camera_path in CAMERA_PRIM_PATHS.items():
+        if stage.GetPrimAtPath(camera_path).IsValid():
+            active_camera_paths[camera_name] = camera_path
+        else:
+            print(f"[WARN] Camera prim not found: {camera_path}")
 
-    print(f"[INFO] Viewport camera set to: {active_capture_camera_path}", flush=True)
+    if not active_camera_paths:
+        print(f"[WARN] Falling back to: {view_camera_path}")
+        active_camera_paths["fallback"] = view_camera_path
+
+    active_capture_camera_name = next(iter(active_camera_paths))
+    active_capture_camera_path = active_camera_paths[active_capture_camera_name]
+    viewport.camera_path = active_capture_camera_path
+
+    print("[INFO] Active viewport capture cameras:", flush=True)
+    for camera_name, camera_path in active_camera_paths.items():
+        print(f"  {camera_name}: {camera_path}", flush=True)
+    print(f"[INFO] Initial viewport camera set to: {active_capture_camera_path}", flush=True)
 
     omni.timeline.get_timeline_interface().play()
 
@@ -356,9 +399,10 @@ def main():
         world.step(render=True)
         simulation_app.update()
 
-    # Test one viewport capture.
-    test_rgb = capture_rgb_from_viewport(
+    # Test viewport capture from every active camera.
+    test_rgbs = capture_rgb_from_cameras(
         viewport=viewport,
+        camera_paths=active_camera_paths,
         world=world,
         simulation_app=simulation_app,
         capture_viewport_to_buffer=capture_viewport_to_buffer,
@@ -368,22 +412,23 @@ def main():
         wait_frames=CAPTURE_WAIT_FRAMES,
     )
 
-    print(
-        "[INFO] Initial viewport capture:",
-        "shape=", test_rgb.shape,
-        "dtype=", test_rgb.dtype,
-        "min=", int(test_rgb.min()),
-        "max=", int(test_rgb.max()),
-        "mean=", float(test_rgb.mean()),
-        flush=True,
-    )
-
-    if float(test_rgb.mean()) == 0.0:
+    for camera_name, test_rgb in test_rgbs.items():
         print(
-            "[WARN] Initial RGB capture is all black. "
-            "The capture pipeline works, but the selected camera may be looking at a dark/empty view.",
+            f"[INFO] Initial viewport capture [{camera_name}]:",
+            "shape=", test_rgb.shape,
+            "dtype=", test_rgb.dtype,
+            "min=", int(test_rgb.min()),
+            "max=", int(test_rgb.max()),
+            "mean=", float(test_rgb.mean()),
             flush=True,
         )
+
+        if float(test_rgb.mean()) == 0.0:
+            print(
+                f"[WARN] Initial RGB capture from {camera_name} is all black. "
+                "The capture pipeline works, but the selected camera may be looking at a dark/empty view.",
+                flush=True,
+            )
 
     # TCP Bridge Server functions.
     command_queue = queue.Queue()
@@ -487,8 +532,9 @@ def main():
             q = np.asarray(robot.get_joint_positions(), dtype=np.float32)
             qd = np.asarray(robot.get_joint_velocities(), dtype=np.float32)
 
-            rgb = capture_rgb_from_viewport(
+            rgb_by_camera = capture_rgb_from_cameras(
                 viewport=viewport,
+                camera_paths=active_camera_paths,
                 world=world,
                 simulation_app=simulation_app,
                 capture_viewport_to_buffer=capture_viewport_to_buffer,
@@ -498,22 +544,37 @@ def main():
                 wait_frames=CAPTURE_WAIT_FRAMES,
             )
 
-            rgb = np.asarray(rgb)
+            encoded_cameras = {}
+            for camera_name, rgb in rgb_by_camera.items():
+                rgb = np.asarray(rgb)
 
-            if rgb.dtype != np.uint8:
-                rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+                if rgb.dtype != np.uint8:
+                    rgb = np.clip(rgb, 0, 255).astype(np.uint8)
 
-            if rgb.ndim == 3 and rgb.shape[-1] == 4:
-                rgb = rgb[:, :, :3]
+                if rgb.ndim == 3 and rgb.shape[-1] == 4:
+                    rgb = rgb[:, :, :3]
 
-            rgb_compressed = zlib.compress(rgb.tobytes(), level=1)
+                rgb_compressed = zlib.compress(rgb.tobytes(), level=1)
+                encoded_cameras[camera_name] = {
+                    "camera_path": active_camera_paths[camera_name],
+                    "rgb_shape": list(rgb.shape),
+                    "rgb_dtype": str(rgb.dtype),
+                    "rgb_zlib_b64": base64.b64encode(rgb_compressed).decode("ascii"),
+                }
+
+            primary_camera = (
+                "front" if "front" in encoded_cameras else next(iter(encoded_cameras))
+            )
+            primary_rgb = encoded_cameras[primary_camera]
 
             reply = {
                 "joint_positions": q.tolist(),
                 "joint_velocities": qd.tolist(),
-                "rgb_shape": list(rgb.shape),
-                "rgb_dtype": str(rgb.dtype),
-                "rgb_zlib_b64": base64.b64encode(rgb_compressed).decode("ascii"),
+                "primary_camera": primary_camera,
+                "rgb_shape": primary_rgb["rgb_shape"],
+                "rgb_dtype": primary_rgb["rgb_dtype"],
+                "rgb_zlib_b64": primary_rgb["rgb_zlib_b64"],
+                "cameras": encoded_cameras,
             }
 
             response_queue.put(reply)

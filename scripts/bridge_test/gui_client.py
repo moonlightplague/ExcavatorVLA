@@ -26,7 +26,9 @@ JOINT_LIMITS = {
 DEFAULT_JOINTS = [0.0, 0.3, -0.2, 0.3]
 STEP = 0.05
 
-RGB_W, RGB_H = 640, 480
+CAMERA_NAMES = ["left", "front", "right"]
+CAMERA_W, CAMERA_H = 320, 240
+RGB_W, RGB_H = CAMERA_W * len(CAMERA_NAMES), CAMERA_H
 PANEL_H = 180
 WIN_W = RGB_W
 WIN_H = RGB_H + PANEL_H
@@ -68,10 +70,25 @@ def recv_json(sock):
     return json.loads(data.decode("utf-8"))
 
 
-def decode_rgb(reply):
-    raw = zlib.decompress(base64.b64decode(reply["rgb_zlib_b64"]))
+def decode_camera_rgb(camera_payload):
+    raw = zlib.decompress(base64.b64decode(camera_payload["rgb_zlib_b64"]))
     arr = np.frombuffer(raw, dtype=np.uint8)
-    return arr.reshape(reply["rgb_shape"])
+    return arr.reshape(camera_payload["rgb_shape"])
+
+
+def decode_rgb(reply):
+    return decode_camera_rgb(reply)
+
+
+def decode_camera_images(reply):
+    cameras = reply.get("cameras")
+    if not isinstance(cameras, dict):
+        return {"front": decode_rgb(reply)}
+
+    decoded = {}
+    for camera_name, camera_payload in cameras.items():
+        decoded[camera_name] = decode_camera_rgb(camera_payload)
+    return decoded
 
 
 def clamp_joint(name, value):
@@ -112,7 +129,7 @@ class GuiClient:
         self.joints = DEFAULT_JOINTS.copy()
         self.actual = self.joints.copy()
         self.velocities = [0.0] * 4
-        self.rgb_surface = None
+        self.camera_surfaces = {}
         self.buttons = []
         self._build_buttons()
 
@@ -164,10 +181,17 @@ class GuiClient:
             reply = recv_json(self.sock)
             self.actual = list(map(float, reply["joint_positions"]))
             self.velocities = list(map(float, reply["joint_velocities"]))
-            rgb = decode_rgb(reply)
-            rgb = np.ascontiguousarray(rgb)
-            self.rgb_surface = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
-            self.status = f"Connected {self.host}:{self.port}"
+            camera_images = decode_camera_images(reply)
+            self.camera_surfaces = {}
+            for camera_name, rgb in camera_images.items():
+                rgb = np.ascontiguousarray(rgb)
+                surface = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
+                self.camera_surfaces[camera_name] = pygame.transform.smoothscale(
+                    surface,
+                    (CAMERA_W, CAMERA_H),
+                )
+            camera_list = ",".join(sorted(self.camera_surfaces.keys()))
+            self.status = f"Connected {self.host}:{self.port} cameras={camera_list}"
         except OSError as exc:
             self.status = f"Lost connection: {exc}"
             self.close()
@@ -190,11 +214,23 @@ class GuiClient:
     def draw(self, surf, font, small_font):
         surf.fill(BG)
 
-        if self.rgb_surface is not None:
-            surf.blit(self.rgb_surface, (0, 0))
-        else:
-            placeholder = font.render("Waiting for RGB...", True, FG)
-            surf.blit(placeholder, placeholder.get_rect(center=(WIN_W // 2, RGB_H // 2)))
+        for i, camera_name in enumerate(CAMERA_NAMES):
+            x = i * CAMERA_W
+            rect = pygame.Rect(x, 0, CAMERA_W, CAMERA_H)
+            pygame.draw.rect(surf, (12, 12, 16), rect)
+
+            camera_surface = self.camera_surfaces.get(camera_name)
+            if camera_surface is not None:
+                surf.blit(camera_surface, rect.topleft)
+            else:
+                placeholder = font.render(f"Waiting for {camera_name}...", True, FG)
+                surf.blit(placeholder, placeholder.get_rect(center=rect.center))
+
+            pygame.draw.rect(surf, (50, 50, 58), rect, width=1)
+            label_bg = pygame.Rect(x + 8, 8, 88, 24)
+            pygame.draw.rect(surf, (0, 0, 0), label_bg, border_radius=3)
+            label = small_font.render(camera_name, True, FG)
+            surf.blit(label, (x + 14, 12))
 
         y0 = RGB_H + MARGIN
         for i, name in enumerate(JOINT_NAMES):

@@ -9,6 +9,11 @@ import omni.usd
 import omni.kit.app
 import omni.ui as ui
 try:
+    import omni.timeline
+    HAS_OMNI_TIMELINE = True
+except Exception:
+    HAS_OMNI_TIMELINE = False
+try:
     import carb
 except Exception:
     carb = None
@@ -35,11 +40,16 @@ SANDBOX_FILL_HEIGHT = 3.00
 SANDBOX_FLOOR_THICKNESS = 0.16
 SANDBOX_WALL_COLOR = (0.34, 0.32, 0.28)
 SANDBOX_FLOOR_COLOR = (0.24, 0.23, 0.20)
+SAND_AMOUNT_BASE_HEIGHT = 3.00
+SAND_AMOUNT_MULTIPLIER = 1.00
+SAND_AMOUNT_MIN_MULTIPLIER = 0.25
+SAND_AMOUNT_MAX_MULTIPLIER = 10.00
+SAND_AMOUNT_HEIGHT_EXPONENT = 0.75
 
 SAND_SIZE_X = SANDBOX_INNER_SIZE_X
 SAND_SIZE_Y = SANDBOX_INNER_SIZE_Y
 SAND_CENTER_X = 0.0
-SAND_CENTER_Y = -6.7
+SAND_CENTER_Y = 6.7
 NX = 89
 NY = 101
 
@@ -49,9 +59,17 @@ SAND_RANGE_AREA_FRACTION = 1.0 / 3.0
 SAND_RANGE_LINEAR_SCALE = math.sqrt(SAND_RANGE_AREA_FRACTION)
 SAND_THICKNESS = 0.36
 SAND_FLOOR_Z = BASE_Z
+SAND_POINT_Z = SAND_FLOOR_Z
+SAND_POINT_RADIUS = min(SANDBOX_INNER_SIZE_X, SANDBOX_INNER_SIZE_Y) * 0.5 - 0.08
 MAX_EXCAVATION_DEPTH = SANDBOX_FILL_HEIGHT
 GRAVITY_MAGNITUDE = 9.81
 GRAVITY_DIRECTION = Gf.Vec3f(0.0, 0.0, -1.0)
+
+WALL_CENTER_X = SAND_CENTER_X
+WALL_CENTER_Y = SAND_CENTER_Y
+WALL_BASE_Z = BASE_Z
+WALL_INNER_SIZE_X = SANDBOX_INNER_SIZE_X
+WALL_INNER_SIZE_Y = SANDBOX_INNER_SIZE_Y
 
 PILE_CENTER_X = 0.0
 PILE_CENTER_Y = -6.7
@@ -120,6 +138,10 @@ SAND_PERFORMANCE_EFFICIENCY_TARGET_PARTICLES = 95000
 SAND_PERFORMANCE_REALISTIC_TARGET_PARTICLES = 260000
 SAND_PERFORMANCE_MAX_SPACING = 0.115
 SAND_PERFORMANCE_MIN_RADIUS_TO_SPACING = 0.30
+SAND_PERFORMANCE_BUDGET_MAX_ITERS = 4
+SAND_PERFORMANCE_BUDGET_TOLERANCE = 1.08
+SAND_PERFORMANCE_MAX_COUNT_HEADROOM = 1.10
+SAND_PERFORMANCE_HARD_MAX_PARTICLE_COUNT = 3000000
 SAND_RESET_HEALTH_MIN_FRAMES = 45
 SAND_RESET_HEALTH_MAX_FRAMES = 260
 SAND_RESET_HEALTH_WINDOW_FRAMES = 15
@@ -129,8 +151,9 @@ SAND_RESET_Z_ESCAPE_ABOVE = 3.0
 SAND_RESET_XY_ESCAPE_MARGIN = 0.35
 SAND_RESET_DISPLACEMENT_P95_BAD = 1.20
 SAND_RESET_DISPLACEMENT_MAX_BAD = 6.0
+SAND_RESET_HEALTH_SAMPLE_MAX = 12000
 
-UNLOAD_BIN_CENTER = np.array([SAND_CENTER_X, -SAND_CENTER_Y, 0.0], dtype=np.float32)
+UNLOAD_BIN_CENTER = np.array([-10.0, -5.0, 0.0], dtype=np.float32)
 UNLOAD_BIN_INNER_SIZE_X = SANDBOX_INNER_SIZE_X
 UNLOAD_BIN_INNER_SIZE_Y = SANDBOX_INNER_SIZE_Y
 UNLOAD_BIN_WALL_THICKNESS = SANDBOX_WALL_THICKNESS
@@ -139,6 +162,20 @@ UNLOAD_BIN_FLOOR_THICKNESS = SANDBOX_FLOOR_THICKNESS
 UNLOAD_BIN_DUMP_HEIGHT = 1.45
 UNLOAD_BIN_WALL_COLOR = (0.24, 0.27, 0.30)
 UNLOAD_BIN_FLOOR_COLOR = (0.20, 0.22, 0.24)
+SAND_SOURCE_SELECTION_EDGE_MARGIN = 0.10
+SAND_SOURCE_RANGE_GUIDE_COLOR = (0.05, 0.95, 0.32)
+SAND_SOURCE_RANGE_GUIDE_WIDTH = 0.040
+SAND_SOURCE_MAX_PROJECTED_FACES = 32
+SAND_SOURCE_RANGE_VISUAL_MAX_VERTICES = 128
+SAND_POINT_RANGE_VISUAL_SEGMENTS = 32
+DEFAULT_SAND_SOURCE_MESH_PATH = "/World/SandSite/SandRetainingWalls"
+SAND_SOURCE_SELECTED_PATH = ""
+SAND_SOURCE_SELECTED_FACE_COUNT = 0
+SAND_SOURCE_TOTAL_PROJECTED_FACE_COUNT = 0
+SAND_SOURCE_RAW_FACE_POLYGONS_XY = None
+SAND_SOURCE_FACE_POLYGONS_XY = None
+SAND_SOURCE_SELECTED_HULL_XY = None
+SAND_SOURCE_POLYGON_XY = None
 
 if hasattr(builtins, "_SAND_SITE_STATE"):
     try:
@@ -172,6 +209,7 @@ builtins._SAND_SITE_STATE = {
     "estimated_particle_count": 0,
     "needs_reset_after_world_ready": not AUTO_CREATE_INITIAL_SAND,
     "last_status_print_time": 0.0,
+    "last_sand_xyz_live_update": 0.0,
     "status": "Sand site script loaded",
 }
 
@@ -182,8 +220,6 @@ STATUS_LABEL = None
 DIRTY_LABEL = None
 PARAM_MODELS = {}
 UI_STATUS_MAX_CHARS = 118
-SAND_AMOUNT_MIN_HEIGHT = 1.00
-SAND_AMOUNT_MAX_HEIGHT = 10.00
 HEIGHTS = None
 BASE_HEIGHTS = None
 X_VALUES = None
@@ -316,6 +352,31 @@ def sand_mode_label(fidelity=None):
     return "Balanced"
 
 
+def clamp_sand_amount(amount=None):
+    value = SAND_AMOUNT_MULTIPLIER if amount is None else float(amount)
+    return clamp_value(value, SAND_AMOUNT_MIN_MULTIPLIER, SAND_AMOUNT_MAX_MULTIPLIER)
+
+
+def sand_height_from_amount(amount=None):
+    amount = clamp_sand_amount(amount)
+    return float(SAND_AMOUNT_BASE_HEIGHT) * (float(amount) ** float(SAND_AMOUNT_HEIGHT_EXPONENT))
+
+
+def sand_amount_from_height(height=None):
+    h = max(0.01, float(SANDBOX_FILL_HEIGHT if height is None else height))
+    base = max(0.01, float(SAND_AMOUNT_BASE_HEIGHT))
+    exponent = max(0.01, float(SAND_AMOUNT_HEIGHT_EXPONENT))
+    return clamp_sand_amount((h / base) ** (1.0 / exponent))
+
+
+def sand_amount_density_spacing_scale(amount=None):
+    amount = clamp_sand_amount(amount)
+    if amount <= 1.0:
+        return 1.0
+    exponent = max(0.0, 1.0 - float(SAND_AMOUNT_HEIGHT_EXPONENT))
+    return float(amount) ** (-exponent / 3.0)
+
+
 def recompute_derived_scene_params():
     global SAND_SIZE_X, SAND_SIZE_Y, PILE_HEIGHT, MAX_EXCAVATION_DEPTH
     global DIGGABLE_RADIUS_X, DIGGABLE_RADIUS_Y
@@ -389,18 +450,13 @@ def estimate_particle_count_from_config():
         spacing_z = max(1.0e-6, float(PARTICLE_LAYER_SPACING_Z))
         floor_z = float(SAND_FLOOR_Z)
         count = 0
-        x_values = np.arange(PILE_CENTER_X - DIGGABLE_RADIUS_X, PILE_CENTER_X + DIGGABLE_RADIUS_X, spacing_xy)
-        y_values = np.arange(PILE_CENTER_Y - DIGGABLE_RADIUS_Y, PILE_CENTER_Y + DIGGABLE_RADIUS_Y, spacing_xy)
-        for x in x_values:
-            for y in y_values:
-                if not is_inside_diggable_xy(float(x), float(y)):
-                    continue
-                surface_z = initial_sand_height_xy(float(x), float(y))
-                fill_depth = max(spacing_z, float(surface_z) - floor_z)
-                pile_depth = min(float(SAND_THICKNESS) + float(PILE_HEIGHT), fill_depth)
-                count += max(1, int(pile_depth / spacing_z))
-                if count >= int(PARTICLE_MAX_COUNT):
-                    return int(PARTICLE_MAX_COUNT)
+        for x, y in footprint_xy_samples(spacing_xy):
+            surface_z = initial_sand_height_xy(float(x), float(y))
+            fill_depth = max(spacing_z, float(surface_z) - floor_z)
+            pile_depth = min(float(SAND_THICKNESS) + float(PILE_HEIGHT), fill_depth)
+            count += max(1, int(pile_depth / spacing_z))
+            if count >= int(PARTICLE_MAX_COUNT):
+                return int(PARTICLE_MAX_COUNT)
         return int(min(int(PARTICLE_MAX_COUNT), max(0, count)))
     except Exception:
         return int(PARTICLE_MAX_COUNT)
@@ -408,11 +464,12 @@ def estimate_particle_count_from_config():
 
 def particle_performance_target_count():
     f = clamp_value(SAND_FIDELITY, 0.0, 1.0)
-    return int(round(lerp_value(
+    base_target = int(round(lerp_value(
         SAND_PERFORMANCE_EFFICIENCY_TARGET_PARTICLES,
         SAND_PERFORMANCE_REALISTIC_TARGET_PARTICLES,
         f,
     )))
+    return int(round(float(base_target) * clamp_sand_amount()))
 
 
 def apply_particle_performance_budget(announce=False):
@@ -431,43 +488,64 @@ def apply_particle_performance_budget(announce=False):
         STATE["particle_budget_estimate_after"] = estimate
         return
 
-    old_spacing = float(PARTICLE_DIGGABLE_SPACING)
-    old_layer = float(PARTICLE_LAYER_SPACING_Z)
-    scale = (float(estimate) / float(target)) ** (1.0 / 3.0)
-    PARTICLE_DIGGABLE_SPACING = clamp_value(old_spacing * scale, old_spacing, SAND_PERFORMANCE_MAX_SPACING)
-    PARTICLE_LAYER_SPACING_Z = clamp_value(
-        max(old_layer * scale, float(PARTICLE_DIGGABLE_SPACING) * PARTICLE_LAYER_SPACING_RATIO),
-        0.025,
-        0.20,
-    )
-    PARTICLE_RADIUS = clamp_value(
-        max(float(PARTICLE_RADIUS), float(PARTICLE_DIGGABLE_SPACING) * SAND_PERFORMANCE_MIN_RADIUS_TO_SPACING),
-        0.006,
-        0.060,
-    )
-    derive_stable_particle_params(layer_spacing_z=PARTICLE_LAYER_SPACING_Z)
-    PARTICLE_MASS = clamp_value(
-        float(SAND_BULK_DENSITY_KG_M3) * (float(PARTICLE_DIGGABLE_SPACING) ** 3),
-        SAND_FIDELITY_MIN_MASS,
-        SAND_FIDELITY_MAX_MASS,
-    )
-    after = int(estimate_particle_count_from_config())
+    start_spacing = float(PARTICLE_DIGGABLE_SPACING)
+    start_layer = float(PARTICLE_LAYER_SPACING_Z)
+    budget_iters = 0
+    after = estimate
+    max_iters = max(1, int(SAND_PERFORMANCE_BUDGET_MAX_ITERS))
+    tolerance = max(1.0, float(SAND_PERFORMANCE_BUDGET_TOLERANCE))
+
+    for budget_iters in range(1, max_iters + 1):
+        if after <= int(round(float(target) * tolerance)):
+            break
+        spacing_before = float(PARTICLE_DIGGABLE_SPACING)
+        layer_before = float(PARTICLE_LAYER_SPACING_Z)
+        scale = (float(after) / float(target)) ** (1.0 / 3.0)
+        PARTICLE_DIGGABLE_SPACING = clamp_value(
+            spacing_before * scale,
+            spacing_before,
+            SAND_PERFORMANCE_MAX_SPACING,
+        )
+        PARTICLE_LAYER_SPACING_Z = clamp_value(
+            max(layer_before * scale, float(PARTICLE_DIGGABLE_SPACING) * PARTICLE_LAYER_SPACING_RATIO),
+            0.025,
+            0.20,
+        )
+        PARTICLE_RADIUS = clamp_value(
+            max(float(PARTICLE_RADIUS), float(PARTICLE_DIGGABLE_SPACING) * SAND_PERFORMANCE_MIN_RADIUS_TO_SPACING),
+            0.006,
+            0.060,
+        )
+        derive_stable_particle_params(layer_spacing_z=PARTICLE_LAYER_SPACING_Z)
+        PARTICLE_MASS = clamp_value(
+            float(SAND_BULK_DENSITY_KG_M3) * (float(PARTICLE_DIGGABLE_SPACING) ** 3),
+            SAND_FIDELITY_MIN_MASS,
+            SAND_FIDELITY_MAX_MASS,
+        )
+        after = int(estimate_particle_count_from_config())
+        if abs(float(PARTICLE_DIGGABLE_SPACING) - spacing_before) < 1.0e-6:
+            break
+
     STATE["particle_budget_applied"] = True
     STATE["particle_budget_estimate_after"] = after
+    STATE["particle_budget_iters"] = int(budget_iters)
     if announce:
         info(
             "[SAND PERF BUDGET]",
             f"target={target}",
             f"estimate_before={estimate}",
             f"estimate_after={after}",
-            f"spacing={old_spacing:.4f}->{PARTICLE_DIGGABLE_SPACING:.4f}",
-            f"layer={old_layer:.4f}->{PARTICLE_LAYER_SPACING_Z:.4f}",
+            f"iters={budget_iters}",
+            f"spacing={start_spacing:.4f}->{PARTICLE_DIGGABLE_SPACING:.4f}",
+            f"layer={start_layer:.4f}->{PARTICLE_LAYER_SPACING_Z:.4f}",
             f"radius={PARTICLE_RADIUS:.4f}",
             f"solver_iters={PARTICLE_SOLVER_POSITION_ITERATIONS}",
         )
 
 
 def update_particle_runtime_state():
+    STATE["sand_amount_x"] = float(SAND_AMOUNT_MULTIPLIER)
+    STATE["sand_fill_height"] = float(SANDBOX_FILL_HEIGHT)
     STATE["sand_fidelity"] = float(SAND_FIDELITY)
     STATE["sand_mode_label"] = sand_mode_label(SAND_FIDELITY)
     STATE["particle_mass"] = float(PARTICLE_MASS)
@@ -485,6 +563,7 @@ def update_particle_runtime_state():
     STATE["estimated_particle_count"] = int(estimate_particle_count_from_config())
     STATE["particle_budget_target"] = int(particle_performance_target_count())
     STATE["particle_budget_applied"] = bool(STATE.get("particle_budget_applied", False))
+    STATE["particle_budget_iters"] = int(STATE.get("particle_budget_iters", 0) or 0)
 
 
 def apply_sand_fidelity_to_particle_globals(fidelity=None, announce=False):
@@ -499,7 +578,19 @@ def apply_sand_fidelity_to_particle_globals(fidelity=None, announce=False):
     f = float(SAND_FIDELITY)
     PARTICLE_DIGGABLE_SPACING = lerp_value(SAND_FIDELITY_EFFICIENCY_SPACING, SAND_FIDELITY_REALISTIC_SPACING, f)
     PARTICLE_RADIUS = lerp_value(SAND_FIDELITY_EFFICIENCY_RADIUS, SAND_FIDELITY_REALISTIC_RADIUS, f)
-    PARTICLE_MAX_COUNT = int(round(lerp_value(SAND_FIDELITY_EFFICIENCY_MAX_COUNT, SAND_FIDELITY_REALISTIC_MAX_COUNT, f)))
+    amount_spacing_scale = sand_amount_density_spacing_scale()
+    PARTICLE_DIGGABLE_SPACING *= amount_spacing_scale
+    PARTICLE_RADIUS *= amount_spacing_scale
+    base_max_count = int(round(lerp_value(
+        SAND_FIDELITY_EFFICIENCY_MAX_COUNT,
+        SAND_FIDELITY_REALISTIC_MAX_COUNT,
+        f,
+    )))
+    budget_max_count = int(round(float(particle_performance_target_count()) * SAND_PERFORMANCE_MAX_COUNT_HEADROOM))
+    PARTICLE_MAX_COUNT = int(min(
+        SAND_PERFORMANCE_HARD_MAX_PARTICLE_COUNT,
+        max(base_max_count, budget_max_count),
+    ))
     PARTICLE_SOLVER_POSITION_ITERATIONS = int(round(lerp_value(
         SAND_FIDELITY_EFFICIENCY_SOLVER_ITERS,
         SAND_FIDELITY_REALISTIC_SOLVER_ITERS,
@@ -520,6 +611,8 @@ def apply_sand_fidelity_to_particle_globals(fidelity=None, announce=False):
             "[SAND FIDELITY]",
             f"value={SAND_FIDELITY:.2f}",
             f"mode={sand_mode_label(SAND_FIDELITY)}",
+            f"amount={SAND_AMOUNT_MULTIPLIER:.2f}x",
+            f"height={SANDBOX_FILL_HEIGHT:.2f}",
             f"spacing={PARTICLE_DIGGABLE_SPACING:.4f}",
             f"radius={PARTICLE_RADIUS:.4f}",
             f"max_count={PARTICLE_MAX_COUNT}",
@@ -555,8 +648,15 @@ def set_sand_fidelity(fidelity, rebuild=False):
 def apply_parameter_models_to_globals():
     global SANDBOX_INNER_SIZE_X, SANDBOX_INNER_SIZE_Y, SANDBOX_WALL_THICKNESS, SANDBOX_WALL_HEIGHT
     global SANDBOX_FILL_HEIGHT, SANDBOX_FLOOR_THICKNESS, SAND_CENTER_X, SAND_CENTER_Y
+    global SAND_AMOUNT_MULTIPLIER
+    global SAND_POINT_Z, SAND_FLOOR_Z, SAND_POINT_RADIUS
+    global SAND_SOURCE_SELECTED_PATH, SAND_SOURCE_SELECTED_FACE_COUNT, SAND_SOURCE_TOTAL_PROJECTED_FACE_COUNT
+    global SAND_SOURCE_RAW_FACE_POLYGONS_XY, SAND_SOURCE_FACE_POLYGONS_XY
+    global SAND_SOURCE_SELECTED_HULL_XY, SAND_SOURCE_POLYGON_XY
+    global WALL_CENTER_X, WALL_CENTER_Y, WALL_BASE_Z, WALL_INNER_SIZE_X, WALL_INNER_SIZE_Y
     global PILE_CENTER_X, PILE_CENTER_Y, PILE_SIGMA_X, PILE_SIGMA_Y, SAND_THICKNESS
     global DIGGABLE_RADIUS_X, DIGGABLE_RADIUS_Y
+    global SAND_SOURCE_SELECTION_EDGE_MARGIN
     global PARTICLE_DIGGABLE_SPACING, PARTICLE_LAYER_SPACING_Z, PARTICLE_RADIUS, PARTICLE_CONTACT_OFFSET
     global PARTICLE_REST_OFFSET, PARTICLE_SOLID_REST_OFFSET, PARTICLE_FLUID_REST_OFFSET, PARTICLE_MASS
     global PARTICLE_JITTER, PARTICLE_SOLVER_POSITION_ITERATIONS, PARTICLE_MAX_VELOCITY, PARTICLE_MAX_COUNT
@@ -577,23 +677,76 @@ def apply_parameter_models_to_globals():
                 raw = current
         return clamp_value(raw, lo, hi)
 
-    SAND_CENTER_X = model_value("sand_center_x", SAND_CENTER_X, -20.0, 20.0)
-    SAND_CENTER_Y = model_value("sand_center_y", SAND_CENTER_Y, -20.0, 20.0)
+    next_sand_x = model_value("sand_center_x", SAND_CENTER_X, -20.0, 20.0)
+    next_sand_y = model_value("sand_center_y", SAND_CENTER_Y, -20.0, 20.0)
+    next_sand_z = model_value("sand_point_z", SAND_POINT_Z, -2.0, 8.0)
+    next_sand_r = model_value("sand_point_r", SAND_POINT_RADIUS, 0.05, 6.0)
+    xy_changed_by_user = (
+        abs(float(next_sand_x) - float(SAND_CENTER_X)) > 1.0e-4
+        or abs(float(next_sand_y) - float(SAND_CENTER_Y)) > 1.0e-4
+    )
+    r_changed_by_user = abs(float(next_sand_r) - float(SAND_POINT_RADIUS)) > 1.0e-4
+    if (xy_changed_by_user or r_changed_by_user) and SAND_SOURCE_SELECTED_HULL_XY is not None:
+        SAND_SOURCE_SELECTED_PATH = ""
+        SAND_SOURCE_SELECTED_FACE_COUNT = 0
+        SAND_SOURCE_TOTAL_PROJECTED_FACE_COUNT = 0
+        SAND_SOURCE_RAW_FACE_POLYGONS_XY = None
+        SAND_SOURCE_FACE_POLYGONS_XY = None
+SAND_SOURCE_SELECTED_HULL_XY = None
+SAND_SOURCE_POLYGON_XY = None
+
+
+def simulation_timeline_is_playing():
+    if not HAS_OMNI_TIMELINE:
+        return True
+    try:
+        timeline = omni.timeline.get_timeline_interface()
+        if timeline is None:
+            return True
+        return bool(timeline.is_playing())
+    except Exception:
+        return True
+        info("[SAND SOURCE SELECT] source=point_xyz reason=sand_point_xy_or_radius_changed")
+    SAND_CENTER_X = next_sand_x
+    SAND_CENTER_Y = next_sand_y
+    SAND_POINT_Z = next_sand_z
+    SAND_POINT_RADIUS = next_sand_r
+    SAND_FLOOR_Z = SAND_POINT_Z
     PILE_CENTER_X = SAND_CENTER_X
     PILE_CENTER_Y = SAND_CENTER_Y
+    SAND_SOURCE_SELECTION_EDGE_MARGIN = model_value("sand_source_shrink_d", SAND_SOURCE_SELECTION_EDGE_MARGIN, 0.0, 2.0)
+
+    WALL_CENTER_X = model_value("wall_center_x", WALL_CENTER_X, -20.0, 20.0)
+    WALL_CENTER_Y = model_value("wall_center_y", WALL_CENTER_Y, -20.0, 20.0)
+    WALL_BASE_Z = model_value("wall_center_z", WALL_BASE_Z, -2.0, 8.0)
+    WALL_INNER_SIZE_X = model_value("wall_size_x", WALL_INNER_SIZE_X, 0.50, 12.0)
+    WALL_INNER_SIZE_Y = model_value("wall_size_y", WALL_INNER_SIZE_Y, 0.50, 12.0)
 
     SANDBOX_INNER_SIZE_X = model_value("sandbox_x", SANDBOX_INNER_SIZE_X, 0.50, 8.0)
     SANDBOX_INNER_SIZE_Y = model_value("sandbox_y", SANDBOX_INNER_SIZE_Y, 0.50, 8.0)
+    if SAND_SOURCE_SELECTED_HULL_XY is None:
+        SANDBOX_INNER_SIZE_X = max(0.10, 2.0 * float(SAND_POINT_RADIUS))
+        SANDBOX_INNER_SIZE_Y = max(0.10, 2.0 * float(SAND_POINT_RADIUS))
     SANDBOX_WALL_THICKNESS = model_value("wall_thickness", SANDBOX_WALL_THICKNESS, 0.02, 0.40)
     SANDBOX_WALL_HEIGHT = model_value("wall_height", SANDBOX_WALL_HEIGHT, 0.10, 2.50)
-    SANDBOX_FILL_HEIGHT = model_value("fill_height", SANDBOX_FILL_HEIGHT, 0.05, SAND_AMOUNT_MAX_HEIGHT)
+    SAND_AMOUNT_MULTIPLIER = model_value(
+        "sand_amount_x",
+        SAND_AMOUNT_MULTIPLIER,
+        SAND_AMOUNT_MIN_MULTIPLIER,
+        SAND_AMOUNT_MAX_MULTIPLIER,
+    )
+    SANDBOX_FILL_HEIGHT = sand_height_from_amount(SAND_AMOUNT_MULTIPLIER)
     SANDBOX_FLOOR_THICKNESS = model_value("floor_thickness", SANDBOX_FLOOR_THICKNESS, 0.04, 0.50)
     SAND_THICKNESS = model_value("sand_thickness", SAND_THICKNESS, 0.02, SANDBOX_FILL_HEIGHT)
 
     DIGGABLE_RADIUS_X = model_value("diggable_x", DIGGABLE_RADIUS_X, 0.05, 0.5 * SANDBOX_INNER_SIZE_X - 0.02)
     DIGGABLE_RADIUS_Y = model_value("diggable_y", DIGGABLE_RADIUS_Y, 0.05, 0.5 * SANDBOX_INNER_SIZE_Y - 0.02)
+    if SAND_SOURCE_SELECTED_HULL_XY is None:
+        DIGGABLE_RADIUS_X = float(SAND_POINT_RADIUS)
+        DIGGABLE_RADIUS_Y = float(SAND_POINT_RADIUS)
     PILE_SIGMA_X = model_value("pile_sigma_x", PILE_SIGMA_X, 0.05, max(0.05, DIGGABLE_RADIUS_X))
     PILE_SIGMA_Y = model_value("pile_sigma_y", PILE_SIGMA_Y, 0.05, max(0.05, DIGGABLE_RADIUS_Y))
+    refresh_selected_sand_polygon_from_hull()
 
     recompute_derived_scene_params()
 
@@ -612,12 +765,22 @@ def apply_parameter_models_to_globals():
 
     recompute_derived_scene_params()
     update_particle_runtime_state()
+    set_sand_generation_range_box("apply_parameters")
 
 
 def refresh_parameter_models_from_globals():
     values = {
         "sand_center_x": SAND_CENTER_X,
         "sand_center_y": SAND_CENTER_Y,
+        "sand_point_z": SAND_POINT_Z,
+        "sand_point_r": SAND_POINT_RADIUS,
+        "sand_amount_x": SAND_AMOUNT_MULTIPLIER,
+        "sand_source_shrink_d": SAND_SOURCE_SELECTION_EDGE_MARGIN,
+        "wall_center_x": WALL_CENTER_X,
+        "wall_center_y": WALL_CENTER_Y,
+        "wall_center_z": WALL_BASE_Z,
+        "wall_size_x": WALL_INNER_SIZE_X,
+        "wall_size_y": WALL_INNER_SIZE_Y,
         "sandbox_x": SANDBOX_INNER_SIZE_X,
         "sandbox_y": SANDBOX_INNER_SIZE_Y,
         "wall_thickness": SANDBOX_WALL_THICKNESS,
@@ -651,13 +814,17 @@ def refresh_parameter_models_from_globals():
         "unload_floor_thickness": UNLOAD_BIN_FLOOR_THICKNESS,
         "unload_dump_height": UNLOAD_BIN_DUMP_HEIGHT,
     }
-    for key, value in values.items():
-        model = PARAM_MODELS.get(key)
-        if model is not None:
-            try:
-                model.set_value(float(value))
-            except Exception:
-                pass
+    STATE["suppress_parameter_callbacks"] = True
+    try:
+        for key, value in values.items():
+            model = PARAM_MODELS.get(key)
+            if model is not None:
+                try:
+                    model.set_value(float(value))
+                except Exception:
+                    pass
+    finally:
+        STATE["suppress_parameter_callbacks"] = False
 
 
 def set_particle_size_and_limit(radius=None, max_count=None, spacing_xy=None, spacing_z=None, rebuild=False):
@@ -673,7 +840,7 @@ def set_particle_size_and_limit(radius=None, max_count=None, spacing_xy=None, sp
         PARTICLE_SOLID_REST_OFFSET = min(float(PARTICLE_SOLID_REST_OFFSET), float(PARTICLE_CONTACT_OFFSET))
         PARTICLE_FLUID_REST_OFFSET = min(float(PARTICLE_FLUID_REST_OFFSET), float(PARTICLE_CONTACT_OFFSET))
     if max_count is not None:
-        PARTICLE_MAX_COUNT = int(round(clamp_value(max_count, 1000, 2000000)))
+        PARTICLE_MAX_COUNT = int(round(clamp_value(max_count, 1000, SAND_PERFORMANCE_HARD_MAX_PARTICLE_COUNT)))
     if spacing_xy is not None:
         PARTICLE_DIGGABLE_SPACING = clamp_value(spacing_xy, 0.025, 0.20)
     if spacing_z is not None:
@@ -751,6 +918,507 @@ def world_bbox_min_max_for_prim(prim):
         return None, None
 
 
+def mesh_world_xy_points_under(prim):
+    if prim is None or not prim.IsValid():
+        return np.empty((0, 2), dtype=np.float32)
+    pts = []
+    for p in Usd.PrimRange(prim):
+        try:
+            if not p.IsA(UsdGeom.Mesh):
+                continue
+            mesh = UsdGeom.Mesh(p)
+            local_points = mesh.GetPointsAttr().Get()
+            if not local_points:
+                continue
+            mat = UsdGeom.Xformable(p).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+            for lp in local_points:
+                wp = mat.Transform(Gf.Vec3d(float(lp[0]), float(lp[1]), float(lp[2])))
+                pts.append((float(wp[0]), float(wp[1])))
+        except Exception:
+            continue
+    if not pts:
+        return np.empty((0, 2), dtype=np.float32)
+    return np.array(pts, dtype=np.float32)
+
+
+def mesh_world_projected_faces_under(prim, max_faces=32):
+    if prim is None or not prim.IsValid():
+        return np.empty((0, 2), dtype=np.float32), [], 0
+    candidates = []
+    total_projected_faces = 0
+    for p in Usd.PrimRange(prim):
+        try:
+            if not p.IsA(UsdGeom.Mesh):
+                continue
+            mesh = UsdGeom.Mesh(p)
+            local_points = mesh.GetPointsAttr().Get()
+            counts = mesh.GetFaceVertexCountsAttr().Get()
+            indices = mesh.GetFaceVertexIndicesAttr().Get()
+            if local_points is None or counts is None or indices is None:
+                continue
+            if len(local_points) == 0 or len(counts) == 0 or len(indices) == 0:
+                continue
+            mat = UsdGeom.Xformable(p).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+            cursor = 0
+            for face_idx, count in enumerate(counts):
+                count = int(count)
+                face_indices = indices[cursor:cursor + count]
+                cursor += count
+                if count < 3:
+                    continue
+                poly = []
+                for raw_idx in face_indices:
+                    idx = int(raw_idx)
+                    if idx < 0 or idx >= len(local_points):
+                        continue
+                    lp = local_points[idx]
+                    wp = mat.Transform(Gf.Vec3d(float(lp[0]), float(lp[1]), float(lp[2])))
+                    poly.append((float(wp[0]), float(wp[1])))
+                if len(poly) < 3:
+                    continue
+                area = abs(polygon_signed_area(poly))
+                if area <= 1.0e-6:
+                    continue
+                total_projected_faces += 1
+                candidates.append((area, str(p.GetPath()), int(face_idx), np.array(poly, dtype=np.float32)))
+        except Exception:
+            continue
+
+    if not candidates:
+        return np.empty((0, 2), dtype=np.float32), [], total_projected_faces
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    selected = candidates[:max(1, int(max_faces))]
+    polys = [item[3] for item in selected]
+    xy_points = np.vstack(polys).astype(np.float32)
+    return xy_points, polys, total_projected_faces
+
+
+def convex_hull_xy(points):
+    pts = np.array(points, dtype=np.float64).reshape(-1, 2)
+    if pts.shape[0] == 0:
+        return None
+    pts = np.unique(np.round(pts, 6), axis=0)
+    if pts.shape[0] < 3:
+        return None
+    pts = pts[np.lexsort((pts[:, 1], pts[:, 0]))]
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 1.0e-9:
+            lower.pop()
+        lower.append(tuple(p))
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 1.0e-9:
+            upper.pop()
+        upper.append(tuple(p))
+    hull = np.array(lower[:-1] + upper[:-1], dtype=np.float32)
+    return hull if hull.shape[0] >= 3 else None
+
+
+def polygon_signed_area(poly):
+    p = np.array(poly, dtype=np.float64).reshape(-1, 2)
+    if p.shape[0] < 3:
+        return 0.0
+    x = p[:, 0]
+    y = p[:, 1]
+    return float(0.5 * np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+
+
+def polygon_centroid_xy(poly):
+    p = np.array(poly, dtype=np.float64).reshape(-1, 2)
+    if p.shape[0] == 0:
+        return np.zeros(2, dtype=np.float32)
+    area = polygon_signed_area(p)
+    if abs(area) < 1.0e-8:
+        return np.mean(p, axis=0).astype(np.float32)
+    x = p[:, 0]
+    y = p[:, 1]
+    x2 = np.roll(x, -1)
+    y2 = np.roll(y, -1)
+    cross = x * y2 - x2 * y
+    cx = np.sum((x + x2) * cross) / (6.0 * area)
+    cy = np.sum((y + y2) * cross) / (6.0 * area)
+    return np.array([cx, cy], dtype=np.float32)
+
+
+def shrink_convex_polygon_xy(poly, shrink_d):
+    p = np.array(poly, dtype=np.float64).reshape(-1, 2)
+    if p.shape[0] < 3:
+        return None
+    if polygon_signed_area(p) < 0.0:
+        p = p[::-1].copy()
+    d = max(0.0, float(shrink_d))
+    if d <= 1.0e-6:
+        return p.astype(np.float32)
+
+    def inside(pt, a, b):
+        e = b - a
+        length = max(1.0e-9, float(np.linalg.norm(e)))
+        return float(e[0] * (pt[1] - a[1]) - e[1] * (pt[0] - a[0])) >= d * length - 1.0e-8
+
+    def intersect(s, ept, a, b):
+        edge = b - a
+        seg = ept - s
+        rhs = d * max(1.0e-9, float(np.linalg.norm(edge))) - (edge[0] * (s[1] - a[1]) - edge[1] * (s[0] - a[0]))
+        denom = edge[0] * seg[1] - edge[1] * seg[0]
+        if abs(float(denom)) < 1.0e-12:
+            return ept
+        t = float(rhs / denom)
+        return s + np.clip(t, 0.0, 1.0) * seg
+
+    out = p.copy()
+    for i in range(p.shape[0]):
+        a = p[i]
+        b = p[(i + 1) % p.shape[0]]
+        if out.shape[0] == 0:
+            break
+        new_pts = []
+        s = out[-1]
+        s_inside = inside(s, a, b)
+        for ept in out:
+            e_inside = inside(ept, a, b)
+            if e_inside:
+                if not s_inside:
+                    new_pts.append(intersect(s, ept, a, b))
+                new_pts.append(ept)
+            elif s_inside:
+                new_pts.append(intersect(s, ept, a, b))
+            s = ept
+            s_inside = e_inside
+        out = np.array(new_pts, dtype=np.float64) if new_pts else np.empty((0, 2), dtype=np.float64)
+    if out.shape[0] < 3 or abs(polygon_signed_area(out)) < 1.0e-6:
+        c = polygon_centroid_xy(p).astype(np.float64)
+        return (c + 0.80 * (p - c)).astype(np.float32)
+    return out.astype(np.float32)
+
+
+def point_in_polygon_xy(x, y, poly):
+    p = np.array(poly, dtype=np.float64).reshape(-1, 2)
+    if p.shape[0] < 3:
+        return False
+    inside = False
+    px = float(x)
+    py = float(y)
+    j = p.shape[0] - 1
+    for i in range(p.shape[0]):
+        xi, yi = p[i]
+        xj, yj = p[j]
+        if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / max(1.0e-12, yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def visual_polygon_xy(poly, max_vertices):
+    p = np.array(poly, dtype=np.float32).reshape(-1, 2)
+    n = int(p.shape[0])
+    limit = max(3, int(max_vertices))
+    if n <= limit:
+        return p
+
+    closed = np.vstack([p, p[0]])
+    edge_vec = closed[1:] - closed[:-1]
+    edge_len = np.linalg.norm(edge_vec, axis=1)
+    perimeter = float(np.sum(edge_len))
+    if perimeter <= 1.0e-6:
+        idx = np.linspace(0, n - 1, limit, dtype=np.int32)
+        return p[idx]
+
+    cumulative = np.concatenate([[0.0], np.cumsum(edge_len)])
+    samples = []
+    for target_dist in np.linspace(0.0, perimeter, limit, endpoint=False):
+        edge_idx = int(np.searchsorted(cumulative, target_dist, side="right") - 1)
+        edge_idx = max(0, min(edge_idx, n - 1))
+        local_len = max(1.0e-9, float(edge_len[edge_idx]))
+        t = float((target_dist - cumulative[edge_idx]) / local_len)
+        pt = closed[edge_idx] + t * edge_vec[edge_idx]
+        samples.append((float(pt[0]), float(pt[1])))
+    return np.array(samples, dtype=np.float32)
+
+
+def selected_mesh_footprint_polygon_xy(hull_xy, shrink_d):
+    hull = np.array(hull_xy, dtype=np.float32).reshape(-1, 2)
+    if hull.shape[0] < 3:
+        return None, None
+
+    # Fallback for non-face mesh data; selected mesh generation normally uses face polygons directly.
+    poly = shrink_convex_polygon_xy(hull, shrink_d)
+    if poly is None:
+        return hull, None
+    if poly.shape[0] < 3:
+        return hull, None
+    return hull, poly
+
+
+def shrink_face_polygons_xy(polygons, shrink_d):
+    out = []
+    for poly in polygons or []:
+        p = np.array(poly, dtype=np.float32).reshape(-1, 2)
+        if p.shape[0] < 3:
+            continue
+        shrunk = shrink_convex_polygon_xy(p, shrink_d)
+        if shrunk is None or np.array(shrunk).reshape(-1, 2).shape[0] < 3:
+            continue
+        out.append(np.array(shrunk, dtype=np.float32).reshape(-1, 2))
+    return out
+
+
+def ellipse_polygon_xy(cx, cy, rx, ry, segments=32):
+    n = max(8, int(segments))
+    rx = max(0.01, float(rx))
+    ry = max(0.01, float(ry))
+    pts = []
+    for i in range(n):
+        a = 2.0 * math.pi * float(i) / float(n)
+        pts.append((float(cx) + rx * math.cos(a), float(cy) + ry * math.sin(a)))
+    return np.array(pts, dtype=np.float32)
+
+
+def current_sand_footprint_polygons_xy():
+    return [current_sand_footprint_polygon_xy()]
+
+
+def current_sand_footprint_polygon_xy():
+    if SAND_SOURCE_POLYGON_XY is not None:
+        return np.array(SAND_SOURCE_POLYGON_XY, dtype=np.float32).reshape(-1, 2)
+    return ellipse_polygon_xy(
+        float(PILE_CENTER_X),
+        float(PILE_CENTER_Y),
+        float(DIGGABLE_RADIUS_X),
+        float(DIGGABLE_RADIUS_Y),
+        SAND_POINT_RANGE_VISUAL_SEGMENTS,
+    )
+
+
+def current_sand_footprint_bbox_xy(padding=0.0):
+    polys = current_sand_footprint_polygons_xy()
+    pts = np.vstack([np.array(p, dtype=np.float32).reshape(-1, 2) for p in polys])
+    mn = np.min(pts, axis=0)
+    mx = np.max(pts, axis=0)
+    pad = max(0.0, float(padding))
+    return float(mn[0] - pad), float(mx[0] + pad), float(mn[1] - pad), float(mx[1] + pad)
+
+
+def polygon_x_intervals_at_y(poly, y):
+    p = np.array(poly, dtype=np.float64).reshape(-1, 2)
+    if p.shape[0] < 3:
+        return []
+    yy = float(y)
+    xs = []
+    n = int(p.shape[0])
+    for i in range(n):
+        x1, y1 = p[i]
+        x2, y2 = p[(i + 1) % n]
+        if abs(float(y2 - y1)) < 1.0e-12:
+            continue
+        if (float(y1) <= yy < float(y2)) or (float(y2) <= yy < float(y1)):
+            t = (yy - float(y1)) / float(y2 - y1)
+            xs.append(float(x1) + t * float(x2 - x1))
+    xs.sort()
+    intervals = []
+    for i in range(0, len(xs) - 1, 2):
+        lo = float(xs[i])
+        hi = float(xs[i + 1])
+        if hi > lo:
+            intervals.append((lo, hi))
+    return intervals
+
+
+def footprint_xy_samples(spacing_xy):
+    poly = current_sand_footprint_polygon_xy()
+    x_min, x_max, y_min, y_max = current_sand_footprint_bbox_xy()
+    spacing = max(1.0e-6, float(spacing_xy))
+    y = float(y_min) + 0.5 * spacing
+    row = 0
+    while y <= float(y_max) + 1.0e-9:
+        intervals = polygon_x_intervals_at_y(poly, y)
+        row_offset = 0.5 * spacing if (row % 2) else 0.0
+        for lo, hi in intervals:
+            start = float(x_min) + row_offset + math.ceil((float(lo) - float(x_min) - row_offset) / spacing) * spacing
+            x = max(float(lo), start)
+            while x <= float(hi) + 1.0e-9:
+                if is_inside_diggable_xy(float(x), float(y)):
+                    yield float(x), float(y)
+                x += spacing
+        row += 1
+        y += spacing
+
+
+def selected_prim_paths():
+    try:
+        selection = omni.usd.get_context().get_selection()
+        if selection is None:
+            return []
+        return [str(p) for p in (selection.get_selected_prim_paths() or []) if str(p)]
+    except Exception as e:
+        info("[WARN] selection read failed:", type(e).__name__, e)
+        return []
+
+
+def first_selected_prim_path():
+    paths = selected_prim_paths()
+    return paths[0] if paths else ""
+
+
+def refresh_selected_sand_polygon_from_hull():
+    global SAND_SOURCE_RAW_FACE_POLYGONS_XY, SAND_SOURCE_FACE_POLYGONS_XY
+    global SAND_SOURCE_SELECTED_HULL_XY, SAND_SOURCE_POLYGON_XY, SAND_CENTER_X, SAND_CENTER_Y, PILE_CENTER_X, PILE_CENTER_Y
+    global SANDBOX_INNER_SIZE_X, SANDBOX_INNER_SIZE_Y
+    global DIGGABLE_RADIUS_X, DIGGABLE_RADIUS_Y, PILE_SIGMA_X, PILE_SIGMA_Y
+    SAND_SOURCE_FACE_POLYGONS_XY = None
+    if SAND_SOURCE_SELECTED_HULL_XY is None:
+        return False
+    hull, poly = selected_mesh_footprint_polygon_xy(SAND_SOURCE_SELECTED_HULL_XY, SAND_SOURCE_SELECTION_EDGE_MARGIN)
+    if poly is None:
+        return False
+    if hull is not None:
+        SAND_SOURCE_SELECTED_HULL_XY = np.array(hull, dtype=np.float32)
+    SAND_SOURCE_POLYGON_XY = np.array(poly, dtype=np.float32)
+    center_xy = polygon_centroid_xy(poly)
+    poly_min = np.min(poly, axis=0)
+    poly_max = np.max(poly, axis=0)
+    SANDBOX_INNER_SIZE_X = max(0.50, float(poly_max[0] - poly_min[0]))
+    SANDBOX_INNER_SIZE_Y = max(0.50, float(poly_max[1] - poly_min[1]))
+    SAND_CENTER_X = float(center_xy[0])
+    SAND_CENTER_Y = float(center_xy[1])
+    PILE_CENTER_X = float(center_xy[0])
+    PILE_CENTER_Y = float(center_xy[1])
+    DIGGABLE_RADIUS_X = max(0.05, 0.5 * SANDBOX_INNER_SIZE_X - 0.08)
+    DIGGABLE_RADIUS_Y = max(0.05, 0.5 * SANDBOX_INNER_SIZE_Y - 0.08)
+    PILE_SIGMA_X = max(0.05, 0.70 * DIGGABLE_RADIUS_X)
+    PILE_SIGMA_Y = max(0.05, 0.70 * DIGGABLE_RADIUS_Y)
+    return True
+
+
+def clear_selected_sand_source_mesh():
+    global SAND_SOURCE_SELECTED_PATH, SAND_SOURCE_SELECTED_FACE_COUNT, SAND_SOURCE_TOTAL_PROJECTED_FACE_COUNT
+    global SAND_SOURCE_RAW_FACE_POLYGONS_XY, SAND_SOURCE_FACE_POLYGONS_XY
+    global SAND_SOURCE_SELECTED_HULL_XY, SAND_SOURCE_POLYGON_XY
+    SAND_SOURCE_SELECTED_PATH = ""
+    SAND_SOURCE_SELECTED_FACE_COUNT = 0
+    SAND_SOURCE_TOTAL_PROJECTED_FACE_COUNT = 0
+    SAND_SOURCE_RAW_FACE_POLYGONS_XY = None
+    SAND_SOURCE_FACE_POLYGONS_XY = None
+    SAND_SOURCE_SELECTED_HULL_XY = None
+    SAND_SOURCE_POLYGON_XY = None
+    set_sand_generation_range_box("sand_point_xyz")
+    store_runtime_api()
+    update_status("Sand source set to point XYZ mode; Reset Sand regenerates particles")
+    info(
+        "[SAND SOURCE SELECT]",
+        "source=point_xyz",
+        "center=", np.round([SAND_CENTER_X, SAND_CENTER_Y, SAND_FLOOR_Z], 3),
+        "inner_size=", (round(float(SANDBOX_INNER_SIZE_X), 3), round(float(SANDBOX_INNER_SIZE_Y), 3)),
+    )
+    return True
+
+
+def use_mesh_path_as_sand_source(path, source_label="mesh"):
+    global SAND_SOURCE_SELECTED_PATH, SAND_SOURCE_SELECTED_FACE_COUNT, SAND_SOURCE_TOTAL_PROJECTED_FACE_COUNT
+    global SAND_SOURCE_RAW_FACE_POLYGONS_XY, SAND_SOURCE_FACE_POLYGONS_XY
+    global SAND_SOURCE_SELECTED_HULL_XY, SAND_SOURCE_POLYGON_XY
+    global SAND_CENTER_X, SAND_CENTER_Y, PILE_CENTER_X, PILE_CENTER_Y
+    global SANDBOX_INNER_SIZE_X, SANDBOX_INNER_SIZE_Y
+    global DIGGABLE_RADIUS_X, DIGGABLE_RADIUS_Y, PILE_SIGMA_X, PILE_SIGMA_Y
+
+    if not path:
+        update_status("Select a sand source mesh/group first")
+        return False
+    prim = get_stage().GetPrimAtPath(Sdf.Path(path))
+    if not prim or not prim.IsValid():
+        update_status(f"Sand source path is invalid: {path}")
+        info("[WARN] [SAND SOURCE SELECT] invalid path:", path)
+        return False
+    mn, mx = world_bbox_min_max_for_prim(prim)
+    if mn is None or mx is None:
+        update_status(f"Selected sand source has no valid bbox: {path}")
+        return False
+
+    xy_points, selected_faces, total_projected_faces = mesh_world_projected_faces_under(
+        prim,
+        SAND_SOURCE_MAX_PROJECTED_FACES,
+    )
+    used_bbox_fallback = False
+    if xy_points.shape[0] == 0:
+        xy_points = mesh_world_xy_points_under(prim)
+    raw_hull = convex_hull_xy(xy_points)
+    if raw_hull is None:
+        used_bbox_fallback = True
+        raw_hull = np.array(
+            [
+                [float(mn[0]), float(mn[1])],
+                [float(mx[0]), float(mn[1])],
+                [float(mx[0]), float(mx[1])],
+                [float(mn[0]), float(mx[1])],
+            ],
+            dtype=np.float32,
+        )
+    shrink = float(SAND_SOURCE_SELECTION_EDGE_MARGIN)
+    hull, poly = selected_mesh_footprint_polygon_xy(raw_hull, shrink)
+    if poly is None:
+        update_status(f"Selected sand source footprint failed: {path}")
+        return False
+
+    center_xy = polygon_centroid_xy(poly)
+    poly_min = np.min(poly, axis=0)
+    poly_max = np.max(poly, axis=0)
+    inner_x = max(0.50, float(poly_max[0] - poly_min[0]))
+    inner_y = max(0.50, float(poly_max[1] - poly_min[1]))
+
+    SAND_SOURCE_SELECTED_PATH = path
+    SAND_SOURCE_SELECTED_FACE_COUNT = int(len(selected_faces))
+    SAND_SOURCE_TOTAL_PROJECTED_FACE_COUNT = int(total_projected_faces)
+    SAND_SOURCE_RAW_FACE_POLYGONS_XY = None
+    SAND_SOURCE_FACE_POLYGONS_XY = None
+    SAND_SOURCE_SELECTED_HULL_XY = np.array(hull, dtype=np.float32)
+    SAND_SOURCE_POLYGON_XY = np.array(poly, dtype=np.float32)
+
+    SAND_CENTER_X = float(center_xy[0])
+    SAND_CENTER_Y = float(center_xy[1])
+    PILE_CENTER_X = float(center_xy[0])
+    PILE_CENTER_Y = float(center_xy[1])
+    SANDBOX_INNER_SIZE_X = inner_x
+    SANDBOX_INNER_SIZE_Y = inner_y
+    DIGGABLE_RADIUS_X = max(0.05, 0.5 * inner_x - 0.08)
+    DIGGABLE_RADIUS_Y = max(0.05, 0.5 * inner_y - 0.08)
+    PILE_SIGMA_X = max(0.05, 0.70 * DIGGABLE_RADIUS_X)
+    PILE_SIGMA_Y = max(0.05, 0.70 * DIGGABLE_RADIUS_Y)
+
+    recompute_derived_scene_params()
+    update_particle_runtime_state()
+    store_runtime_api()
+    set_sand_generation_range_box("selected_sand_mesh")
+    update_status(f"Sand source mesh/group selected: {path}; Reset Sand to regenerate particles")
+    info(
+        "[SAND SOURCE SELECT]",
+        f"source={source_label}",
+        "path=", path,
+        "center=", np.round([SAND_CENTER_X, SAND_CENTER_Y, SAND_FLOOR_Z], 3),
+        "inner_size=", (round(float(SANDBOX_INNER_SIZE_X), 3), round(float(SANDBOX_INNER_SIZE_Y), 3)),
+        "diggable_radius=", (round(float(DIGGABLE_RADIUS_X), 3), round(float(DIGGABLE_RADIUS_Y), 3)),
+        "mesh_shrink_d=", round(float(shrink), 3),
+        "projected_faces_used=", int(SAND_SOURCE_SELECTED_FACE_COUNT),
+        "projected_faces_total=", int(SAND_SOURCE_TOTAL_PROJECTED_FACE_COUNT),
+        "max_projected_faces=", int(SAND_SOURCE_MAX_PROJECTED_FACES),
+        "bbox_fallback=", bool(used_bbox_fallback),
+        "hull_vertices=", int(len(hull)),
+        "active_vertices=", int(len(poly)),
+    )
+    return True
+
+
+def use_selected_mesh_as_sand_source():
+    return use_mesh_path_as_sand_source(first_selected_prim_path(), source_label="selected_mesh")
+
+
+def apply_default_sand_source_mesh():
+    return use_mesh_path_as_sand_source(DEFAULT_SAND_SOURCE_MESH_PATH, source_label="preset_mesh")
+
+
 def fmt_bbox(mn, mx):
     if mn is None or mx is None:
         return "None"
@@ -781,38 +1449,163 @@ def sand_make_sphere(path, translate, radius, color, collision=False, opacity=No
     return prim
 
 
-def sand_make_cylinder(path, translate, radius, depth, color, rotate_xyz=(0.0, 90.0, 0.0), collision=False):
+def set_sand_generation_range_box(label=""):
+    stage = get_stage()
+    cleanup_key = "sand_range_guide_cleanup_done"
+    if not bool(STATE.get(cleanup_key, False)):
+        for old_path in [
+            f"{root_path()}/SandGenerationRangeColumn",
+            f"{root_path()}/SandGenerationRangeBox",
+        ]:
+            try:
+                stage.RemovePrim(Sdf.Path(old_path))
+            except Exception:
+                pass
+        STATE[cleanup_key] = True
+    path = f"{root_path()}/SandGenerationRangeGuide"
+    height = max(0.20, float(SANDBOX_FILL_HEIGHT))
+    poly = current_sand_footprint_polygon_xy()
+    visual_poly = visual_polygon_xy(poly, SAND_SOURCE_RANGE_VISUAL_MAX_VERTICES)
+    n = int(len(visual_poly))
+    z0 = float(SAND_FLOOR_Z)
+    z1 = float(SAND_FLOOR_Z) + height
+    points = []
+    counts = []
+    if n >= 3:
+        bottom = [Gf.Vec3f(float(x), float(y), z0) for x, y in visual_poly] + [
+            Gf.Vec3f(float(visual_poly[0][0]), float(visual_poly[0][1]), z0)
+        ]
+        top = [Gf.Vec3f(float(x), float(y), z1) for x, y in visual_poly] + [
+            Gf.Vec3f(float(visual_poly[0][0]), float(visual_poly[0][1]), z1)
+        ]
+        points.extend(bottom)
+        counts.append(len(bottom))
+        points.extend(top)
+        counts.append(len(top))
+        step = max(1, n // 8)
+        for i in range(0, n, step):
+            x, y = visual_poly[i]
+            points.extend([Gf.Vec3f(float(x), float(y), z0), Gf.Vec3f(float(x), float(y), z1)])
+            counts.append(2)
+    prim = get_prim(path)
+    created = False
+    if not prim.IsValid() or not prim.IsA(UsdGeom.BasisCurves):
+        try:
+            stage.RemovePrim(Sdf.Path(path))
+        except Exception:
+            pass
+        curve = UsdGeom.BasisCurves.Define(stage, path)
+        created = True
+    else:
+        curve = UsdGeom.BasisCurves(prim)
+    if len(points) < 2:
+        points = [Gf.Vec3f(0.0, 0.0, 0.0), Gf.Vec3f(0.001, 0.0, 0.0)]
+        counts = [2]
+    try:
+        curve.GetPointsAttr().Set(points) if curve.GetPointsAttr().IsValid() else curve.CreatePointsAttr(points)
+        curve.GetCurveVertexCountsAttr().Set(counts) if curve.GetCurveVertexCountsAttr().IsValid() else curve.CreateCurveVertexCountsAttr(counts)
+    except Exception:
+        curve.CreatePointsAttr(points)
+        curve.CreateCurveVertexCountsAttr(counts)
+    if created or label != "sand_xyz_live":
+        try:
+            curve.CreateTypeAttr(UsdGeom.Tokens.linear)
+            try:
+                curve.GetBasisAttr().Clear()
+            except Exception:
+                pass
+            curve.CreateWrapAttr(UsdGeom.Tokens.nonperiodic)
+            curve.CreateWidthsAttr([float(SAND_SOURCE_RANGE_GUIDE_WIDTH)])
+        except Exception:
+            pass
+    prim = curve.GetPrim()
+    if created or label != "sand_xyz_live":
+        sand_set_color(prim, SAND_SOURCE_RANGE_GUIDE_COLOR, None)
+    poly_min = np.min(np.array(poly, dtype=np.float32).reshape(-1, 2), axis=0)
+    poly_max = np.max(np.array(poly, dtype=np.float32).reshape(-1, 2), axis=0)
+    center = polygon_centroid_xy(poly)
+    if label and label != "sand_xyz_live":
+        info(
+            "[SAND SOURCE RANGE]",
+            f"label={label}",
+            "path=", path,
+            "center=", np.round([float(center[0]), float(center[1]), float(SAND_FLOOR_Z) + 0.5 * height], 3),
+            "bbox_size=", (round(float(poly_max[0] - poly_min[0]), 3), round(float(poly_max[1] - poly_min[1]), 3)),
+            "vertices=", int(len(poly)),
+            "visual_vertices=", int(len(visual_poly)),
+            "height=", round(height, 3),
+            "mesh_shrink_d=", round(float(SAND_SOURCE_SELECTION_EDGE_MARGIN), 3),
+        )
+    return path
+
+
+def sand_make_cylinder(path, translate, radius, depth, color, rotate_xyz=(0.0, 90.0, 0.0), collision=False, opacity=None):
     stage = get_stage()
     cyl = UsdGeom.Cylinder.Define(stage, path)
     cyl.CreateRadiusAttr(float(radius))
     cyl.CreateHeightAttr(float(depth))
     prim = cyl.GetPrim()
     sand_set_xform(prim, translate=translate, rotate_xyz=rotate_xyz)
-    sand_set_color(prim, color)
+    sand_set_color(prim, color, opacity)
     if collision:
         UsdPhysics.CollisionAPI.Apply(prim)
     return prim
 
 
+def sand_make_polygon_prism(path, polygon_xy, z_min, z_max, color, opacity=None):
+    poly = np.array(polygon_xy, dtype=np.float32).reshape(-1, 2)
+    if poly.shape[0] < 3:
+        return None
+    mesh = UsdGeom.Mesh.Define(get_stage(), path)
+    pts = []
+    for xy in poly:
+        pts.append(Gf.Vec3f(float(xy[0]), float(xy[1]), float(z_min)))
+    for xy in poly:
+        pts.append(Gf.Vec3f(float(xy[0]), float(xy[1]), float(z_max)))
+    n = int(poly.shape[0])
+    counts = [n, n]
+    indices = list(range(n - 1, -1, -1)) + list(range(n, 2 * n))
+    for i in range(n):
+        j = (i + 1) % n
+        counts.append(4)
+        indices.extend([i, j, n + j, n + i])
+    mesh.CreatePointsAttr(pts)
+    mesh.CreateFaceVertexCountsAttr(counts)
+    mesh.CreateFaceVertexIndicesAttr(indices)
+    try:
+        mesh.CreateSubdivisionSchemeAttr().Set(UsdGeom.Tokens.none)
+        mesh.CreateDoubleSidedAttr(False)
+    except Exception:
+        pass
+    prim = mesh.GetPrim()
+    sand_set_color(prim, color, opacity)
+    try:
+        if prim.HasAPI(UsdPhysics.CollisionAPI):
+            prim.RemoveAPI(UsdPhysics.CollisionAPI)
+    except Exception:
+        pass
+    return prim
+
+
 def sand_x_min():
-    return SAND_CENTER_X - 0.5 * SAND_SIZE_X
+    return current_sand_footprint_bbox_xy()[0]
 
 
 def sand_x_max():
-    return SAND_CENTER_X + 0.5 * SAND_SIZE_X
+    return current_sand_footprint_bbox_xy()[1]
 
 
 def sand_y_min():
-    return SAND_CENTER_Y - 0.5 * SAND_SIZE_Y
+    return current_sand_footprint_bbox_xy()[2]
 
 
 def sand_y_max():
-    return SAND_CENTER_Y + 0.5 * SAND_SIZE_Y
+    return current_sand_footprint_bbox_xy()[3]
 
 
 def initial_sand_height_xy(x, y):
     if not is_inside_diggable_xy(x, y):
-        return BASE_Z
+        return SAND_FLOOR_Z
     dx = (float(x) - PILE_CENTER_X) / PILE_SIGMA_X
     dy = (float(y) - PILE_CENTER_Y) / PILE_SIGMA_Y
     mound = PILE_HEIGHT * (0.82 + 0.18 * math.exp(-0.5 * (dx * dx + dy * dy)))
@@ -822,7 +1615,7 @@ def initial_sand_height_xy(x, y):
     )
     n = math.sin(12.9898 * float(x) + 78.233 * float(y) + NOISE_SEED) * 43758.5453
     n = n - math.floor(n)
-    return BASE_Z + mound + ripple + NOISE_AMP * (2.0 * n - 1.0)
+    return SAND_FLOOR_Z + mound + ripple + NOISE_AMP * (2.0 * n - 1.0)
 
 
 def in_sand_bounds(x, y):
@@ -830,10 +1623,13 @@ def in_sand_bounds(x, y):
 
 
 def is_inside_diggable_xy(x, y):
-    return (
-        abs(float(x) - PILE_CENTER_X) <= DIGGABLE_RADIUS_X
-        and abs(float(y) - PILE_CENTER_Y) <= DIGGABLE_RADIUS_Y
-    )
+    if SAND_SOURCE_POLYGON_XY is not None:
+        return point_in_polygon_xy(x, y, SAND_SOURCE_POLYGON_XY)
+    rx = max(1.0e-6, float(DIGGABLE_RADIUS_X))
+    ry = max(1.0e-6, float(DIGGABLE_RADIUS_Y))
+    dx = (float(x) - float(PILE_CENTER_X)) / rx
+    dy = (float(y) - float(PILE_CENTER_Y)) / ry
+    return (dx * dx + dy * dy) <= 1.0
 
 
 def height_from_grid(x, y):
@@ -871,6 +1667,31 @@ def current_real_particle_positions():
     return np.array(points, dtype=np.float32).reshape(-1, 3)
 
 
+def current_real_particle_positions_sampled(max_samples=None):
+    root = root_path()
+    prim = get_prim(f"{root}/{PARTICLE_POINTS_PATH_SUFFIX}")
+    if not prim.IsValid():
+        return np.empty((0, 3), dtype=np.float32), 0
+    points_attr = prim.GetAttribute("points")
+    points = points_attr.Get() if points_attr.IsValid() else None
+    if points is None or len(points) == 0:
+        return np.empty((0, 3), dtype=np.float32), 0
+
+    total = int(len(points))
+    limit = total if max_samples is None else max(1, int(max_samples))
+    if total <= limit:
+        return np.array(points, dtype=np.float32).reshape(-1, 3), total
+
+    indices = np.linspace(0, total - 1, limit, dtype=np.int64)
+    sampled = np.empty((len(indices), 3), dtype=np.float32)
+    for out_i, src_i in enumerate(indices):
+        p = points[int(src_i)]
+        sampled[out_i, 0] = float(p[0])
+        sampled[out_i, 1] = float(p[1])
+        sampled[out_i, 2] = float(p[2])
+    return sampled, total
+
+
 async def step_updates(frames=1):
     app = omni.kit.app.get_app()
     for _ in range(max(1, int(frames))):
@@ -878,17 +1699,20 @@ async def step_updates(frames=1):
 
 
 def sand_reset_health_stats(prev_points=None):
-    points = current_real_particle_positions()
+    points, total_count = current_real_particle_positions_sampled(SAND_RESET_HEALTH_SAMPLE_MAX)
     if points.shape[0] == 0:
         return {"ok": False, "reason": "no_particles", "n": 0}
 
-    n = int(points.shape[0])
+    n = int(total_count)
+    sample_n = int(points.shape[0])
     x_min = float(SAND_CENTER_X - float(DIGGABLE_RADIUS_X) - SAND_RESET_XY_ESCAPE_MARGIN)
     x_max = float(SAND_CENTER_X + float(DIGGABLE_RADIUS_X) + SAND_RESET_XY_ESCAPE_MARGIN)
     y_min = float(SAND_CENTER_Y - float(DIGGABLE_RADIUS_Y) - SAND_RESET_XY_ESCAPE_MARGIN)
     y_max = float(SAND_CENTER_Y + float(DIGGABLE_RADIUS_Y) + SAND_RESET_XY_ESCAPE_MARGIN)
-    z_min_allowed = float(SAND_FLOOR_Z) - float(SAND_RESET_Z_ESCAPE_BELOW)
-    z_max_allowed = float(SAND_FLOOR_Z) + float(SANDBOX_FILL_HEIGHT) + float(SAND_RESET_Z_ESCAPE_ABOVE)
+    z_escape_below = max(5.0, 2.0 * float(SANDBOX_FILL_HEIGHT))
+    z_escape_above = max(5.0, float(SAND_RESET_Z_ESCAPE_ABOVE))
+    z_min_allowed = min(float(BASE_Z) - 3.0, float(SAND_FLOOR_Z) - z_escape_below)
+    z_max_allowed = float(SAND_FLOOR_Z) + float(SANDBOX_FILL_HEIGHT) + z_escape_above
 
     outside = (
         (points[:, 0] < x_min)
@@ -898,7 +1722,8 @@ def sand_reset_health_stats(prev_points=None):
     )
     z_min = float(np.min(points[:, 2]))
     z_max = float(np.max(points[:, 2]))
-    outside_count = int(np.count_nonzero(outside))
+    outside_count_sample = int(np.count_nonzero(outside))
+    outside_count = int(round(outside_count_sample * (float(n) / float(max(1, sample_n)))))
 
     displacement_p95 = 0.0
     displacement_max = 0.0
@@ -923,25 +1748,33 @@ def sand_reset_health_stats(prev_points=None):
         "ok": not bad_reasons,
         "reason": "ok" if not bad_reasons else ";".join(bad_reasons[:3]),
         "n": n,
+        "sample_n": sample_n,
         "z_min": z_min,
         "z_max": z_max,
         "outside_xy": outside_count,
+        "outside_xy_sample": outside_count_sample,
         "disp_p95": displacement_p95,
         "disp_max": displacement_max,
     }
 
 
 async def wait_for_sand_reset_health(label="sand_reset"):
-    prev = current_real_particle_positions()
+    prev, _ = current_real_particle_positions_sampled(SAND_RESET_HEALTH_SAMPLE_MAX)
     stats = None
     elapsed = 0
     max_frames = max(int(SAND_RESET_HEALTH_MIN_FRAMES), int(SAND_RESET_HEALTH_MAX_FRAMES))
     window = max(1, int(SAND_RESET_HEALTH_WINDOW_FRAMES))
     while elapsed < max_frames:
+        if not bool(STATE.get("running", False)) or not simulation_timeline_is_playing():
+            return False, {
+                "ok": False,
+                "reason": "timeline_stopped_or_runtime_stopped",
+                "n": int(STATE.get("real_sand_particle_count", 0) or 0),
+            }
         await step_updates(window)
         elapsed += window
         stats = sand_reset_health_stats(prev)
-        prev = current_real_particle_positions()
+        prev, _ = current_real_particle_positions_sampled(SAND_RESET_HEALTH_SAMPLE_MAX)
         info(
             "[SAND RESET HEALTH]",
             f"label={label}",
@@ -949,6 +1782,7 @@ async def wait_for_sand_reset_health(label="sand_reset"):
             f"ok={stats.get('ok')}",
             f"reason={stats.get('reason')}",
             f"n={stats.get('n')}",
+            f"sample_n={stats.get('sample_n', 0)}",
             f"z=({stats.get('z_min', 0.0):.3f},{stats.get('z_max', 0.0):.3f})",
             f"outside_xy={stats.get('outside_xy', 0)}",
             f"disp_p95={stats.get('disp_p95', 0.0):.3f}",
@@ -964,11 +1798,17 @@ async def reset_sand_surface_stably(label="ui"):
     if bool(STATE.get("sand_reset_active", False)):
         update_status("Sand reset already running", force=True)
         return False
+    if not bool(STATE.get("running", False)) or not simulation_timeline_is_playing():
+        info("[SAND RESET] skipped: timeline stopped or runtime stopped", f"label={label}")
+        return False
     STATE["sand_reset_active"] = True
     try:
         attempts = max(1, int(SAND_RESET_MAX_ATTEMPTS))
         last_stats = None
         for attempt in range(1, attempts + 1):
+            if not bool(STATE.get("running", False)) or not simulation_timeline_is_playing():
+                last_stats = {"ok": False, "reason": "timeline_stopped_or_runtime_stopped"}
+                break
             update_status(f"Reset real particle sand attempt {attempt}/{attempts}", force=True)
             info("[SAND RESET NATIVE]", f"label={label}", f"attempt={attempt}/{attempts}")
             if BASE_HEIGHTS is not None and HEIGHTS is not None:
@@ -1010,6 +1850,9 @@ async def reset_sand_surface_stably(label="ui"):
 
 def request_sand_reset(label="ui"):
     try:
+        if not bool(STATE.get("running", False)) or not simulation_timeline_is_playing():
+            info("[SAND RESET] request skipped: timeline stopped or runtime stopped", f"label={label}")
+            return False
         asyncio.ensure_future(reset_sand_surface_stably(label))
         return True
     except Exception as e:
@@ -1034,10 +1877,7 @@ def particle_surface_heightmap(res=32, fallback_to_floor=True):
     res = max(4, min(256, int(res)))
     points = current_real_particle_positions()
     hm = np.full((res, res), np.nan, dtype=np.float32)
-    x_min = float(PILE_CENTER_X) - float(DIGGABLE_RADIUS_X)
-    x_max = float(PILE_CENTER_X) + float(DIGGABLE_RADIUS_X)
-    y_min = float(PILE_CENTER_Y) - float(DIGGABLE_RADIUS_Y)
-    y_max = float(PILE_CENTER_Y) + float(DIGGABLE_RADIUS_Y)
+    x_min, x_max, y_min, y_max = current_sand_footprint_bbox_xy()
     if points.shape[0] > 0 and x_max > x_min and y_max > y_min:
         mask = (
             (points[:, 0] >= x_min)
@@ -1060,10 +1900,7 @@ def particle_surface_heightmap(res=32, fallback_to_floor=True):
 def particle_excavated_volume(res=32):
     res = max(4, min(256, int(res)))
     hm = particle_surface_heightmap(res=res, fallback_to_floor=True)
-    x_min = float(PILE_CENTER_X) - float(DIGGABLE_RADIUS_X)
-    x_max = float(PILE_CENTER_X) + float(DIGGABLE_RADIUS_X)
-    y_min = float(PILE_CENTER_Y) - float(DIGGABLE_RADIUS_Y)
-    y_max = float(PILE_CENTER_Y) + float(DIGGABLE_RADIUS_Y)
+    x_min, x_max, y_min, y_max = current_sand_footprint_bbox_xy()
     if x_max <= x_min or y_max <= y_min:
         return 0.0
     xs = np.linspace(x_min, x_max, res, dtype=np.float32)
@@ -1146,14 +1983,15 @@ def clamp(x, lo, hi):
 
 def build_height_arrays():
     global HEIGHTS, BASE_HEIGHTS, X_VALUES, Y_VALUES, CELL_AREA
-    X_VALUES = np.linspace(sand_x_min(), sand_x_max(), NX, dtype=np.float32)
-    Y_VALUES = np.linspace(sand_y_min(), sand_y_max(), NY, dtype=np.float32)
+    x_min, x_max, y_min, y_max = current_sand_footprint_bbox_xy()
+    X_VALUES = np.linspace(x_min, x_max, NX, dtype=np.float32)
+    Y_VALUES = np.linspace(y_min, y_max, NY, dtype=np.float32)
     HEIGHTS = np.zeros((NY, NX), dtype=np.float32)
     for j, y in enumerate(Y_VALUES):
         for i, x in enumerate(X_VALUES):
             HEIGHTS[j, i] = initial_sand_height_xy(float(x), float(y))
     BASE_HEIGHTS = HEIGHTS.copy()
-    CELL_AREA = float((SAND_SIZE_X / max(1, NX - 1)) * (SAND_SIZE_Y / max(1, NY - 1)))
+    CELL_AREA = float(((x_max - x_min) / max(1, NX - 1)) * ((y_max - y_min) / max(1, NY - 1)))
 
 
 def refresh_sand_mesh():
@@ -1332,37 +2170,53 @@ def create_sand_particle_material(root):
 def sand_particle_points():
     rng = random.Random(4107)
     points = []
-    velocities = []
-    widths = []
     floor_z = float(SAND_FLOOR_Z)
+    generated_outside = 0
+    candidate_count = 0
+    z_min = None
+    z_max = None
 
-    x_values = np.arange(PILE_CENTER_X - DIGGABLE_RADIUS_X, PILE_CENTER_X + DIGGABLE_RADIUS_X, PARTICLE_DIGGABLE_SPACING)
-    y_values = np.arange(PILE_CENTER_Y - DIGGABLE_RADIUS_Y, PILE_CENTER_Y + DIGGABLE_RADIUS_Y, PARTICLE_DIGGABLE_SPACING)
-    for x in x_values:
-        for y in y_values:
-            if not is_inside_diggable_xy(float(x), float(y)):
+    for x, y in footprint_xy_samples(PARTICLE_DIGGABLE_SPACING):
+        surface_z = initial_sand_height_xy(float(x), float(y))
+        fill_depth = max(PARTICLE_LAYER_SPACING_Z, surface_z - floor_z)
+        pile_depth = min(SAND_THICKNESS + PILE_HEIGHT, fill_depth)
+        layers = max(1, int(pile_depth / PARTICLE_LAYER_SPACING_Z))
+        for layer in range(layers):
+            if len(points) >= PARTICLE_MAX_COUNT:
+                meta = {
+                    "candidate_count": candidate_count,
+                    "generated_outside": generated_outside,
+                    "z_min": z_min,
+                    "z_max": z_max,
+                    "limited": True,
+                }
+                velocities = [Gf.Vec3f(0.0, 0.0, 0.0)] * len(points)
+                widths = [float(PARTICLE_RADIUS * 2.0)] * len(points)
+                return points, velocities, widths, meta
+            z = floor_z + PARTICLE_RADIUS * 1.2 + layer * PARTICLE_LAYER_SPACING_Z
+            if z > surface_z + PARTICLE_RADIUS * 0.8:
                 continue
-            surface_z = initial_sand_height_xy(float(x), float(y))
-            fill_depth = max(PARTICLE_LAYER_SPACING_Z, surface_z - floor_z)
-            pile_depth = min(SAND_THICKNESS + PILE_HEIGHT, fill_depth)
-            layers = max(1, int(pile_depth / PARTICLE_LAYER_SPACING_Z))
-            for layer in range(layers):
-                if len(points) >= PARTICLE_MAX_COUNT:
-                    return points, velocities, widths
-                z = floor_z + PARTICLE_RADIUS * 1.2 + layer * PARTICLE_LAYER_SPACING_Z
-                if z > surface_z + PARTICLE_RADIUS * 0.8:
-                    continue
-                points.append(
-                    Gf.Vec3f(
-                        float(x) + rng.uniform(-PARTICLE_JITTER, PARTICLE_JITTER),
-                        float(y) + rng.uniform(-PARTICLE_JITTER, PARTICLE_JITTER),
-                        float(z) + rng.uniform(-PARTICLE_JITTER * 0.4, PARTICLE_JITTER * 0.4),
-                    )
-                )
-                velocities.append(Gf.Vec3f(0.0, 0.0, 0.0))
-                widths.append(float(PARTICLE_RADIUS * 2.0))
+            candidate_count += 1
+            px = float(x) + rng.uniform(-PARTICLE_JITTER, PARTICLE_JITTER)
+            py = float(y) + rng.uniform(-PARTICLE_JITTER, PARTICLE_JITTER)
+            if not is_inside_diggable_xy(px, py):
+                generated_outside += 1
+                continue
+            pz = float(z) + rng.uniform(-PARTICLE_JITTER * 0.4, PARTICLE_JITTER * 0.4)
+            z_min = pz if z_min is None else min(z_min, pz)
+            z_max = pz if z_max is None else max(z_max, pz)
+            points.append(Gf.Vec3f(px, py, pz))
 
-    return points, velocities, widths
+    meta = {
+        "candidate_count": candidate_count,
+        "generated_outside": generated_outside,
+        "z_min": z_min,
+        "z_max": z_max,
+        "limited": False,
+    }
+    velocities = [Gf.Vec3f(0.0, 0.0, 0.0)] * len(points)
+    widths = [float(PARTICLE_RADIUS * 2.0)] * len(points)
+    return points, velocities, widths, meta
 
 
 def print_particle_spacing_diagnostics():
@@ -1400,11 +2254,29 @@ def make_real_particle_sand(root):
         return None
 
     try:
+        timing_start = time.perf_counter()
         print_particle_spacing_diagnostics()
         system = create_physx_particle_system(root)
         material = create_sand_particle_material(root)
-        points, velocities, widths = sand_particle_points()
-        limited_by_max_count = len(points) >= int(PARTICLE_MAX_COUNT)
+        timing_setup = time.perf_counter()
+        points, velocities, widths, gen_meta = sand_particle_points()
+        timing_points = time.perf_counter()
+        raw_count = int(gen_meta.get("candidate_count", len(points)))
+        generated_outside = int(gen_meta.get("generated_outside", 0))
+        limited_by_max_count = bool(gen_meta.get("limited", False)) or len(points) >= int(PARTICLE_MAX_COUNT)
+        bbox = current_sand_footprint_bbox_xy()
+        footprint_vertices = int(len(current_sand_footprint_polygon_xy()))
+        info(
+            "[SAND GEN FOOTPRINT]",
+            "source=", "mesh" if SAND_SOURCE_POLYGON_XY is not None else "point_xyz",
+            "sampler=polygon_scanline",
+            "particles_raw=", int(raw_count),
+            "particles_kept=", int(len(points)),
+            "generated_outside_footprint=", int(generated_outside),
+            "footprint_vertices=", footprint_vertices,
+            "projected_faces=", int(SAND_SOURCE_SELECTED_FACE_COUNT),
+            "bbox=", tuple(round(float(v), 3) for v in bbox),
+        )
 
         particles = UsdGeom.Points.Define(get_stage(), f"{root}/{PARTICLE_POINTS_PATH_SUFFIX}")
         particles.CreatePointsAttr(points)
@@ -1412,6 +2284,7 @@ def make_real_particle_sand(root):
         particles.CreateWidthsAttr(widths)
         prim = particles.GetPrim()
         sand_set_color(prim, (0.72, 0.56, 0.33), 1.0)
+        timing_author = time.perf_counter()
 
         particle_set_api = apply_api_by_names(prim, ["PhysxParticleSetAPI"])
         particle_api = apply_api_by_names(prim, ["PhysxParticleAPI"])
@@ -1445,13 +2318,24 @@ def make_real_particle_sand(root):
             UsdShade.MaterialBindingAPI.Apply(system.GetPrim()).Bind(material)
         except Exception as e:
             info("[WARN] real sand material bind failed:", e)
+        timing_physx = time.perf_counter()
 
         STATE["real_sand_enabled"] = True
         STATE["real_sand_particle_count"] = len(points)
         STATE["real_sand_error"] = "" if not limited_by_max_count else "limited_by_particle_max_count"
         update_particle_runtime_state()
-        z_values = [float(p[2]) for p in points]
+        z_min = gen_meta.get("z_min")
+        z_max = gen_meta.get("z_max")
         info("Created real PhysX particle sand:", prim.GetPath())
+        info(
+            "[SAND GEN TIMING]",
+            f"setup_ms={(timing_setup - timing_start) * 1000.0:.1f}",
+            f"points_ms={(timing_points - timing_setup) * 1000.0:.1f}",
+            f"usd_author_ms={(timing_author - timing_points) * 1000.0:.1f}",
+            f"physx_bind_ms={(timing_physx - timing_author) * 1000.0:.1f}",
+            f"total_ms={(timing_physx - timing_start) * 1000.0:.1f}",
+            f"particles={len(points)}",
+        )
         info(
             "Real sand particle count:",
             len(points),
@@ -1470,7 +2354,7 @@ def make_real_particle_sand(root):
             "range_area_fraction=", SAND_RANGE_AREA_FRACTION,
             "range_linear_scale=", SAND_RANGE_LINEAR_SCALE,
             "floor_z=", SAND_FLOOR_Z,
-            f"z_range=({min(z_values):.3f},{max(z_values):.3f})" if z_values else "z_range=(none)",
+            f"z_range=({float(z_min):.3f},{float(z_max):.3f})" if z_min is not None and z_max is not None else "z_range=(none)",
         )
         try:
             info("Real sand applied schemas:", list(prim.GetAppliedSchemas()))
@@ -1623,15 +2507,19 @@ def make_unload_bin(root):
 
 def make_sand_retaining_walls(root):
     wall_root = f"{root}/SandRetainingWalls"
+    try:
+        get_stage().RemovePrim(Sdf.Path(wall_root))
+    except Exception:
+        pass
     UsdGeom.Xform.Define(get_stage(), wall_root)
 
-    cx = float(PILE_CENTER_X)
-    cy = float(PILE_CENTER_Y)
-    sx = float(SANDBOX_INNER_SIZE_X)
-    sy = float(SANDBOX_INNER_SIZE_Y)
+    cx = float(WALL_CENTER_X)
+    cy = float(WALL_CENTER_Y)
+    sx = float(WALL_INNER_SIZE_X)
+    sy = float(WALL_INNER_SIZE_Y)
     t = float(SANDBOX_WALL_THICKNESS)
     h = float(SANDBOX_WALL_HEIGHT)
-    z = float(BASE_Z) + 0.5 * h
+    z = float(WALL_BASE_Z) + 0.5 * h
 
     sand_make_cube(
         f"{wall_root}/WallLeft",
@@ -1666,13 +2554,28 @@ def make_sand_retaining_walls(root):
         "Created sand retaining walls:",
         wall_root,
         "inner_size=",
-        (SANDBOX_INNER_SIZE_X, SANDBOX_INNER_SIZE_Y),
+        (WALL_INNER_SIZE_X, WALL_INNER_SIZE_Y),
+        "center=",
+        (WALL_CENTER_X, WALL_CENTER_Y, WALL_BASE_Z),
         "wall_height=",
         SANDBOX_WALL_HEIGHT,
         "wall_thickness=",
         SANDBOX_WALL_THICKNESS,
     )
     return wall_root
+
+
+def clean_sand_retaining_walls(root=None):
+    root = root_path() if root is None else str(root)
+    wall_root = f"{root}/SandRetainingWalls"
+    try:
+        get_stage().RemovePrim(Sdf.Path(wall_root))
+        info("Cleaned sand retaining walls:", wall_root)
+        update_status("Sand walls cleaned")
+        return True
+    except Exception as e:
+        info("[WARN] clean sand retaining walls failed:", type(e).__name__, e)
+        return False
 
 
 def unload_bin_dump_point():
@@ -1685,12 +2588,14 @@ def unload_bin_dump_point():
 def sand_scene_context():
     live_stats = real_sand_stats()
     return {
-        "sand_center": np.array([float(SAND_CENTER_X), float(SAND_CENTER_Y), float(BASE_Z)], dtype=np.float32),
+        "sand_center": np.array([float(SAND_CENTER_X), float(SAND_CENTER_Y), float(SAND_FLOOR_Z)], dtype=np.float32),
         "sand_size": np.array([float(SAND_SIZE_X), float(SAND_SIZE_Y)], dtype=np.float32),
-        "pile_center": np.array([float(PILE_CENTER_X), float(PILE_CENTER_Y), float(BASE_Z)], dtype=np.float32),
+        "pile_center": np.array([float(PILE_CENTER_X), float(PILE_CENTER_Y), float(SAND_FLOOR_Z)], dtype=np.float32),
         "diggable_radius": np.array([float(DIGGABLE_RADIUS_X), float(DIGGABLE_RADIUS_Y)], dtype=np.float32),
         "sandbox_inner_size": np.array([float(SANDBOX_INNER_SIZE_X), float(SANDBOX_INNER_SIZE_Y)], dtype=np.float32),
         "sandbox_wall_height": float(SANDBOX_WALL_HEIGHT),
+        "wall_center": np.array([float(WALL_CENTER_X), float(WALL_CENTER_Y), float(WALL_BASE_Z)], dtype=np.float32),
+        "wall_inner_size": np.array([float(WALL_INNER_SIZE_X), float(WALL_INNER_SIZE_Y)], dtype=np.float32),
         "sand_floor_z": float(SAND_FLOOR_Z),
         "sand_base_z": float(BASE_Z),
         "sand_fill_height": float(SANDBOX_FILL_HEIGHT),
@@ -1749,7 +2654,20 @@ def print_status():
     info("========== SAND SITE STATUS ==========")
     info("root:", root_path())
     info("sand_bounds:", (sand_x_min(), sand_x_max(), sand_y_min(), sand_y_max()))
-    info("sand_floor_z:", SAND_FLOOR_Z, "sand_surface_base_z:", BASE_Z, "sand_thickness:", SAND_THICKNESS)
+    info(
+        "sand_point_xyz:",
+        (SAND_CENTER_X, SAND_CENTER_Y, SAND_POINT_Z),
+        "amount_x:",
+        SAND_AMOUNT_MULTIPLIER,
+        "actual_fill_height:",
+        SANDBOX_FILL_HEIGHT,
+        "sand_floor_z:",
+        SAND_FLOOR_Z,
+        "sand_surface_base_z:",
+        BASE_Z,
+        "sand_thickness:",
+        SAND_THICKNESS,
+    )
     info(
         "sandbox:",
         "inner_size=", (SANDBOX_INNER_SIZE_X, SANDBOX_INNER_SIZE_Y),
@@ -1766,7 +2684,16 @@ def print_status():
         "max_excavation_depth=", MAX_EXCAVATION_DEPTH,
     )
     info("real_sand_scope:", "pile_only" if REAL_SAND_PILE_ONLY else "full_bed")
+    info(
+        "sand_source:",
+        "mesh" if SAND_SOURCE_POLYGON_XY is not None else "point_xyz",
+        "selected_path:", SAND_SOURCE_SELECTED_PATH,
+        "projected_faces=", SAND_SOURCE_SELECTED_FACE_COUNT,
+        "projected_faces_total=", SAND_SOURCE_TOTAL_PROJECTED_FACE_COUNT,
+        "vertices:", 0 if SAND_SOURCE_POLYGON_XY is None else len(SAND_SOURCE_POLYGON_XY),
+    )
     info("diggable_center:", (PILE_CENTER_X, PILE_CENTER_Y), "diggable_radius:", (DIGGABLE_RADIUS_X, DIGGABLE_RADIUS_Y))
+    info("wall_point_xyz:", (WALL_CENTER_X, WALL_CENTER_Y, WALL_BASE_Z), "wall_inner_size:", (WALL_INNER_SIZE_X, WALL_INNER_SIZE_Y))
     info("real_sand_enabled:", STATE.get("real_sand_enabled"))
     info("real_sand_particle_count:", STATE.get("real_sand_particle_count"))
     info(
@@ -1978,6 +2905,8 @@ def build_sand_site():
     UsdGeom.Xform.Define(get_stage(), root)
     initialize_sand_reference_grid(root)
     make_sand_retaining_walls(root)
+    apply_default_sand_source_mesh()
+    set_sand_generation_range_box("build_sand_site")
     if AUTO_CREATE_INITIAL_SAND:
         make_real_particle_sand(root)
         STATE["needs_reset_after_world_ready"] = False
@@ -2025,6 +2954,29 @@ def build_ui():
         refresh_parameter_models_from_globals()
         set_clean("Reset requested")
 
+    def clean_sand_clicked():
+        clear_real_particle_sand()
+        set_sand_generation_range_box("clean_sand")
+        set_clean("Sand cleaned")
+
+    def use_point_xyz_sand_clicked():
+        apply_parameter_models_to_globals()
+        clear_selected_sand_source_mesh()
+        refresh_parameter_models_from_globals()
+        set_clean("Sand source uses point XYZ; click Reset Sand")
+
+    def generate_walls_clicked():
+        apply_parameter_models_to_globals()
+        make_sand_retaining_walls(root_path())
+        store_runtime_api()
+        set_clean("Walls generated")
+        update_status("Sand walls generated from wall point XYZ", force=True)
+
+    def clean_walls_clicked():
+        clean_sand_retaining_walls(root_path())
+        store_runtime_api()
+        set_clean("Walls cleaned")
+
     def apply_clicked():
         apply_parameter_models_to_globals()
         store_runtime_api()
@@ -2045,15 +2997,77 @@ def build_ui():
 
     PARAM_MODELS = {}
 
+    def sync_sand_xyz_from_models_live(key=None):
+        global SAND_CENTER_X, SAND_CENTER_Y, PILE_CENTER_X, PILE_CENTER_Y
+        global SAND_POINT_Z, SAND_FLOOR_Z, SAND_POINT_RADIUS
+        global SANDBOX_INNER_SIZE_X, SANDBOX_INNER_SIZE_Y, DIGGABLE_RADIUS_X, DIGGABLE_RADIUS_Y, PILE_SIGMA_X, PILE_SIGMA_Y
+        global SAND_SOURCE_SELECTED_PATH, SAND_SOURCE_SELECTED_FACE_COUNT, SAND_SOURCE_TOTAL_PROJECTED_FACE_COUNT
+        global SAND_SOURCE_RAW_FACE_POLYGONS_XY, SAND_SOURCE_FACE_POLYGONS_XY
+        global SAND_SOURCE_SELECTED_HULL_XY, SAND_SOURCE_POLYGON_XY
+        if bool(STATE.get("suppress_parameter_callbacks", False)):
+            return
+        try:
+            x = float(PARAM_MODELS["sand_center_x"].get_value_as_float())
+            y = float(PARAM_MODELS["sand_center_y"].get_value_as_float())
+            z = float(PARAM_MODELS["sand_point_z"].get_value_as_float())
+            r = max(0.05, float(PARAM_MODELS["sand_point_r"].get_value_as_float()))
+        except Exception:
+            return
+        if key in ("sand_center_x", "sand_center_y", "sand_point_r") and SAND_SOURCE_SELECTED_HULL_XY is not None:
+            SAND_SOURCE_SELECTED_PATH = ""
+            SAND_SOURCE_SELECTED_FACE_COUNT = 0
+            SAND_SOURCE_TOTAL_PROJECTED_FACE_COUNT = 0
+            SAND_SOURCE_RAW_FACE_POLYGONS_XY = None
+            SAND_SOURCE_FACE_POLYGONS_XY = None
+            SAND_SOURCE_SELECTED_HULL_XY = None
+            SAND_SOURCE_POLYGON_XY = None
+            info("[SAND SOURCE SELECT] source=point_xyz reason=sand_xyz_slider")
+        SAND_CENTER_X = x
+        SAND_CENTER_Y = y
+        PILE_CENTER_X = x
+        PILE_CENTER_Y = y
+        SAND_POINT_Z = z
+        SAND_FLOOR_Z = z
+        SAND_POINT_RADIUS = r
+        if SAND_SOURCE_SELECTED_HULL_XY is None:
+            SANDBOX_INNER_SIZE_X = 2.0 * r
+            SANDBOX_INNER_SIZE_Y = 2.0 * r
+            DIGGABLE_RADIUS_X = r
+            DIGGABLE_RADIUS_Y = r
+            PILE_SIGMA_X = max(0.05, 0.70 * r)
+            PILE_SIGMA_Y = max(0.05, 0.70 * r)
+        now = time.time()
+        if now - float(STATE.get("last_sand_xyz_live_update", 0.0) or 0.0) < 0.05:
+            return
+        STATE["last_sand_xyz_live_update"] = now
+        set_sand_generation_range_box("sand_xyz_live")
+
+    def use_selected_sand_mesh_clicked():
+        apply_parameter_models_to_globals()
+        if use_selected_mesh_as_sand_source():
+            refresh_parameter_models_from_globals()
+            set_sand_generation_range_box("selected_sand_mesh_ui")
+            store_runtime_api()
+            refresh_parameter_models_from_globals()
+            set_clean("Sand source set; click Reset Sand")
+
     def model_changed(_model=None, key=None):
+        if bool(STATE.get("suppress_parameter_callbacks", False)):
+            return
         set_dirty("Changed, needs Apply")
 
-    def add_listener(model, key):
+    def add_listener(model, key, live_fn=None):
         for fn_name in ["add_value_changed_fn", "add_value_changed_fn"]:
             try:
                 fn = getattr(model, fn_name, None)
                 if callable(fn):
-                    fn(lambda m, k=key: model_changed(m, k))
+                    def _on_change(m, k=key, lf=live_fn):
+                        if bool(STATE.get("suppress_parameter_callbacks", False)):
+                            return
+                        if callable(lf):
+                            lf(k)
+                        model_changed(m, k)
+                    fn(_on_change)
                     return
             except Exception:
                 pass
@@ -2076,23 +3090,47 @@ def build_ui():
         ui.Label(title)
 
     def add_sand_amount_row():
-        key = "fill_height"
+        key = "sand_amount_x"
         if key not in PARAM_MODELS:
-            PARAM_MODELS[key] = ui.SimpleFloatModel(float(SANDBOX_FILL_HEIGHT))
+            PARAM_MODELS[key] = ui.SimpleFloatModel(float(SAND_AMOUNT_MULTIPLIER))
             add_listener(PARAM_MODELS[key], key)
         with ui.VStack(spacing=3):
             with ui.HStack(spacing=8):
-                ui.Label("Sand amount", width=96)
+                ui.Label("Sand amount x", width=96)
                 ui.FloatSlider(
                     model=PARAM_MODELS[key],
-                    min=SAND_AMOUNT_MIN_HEIGHT,
-                    max=SAND_AMOUNT_MAX_HEIGHT,
+                    min=SAND_AMOUNT_MIN_MULTIPLIER,
+                    max=SAND_AMOUNT_MAX_MULTIPLIER,
                     width=382,
                 )
                 ui.FloatField(model=PARAM_MODELS[key], width=66)
             ui.Label(
                 ui_short_text(
-                    "Higher amount adds sand upward only. Click Reset Sand to rebuild particles with this height.",
+                    "1x equals old 3m. Up to 10x uses compressed height, denser spacing, and a larger particle budget.",
+                    112,
+                ),
+                width=610,
+            )
+
+    def add_sand_xyz_sliders():
+        specs = [
+            ("sand_center_x", "Sand X", SAND_CENTER_X, -20.0, 20.0),
+            ("sand_center_y", "Sand Y", SAND_CENTER_Y, -20.0, 20.0),
+            ("sand_point_z", "Sand Z", SAND_POINT_Z, -2.0, 8.0),
+            ("sand_point_r", "Sand R", SAND_POINT_RADIUS, 0.05, 6.0),
+        ]
+        with ui.VStack(spacing=3):
+            for key, label, value, lo, hi in specs:
+                if key not in PARAM_MODELS:
+                    PARAM_MODELS[key] = ui.SimpleFloatModel(float(value))
+                    add_listener(PARAM_MODELS[key], key, live_fn=sync_sand_xyz_from_models_live)
+                with ui.HStack(spacing=8):
+                    ui.Label(label, width=72)
+                    ui.FloatSlider(model=PARAM_MODELS[key], min=float(lo), max=float(hi), width=400)
+                    ui.FloatField(model=PARAM_MODELS[key], width=76)
+            ui.Label(
+                ui_short_text(
+                    "Drag XYZ/R to move the guide live. R is for point mode; Reset Sand rebuilds particles there.",
                     112,
                 ),
                 width=610,
@@ -2130,40 +3168,50 @@ def build_ui():
                 ui.Button("Apply", width=82, clicked_fn=apply_clicked)
                 ui.Button("Apply + Rebuild", width=132, clicked_fn=apply_rebuild_clicked)
                 ui.Button("Reset Sand", width=112, clicked_fn=reset_clicked)
+                ui.Button("Clean Sand", width=104, clicked_fn=clean_sand_clicked)
                 ui.Button("Status", width=82, clicked_fn=status_clicked)
             with ui.ScrollingFrame(height=540):
                 with ui.VStack(spacing=5):
                     section("Sand Amount")
+                    with ui.HStack(spacing=6):
+                        ui.Button("Use Selected Sand Mesh", width=178, clicked_fn=use_selected_sand_mesh_clicked)
+                        ui.Button("Use Point XYZ Sand", width=150, clicked_fn=use_point_xyz_sand_clicked)
+                        ui.Label("Mesh affects sand footprint only, not walls", width=240)
                     add_sand_amount_row()
+                    add_sand_xyz_sliders()
                     add_param_row([
-                        ("sand_center_x", "center x", SAND_CENTER_X),
-                        ("sand_center_y", "center y", SAND_CENTER_Y),
-                        ("sandbox_x", "inner size x", SANDBOX_INNER_SIZE_X),
+                        ("sand_source_shrink_d", "mesh shrink d", SAND_SOURCE_SELECTION_EDGE_MARGIN),
+                        ("sandbox_x", "source size x", SANDBOX_INNER_SIZE_X),
+                        ("sandbox_y", "source size y", SANDBOX_INNER_SIZE_Y),
                     ])
                     add_param_row([
-                        ("sandbox_y", "inner size y", SANDBOX_INNER_SIZE_Y),
                         ("sand_thickness", "base layer", SAND_THICKNESS),
-                        ("wall_height", "wall height", SANDBOX_WALL_HEIGHT),
-                    ])
-                    add_param_row([
                         ("diggable_x", "active radius x", DIGGABLE_RADIUS_X),
                         ("diggable_y", "active radius y", DIGGABLE_RADIUS_Y),
                     ])
 
+                    section("Walls")
+                    with ui.HStack(spacing=6):
+                        ui.Button("Generate Walls", width=128, clicked_fn=generate_walls_clicked)
+                        ui.Button("Clean Walls", width=104, clicked_fn=clean_walls_clicked)
+                        ui.Label("Walls use wall point XYZ and do not follow selected sand mesh", width=360)
+                    add_param_row([
+                        ("wall_center_x", "wall point x", WALL_CENTER_X),
+                        ("wall_center_y", "wall point y", WALL_CENTER_Y),
+                        ("wall_center_z", "wall point z", WALL_BASE_Z),
+                    ])
+                    add_param_row([
+                        ("wall_size_x", "wall size x", WALL_INNER_SIZE_X),
+                        ("wall_size_y", "wall size y", WALL_INNER_SIZE_Y),
+                        ("wall_height", "wall height", SANDBOX_WALL_HEIGHT),
+                    ])
+                    add_param_row([
+                        ("wall_thickness", "wall thick", SANDBOX_WALL_THICKNESS),
+                        ("floor_thickness", "floor thick", SANDBOX_FLOOR_THICKNESS),
+                    ])
+
                     section("Sand Fidelity")
                     add_fidelity_row()
-
-                    section("Unload Bin")
-                    add_param_row([
-                        ("unload_x", "bin center x", float(UNLOAD_BIN_CENTER[0])),
-                        ("unload_y", "bin center y", float(UNLOAD_BIN_CENTER[1])),
-                        ("unload_size_x", "inner size x", UNLOAD_BIN_INNER_SIZE_X),
-                    ])
-                    add_param_row([
-                        ("unload_size_y", "inner size y", UNLOAD_BIN_INNER_SIZE_Y),
-                        ("unload_wall_height", "wall height", UNLOAD_BIN_WALL_HEIGHT),
-                        ("unload_dump_height", "dump height", UNLOAD_BIN_DUMP_HEIGHT),
-                    ])
 
     builtins._SAND_SITE_UI_WINDOW = WINDOW
     WINDOW.visible = True

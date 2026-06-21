@@ -90,6 +90,7 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "trace_building_plan": False,
     "trace_no_plan_notice_time": 0.0,
     "trace_no_plan_notice_shown": False,
+    "excavator_render_mode": True,
     "request_calibrate": False,
     "request_home": False,
     "request_print": False,
@@ -100,6 +101,23 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
         "bucket": 0.0,
     },
     "target_cmd": np.array([0.0, 0.0, 0.0], dtype=np.float32),
+    "manual_unload_override_enabled": False,
+    "manual_unload_point": None,
+    "manual_unload_inner_size": None,
+    "manual_unload_z_range": None,
+    "manual_unload_radius": 0.45,
+    "manual_unload_mesh_shrink_d": 0.12,
+    "manual_unload_range_shape": "circle",
+    "manual_unload_selected_size_xy": None,
+    "manual_unload_polygon_xy": None,
+    "manual_unload_selected_hull_xy": None,
+    "manual_unload_source": "",
+    "manual_unload_selected_path": "",
+    "last_unload_model_xyz": None,
+    "last_unload_model_z_range": None,
+    "last_unload_model_radius": 0.45,
+    "last_unload_model_shrink_d": 0.12,
+    "last_unload_sync_time": 0.0,
     "speed_multiplier": 1.0,
     "last_status_time": 0.0,
     "status_interval": 0.5,
@@ -284,6 +302,11 @@ TARGET_COLOR_REACHABLE = (0.1, 0.85, 0.25)
 TARGET_COLOR_UNREACHABLE = (1.0, 0.75, 0.05)
 UNLOAD_MARKER_RADIUS = 0.13
 UNLOAD_MARKER_COLOR = (0.05, 0.70, 1.0)
+UNLOAD_RANGE_COLUMN_COLOR = (0.0, 0.55, 1.0)
+UNLOAD_RANGE_COLUMN_OPACITY = 0.07
+UNLOAD_RANGE_GUIDE_WIDTH = 0.040
+UNLOAD_RANGE_VISUAL_MAX_VERTICES = 32
+UNLOAD_RANGE_CIRCLE_SEGMENTS = 20
 
 BUCKET_SAND_COLLIDER_CONTACT_OFFSET = 0.055
 BUCKET_SAND_COLLIDER_REST_OFFSET = 0.010
@@ -492,6 +515,9 @@ UNLOAD_FINAL_SWING_TOL_DEG = 0.75
 UNLOAD_FINAL_JOINT_TOL_DEG = 2.50
 UNLOAD_FINAL_LOAD_XY_TOL = 0.42
 UNLOAD_FINAL_LOAD_Z_CLEARANCE = 0.05
+UNLOAD_POINT_DEFAULT_RADIUS = 0.45
+UNLOAD_SELECTED_EDGE_MARGIN = 0.12
+DEFAULT_UNLOAD_SOURCE_MESH_PATH = "/World/SandSite/UnloadBin"
 
 DIG_PLAN_CANDIDATES = [
     {
@@ -591,6 +617,7 @@ TRACE_COUNT = 16
 
 SLIDER_MODELS = {}
 TARGET_MODELS = {}
+UNLOAD_MODELS = {}
 
 
 # ============================================================
@@ -869,6 +896,39 @@ def ensure_timeline_playing(label=""):
         return True
 
 
+def timeline_allows_background_work():
+    return bool(STATE.get("running", False)) and bool(simulation_timeline_is_playing())
+
+
+def handle_timeline_stop_if_needed(label=""):
+    if simulation_timeline_is_playing():
+        STATE["timeline_stop_handled"] = False
+        return False
+    if bool(STATE.get("timeline_stop_handled", False)):
+        return True
+
+    STATE["timeline_stop_handled"] = True
+    STATE["auto_collect_stop_requested"] = True
+    STATE["follow"] = False
+    STATE["manual_joint_active"] = False
+    STATE["manual_joint_target"] = None
+    STATE["sand_site_reset_active"] = False
+
+    for task_name in [
+        "auto_collect",
+        "motion",
+        "planner",
+        "replay",
+        "sand_reset",
+        "startup_sand_reset",
+    ]:
+        cancel_registered_task(task_name, reason=f"timeline_stopped:{label}")
+
+    info_print("[TIMELINE STOP]", f"label={label}", "action=cancel_background_tasks")
+    update_status("[TIMELINE STOP] background tasks cancelled; press Play before running again", force=True)
+    return True
+
+
 def object_physics_view_state(obj, depth=0):
     if obj is None or depth > 3:
         return None
@@ -970,7 +1030,12 @@ async def wait_for_articulation_action_ready(
         else:
             stable = 0
             if not bool(last_detail.get("timeline_playing", True)):
-                ensure_timeline_playing(label)
+                handle_timeline_stop_if_needed(label)
+                reason = f"action_channel_not_ready {format_action_ready_detail(last_detail)}"
+                info_print("[DIG EXEC FAILED]", f"label={label}", reason)
+                if record_failure:
+                    set_execution_failure_reason(f"execution_failed/action_channel_not_ready:{label}:{reason}")
+                return False, reason, last_detail
         await step_updates(1)
     reason = f"action_channel_not_ready {format_action_ready_detail(last_detail)}"
     info_print("[DIG EXEC FAILED]", f"label={label}", reason)
@@ -1232,6 +1297,123 @@ def set_color(prim, color):
         )
     except Exception:
         pass
+
+
+def set_prim_visibility(prim_or_path, visible):
+    prim = prim_or_path if hasattr(prim_or_path, "IsValid") else get_prim(prim_or_path)
+    if not prim or not prim.IsValid():
+        return False
+    token = UsdGeom.Tokens.inherited if bool(visible) else UsdGeom.Tokens.invisible
+    try:
+        UsdGeom.Imageable(prim).GetVisibilityAttr().Set(token)
+        return True
+    except Exception as e:
+        info_print("[WARN] visibility set failed:", prim.GetPath().pathString, type(e).__name__, e)
+        return False
+
+
+def restore_excavator_control_visibility():
+    paths = []
+    if ROBOT_ROOT:
+        paths.append(ROBOT_ROOT)
+    paths.extend(LINK_PATHS.values())
+
+    restored = 0
+    visited = set()
+    for path in paths:
+        prim = get_prim(path)
+        while prim and prim.IsValid():
+            prim_path = prim.GetPath().pathString
+            if prim_path in visited:
+                break
+            visited.add(prim_path)
+            if set_prim_visibility(prim, True):
+                restored += 1
+            if prim_path in ("/World", "/"):
+                break
+            prim = prim.GetParent()
+    return restored
+
+
+def subtree_has_mesh(prim):
+    if not prim or not prim.IsValid():
+        return False
+    for p in Usd.PrimRange(prim):
+        try:
+            if p.IsA(UsdGeom.Mesh):
+                return True
+        except Exception:
+            if str(p.GetTypeName()) == "Mesh":
+                return True
+    return False
+
+
+def collect_excavator_display_roots():
+    physical_roots = []
+    render_roots = []
+    ignored_child_names = {
+        "visuals",
+        "collisions",
+        "joints",
+        "looks",
+        "root_joint",
+        "cameras",
+        "sensors",
+    }
+
+    for link_name, link_path in LINK_PATHS.items():
+        link_prim = get_prim(link_path)
+        if not link_prim or not link_prim.IsValid():
+            continue
+
+        visuals = get_prim(f"{link_path}/visuals")
+        if visuals and visuals.IsValid():
+            physical_roots.append(visuals.GetPath().pathString)
+
+        for child in link_prim.GetChildren():
+            child_name = child.GetName()
+            if child_name.lower() in ignored_child_names:
+                continue
+            if subtree_has_mesh(child):
+                render_roots.append(child.GetPath().pathString)
+
+    return physical_roots, render_roots
+
+
+def apply_excavator_render_mode(render_on=None, force_status=True):
+    if render_on is None:
+        render_on = bool(STATE.get("excavator_render_mode", False))
+    render_on = bool(render_on)
+    STATE["excavator_render_mode"] = render_on
+
+    control_visible_count = restore_excavator_control_visibility()
+    world_model_visible = set_prim_visibility("/World/model", render_on)
+    physical_roots, render_roots = collect_excavator_display_roots()
+    for path in physical_roots:
+        set_prim_visibility(path, not render_on)
+    for path in render_roots:
+        set_prim_visibility(path, render_on)
+
+    mode = "render" if render_on else "physics"
+    msg = (
+        f"Excavator display mode = {mode}; "
+        f"render_roots={len(render_roots)} physical_visuals={len(physical_roots)} "
+        f"world_model_visible={world_model_visible}"
+    )
+    info_print(
+        "[DISPLAY MODE]",
+        f"mode={mode}",
+        f"world_model_visible={world_model_visible}",
+        f"render_roots={len(render_roots)}",
+        f"physical_visuals={len(physical_roots)}",
+    )
+    if force_status:
+        update_status(msg, force=True)
+    return render_on
+
+
+def toggle_excavator_render_mode():
+    return apply_excavator_render_mode(not bool(STATE.get("excavator_render_mode", False)))
 
 
 def set_prim_attr(prim, name, value, type_name=None):
@@ -1593,6 +1775,177 @@ def bbox_min_max(path):
     )
 
 
+def bbox_center_size(path):
+    mn, mx = bbox_min_max(path)
+    if mn is None or mx is None:
+        return None, None, None, None
+    center = 0.5 * (mn + mx)
+    size = np.maximum(mx - mn, np.zeros(3, dtype=np.float32))
+    return center.astype(np.float32), size.astype(np.float32), mn, mx
+
+
+def selected_prim_paths():
+    try:
+        selection = omni.usd.get_context().get_selection()
+        if selection is None:
+            return []
+        paths = selection.get_selected_prim_paths()
+        return [str(p) for p in (paths or []) if str(p)]
+    except Exception as e:
+        info_print("[WARN] selection read failed:", type(e).__name__, e)
+        return []
+
+
+def first_selected_prim_path():
+    paths = selected_prim_paths()
+    return paths[0] if paths else ""
+
+
+def mesh_world_xy_points_under(prim):
+    if prim is None or not prim.IsValid():
+        return np.empty((0, 2), dtype=np.float32)
+    pts = []
+    for p in Usd.PrimRange(prim):
+        try:
+            if not p.IsA(UsdGeom.Mesh):
+                continue
+            local_points = UsdGeom.Mesh(p).GetPointsAttr().Get()
+            if not local_points:
+                continue
+            mat = UsdGeom.Xformable(p).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+            for lp in local_points:
+                wp = mat.Transform(Gf.Vec3d(float(lp[0]), float(lp[1]), float(lp[2])))
+                pts.append((float(wp[0]), float(wp[1])))
+        except Exception:
+            continue
+    if not pts:
+        return np.empty((0, 2), dtype=np.float32)
+    return np.array(pts, dtype=np.float32)
+
+
+def convex_hull_xy(points):
+    pts = np.array(points, dtype=np.float64).reshape(-1, 2)
+    if pts.shape[0] < 3:
+        return None
+    pts = np.unique(np.round(pts, 6), axis=0)
+    if pts.shape[0] < 3:
+        return None
+    pts = pts[np.lexsort((pts[:, 1], pts[:, 0]))]
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 1.0e-9:
+            lower.pop()
+        lower.append(tuple(p))
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 1.0e-9:
+            upper.pop()
+        upper.append(tuple(p))
+    hull = np.array(lower[:-1] + upper[:-1], dtype=np.float32)
+    return hull if hull.shape[0] >= 3 else None
+
+
+def polygon_signed_area(poly):
+    p = np.array(poly, dtype=np.float64).reshape(-1, 2)
+    if p.shape[0] < 3:
+        return 0.0
+    x = p[:, 0]
+    y = p[:, 1]
+    return float(0.5 * np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+
+
+def polygon_centroid_xy(poly):
+    p = np.array(poly, dtype=np.float64).reshape(-1, 2)
+    if p.shape[0] == 0:
+        return np.zeros(2, dtype=np.float32)
+    area = polygon_signed_area(p)
+    if abs(area) < 1.0e-8:
+        return np.mean(p, axis=0).astype(np.float32)
+    x = p[:, 0]
+    y = p[:, 1]
+    x2 = np.roll(x, -1)
+    y2 = np.roll(y, -1)
+    cross = x * y2 - x2 * y
+    return np.array([
+        np.sum((x + x2) * cross) / (6.0 * area),
+        np.sum((y + y2) * cross) / (6.0 * area),
+    ], dtype=np.float32)
+
+
+def shrink_convex_polygon_xy(poly, shrink_d):
+    p = np.array(poly, dtype=np.float64).reshape(-1, 2)
+    if p.shape[0] < 3:
+        return None
+    if polygon_signed_area(p) < 0.0:
+        p = p[::-1].copy()
+    d = max(0.0, float(shrink_d))
+    if d <= 1.0e-6:
+        return p.astype(np.float32)
+
+    def inside(pt, a, b):
+        e = b - a
+        length = max(1.0e-9, float(np.linalg.norm(e)))
+        return float(e[0] * (pt[1] - a[1]) - e[1] * (pt[0] - a[0])) >= d * length - 1.0e-8
+
+    def intersect(s, ept, a, b):
+        edge = b - a
+        seg = ept - s
+        rhs = d * max(1.0e-9, float(np.linalg.norm(edge))) - (edge[0] * (s[1] - a[1]) - edge[1] * (s[0] - a[0]))
+        denom = edge[0] * seg[1] - edge[1] * seg[0]
+        if abs(float(denom)) < 1.0e-12:
+            return ept
+        return s + np.clip(float(rhs / denom), 0.0, 1.0) * seg
+
+    out = p.copy()
+    for i in range(p.shape[0]):
+        a = p[i]
+        b = p[(i + 1) % p.shape[0]]
+        if out.shape[0] == 0:
+            break
+        new_pts = []
+        s = out[-1]
+        s_inside = inside(s, a, b)
+        for ept in out:
+            e_inside = inside(ept, a, b)
+            if e_inside:
+                if not s_inside:
+                    new_pts.append(intersect(s, ept, a, b))
+                new_pts.append(ept)
+            elif s_inside:
+                new_pts.append(intersect(s, ept, a, b))
+            s = ept
+            s_inside = e_inside
+        out = np.array(new_pts, dtype=np.float64) if new_pts else np.empty((0, 2), dtype=np.float64)
+    if out.shape[0] < 3 or abs(polygon_signed_area(out)) < 1.0e-6:
+        c = polygon_centroid_xy(p).astype(np.float64)
+        return (c + 0.80 * (p - c)).astype(np.float32)
+    return out.astype(np.float32)
+
+
+def visual_polygon_xy(poly, max_vertices):
+    p = np.array(poly, dtype=np.float32).reshape(-1, 2)
+    n = int(p.shape[0])
+    limit = max(3, int(max_vertices))
+    if n <= limit:
+        return p
+    idx = np.linspace(0, n - 1, limit, dtype=np.int32)
+    return p[idx]
+
+
+def circle_polygon_xy(cx, cy, radius, segments=20):
+    n = max(8, int(segments))
+    r = max(0.01, float(radius))
+    pts = []
+    for i in range(n):
+        a = 2.0 * math.pi * float(i) / float(n)
+        pts.append((float(cx) + r * math.cos(a), float(cy) + r * math.sin(a)))
+    return np.array(pts, dtype=np.float32)
+
+
 def prim_collision_enabled(prim):
     try:
         attr = prim.GetAttribute("physics:collisionEnabled")
@@ -1802,6 +2155,15 @@ def make_cube(path, translate, scale, color, collision=True):
     return prim
 
 
+def make_box(path, translate, scale, color, collision=False, opacity=None):
+    prim = make_cube(path, translate=translate, scale=scale, color=color, collision=collision)
+    if opacity is not None:
+        set_opacity(prim, opacity)
+    if not collision:
+        disable_collision(prim, "box")
+    return prim
+
+
 def make_sphere(path, translate, radius, color, collision=False):
     sphere = UsdGeom.Sphere.Define(stage, path)
     sphere.CreateRadiusAttr(float(radius))
@@ -1812,6 +2174,124 @@ def make_sphere(path, translate, radius, color, collision=False):
         UsdPhysics.CollisionAPI.Apply(prim)
     else:
         disable_collision(prim, "sphere")
+    return prim
+
+
+def set_opacity(prim, opacity):
+    try:
+        UsdGeom.Gprim(prim).CreateDisplayOpacityAttr([float(opacity)])
+    except Exception:
+        pass
+
+
+def make_cylinder(path, translate, radius, height, color, collision=False, opacity=None):
+    cyl = UsdGeom.Cylinder.Define(stage, path)
+    cyl.CreateRadiusAttr(float(radius))
+    cyl.CreateHeightAttr(float(height))
+    prim = cyl.GetPrim()
+    set_xform(prim, translate=translate)
+    set_color(prim, color)
+    if opacity is not None:
+        set_opacity(prim, opacity)
+    if collision:
+        UsdPhysics.CollisionAPI.Apply(prim)
+    else:
+        disable_collision(prim, "cylinder")
+    return prim
+
+
+def make_polygon_prism(path, polygon_xy, z_min, z_max, color, opacity=None):
+    poly = np.array(polygon_xy, dtype=np.float32).reshape(-1, 2)
+    if poly.shape[0] < 3:
+        return None
+    mesh = UsdGeom.Mesh.Define(stage, path)
+    pts = []
+    for xy in poly:
+        pts.append(Gf.Vec3f(float(xy[0]), float(xy[1]), float(z_min)))
+    for xy in poly:
+        pts.append(Gf.Vec3f(float(xy[0]), float(xy[1]), float(z_max)))
+    n = int(poly.shape[0])
+    counts = [n, n]
+    indices = list(range(n - 1, -1, -1)) + list(range(n, 2 * n))
+    for i in range(n):
+        j = (i + 1) % n
+        counts.append(4)
+        indices.extend([i, j, n + j, n + i])
+    mesh.CreatePointsAttr(pts)
+    mesh.CreateFaceVertexCountsAttr(counts)
+    mesh.CreateFaceVertexIndicesAttr(indices)
+    try:
+        mesh.CreateSubdivisionSchemeAttr().Set(UsdGeom.Tokens.none)
+        mesh.CreateDoubleSidedAttr(False)
+    except Exception:
+        pass
+    prim = mesh.GetPrim()
+    set_color(prim, color)
+    if opacity is not None:
+        set_opacity(prim, opacity)
+    disable_collision(prim, "polygon_prism")
+    return prim
+
+
+def make_polygon_wire_column(path, polygon_xy, z_min, z_max, color, width=None):
+    poly = np.array(polygon_xy, dtype=np.float32).reshape(-1, 2)
+    if poly.shape[0] < 3:
+        return None
+
+    z0 = float(z_min)
+    z1 = float(z_max)
+    n = int(poly.shape[0])
+    points = []
+    counts = []
+
+    bottom = [Gf.Vec3f(float(x), float(y), z0) for x, y in poly] + [
+        Gf.Vec3f(float(poly[0][0]), float(poly[0][1]), z0)
+    ]
+    top = [Gf.Vec3f(float(x), float(y), z1) for x, y in poly] + [
+        Gf.Vec3f(float(poly[0][0]), float(poly[0][1]), z1)
+    ]
+    points.extend(bottom)
+    counts.append(len(bottom))
+    points.extend(top)
+    counts.append(len(top))
+
+    step = max(1, n // 8)
+    for i in range(0, n, step):
+        x, y = poly[i]
+        points.extend([Gf.Vec3f(float(x), float(y), z0), Gf.Vec3f(float(x), float(y), z1)])
+        counts.append(2)
+
+    prim = get_prim(path)
+    if not prim.IsValid() or not prim.IsA(UsdGeom.BasisCurves):
+        try:
+            stage.RemovePrim(Sdf.Path(path))
+        except Exception:
+            pass
+        curve = UsdGeom.BasisCurves.Define(stage, path)
+    else:
+        curve = UsdGeom.BasisCurves(prim)
+
+    try:
+        curve.GetPointsAttr().Set(points) if curve.GetPointsAttr().IsValid() else curve.CreatePointsAttr(points)
+        curve.GetCurveVertexCountsAttr().Set(counts) if curve.GetCurveVertexCountsAttr().IsValid() else curve.CreateCurveVertexCountsAttr(counts)
+    except Exception:
+        curve.CreatePointsAttr(points)
+        curve.CreateCurveVertexCountsAttr(counts)
+
+    try:
+        curve.CreateTypeAttr(UsdGeom.Tokens.linear)
+        try:
+            curve.GetBasisAttr().Clear()
+        except Exception:
+            pass
+        curve.CreateWrapAttr(UsdGeom.Tokens.nonperiodic)
+        curve.CreateWidthsAttr([float(UNLOAD_RANGE_GUIDE_WIDTH if width is None else width)])
+    except Exception:
+        pass
+
+    prim = curve.GetPrim()
+    set_color(prim, color)
+    disable_collision(prim, "polygon_wire_column")
     return prim
 
 
@@ -2061,6 +2541,31 @@ def task_scene_context():
             except Exception as e:
                 info_print("[WARN] sand site dump_point failed:", type(e).__name__, e)
 
+    source = "sand_site" if api is not None else "fallback"
+    if bool(STATE.get("manual_unload_override_enabled", False)):
+        manual_point = STATE.get("manual_unload_point")
+        if manual_point is not None:
+            try:
+                p = np.array(manual_point, dtype=np.float32).reshape(-1)[:3]
+                if len(p) >= 3:
+                    bin_center = np.array([float(p[0]), float(p[1]), GROUND_TOP_Z], dtype=np.float32)
+                    dump_point = p.copy()
+                    manual_inner = STATE.get("manual_unload_inner_size")
+                    if manual_inner is not None:
+                        size = np.array(manual_inner, dtype=np.float32).reshape(-1)[:2]
+                        if len(size) >= 2:
+                            bin_inner = np.maximum(size, np.array([0.2, 0.2], dtype=np.float32))
+                    manual_z_range = STATE.get("manual_unload_z_range")
+                    if manual_z_range is not None:
+                        zr = np.array(manual_z_range, dtype=np.float32).reshape(-1)[:2]
+                        if len(zr) >= 2:
+                            bin_z_range = np.array([min(float(zr[0]), float(zr[1])), max(float(zr[0]), float(zr[1]))], dtype=np.float32)
+                    else:
+                        bin_z_range = np.array([GROUND_TOP_Z - 0.05, max(GROUND_TOP_Z, float(p[2]))], dtype=np.float32)
+                    source = "manual_unload_override"
+            except Exception as e:
+                info_print("[WARN] manual unload override ignored:", type(e).__name__, e)
+
     bin_center = np.array(bin_center[:3], dtype=np.float32)
     bin_inner = np.maximum(bin_inner[:2], np.array([0.2, 0.2], dtype=np.float32))
     bin_half = 0.5 * bin_inner
@@ -2074,7 +2579,7 @@ def task_scene_context():
     unload_point = np.array([float(bin_center[0]), float(bin_center[1]), dump_z], dtype=np.float32)
 
     return {
-        "source": "sand_site" if api is not None else "fallback",
+        "source": source,
         "pile_center": pile_center[:3],
         "pile_radius": np.maximum(pile_radius[:2], np.array([0.1, 0.1], dtype=np.float32)),
         "unload_bin_center": bin_center,
@@ -2148,6 +2653,8 @@ def unload_landing_point_from_release(point=None):
         src = np.array(point, dtype=np.float32).reshape(-1)[:3]
         p[0] = float(src[0])
         p[1] = float(src[1])
+        if len(src) >= 3:
+            p[2] = float(src[2])
     return p
 
 
@@ -2283,6 +2790,121 @@ def ensure_unload_marker(point=None, label=""):
             f"[UNLOAD MARKER] {label}: "
             f"role=sand_landing_target_not_bucket_release "
             f"path={UNLOAD_MARKER_PATH} pos={vec_list(p, 3)}"
+        )
+    ensure_unload_range_column(p, label=label)
+    return prim
+
+
+def manual_unload_radius():
+    try:
+        return max(0.05, float(STATE.get("manual_unload_radius", UNLOAD_POINT_DEFAULT_RADIUS)))
+    except Exception:
+        return float(UNLOAD_POINT_DEFAULT_RADIUS)
+
+
+def manual_unload_mesh_shrink_d():
+    try:
+        return max(0.0, float(STATE.get("manual_unload_mesh_shrink_d", UNLOAD_SELECTED_EDGE_MARGIN)))
+    except Exception:
+        return float(UNLOAD_SELECTED_EDGE_MARGIN)
+
+
+def ensure_unload_range_column(point=None, label=""):
+    if CONTROL_ROOT is None:
+        return None
+    p = unload_landing_point_from_release(point)
+    z_min = float(GROUND_TOP_Z)
+    z_max = max(float(p[2]), z_min + 0.25)
+    z_range = STATE.get("manual_unload_z_range")
+    if z_range is not None:
+        try:
+            zr = np.array(z_range, dtype=np.float32).reshape(-1)[:2]
+            if len(zr) >= 2:
+                z_min = min(float(zr[0]), float(zr[1]))
+                z_max = max(float(zr[0]), float(zr[1]))
+        except Exception:
+            pass
+    if z_max - z_min < 0.05:
+        z_max = z_min + 0.05
+    height = float(z_max - z_min)
+    center = (float(p[0]), float(p[1]), z_min + 0.5 * height)
+    shape = str(STATE.get("manual_unload_range_shape", "circle") or "circle")
+    box_path = f"{CONTROL_ROOT}/UnloadSelectedRangeBox"
+    cyl_path = f"{CONTROL_ROOT}/UnloadSelectedRangeCylinder"
+
+    if shape in ("box", "mesh"):
+        try:
+            stage.RemovePrim(Sdf.Path(cyl_path))
+        except Exception:
+            pass
+        inner = STATE.get("manual_unload_inner_size")
+        if inner is None:
+            radius = manual_unload_radius()
+            inner = np.array([2.0 * radius, 2.0 * radius], dtype=np.float32)
+        inner = np.maximum(np.array(inner, dtype=np.float32).reshape(-1)[:2], np.array([0.05, 0.05], dtype=np.float32))
+        poly = STATE.get("manual_unload_polygon_xy")
+        if poly is not None:
+            visual_poly = visual_polygon_xy(poly, UNLOAD_RANGE_VISUAL_MAX_VERTICES)
+            prim = make_polygon_wire_column(
+                box_path,
+                polygon_xy=visual_poly,
+                z_min=z_min,
+                z_max=z_max,
+                color=UNLOAD_RANGE_COLUMN_COLOR,
+                width=UNLOAD_RANGE_GUIDE_WIDTH,
+            )
+        else:
+            half_x = 0.5 * float(inner[0])
+            half_y = 0.5 * float(inner[1])
+            visual_poly = np.array(
+                [
+                    [float(p[0]) - half_x, float(p[1]) - half_y],
+                    [float(p[0]) + half_x, float(p[1]) - half_y],
+                    [float(p[0]) + half_x, float(p[1]) + half_y],
+                    [float(p[0]) - half_x, float(p[1]) + half_y],
+                ],
+                dtype=np.float32,
+            )
+            prim = make_polygon_wire_column(
+                box_path,
+                polygon_xy=visual_poly,
+                z_min=z_min,
+                z_max=z_max,
+                color=UNLOAD_RANGE_COLUMN_COLOR,
+                width=UNLOAD_RANGE_GUIDE_WIDTH,
+            )
+        if label:
+            info_print(
+                f"[UNLOAD RANGE] {label}: "
+                f"shape=box path={box_path} center={vec_list(center, 3)} "
+                f"inner_size={vec_list(inner, 2)} vertices={0 if poly is None else len(poly)} "
+                f"visual_vertices={0 if poly is None else len(visual_polygon_xy(poly, UNLOAD_RANGE_VISUAL_MAX_VERTICES))} z_range=({z_min:.3f},{z_max:.3f}) height={height:.3f} "
+                f"mesh_shrink_d={manual_unload_mesh_shrink_d():.3f}"
+            )
+        return prim
+
+    try:
+        stage.RemovePrim(Sdf.Path(box_path))
+    except Exception:
+        pass
+    try:
+        stage.RemovePrim(Sdf.Path(cyl_path))
+    except Exception:
+        pass
+    radius = manual_unload_radius()
+    circle_poly = circle_polygon_xy(float(p[0]), float(p[1]), radius, UNLOAD_RANGE_CIRCLE_SEGMENTS)
+    prim = make_polygon_wire_column(
+        cyl_path,
+        polygon_xy=circle_poly,
+        z_min=z_min,
+        z_max=z_max,
+        color=UNLOAD_RANGE_COLUMN_COLOR,
+        width=UNLOAD_RANGE_GUIDE_WIDTH,
+    )
+    if label:
+        info_print(
+            f"[UNLOAD RANGE] {label}: "
+            f"shape=circle path={cyl_path} center={vec_list(center, 3)} radius={radius:.3f} z_range=({z_min:.3f},{z_max:.3f}) height={height:.3f}"
         )
     return prim
 
@@ -3534,6 +4156,9 @@ async def wait_for_sand_particles_stable(label="sand_reset"):
     last_stats = None
 
     while elapsed < max_frames:
+        if not timeline_allows_background_work():
+            handle_timeline_stop_if_needed(label)
+            return False, {"aborted": True, "reason": "timeline_stopped_or_runtime_stopped"}
         await step_updates(window)
         elapsed += window
         cur = sand_particle_snapshot()
@@ -3578,6 +4203,10 @@ async def wait_for_sand_particles_stable(label="sand_reset"):
 
 async def reset_sand_site_stably(label=""):
     label = str(label or "sand_reset")
+    if not timeline_allows_background_work():
+        handle_timeline_stop_if_needed(label)
+        info_print("[SAND RESET] skipped: timeline stopped or runtime stopped", f"label={label}")
+        return False
     if not sand_site_active():
         info_print("[SAND RESET] skipped: sand site inactive", f"label={label}")
         return False
@@ -3586,6 +4215,9 @@ async def reset_sand_site_stably(label=""):
         info_print("[SAND RESET] already active; waiting", f"label={label}", f"active_label={STATE.get('sand_site_last_reset_label')}")
         waited = 0
         while bool(STATE.get("sand_site_reset_active", False)) and waited < int(SAND_RESET_SETTLE_MAX_FRAMES):
+            if not timeline_allows_background_work():
+                handle_timeline_stop_if_needed(label)
+                return False
             await step_updates(15)
             waited += 15
         return bool(STATE.get("sand_site_stable_reset_done", False))
@@ -3604,6 +4236,10 @@ async def reset_sand_site_stably(label=""):
         ok = False
         stats = None
         for attempt in range(1, max_attempts + 1):
+            if not timeline_allows_background_work():
+                handle_timeline_stop_if_needed(label)
+                stats = {"aborted": True, "reason": "timeline_stopped_or_runtime_stopped"}
+                break
             update_status(f"[SAND RESET] native reset start: {label} attempt={attempt}", force=True)
             if callable(stable_reset_fn):
                 info_print("[SAND RESET NATIVE]", f"label={label}", f"attempt={attempt}/{max_attempts}", "calling=sand_site.reset_stably")
@@ -3665,6 +4301,10 @@ builtins._EXCAVATOR_STABLE_SAND_RESET = request_sand_site_stable_reset
 async def delayed_startup_sand_reset():
     await step_updates(max(1, int(AUTO_RESET_SAND_UI_READY_DELAY_FRAMES)))
     if not STATE.get("running", False):
+        return
+    if not simulation_timeline_is_playing():
+        handle_timeline_stop_if_needed("after_ui_ready")
+        info_print("[SAND RESET] skipped after_ui_ready", "reason=timeline_stopped")
         return
     api = get_sand_site_api()
     if isinstance(api, dict) and bool(api.get("last_reset_healthy", False)):
@@ -5456,10 +6096,69 @@ def set_target_models_from_xyz(p):
     STATE["last_target_sync_time"] = time.time()
 
 
+def set_unload_models_from_xyz(p):
+    p = np.array(p, dtype=np.float32).reshape(-1)[:3]
+    if len(p) < 3:
+        return
+    set_manual_unload_point_xyz(float(p[0]), float(p[1]), float(p[2]), source="set_models", range_shape="circle")
+    update_unload_models_only(p)
+
+
+def update_unload_models_only(p):
+    p = np.array(p, dtype=np.float32).reshape(-1)[:3]
+    if len(p) < 3:
+        return
+    for axis, value in [("x", p[0]), ("y", p[1]), ("z", p[2])]:
+        model = UNLOAD_MODELS.get(axis)
+        if model is not None:
+            try:
+                model.set_value(float(value))
+            except Exception:
+                pass
+    z_range = STATE.get("manual_unload_z_range")
+    if z_range is not None:
+        try:
+            zr = np.array(z_range, dtype=np.float32).reshape(-1)[:2]
+        except Exception:
+            zr = np.array([float(GROUND_TOP_Z), float(p[2])], dtype=np.float32)
+    else:
+        zr = np.array([float(GROUND_TOP_Z), float(p[2])], dtype=np.float32)
+    if len(zr) < 2:
+        zr = np.array([float(GROUND_TOP_Z), float(p[2])], dtype=np.float32)
+    zr = np.array([min(float(zr[0]), float(zr[1])), max(float(zr[0]), float(zr[1]))], dtype=np.float32)
+    for key, value in [("z_min", zr[0]), ("z_max", zr[1])]:
+        model = UNLOAD_MODELS.get(key)
+        if model is not None:
+            try:
+                model.set_value(float(value))
+            except Exception:
+                pass
+    radius_model = UNLOAD_MODELS.get("r")
+    if radius_model is not None:
+        try:
+            radius_model.set_value(float(manual_unload_radius()))
+        except Exception:
+            pass
+    shrink_model = UNLOAD_MODELS.get("d")
+    if shrink_model is not None:
+        try:
+            shrink_model.set_value(float(manual_unload_mesh_shrink_d()))
+        except Exception:
+            pass
+    STATE["last_unload_model_xyz"] = p.copy()
+    STATE["last_unload_model_z_range"] = zr.copy()
+    STATE["last_unload_model_radius"] = float(manual_unload_radius())
+    STATE["last_unload_model_shrink_d"] = float(manual_unload_mesh_shrink_d())
+    STATE["last_unload_sync_time"] = time.time()
+
+
 async def auto_collect_prepare_environment():
     was_recording = bool(STATE.get("dataset_recording", False))
     STATE["dataset_recording"] = False
     reset_dig_plan()
+    if handle_timeline_stop_if_needed("auto_collect_prepare_start"):
+        STATE["dataset_recording"] = was_recording
+        return False
 
     if IK_MODEL is None:
         update_status("[AUTO DATASET] calibrating IK", force=True)
@@ -5491,6 +6190,9 @@ async def auto_collect_prepare_environment():
     )
     if should_reset_sand:
         try:
+            if handle_timeline_stop_if_needed("auto_collect_prepare_reset"):
+                STATE["dataset_recording"] = was_recording
+                return False
             update_status("[AUTO DATASET] resetting sand after home pose", force=True)
             info_print(
                 "[AUTO DATASET RESET]",
@@ -6891,7 +7593,8 @@ def build_scene():
     )
     disable_collision(get_prim(TARGET_PATH), "target_ball")
     UNLOAD_MARKER_PATH = f"{CONTROL_ROOT}/UnloadPointBall"
-    ensure_unload_marker(label="build_scene")
+    if not apply_default_unload_source_mesh():
+        ensure_unload_marker(label="build_scene")
 
     api = get_sand_site_api()
     move_target = None if api is None else api.get("move_target_to_entry")
@@ -7303,6 +8006,169 @@ def set_target_xyz(x, y, z):
         set_target_color(TARGET_COLOR_DEFAULT)
 
 
+def set_manual_unload_point_xyz(x, y, z, source="ui", inner_size=None, z_range=None, selected_path="", range_shape=None):
+    p = np.array([float(x), float(y), float(z)], dtype=np.float32)
+    STATE["manual_unload_override_enabled"] = True
+    STATE["manual_unload_point"] = p.copy()
+    STATE["manual_unload_source"] = str(source)
+    radius = manual_unload_radius()
+    if selected_path:
+        STATE["manual_unload_selected_path"] = str(selected_path)
+    if inner_size is not None:
+        arr = np.array(inner_size, dtype=np.float32).reshape(-1)[:2]
+        if len(arr) >= 2:
+            STATE["manual_unload_inner_size"] = np.maximum(arr, np.array([0.2, 0.2], dtype=np.float32))
+            radius = 0.5 * float(np.min(STATE["manual_unload_inner_size"]))
+            STATE["manual_unload_radius"] = max(0.05, radius)
+            STATE["manual_unload_range_shape"] = str(range_shape or "box")
+    elif STATE.get("manual_unload_inner_size") is None:
+        d = 2.0 * radius
+        STATE["manual_unload_inner_size"] = np.array([d, d], dtype=np.float32)
+        STATE["manual_unload_range_shape"] = str(range_shape or "circle")
+    else:
+        d = 2.0 * radius
+        STATE["manual_unload_inner_size"] = np.array([d, d], dtype=np.float32)
+        STATE["manual_unload_range_shape"] = str(range_shape or "circle")
+    if range_shape is not None:
+        STATE["manual_unload_range_shape"] = str(range_shape)
+        if str(range_shape) == "circle":
+            STATE["manual_unload_polygon_xy"] = None
+            STATE["manual_unload_selected_hull_xy"] = None
+            STATE["manual_unload_selected_size_xy"] = None
+    if z_range is not None:
+        arr = np.array(z_range, dtype=np.float32).reshape(-1)[:2]
+        if len(arr) >= 2:
+            STATE["manual_unload_z_range"] = np.array([min(float(arr[0]), float(arr[1])), max(float(arr[0]), float(arr[1]))], dtype=np.float32)
+    else:
+        STATE["manual_unload_z_range"] = np.array([min(float(GROUND_TOP_Z), float(z)), max(float(GROUND_TOP_Z), float(z))], dtype=np.float32)
+    ensure_unload_marker(p, label=f"manual_{source}")
+    reset_dig_plan()
+    return p
+
+
+def set_manual_unload_from_mesh_path(path, source="selected_mesh", status=True):
+    if not path:
+        update_status("[UNLOAD SETUP] select a mesh/group first", force=True)
+        return False
+    prim = get_prim(path)
+    if not prim or not prim.IsValid():
+        update_status(f"[UNLOAD SETUP] mesh path invalid: {path}", force=True)
+        info_print("[WARN] [UNLOAD SETUP] invalid mesh path:", path)
+        return False
+    center, size, mn, mx = bbox_center_size(path)
+    if center is None:
+        update_status(f"[UNLOAD SETUP] selected prim has no valid bbox: {path}", force=True)
+        return False
+    shrink = get_unload_mesh_shrink_from_model()
+    STATE["manual_unload_mesh_shrink_d"] = float(shrink)
+    xy_points = mesh_world_xy_points_under(prim)
+    hull = convex_hull_xy(xy_points)
+    if hull is None:
+        hull = np.array(
+            [
+                [float(mn[0]), float(mn[1])],
+                [float(mx[0]), float(mn[1])],
+                [float(mx[0]), float(mx[1])],
+                [float(mn[0]), float(mx[1])],
+            ],
+            dtype=np.float32,
+        )
+    poly = shrink_convex_polygon_xy(hull, shrink)
+    if poly is None:
+        update_status(f"[UNLOAD SETUP] selected mesh footprint failed: {path}", force=True)
+        return False
+    footprint_center = polygon_centroid_xy(poly)
+    poly_min = np.min(poly, axis=0)
+    poly_max = np.max(poly, axis=0)
+    inner = np.maximum(poly_max - poly_min, np.array([0.2, 0.2], dtype=np.float32))
+    point = np.array([float(footprint_center[0]), float(footprint_center[1]), float(mx[2]) + 0.06], dtype=np.float32)
+    STATE["manual_unload_selected_size_xy"] = np.maximum(np.max(hull, axis=0) - np.min(hull, axis=0), np.array([0.2, 0.2], dtype=np.float32))
+    STATE["manual_unload_selected_hull_xy"] = np.array(hull, dtype=np.float32)
+    STATE["manual_unload_polygon_xy"] = np.array(poly, dtype=np.float32)
+    set_manual_unload_point_xyz(
+        float(point[0]),
+        float(point[1]),
+        float(point[2]),
+        source=source,
+        inner_size=inner,
+        z_range=np.array([float(mn[2]), float(point[2])], dtype=np.float32),
+        selected_path=path,
+        range_shape="box",
+    )
+    update_unload_models_only(point)
+    info_print(
+        "[UNLOAD SETUP]",
+        f"source={source}",
+        f"path={path}",
+        f"center={vec_list([footprint_center[0], footprint_center[1], point[2]], 3)}",
+        f"size={vec_list(size, 3)}",
+        f"inner_size={vec_list(inner, 2)}",
+        f"mesh_shrink_d={shrink:.3f}",
+        f"hull_vertices={len(hull)}",
+        f"active_vertices={len(poly)}",
+        f"point={vec_list(point, 3)}",
+    )
+    if status:
+        update_status(f"[UNLOAD SETUP] mesh/group selected: {path}", force=True)
+    return True
+
+
+def set_manual_unload_from_selected_mesh():
+    return set_manual_unload_from_mesh_path(first_selected_prim_path(), source="selected_mesh", status=True)
+
+
+def apply_default_unload_source_mesh():
+    return set_manual_unload_from_mesh_path(DEFAULT_UNLOAD_SOURCE_MESH_PATH, source="preset_mesh", status=False)
+
+
+def set_manual_unload_from_selected_point():
+    path = first_selected_prim_path()
+    if not path:
+        update_status("[UNLOAD SETUP] select an unload point prim first", force=True)
+        return False
+    center, size, mn, mx = bbox_center_size(path)
+    if center is None:
+        center = get_prim_translation(path)
+        size = np.zeros(3, dtype=np.float32)
+    point = np.array(center[:3], dtype=np.float32)
+    set_manual_unload_point_xyz(
+        float(point[0]),
+        float(point[1]),
+        float(point[2]),
+        source="selected_point",
+        inner_size=np.array([2.0 * UNLOAD_POINT_DEFAULT_RADIUS, 2.0 * UNLOAD_POINT_DEFAULT_RADIUS], dtype=np.float32),
+        selected_path=path,
+        range_shape="circle",
+    )
+    update_unload_models_only(point)
+    info_print(
+        "[UNLOAD SETUP]",
+        "source=selected_point",
+        f"path={path}",
+        f"point={vec_list(point, 3)}",
+    )
+    update_status(f"[UNLOAD SETUP] point selected: {path}", force=True)
+    return True
+
+
+def clear_manual_unload_override():
+    STATE["manual_unload_override_enabled"] = False
+    STATE["manual_unload_point"] = None
+    STATE["manual_unload_inner_size"] = None
+    STATE["manual_unload_z_range"] = None
+    STATE["manual_unload_radius"] = float(UNLOAD_POINT_DEFAULT_RADIUS)
+    STATE["manual_unload_mesh_shrink_d"] = float(UNLOAD_SELECTED_EDGE_MARGIN)
+    STATE["manual_unload_range_shape"] = "circle"
+    STATE["manual_unload_selected_size_xy"] = None
+    STATE["manual_unload_source"] = ""
+    STATE["manual_unload_selected_path"] = ""
+    reset_dig_plan()
+    p = unload_bin_landing_point()
+    ensure_unload_marker(p, label="clear_manual_unload_override")
+    update_unload_models_only(p)
+    update_status("[UNLOAD SETUP] cleared manual override; using sand site/default unload bin", force=True)
+
+
 def update_target_from_models():
     x = TARGET_MODELS["x"].as_float
     y = TARGET_MODELS["y"].as_float
@@ -7316,6 +8182,71 @@ def get_target_xyz_from_models():
         TARGET_MODELS["y"].as_float,
         max(TARGET_MODELS["z"].as_float, TARGET_MIN_Z),
     ], dtype=np.float32)
+
+
+def get_unload_xyz_from_models():
+    z_model = UNLOAD_MODELS.get("z_max") or UNLOAD_MODELS.get("z")
+    try:
+        z_value = float(z_model.as_float) if z_model is not None else float(unload_bin_landing_point()[2])
+    except Exception:
+        try:
+            z_value = float(z_model.get_value_as_float()) if z_model is not None else float(unload_bin_landing_point()[2])
+        except Exception:
+            z_value = float(unload_bin_landing_point()[2])
+    return np.array([
+        UNLOAD_MODELS["x"].as_float,
+        UNLOAD_MODELS["y"].as_float,
+        z_value,
+    ], dtype=np.float32)
+
+
+def get_unload_z_range_from_models():
+    p = get_unload_xyz_from_models()
+    z_min_model = UNLOAD_MODELS.get("z_min")
+    z_max_model = UNLOAD_MODELS.get("z_max") or UNLOAD_MODELS.get("z")
+
+    def model_float(model, fallback):
+        if model is None:
+            return float(fallback)
+        try:
+            return float(model.as_float)
+        except Exception:
+            try:
+                return float(model.get_value_as_float())
+            except Exception:
+                return float(fallback)
+
+    z_min = model_float(z_min_model, GROUND_TOP_Z)
+    z_max = model_float(z_max_model, p[2])
+    if abs(z_max - z_min) < 0.03:
+        z_max = z_min + 0.03
+    return np.array([min(z_min, z_max), max(z_min, z_max)], dtype=np.float32)
+
+
+def get_unload_radius_from_model():
+    model = UNLOAD_MODELS.get("r")
+    if model is None:
+        return manual_unload_radius()
+    try:
+        return max(0.05, float(model.as_float))
+    except Exception:
+        try:
+            return max(0.05, float(model.get_value_as_float()))
+        except Exception:
+            return manual_unload_radius()
+
+
+def get_unload_mesh_shrink_from_model():
+    model = UNLOAD_MODELS.get("d")
+    if model is None:
+        return manual_unload_mesh_shrink_d()
+    try:
+        return max(0.0, float(model.as_float))
+    except Exception:
+        try:
+            return max(0.0, float(model.get_value_as_float()))
+        except Exception:
+            return manual_unload_mesh_shrink_d()
 
 
 def sync_target_from_sliders_live(force=False):
@@ -7345,6 +8276,84 @@ def sync_target_from_sliders_live(force=False):
     set_target_xyz(float(p[0]), float(p[1]), float(p[2]))
     STATE["last_target_model_xyz"] = p.copy()
     STATE["last_target_sync_time"] = now
+
+
+def sync_unload_from_sliders_live(force=False):
+    if STATE.get("auto_collect_active", False):
+        return
+
+    now = time.time()
+    if (not force) and now - float(STATE.get("last_unload_sync_time", 0.0) or 0.0) < float(STATE.get("target_sync_interval", 0.05)):
+        return
+    if not UNLOAD_MODELS:
+        return
+
+    p = get_unload_xyz_from_models()
+    z_range = get_unload_z_range_from_models()
+    radius = get_unload_radius_from_model()
+    shrink_d = get_unload_mesh_shrink_from_model()
+    last = STATE.get("last_unload_model_xyz")
+    last_z_range = STATE.get("last_unload_model_z_range")
+    last_radius = float(STATE.get("last_unload_model_radius", radius) or radius)
+    last_shrink_d = float(STATE.get("last_unload_model_shrink_d", shrink_d) or shrink_d)
+    if not force and last is not None:
+        try:
+            xyz_same = float(np.linalg.norm(p - np.array(last, dtype=np.float32).reshape(-1)[:3])) < 1.0e-4
+            if last_z_range is None:
+                z_range_same = False
+            else:
+                z_range_same = float(np.linalg.norm(z_range - np.array(last_z_range, dtype=np.float32).reshape(-1)[:2])) < 1.0e-4
+            radius_same = abs(float(radius) - last_radius) < 1.0e-4
+            shrink_same = abs(float(shrink_d) - last_shrink_d) < 1.0e-4
+            if xyz_same and z_range_same and radius_same and shrink_same:
+                STATE["last_unload_sync_time"] = now
+                return
+        except Exception:
+            pass
+    STATE["manual_unload_mesh_shrink_d"] = shrink_d
+    if str(STATE.get("manual_unload_source", "")).startswith("selected_mesh"):
+        hull = STATE.get("manual_unload_selected_hull_xy")
+        if hull is not None:
+            poly = shrink_convex_polygon_xy(hull, shrink_d)
+            if poly is not None:
+                STATE["manual_unload_polygon_xy"] = np.array(poly, dtype=np.float32)
+                poly_min = np.min(poly, axis=0)
+                poly_max = np.max(poly, axis=0)
+                inner = np.maximum(poly_max - poly_min, np.array([0.2, 0.2], dtype=np.float32))
+            else:
+                inner = np.array(STATE.get("manual_unload_inner_size"), dtype=np.float32).reshape(-1)[:2]
+            STATE["manual_unload_selected_size_xy"] = np.maximum(np.max(np.array(hull, dtype=np.float32), axis=0) - np.min(np.array(hull, dtype=np.float32), axis=0), np.array([0.2, 0.2], dtype=np.float32))
+            set_manual_unload_point_xyz(
+                float(p[0]),
+                float(p[1]),
+                float(p[2]),
+                source="selected_mesh_ui",
+                inner_size=inner,
+                z_range=z_range,
+                selected_path=str(STATE.get("manual_unload_selected_path", "")),
+                range_shape="box",
+            )
+            STATE["last_unload_model_xyz"] = p.copy()
+            STATE["last_unload_model_z_range"] = z_range.copy()
+            STATE["last_unload_model_radius"] = float(manual_unload_radius())
+            STATE["last_unload_model_shrink_d"] = float(shrink_d)
+            STATE["last_unload_sync_time"] = now
+            return
+    STATE["manual_unload_radius"] = radius
+    set_manual_unload_point_xyz(
+        float(p[0]),
+        float(p[1]),
+        float(p[2]),
+        source="ui",
+        inner_size=np.array([2.0 * radius, 2.0 * radius], dtype=np.float32),
+        z_range=z_range,
+        range_shape="circle",
+    )
+    STATE["last_unload_model_xyz"] = p.copy()
+    STATE["last_unload_model_z_range"] = z_range.copy()
+    STATE["last_unload_model_radius"] = float(radius)
+    STATE["last_unload_model_shrink_d"] = float(shrink_d)
+    STATE["last_unload_sync_time"] = now
 
 
 TRACE_CURVE_PATH = None
@@ -12030,6 +13039,9 @@ def build_ui():
         CTRL.print_state()
         update_status("State printed", force=True)
 
+    def toggle_render_mode_from_ui():
+        toggle_excavator_render_mode()
+
     def set_log_normal_from_ui():
         set_log_mode("normal")
 
@@ -12117,6 +13129,15 @@ def build_ui():
     def run_dig_step_button(step_index):
         register_async_task("motion", execute_dig_plan_step(step_index), replace=True)
 
+    def use_selected_unload_mesh_from_ui():
+        set_manual_unload_from_selected_mesh()
+
+    def use_selected_unload_point_from_ui():
+        set_manual_unload_from_selected_point()
+
+    def clear_unload_override_from_ui():
+        clear_manual_unload_override()
+
     WINDOW = ui.Window("Excavator Slider Control v3", width=620, height=760)
 
     with WINDOW.frame:
@@ -12165,9 +13186,10 @@ def build_ui():
                         model.add_value_changed_fn(on_manual_joint_slider_changed)
 
                     with ui.HStack(spacing=6):
-                        ui.Label("Manual joints", width=300)
+                        ui.Label("Manual joints", width=170)
                         ui.Button("Home", width=82, clicked_fn=home)
                         ui.Button("Print State", width=104, clicked_fn=print_state)
+                        ui.Button("Render Mode", width=112, clicked_fn=toggle_render_mode_from_ui)
 
                     ui.Separator()
                     ui.Label("Auto Dataset (primary pipeline)")
@@ -12196,20 +13218,70 @@ def build_ui():
                         speed_model.add_value_changed_fn(update_speed_multiplier)
 
                     ui.Separator()
-                    ui.Label("Target ball position")
+                    with ui.HStack(spacing=10):
+                        with ui.VStack(width=292, spacing=4):
+                            ui.Label("Target ball position")
+                            p = get_target_pos()
+                            for axis, val in [("x", p[0]), ("y", p[1]), ("z", p[2])]:
+                                model = ui.SimpleFloatModel(float(val))
+                                TARGET_MODELS[axis] = model
+                                with ui.HStack(spacing=4):
+                                    ui.Label(axis.upper(), width=20)
+                                    ui.FloatSlider(model=model, min=-15.0, max=15.0, width=170)
+                                    ui.FloatField(model=model, width=70)
 
-                    p = get_target_pos()
+                        with ui.VStack(width=292, spacing=4):
+                            ui.Label("Unload point / Z range")
+                            unload_p = np.array(STATE.get("manual_unload_point") if STATE.get("manual_unload_point") is not None else unload_bin_landing_point(), dtype=np.float32).reshape(-1)[:3]
+                            unload_z_range = STATE.get("manual_unload_z_range")
+                            if unload_z_range is not None:
+                                try:
+                                    unload_z_range = np.array(unload_z_range, dtype=np.float32).reshape(-1)[:2]
+                                except Exception:
+                                    unload_z_range = None
+                            if unload_z_range is None or len(unload_z_range) < 2:
+                                unload_z_range = np.array([float(GROUND_TOP_Z), float(unload_p[2])], dtype=np.float32)
+                            unload_z_min = min(float(unload_z_range[0]), float(unload_z_range[1]))
+                            unload_z_max = max(float(unload_z_range[0]), float(unload_z_range[1]))
+                            for axis, val in [("x", unload_p[0]), ("y", unload_p[1])]:
+                                model = ui.SimpleFloatModel(float(val))
+                                UNLOAD_MODELS[axis] = model
+                                with ui.HStack(spacing=4):
+                                    ui.Label(axis.upper(), width=20)
+                                    ui.FloatSlider(model=model, min=-15.0, max=15.0, width=170)
+                                    ui.FloatField(model=model, width=70)
+                            for key, label, val in [("z_min", "Z Min", unload_z_min), ("z_max", "Z Max", unload_z_max)]:
+                                model = ui.SimpleFloatModel(float(val))
+                                UNLOAD_MODELS[key] = model
+                                with ui.HStack(spacing=4):
+                                    ui.Label(label, width=48)
+                                    ui.FloatSlider(model=model, min=-2.0, max=8.0, width=142)
+                                    ui.FloatField(model=model, width=70)
+                            radius_model = ui.SimpleFloatModel(float(manual_unload_radius()))
+                            UNLOAD_MODELS["r"] = radius_model
+                            with ui.HStack(spacing=4):
+                                ui.Label("R", width=20)
+                                ui.FloatSlider(model=radius_model, min=0.05, max=4.0, width=170)
+                                ui.FloatField(model=radius_model, width=70)
+                            shrink_model = ui.SimpleFloatModel(float(manual_unload_mesh_shrink_d()))
+                            UNLOAD_MODELS["d"] = shrink_model
+                            with ui.HStack(spacing=4):
+                                ui.Label("D", width=20)
+                                ui.FloatSlider(model=shrink_model, min=0.0, max=2.0, width=170)
+                                ui.FloatField(model=shrink_model, width=70)
+                            STATE["last_unload_model_xyz"] = unload_p.copy()
+                            STATE["last_unload_model_z_range"] = np.array([unload_z_min, unload_z_max], dtype=np.float32)
+                            STATE["last_unload_model_radius"] = float(manual_unload_radius())
+                            STATE["last_unload_model_shrink_d"] = float(manual_unload_mesh_shrink_d())
+                            STATE["last_unload_sync_time"] = time.time()
 
-                    for axis, val in [("x", p[0]), ("y", p[1]), ("z", p[2])]:
-                        model = ui.SimpleFloatModel(float(val))
-                        TARGET_MODELS[axis] = model
-
-                        with ui.HStack(spacing=6):
-                            ui.Label(axis.upper(), width=80)
-                            ui.FloatSlider(model=model, min=-15.0, max=15.0, width=360)
-                            ui.FloatField(model=model, width=90)
-
-                    # Target sliders sync live; no Apply button required
+                    ui.Label("Z Min/Max sets the blue unload range height; Z Max is the marker/release height.", width=590)
+                    ui.Label("R applies to point/XYZ mode; D shrinks selected mesh XY footprint. Auto Dataset uses this unload target.", width=590)
+                    ui.Label("Unload point setup")
+                    with ui.HStack(spacing=6):
+                        ui.Button("Unload Selected Mesh", width=166, clicked_fn=use_selected_unload_mesh_from_ui)
+                        ui.Button("Unload Selected Point", width=166, clicked_fn=use_selected_unload_point_from_ui)
+                        ui.Button("Clear Unload Override", width=160, clicked_fn=clear_unload_override_from_ui)
 
                     ui.Separator()
                     ui.Label("Debug Planner / Trace")
@@ -12289,6 +13361,7 @@ async def main():
         World.clear_instance()
 
     setup_paths()
+    apply_excavator_render_mode(True, force_status=False)
     configure_joints()
     build_scene()
     if sand_site_active():
@@ -12400,11 +13473,16 @@ async def main():
         register_async_task("startup_sand_reset", delayed_startup_sand_reset(), replace=True)
 
     while STATE["running"]:
+        if handle_timeline_stop_if_needed("main_loop"):
+            await step_updates(max(1, int(60 / CONTROL_HZ)))
+            continue
+
         if STATE["request_calibrate"]:
             STATE["request_calibrate"] = False
             await calibrate_ik()
 
         sync_target_from_sliders_live(force=False)
+        sync_unload_from_sliders_live(force=False)
 
         apply_manual_joint_target_step()
 

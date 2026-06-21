@@ -283,12 +283,21 @@ def _ensure_zsp_configuration_aliases(project_root):
         if not os.path.isfile(source):
             print(f"[WARN] ZSP source USD missing for configuration alias: {source}")
             continue
+        needs_copy = not os.path.exists(target)
         if os.path.exists(target):
+            try:
+                needs_copy = os.path.islink(target) or os.path.getsize(target) < 128 or os.path.getsize(target) != os.path.getsize(source)
+            except Exception:
+                needs_copy = True
+        if not needs_copy:
             continue
         try:
-            os.symlink(os.path.join("..", filename), target)
-        except Exception:
+            if os.path.exists(target) and not os.path.islink(target):
+                os.remove(target)
             shutil.copy2(source, target)
+            print(f"[INFO] Refreshed ZSP configuration USD alias: {target}")
+        except Exception as exc:
+            print(f"[WARN] Could not refresh ZSP configuration alias {target}: {repr(exc)}")
 
 
 def _pump_kit_updates(frame_count=5):
@@ -332,6 +341,8 @@ def _open_selected_stage(project_root):
 
 PROJECT_ROOT = ensure_project_root()
 print(f"[INFO] Excavator model source: {_selected_model_label()}")
+_ensure_zsp_configuration_aliases(PROJECT_ROOT)
+_normalize_zsp_layer_paths(PROJECT_ROOT)
 _open_selected_stage(PROJECT_ROOT)
 
 from excavator_app.bootstrap import run_excavator_with_sand

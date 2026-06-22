@@ -71,12 +71,7 @@ def cache_dig_plan_trace_points(rt, seq=None, start_q=None):
 
 
 def cache_active_stage_trace_points(rt, stage_name, q_start, q_goal, stage_index=None, include_remaining=True):
-    """Cache the path that execution is about to command.
-
-    The full dig plan preview is built from the plan start pose. During execution the
-    robot may already be at a slightly different command state, so the active trace
-    must start from the live q_start that will be sent to move_to_profile().
-    """
+    """Cache the execution segment for diagnostics without replacing blue plan trace."""
     if q_start is None or q_goal is None:
         return []
 
@@ -131,13 +126,10 @@ def cache_active_stage_trace_points(rt, stage_name, q_start, q_goal, stage_index
             )
 
     points = points[: rt.TRACE_PLAN_MAX_POINTS]
-    rt.STATE["dig_plan_trace_points"] = _copy_points(points, rt.TRACE_PLAN_MAX_POINTS)
-    rt.STATE["dig_plan_trace_stage_breaks"] = breaks
-    rt.STATE["trace_planned_bucket_points"] = rt.STATE["dig_plan_trace_points"]
-    rt.STATE["trace_plan_source"] = "active_command_remaining"
-    rt.STATE["trace_render_dirty"] = True
-    rt.STATE["trace_no_plan_notice_shown"] = False
-    return rt.STATE["dig_plan_trace_points"]
+    rt.STATE["active_stage_trace_points"] = _copy_points(points, rt.TRACE_PLAN_MAX_POINTS)
+    rt.STATE["active_stage_trace_stage_breaks"] = breaks
+    rt.STATE["active_stage_trace_source"] = "active_command_remaining"
+    return rt.STATE["active_stage_trace_points"]
 
 
 def planned_bucket_points_from_dig_plan(rt):

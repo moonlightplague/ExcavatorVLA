@@ -72,7 +72,7 @@ WALL_INNER_SIZE_X = SANDBOX_INNER_SIZE_X
 WALL_INNER_SIZE_Y = SANDBOX_INNER_SIZE_Y
 
 PILE_CENTER_X = 0.0
-PILE_CENTER_Y = -6.7
+PILE_CENTER_Y = SAND_CENTER_Y
 PILE_HEIGHT = SANDBOX_FILL_HEIGHT
 PILE_SIGMA_X = 0.56
 PILE_SIGMA_Y = 0.56
@@ -210,6 +210,7 @@ builtins._SAND_SITE_STATE = {
     "needs_reset_after_world_ready": not AUTO_CREATE_INITIAL_SAND,
     "last_status_print_time": 0.0,
     "last_sand_xyz_live_update": 0.0,
+    "footprint_sample_cache": {},
     "status": "Sand site script loaded",
 }
 
@@ -692,21 +693,10 @@ def apply_parameter_models_to_globals():
         SAND_SOURCE_TOTAL_PROJECTED_FACE_COUNT = 0
         SAND_SOURCE_RAW_FACE_POLYGONS_XY = None
         SAND_SOURCE_FACE_POLYGONS_XY = None
-SAND_SOURCE_SELECTED_HULL_XY = None
-SAND_SOURCE_POLYGON_XY = None
-
-
-def simulation_timeline_is_playing():
-    if not HAS_OMNI_TIMELINE:
-        return True
-    try:
-        timeline = omni.timeline.get_timeline_interface()
-        if timeline is None:
-            return True
-        return bool(timeline.is_playing())
-    except Exception:
-        return True
+        SAND_SOURCE_SELECTED_HULL_XY = None
+        SAND_SOURCE_POLYGON_XY = None
         info("[SAND SOURCE SELECT] source=point_xyz reason=sand_point_xy_or_radius_changed")
+
     SAND_CENTER_X = next_sand_x
     SAND_CENTER_Y = next_sand_y
     SAND_POINT_Z = next_sand_z
@@ -765,7 +755,20 @@ def simulation_timeline_is_playing():
 
     recompute_derived_scene_params()
     update_particle_runtime_state()
+    rebuild_sand_reference_grid("apply_parameters")
     set_sand_generation_range_box("apply_parameters")
+
+
+def simulation_timeline_is_playing():
+    if not HAS_OMNI_TIMELINE:
+        return True
+    try:
+        timeline = omni.timeline.get_timeline_interface()
+        if timeline is None:
+            return True
+        return bool(timeline.is_playing())
+    except Exception:
+        return True
 
 
 def refresh_parameter_models_from_globals():
@@ -1232,6 +1235,23 @@ def footprint_xy_samples(spacing_xy):
     poly = current_sand_footprint_polygon_xy()
     x_min, x_max, y_min, y_max = current_sand_footprint_bbox_xy()
     spacing = max(1.0e-6, float(spacing_xy))
+    try:
+        poly_key = tuple((round(float(x), 5), round(float(y), 5)) for x, y in np.array(poly, dtype=np.float32).reshape(-1, 2))
+        cache_key = (round(spacing, 5), poly_key, round(float(x_min), 5), round(float(x_max), 5), round(float(y_min), 5), round(float(y_max), 5))
+        cache = STATE.get("footprint_sample_cache")
+        if not isinstance(cache, dict):
+            cache = {}
+            STATE["footprint_sample_cache"] = cache
+        cached = cache.get(cache_key)
+        if cached is not None:
+            for x, y in cached:
+                yield float(x), float(y)
+            return
+    except Exception:
+        cache_key = None
+        cache = None
+
+    samples = []
     y = float(y_min) + 0.5 * spacing
     row = 0
     while y <= float(y_max) + 1.0e-9:
@@ -1242,10 +1262,14 @@ def footprint_xy_samples(spacing_xy):
             x = max(float(lo), start)
             while x <= float(hi) + 1.0e-9:
                 if is_inside_diggable_xy(float(x), float(y)):
+                    samples.append((float(x), float(y)))
                     yield float(x), float(y)
                 x += spacing
         row += 1
         y += spacing
+    if cache_key is not None and isinstance(cache, dict):
+        cache.clear()
+        cache[cache_key] = samples
 
 
 def selected_prim_paths():
@@ -1298,6 +1322,7 @@ def clear_selected_sand_source_mesh():
     global SAND_SOURCE_SELECTED_PATH, SAND_SOURCE_SELECTED_FACE_COUNT, SAND_SOURCE_TOTAL_PROJECTED_FACE_COUNT
     global SAND_SOURCE_RAW_FACE_POLYGONS_XY, SAND_SOURCE_FACE_POLYGONS_XY
     global SAND_SOURCE_SELECTED_HULL_XY, SAND_SOURCE_POLYGON_XY
+    global PILE_CENTER_X, PILE_CENTER_Y
     SAND_SOURCE_SELECTED_PATH = ""
     SAND_SOURCE_SELECTED_FACE_COUNT = 0
     SAND_SOURCE_TOTAL_PROJECTED_FACE_COUNT = 0
@@ -1305,6 +1330,9 @@ def clear_selected_sand_source_mesh():
     SAND_SOURCE_FACE_POLYGONS_XY = None
     SAND_SOURCE_SELECTED_HULL_XY = None
     SAND_SOURCE_POLYGON_XY = None
+    PILE_CENTER_X = SAND_CENTER_X
+    PILE_CENTER_Y = SAND_CENTER_Y
+    rebuild_sand_reference_grid("sand_point_xyz")
     set_sand_generation_range_box("sand_point_xyz")
     store_runtime_api()
     update_status("Sand source set to point XYZ mode; Reset Sand regenerates particles")
@@ -1390,6 +1418,7 @@ def use_mesh_path_as_sand_source(path, source_label="mesh"):
 
     recompute_derived_scene_params()
     update_particle_runtime_state()
+    rebuild_sand_reference_grid("selected_sand_mesh")
     store_runtime_api()
     set_sand_generation_range_box("selected_sand_mesh")
     update_status(f"Sand source mesh/group selected: {path}; Reset Sand to regenerate particles")
@@ -2007,6 +2036,17 @@ def initialize_sand_reference_grid(root):
     return None
 
 
+def rebuild_sand_reference_grid(label=""):
+    build_height_arrays()
+    refresh_sand_mesh()
+    info(
+        "[SAND REFERENCE GRID]",
+        f"label={label}",
+        "center=", np.round([PILE_CENTER_X, PILE_CENTER_Y, SAND_FLOOR_Z], 3),
+        "bbox=", tuple(round(float(v), 3) for v in current_sand_footprint_bbox_xy()),
+    )
+
+
 def set_schema_attr(obj, names, value):
     for name in names:
         fn = getattr(obj, name, None)
@@ -2587,11 +2627,20 @@ def unload_bin_dump_point():
 
 def sand_scene_context():
     live_stats = real_sand_stats()
+    try:
+        footprint = current_sand_footprint_polygon_xy()
+        footprint_center = polygon_centroid_xy(footprint)
+        footprint_min = np.min(footprint, axis=0)
+        footprint_max = np.max(footprint, axis=0)
+        footprint_radius = np.maximum((footprint_max - footprint_min) * 0.5, np.array([0.05, 0.05], dtype=np.float32))
+    except Exception:
+        footprint_center = np.array([float(PILE_CENTER_X), float(PILE_CENTER_Y)], dtype=np.float32)
+        footprint_radius = np.array([float(DIGGABLE_RADIUS_X), float(DIGGABLE_RADIUS_Y)], dtype=np.float32)
     return {
         "sand_center": np.array([float(SAND_CENTER_X), float(SAND_CENTER_Y), float(SAND_FLOOR_Z)], dtype=np.float32),
         "sand_size": np.array([float(SAND_SIZE_X), float(SAND_SIZE_Y)], dtype=np.float32),
-        "pile_center": np.array([float(PILE_CENTER_X), float(PILE_CENTER_Y), float(SAND_FLOOR_Z)], dtype=np.float32),
-        "diggable_radius": np.array([float(DIGGABLE_RADIUS_X), float(DIGGABLE_RADIUS_Y)], dtype=np.float32),
+        "pile_center": np.array([float(footprint_center[0]), float(footprint_center[1]), float(SAND_FLOOR_Z)], dtype=np.float32),
+        "diggable_radius": np.array([float(footprint_radius[0]), float(footprint_radius[1])], dtype=np.float32),
         "sandbox_inner_size": np.array([float(SANDBOX_INNER_SIZE_X), float(SANDBOX_INNER_SIZE_Y)], dtype=np.float32),
         "sandbox_wall_height": float(SANDBOX_WALL_HEIGHT),
         "wall_center": np.array([float(WALL_CENTER_X), float(WALL_CENTER_Y), float(WALL_BASE_Z)], dtype=np.float32),
@@ -2846,6 +2895,7 @@ def store_runtime_api():
         "root_path": root_path(),
         "height_fn": height_from_grid,
         "initial_height_fn": initial_sand_height_xy,
+        "particle_positions_fn": current_real_particle_positions,
         "particle_surface_height_fn": particle_surface_height_at_xy,
         "particle_heightmap_fn": particle_surface_heightmap,
         "particle_excavated_volume_fn": particle_excavated_volume,
@@ -2903,9 +2953,9 @@ def build_sand_site():
     clear_previous_site(root)
     ensure_physics_scene()
     UsdGeom.Xform.Define(get_stage(), root)
-    initialize_sand_reference_grid(root)
     make_sand_retaining_walls(root)
     apply_default_sand_source_mesh()
+    initialize_sand_reference_grid(root)
     set_sand_generation_range_box("build_sand_site")
     if AUTO_CREATE_INITIAL_SAND:
         make_real_particle_sand(root)

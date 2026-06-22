@@ -239,6 +239,7 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dig_plan_candidate": None,
     "dataset_sand_metrics_path": "",
     "dataset_initial_pile_particle_ids": None,
+    "dataset_initial_pile_particle_mask": None,
     "dataset_initial_pile_particle_count": 0,
     "dataset_max_bucket_particles": 0,
     "dataset_max_bucket_from_pile_particles": 0,
@@ -250,6 +251,11 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_phase_metrics": {},
     "sand_metrics_last_time": 0.0,
     "sand_metrics_last": None,
+    "sand_snapshot_last_time": 0.0,
+    "sand_snapshot_last": None,
+    "sand_perf_last": {},
+    "rigid_obstacle_cache_time": 0.0,
+    "rigid_obstacle_cache": None,
     "sand_site_stable_reset_done": False,
     "sand_site_reset_active": False,
     "sand_site_last_reset_label": "",
@@ -332,7 +338,7 @@ FREEZE_MIN_DURATION = 0.45
 FREEZE_SWING_ONLY_MIN_DURATION = 2.25
 FREEZE_BUCKET_CUT_MIN_DURATION = 1.35
 FREEZE_PRINT_INTERVAL = 1.0
-SAND_CONTACT_PHASES = {"insert_cut", "pull_mid_cut", "pull_exit_cut"}
+SAND_CONTACT_PHASES = {"insert_cut", "pull_mid_cut", "pull_exit_cut", "curl_to_hold_material"}
 SAND_CONTACT_BUCKET_PROGRESS_MIN = 80
 SAND_CONTACT_PILE_PROGRESS_MIN = 60
 SAND_CONTACT_TIP_PROGRESS_MIN_M = 0.015
@@ -348,6 +354,12 @@ SAND_CONTACT_ADVANCE_TIP_MIN_M = 0.18
 SAND_CONTACT_ADVANCE_FALLBACK_BUCKET_MIN = 300
 SAND_CONTACT_ADVANCE_FALLBACK_PILE_MIN = 300
 SAND_CONTACT_MAX_STAGE_WALL_SECONDS = 8.0
+SAND_CONTACT_SPILL_RATIO_MAX = 0.55
+SAND_CONTACT_SPILL_WITHOUT_LOAD_MIN = 140
+CURL_HOLD_MIN_BUCKET_PARTICLES = 80
+CURL_HOLD_ACCEPT_BUCKET_DEG = -82.0
+CURL_HOLD_ACCEPT_MAX_ERR_DEG = 34.0
+CURL_HOLD_TARGET_DEG = -90.0
 MANUAL_FREEZE_STOP_ENABLED = True
 AUTO_FREEZE_STOP_ENABLED = True
 
@@ -388,6 +400,12 @@ AUTO_DIG_TOPK_TARGETS = 8
 AUTO_DIG_CORE_NORM_MAX = 0.62
 AUTO_DIG_DENSITY_RADIUS = 0.34
 AUTO_DIG_MIN_LOCAL_PARTICLES = 24
+AUTO_DIG_MIN_SWEPT_PARTICLES = 24
+AUTO_DIG_RING_RADII = [0.0, 0.18, 0.36, 0.55]
+AUTO_DIG_RING_POINTS = [1, 6, 8, 10]
+AUTO_DIG_DEPTH_PRIORITY = [0.22, 0.18, 0.14, 0.10]
+AUTO_DIG_SWEEP_RADIUS = 0.30
+AUTO_DIG_FULL_PLAN_TOPK_PER_RING = 4
 AUTO_UNLOAD_GRID_SIZE = 5
 AUTO_UNLOAD_WALL_MARGIN = 0.18
 AUTO_UNLOAD_EMPTY_CELL_HEIGHT = -1.0
@@ -406,6 +424,10 @@ AUTO_COLLECT_INITIAL_POSES_DEG = [
 SAND_PARTICLE_PATH_SUFFIX = "RealSandParticles"
 SAND_PARTICLE_MASS_DEFAULT = 0.535
 SAND_METRICS_INTERVAL = 0.45
+SAND_SNAPSHOT_MAX_AGE = 0.35
+SAND_SNAPSHOT_GRID_RES = 64
+SAND_SNAPSHOT_GRID_MAX_RES = 96
+SAND_SNAPSHOT_CELL_RADIUS_LIMIT = 10
 AUTO_RESET_SAND_AFTER_WORLD_READY = False
 AUTO_RESET_SAND_AFTER_UI_READY = True
 AUTO_RESET_SAND_UI_READY_DELAY_FRAMES = 60
@@ -424,6 +446,16 @@ SAND_PILE_RADIUS_X = 1.18
 SAND_PILE_RADIUS_Y = 1.18
 SAND_PILE_Z_MIN = -0.05
 SAND_PILE_Z_MAX = 2.20
+SAND_SETTLED_MIN_FRACTION_IN_FOOTPRINT = 0.55
+SAND_SETTLED_HIGH_AIR_FRACTION_MAX = 0.08
+SAND_SETTLED_Z_MARGIN = 0.75
+SAND_SETTLED_SURFACE_MARGIN = 0.35
+SAND_SURFACE_QUERY_RADIUS = 0.24
+FRONT_EDGE_BODY_DEPTH_SOFT_MARGIN = 0.045
+FRONT_EDGE_BODY_DEPTH_HARD_MARGIN = 0.145
+FRONT_EDGE_MIN_TIP_DEPTH = 0.020
+EXIT_BODY_DEPTH_SOFT_MARGIN = 0.10
+EXIT_BODY_DEPTH_HARD_MARGIN = 0.26
 SAND_BIN_HALF_X = 1.25
 SAND_BIN_HALF_Y = 1.25
 SAND_BIN_Z_MIN = -0.05
@@ -479,10 +511,10 @@ BUCKET_LIFT_LEVEL_TOL_DEG = 4.0
 BUCKET_CARRY_HOLD_TILT_DEG = 18.0
 BUCKET_CARRY_HOLD_TOL_DEG = 8.0
 BUCKET_CARRY_MIN_POUR_ABOVE_LOAD_Z = 0.08
-BUCKET_DIG_APPROACH_WORLD_DEG = -78.0
-BUCKET_DIG_INSERT_WORLD_DEG = -96.0
-BUCKET_DIG_PULL_WORLD_DEG = -108.0
-BUCKET_DIG_EXIT_WORLD_DEG = -118.0
+BUCKET_DIG_APPROACH_WORLD_DEG = -52.0
+BUCKET_DIG_INSERT_WORLD_DEG = -78.0
+BUCKET_DIG_PULL_WORLD_DEG = -92.0
+BUCKET_DIG_EXIT_WORLD_DEG = -96.0
 BUCKET_UNLOAD_DUMP_DEG = 82.0
 UNLOAD_DUMP_BUCKET_TOL_DEG = 18.0
 UNLOAD_DUMP_ACCEPT_ERR = 0.45
@@ -522,63 +554,91 @@ DEFAULT_UNLOAD_SOURCE_MESH_PATH = "/World/SandSite/UnloadBin"
 DIG_PLAN_CANDIDATES = [
     {
         "id": "balanced",
-        "approach_offset": 0.25,
-        "pre_z": 0.60,
-        "contact_z": 0.03,
-        "insert_depth": 0.14,
-        "mid_pull": 0.35,
-        "mid_depth": 0.28,
-        "exit_pull": 0.55,
-        "exit_depth": 0.08,
-        "curl_z": 0.08,
+        "approach_offset": 0.34,
+        "pre_z": 0.46,
+        "contact_z": 0.055,
+        "insert_depth": 0.08,
+        "mid_pull": 0.34,
+        "mid_depth": 0.14,
+        "exit_pull": 0.56,
+        "exit_depth": 0.04,
+        "exit_lift_z": 0.08,
+        "curl_z": 0.34,
         "lift_height": 0.70,
         "unload_height_delta": 0.00,
         "unload_dump_deg": 82.0,
+        "bucket_attack_world": -52.0,
+        "bucket_cut_world": -78.0,
+        "bucket_mid_cut_world": -92.0,
+        "bucket_exit_world": -96.0,
+        "bucket_curl": CURL_HOLD_TARGET_DEG,
+        "curl_boom_lift_deg": 4.5,
     },
     {
         "id": "high_lift",
-        "approach_offset": 0.32,
-        "pre_z": 0.82,
-        "contact_z": 0.06,
-        "insert_depth": 0.12,
-        "mid_pull": 0.35,
-        "mid_depth": 0.24,
-        "exit_pull": 0.58,
-        "exit_depth": 0.06,
-        "curl_z": 0.16,
+        "approach_offset": 0.42,
+        "pre_z": 0.62,
+        "contact_z": 0.075,
+        "insert_depth": 0.07,
+        "mid_pull": 0.38,
+        "mid_depth": 0.12,
+        "exit_pull": 0.62,
+        "exit_depth": 0.03,
+        "exit_lift_z": 0.10,
+        "curl_z": 0.40,
         "lift_height": 1.05,
         "unload_height_delta": 0.18,
         "unload_dump_deg": 86.0,
+        "bucket_attack_world": -48.0,
+        "bucket_cut_world": -74.0,
+        "bucket_mid_cut_world": -90.0,
+        "bucket_exit_world": -94.0,
+        "bucket_curl": CURL_HOLD_TARGET_DEG,
+        "curl_boom_lift_deg": 5.5,
     },
     {
-        "id": "deep_short",
-        "approach_offset": 0.20,
-        "pre_z": 0.70,
-        "contact_z": 0.04,
-        "insert_depth": 0.18,
-        "mid_pull": 0.28,
-        "mid_depth": 0.34,
-        "exit_pull": 0.46,
-        "exit_depth": 0.10,
-        "curl_z": 0.10,
+        "id": "front_bite",
+        "approach_offset": 0.46,
+        "pre_z": 0.52,
+        "contact_z": 0.06,
+        "insert_depth": 0.10,
+        "mid_pull": 0.30,
+        "mid_depth": 0.16,
+        "exit_pull": 0.50,
+        "exit_depth": 0.05,
+        "exit_lift_z": 0.08,
+        "curl_z": 0.36,
         "lift_height": 0.88,
         "unload_height_delta": 0.10,
         "unload_dump_deg": 88.0,
+        "bucket_attack_world": -58.0,
+        "bucket_cut_world": -84.0,
+        "bucket_mid_cut_world": -96.0,
+        "bucket_exit_world": -98.0,
+        "bucket_curl": CURL_HOLD_TARGET_DEG,
+        "curl_boom_lift_deg": 4.0,
     },
     {
         "id": "shallow_long",
-        "approach_offset": 0.42,
-        "pre_z": 0.78,
+        "approach_offset": 0.54,
+        "pre_z": 0.58,
         "contact_z": 0.08,
-        "insert_depth": 0.12,
+        "insert_depth": 0.06,
         "mid_pull": 0.48,
-        "mid_depth": 0.24,
+        "mid_depth": 0.10,
         "exit_pull": 0.72,
-        "exit_depth": 0.06,
-        "curl_z": 0.18,
+        "exit_depth": 0.02,
+        "exit_lift_z": 0.12,
+        "curl_z": 0.44,
         "lift_height": 1.15,
         "unload_height_delta": 0.22,
         "unload_dump_deg": 86.0,
+        "bucket_attack_world": -45.0,
+        "bucket_cut_world": -70.0,
+        "bucket_mid_cut_world": -86.0,
+        "bucket_exit_world": -92.0,
+        "bucket_curl": CURL_HOLD_TARGET_DEG,
+        "curl_boom_lift_deg": 6.0,
     },
 ]
 
@@ -2519,6 +2579,8 @@ def task_scene_context():
     bin_center = api_array(raw, "unload_bin_center", [float(AUTO_COLLECT_TARGET_CENTER[0]), -float(AUTO_COLLECT_TARGET_CENTER[1]), GROUND_TOP_Z], 3)
     bin_inner = api_array(raw, "unload_bin_inner_size", [2.0 * SAND_BIN_HALF_X, 2.0 * SAND_BIN_HALF_Y], 2)
     bin_z_range = api_array(raw, "unload_bin_z_range", [SAND_BIN_Z_MIN, SAND_BIN_Z_MAX], 2)
+    sand_floor_z = float(raw.get("sand_floor_z", GROUND_TOP_Z))
+    sand_fill_height = float(raw.get("sand_fill_height", max(0.25, SAND_PILE_Z_MAX - SAND_PILE_Z_MIN)))
 
     dump_default = [
         float(bin_center[0]),
@@ -2582,6 +2644,8 @@ def task_scene_context():
         "source": source,
         "pile_center": pile_center[:3],
         "pile_radius": np.maximum(pile_radius[:2], np.array([0.1, 0.1], dtype=np.float32)),
+        "sand_floor_z": float(sand_floor_z),
+        "sand_fill_height": max(0.05, float(sand_fill_height)),
         "unload_bin_center": bin_center,
         "unload_bin_inner_size": bin_inner,
         "unload_bin_half_size": bin_half,
@@ -3974,8 +4038,14 @@ def planner_config_snapshot():
         "auto_dig_grid_size": AUTO_DIG_GRID_SIZE,
         "auto_dig_topk_targets": AUTO_DIG_TOPK_TARGETS,
         "auto_dig_core_norm_max": AUTO_DIG_CORE_NORM_MAX,
-        "auto_dig_density_radius": AUTO_DIG_DENSITY_RADIUS,
-        "auto_dig_min_local_particles": AUTO_DIG_MIN_LOCAL_PARTICLES,
+            "auto_dig_density_radius": AUTO_DIG_DENSITY_RADIUS,
+            "auto_dig_min_local_particles": AUTO_DIG_MIN_LOCAL_PARTICLES,
+            "auto_dig_min_swept_particles": AUTO_DIG_MIN_SWEPT_PARTICLES,
+            "auto_dig_ring_radii": list(AUTO_DIG_RING_RADII),
+        "auto_dig_ring_points": list(AUTO_DIG_RING_POINTS),
+        "auto_dig_depth_priority": list(AUTO_DIG_DEPTH_PRIORITY),
+        "auto_dig_sweep_radius": AUTO_DIG_SWEEP_RADIUS,
+        "auto_dig_full_plan_topk_per_ring": AUTO_DIG_FULL_PLAN_TOPK_PER_RING,
         "auto_unload_grid_size": AUTO_UNLOAD_GRID_SIZE,
     }
 
@@ -4105,6 +4175,18 @@ def sand_particle_prim():
 
 
 def sand_particle_positions():
+    api = get_sand_site_api()
+    fn = api.get("particle_positions_fn") if isinstance(api, dict) else None
+    if callable(fn):
+        try:
+            points = fn()
+            if points is not None:
+                arr = np.asarray(points, dtype=np.float32)
+                if arr.ndim == 2 and arr.shape[1] >= 3 and arr.shape[0] > 0:
+                    return np.ascontiguousarray(arr[:, :3], dtype=np.float32)
+        except Exception:
+            pass
+
     prim = sand_particle_prim()
     if prim is None:
         return None
@@ -4113,10 +4195,195 @@ def sand_particle_positions():
         points = attr.Get() if attr.IsValid() else None
         if points is None or len(points) == 0:
             return None
+        try:
+            arr = np.asarray(points, dtype=np.float32)
+            if arr.ndim == 2 and arr.shape[1] >= 3:
+                return np.ascontiguousarray(arr[:, :3], dtype=np.float32)
+        except Exception:
+            pass
         return np.array([[float(p[0]), float(p[1]), float(p[2])] for p in points], dtype=np.float32)
     except Exception as e:
         info_print("[WARN] sand particle read failed:", type(e).__name__, e)
         return None
+
+
+def invalidate_sand_runtime_caches(reason=""):
+    STATE["sand_snapshot_last"] = None
+    STATE["sand_snapshot_last_time"] = 0.0
+    STATE["sand_metrics_last"] = None
+    STATE["sand_metrics_last_time"] = 0.0
+    if reason:
+        STATE["sand_cache_invalidated_reason"] = str(reason)
+
+
+def build_sand_spatial_index(points, ctx=None):
+    if points is None or len(points) == 0:
+        return None
+    p = np.asarray(points, dtype=np.float32)
+    center, radius, _floor_z, _fill_height, _z_min, _z_expected_max = sand_pile_geometry_from_context(ctx)
+    x_min = float(center[0] - radius[0])
+    x_max = float(center[0] + radius[0])
+    y_min = float(center[1] - radius[1])
+    y_max = float(center[1] + radius[1])
+    if x_max <= x_min or y_max <= y_min:
+        return None
+    res = max(8, min(int(SAND_SNAPSHOT_GRID_MAX_RES), int(SAND_SNAPSHOT_GRID_RES)))
+    ix = np.clip(((p[:, 0] - x_min) / max(1.0e-6, x_max - x_min) * res).astype(np.int32), 0, res - 1)
+    iy = np.clip(((p[:, 1] - y_min) / max(1.0e-6, y_max - y_min) * res).astype(np.int32), 0, res - 1)
+    flat = iy * res + ix
+    order = np.argsort(flat, kind="mergesort")
+    sorted_flat = flat[order]
+    unique, starts, counts = np.unique(sorted_flat, return_index=True, return_counts=True)
+    cell_slices = {int(cell): (int(start), int(start + count)) for cell, start, count in zip(unique, starts, counts)}
+    counts_grid = np.zeros((res, res), dtype=np.int32)
+    z_max_grid = np.full((res, res), np.nan, dtype=np.float32)
+    np.add.at(counts_grid, (iy, ix), 1)
+    for gx, gy, gz in zip(ix, iy, p[:, 2]):
+        old = z_max_grid[gy, gx]
+        if np.isnan(old) or float(gz) > float(old):
+            z_max_grid[gy, gx] = float(gz)
+    return {
+        "points": p,
+        "bbox": (x_min, x_max, y_min, y_max),
+        "res": int(res),
+        "flat": flat,
+        "order": order,
+        "sorted_flat": sorted_flat,
+        "cell_slices": cell_slices,
+        "counts_grid": counts_grid,
+        "z_max_grid": z_max_grid,
+    }
+
+
+def sand_snapshot_local_indices(snapshot, x, y, radius):
+    if not isinstance(snapshot, dict):
+        return np.zeros(0, dtype=np.int64)
+    index = snapshot.get("spatial_index")
+    if not isinstance(index, dict):
+        return np.zeros(0, dtype=np.int64)
+    p = index.get("points")
+    if p is None or len(p) == 0:
+        return np.zeros(0, dtype=np.int64)
+    x_min, x_max, y_min, y_max = index["bbox"]
+    res = int(index["res"])
+    if x_max <= x_min or y_max <= y_min:
+        return np.zeros(0, dtype=np.int64)
+    gx = int(np.clip((float(x) - x_min) / max(1.0e-6, x_max - x_min) * res, 0, res - 1))
+    gy = int(np.clip((float(y) - y_min) / max(1.0e-6, y_max - y_min) * res, 0, res - 1))
+    cell_w = max(1.0e-6, (x_max - x_min) / float(res))
+    cell_h = max(1.0e-6, (y_max - y_min) / float(res))
+    rx = min(int(SAND_SNAPSHOT_CELL_RADIUS_LIMIT), int(math.ceil(float(radius) / cell_w)) + 1)
+    ry = min(int(SAND_SNAPSHOT_CELL_RADIUS_LIMIT), int(math.ceil(float(radius) / cell_h)) + 1)
+    chunks = []
+    order = index["order"]
+    cell_slices = index["cell_slices"]
+    for cy in range(max(0, gy - ry), min(res - 1, gy + ry) + 1):
+        row = cy * res
+        for cx in range(max(0, gx - rx), min(res - 1, gx + rx) + 1):
+            sl = cell_slices.get(int(row + cx))
+            if sl is None:
+                continue
+            chunks.append(order[sl[0]:sl[1]])
+    if not chunks:
+        return np.zeros(0, dtype=np.int64)
+    return np.concatenate(chunks).astype(np.int64, copy=False)
+
+
+def sand_snapshot_surface_height(snapshot, x, y, radius=None):
+    if not isinstance(snapshot, dict):
+        return None
+    settled = snapshot.get("settled_points")
+    if settled is None or len(settled) == 0:
+        return None
+    r = float(radius) if radius is not None else float(SAND_SURFACE_QUERY_RADIUS)
+    idx = sand_snapshot_local_indices(snapshot, x, y, r)
+    if idx is None or len(idx) == 0:
+        return None
+    p = settled[idx]
+    d2 = (p[:, 0] - float(x)) ** 2 + (p[:, 1] - float(y)) ** 2
+    near = p[d2 <= r * r]
+    if len(near) == 0:
+        return None
+    _center, _radius, floor_z, _fill_height, _z_min, z_expected_max = sand_pile_geometry_from_context(snapshot.get("ctx"))
+    z = float(np.percentile(near[:, 2], 90.0))
+    return float(max(float(floor_z) + 0.02, min(z, float(z_expected_max))))
+
+
+def sand_snapshot_density_count(snapshot, x, y, radius):
+    if not isinstance(snapshot, dict):
+        return 0
+    settled = snapshot.get("settled_points")
+    if settled is None or len(settled) == 0:
+        return 0
+    r = float(radius)
+    idx = sand_snapshot_local_indices(snapshot, x, y, r)
+    if idx is None or len(idx) == 0:
+        return 0
+    p = settled[idx]
+    d2 = (p[:, 0] - float(x)) ** 2 + (p[:, 1] - float(y)) ** 2
+    return int(np.count_nonzero(d2 <= r * r))
+
+
+def get_sand_snapshot(force=False, label="", max_age=None):
+    now = time.time()
+    max_age = float(SAND_SNAPSHOT_MAX_AGE if max_age is None else max_age)
+    cached = STATE.get("sand_snapshot_last")
+    if (
+        not force
+        and isinstance(cached, dict)
+        and now - float(STATE.get("sand_snapshot_last_time", 0.0) or 0.0) <= max_age
+    ):
+        return cached
+
+    t0 = time.perf_counter()
+    ctx = task_scene_context()
+    points = sand_particle_positions()
+    t_read = time.perf_counter()
+    if points is None or len(points) == 0:
+        snapshot = {
+            "available": False,
+            "reason": "missing_particle_points",
+            "label": str(label),
+            "created_at": now,
+            "ctx": ctx,
+            "points": None,
+            "settled_points": None,
+            "settle": {"ok": False, "reason": "missing_particles", "n": 0},
+            "spatial_index": None,
+            "perf_ms": {"read": (t_read - t0) * 1000.0, "total": (time.perf_counter() - t0) * 1000.0},
+        }
+        STATE["sand_snapshot_last"] = snapshot
+        STATE["sand_snapshot_last_time"] = now
+        return snapshot
+
+    settle = sand_settle_status(points=points, ctx=ctx)
+    settled_points = filter_settled_sand_particles(points, ctx=ctx) if bool(settle.get("ok", False)) else None
+    t_filter = time.perf_counter()
+    index = build_sand_spatial_index(settled_points, ctx=ctx) if settled_points is not None and len(settled_points) > 0 else None
+    t_index = time.perf_counter()
+    snapshot = {
+        "available": True,
+        "reason": "ok",
+        "label": str(label),
+        "created_at": now,
+        "ctx": ctx,
+        "points": np.asarray(points, dtype=np.float32),
+        "particle_count": int(len(points)),
+        "settle": settle,
+        "settled_points": settled_points,
+        "settled_count": int(0 if settled_points is None else len(settled_points)),
+        "spatial_index": index,
+        "perf_ms": {
+            "read": (t_read - t0) * 1000.0,
+            "filter": (t_filter - t_read) * 1000.0,
+            "index": (t_index - t_filter) * 1000.0,
+            "total": (t_index - t0) * 1000.0,
+        },
+    }
+    STATE["sand_snapshot_last"] = snapshot
+    STATE["sand_snapshot_last_time"] = now
+    STATE["sand_perf_last"] = dict(snapshot["perf_ms"])
+    return snapshot
 
 
 def sand_particle_snapshot():
@@ -4201,6 +4468,43 @@ async def wait_for_sand_particles_stable(label="sand_reset"):
     return False, last_stats
 
 
+async def wait_for_sand_settled_on_ground(label="sand_settle"):
+    label = str(label)
+    max_frames = max(int(SAND_RESET_SETTLE_MIN_FRAMES), int(SAND_RESET_SETTLE_MAX_FRAMES))
+    window = max(15, int(SAND_RESET_STABLE_WINDOW_FRAMES))
+    elapsed = 0
+    stable_windows = 0
+    last_status = None
+    while elapsed < max_frames:
+        if not timeline_allows_background_work():
+            handle_timeline_stop_if_needed(label)
+            return False, {"aborted": True, "reason": "timeline_stopped_or_runtime_stopped"}
+        await step_updates(window)
+        elapsed += window
+        status = sand_settle_status()
+        last_status = status
+        if bool(status.get("ok", False)):
+            stable_windows += 1
+        else:
+            stable_windows = 0
+        info_print(
+            "[SAND SETTLED CHECK]",
+            f"label={label}",
+            f"frames={elapsed}",
+            f"ok={status.get('ok')}",
+            f"stable_windows={stable_windows}",
+            f"reason={status.get('reason')}",
+            f"n={status.get('n')}",
+            f"footprint={status.get('footprint_count')}",
+            f"z_p90={fmt_optional(status.get('z_p90'))}",
+            f"z_max={fmt_optional(status.get('z_max'))}",
+            f"fill={fmt_optional(status.get('fill_height'))}",
+        )
+        if stable_windows >= 2:
+            return True, status
+    return False, last_status
+
+
 async def reset_sand_site_stably(label=""):
     label = str(label or "sand_reset")
     if not timeline_allows_background_work():
@@ -4249,9 +4553,15 @@ async def reset_sand_site_stably(label=""):
                 else:
                     native_ok = bool(result)
                 if native_ok:
-                    ok = True
-                    stats = {"native_stable_reset": True}
-                    break
+                    ok, stats = await wait_for_sand_settled_on_ground(f"{label}_native_settle{attempt}")
+                    if ok:
+                        stats = dict(stats or {})
+                        stats["native_stable_reset"] = True
+                        break
+                    if attempt < max_attempts:
+                        info_print("[SAND RESET RETRY]", f"label={label}", f"attempt={attempt}", f"reason={stats}")
+                        await step_updates(30)
+                        continue
                 if not native_ok and attempt < max_attempts:
                     info_print("[SAND RESET RETRY]", f"label={label}", f"attempt={attempt}", "reason=native_stable_reset_failed")
                     await step_updates(30)
@@ -4262,7 +4572,11 @@ async def reset_sand_site_stably(label=""):
 
             ok, stats = await wait_for_sand_particles_stable(f"{label}_attempt{attempt}")
             if ok:
-                break
+                settled_ok, settled_stats = await wait_for_sand_settled_on_ground(f"{label}_settled_attempt{attempt}")
+                ok = bool(settled_ok)
+                stats = dict(settled_stats or stats or {})
+                if ok:
+                    break
             escaped = isinstance(stats, dict) and bool(stats.get("escaped", False))
             if escaped and attempt < max_attempts:
                 info_print("[SAND RESET RETRY]", f"label={label}", f"attempt={attempt}", "reason=escaped_particles")
@@ -4276,6 +4590,7 @@ async def reset_sand_site_stably(label=""):
         else:
             update_status(f"[SAND RESET] not fully stable before timeout: {label}", force=True)
         info_print("[SAND RESET DONE]", f"label={label}", f"stable={ok}", f"stats={stats}")
+        invalidate_sand_runtime_caches(f"sand_reset:{label}")
         return bool(ok)
     except Exception as e:
         STATE["sand_site_stable_reset_done"] = False
@@ -4355,20 +4670,101 @@ def mask_points_in_box(points, center, half_xy, z_min, z_max):
     )
 
 
+def sand_pile_geometry_from_context(ctx=None):
+    ctx = task_scene_context() if ctx is None else ctx
+    center = np.array(ctx.get("pile_center", SAND_PILE_CENTER), dtype=np.float32).reshape(-1)[:3]
+    radius = np.array(ctx.get("pile_radius", [SAND_PILE_RADIUS_X, SAND_PILE_RADIUS_Y]), dtype=np.float32).reshape(-1)[:2]
+    radius = np.maximum(radius, np.array([0.05, 0.05], dtype=np.float32))
+    floor_z = float(ctx.get("sand_floor_z", GROUND_TOP_Z))
+    fill_height = max(0.05, float(ctx.get("sand_fill_height", SAND_PILE_Z_MAX - SAND_PILE_Z_MIN)))
+    z_min = min(float(SAND_PILE_Z_MIN), floor_z - 0.10)
+    z_expected_max = floor_z + fill_height + float(SAND_SETTLED_Z_MARGIN)
+    return center, radius, floor_z, fill_height, z_min, z_expected_max
+
+
+def sand_pile_xy_mask(points, ctx=None):
+    n = 0 if points is None else int(len(points))
+    if points is None or n == 0:
+        return np.zeros(n, dtype=bool)
+    center, radius, _, _, _, _ = sand_pile_geometry_from_context(ctx)
+    dx = (points[:, 0] - center[0]) / max(1e-5, float(radius[0]))
+    dy = (points[:, 1] - center[1]) / max(1e-5, float(radius[1]))
+    return dx * dx + dy * dy <= 1.0
+
+
+def sand_settle_status(points=None, ctx=None):
+    points = sand_particle_positions() if points is None else points
+    if points is None or len(points) == 0:
+        return {"ok": False, "reason": "missing_particles", "n": 0}
+    p = np.array(points, dtype=np.float32)
+    ctx = task_scene_context() if ctx is None else ctx
+    _, _, floor_z, fill_height, z_min, z_expected_max = sand_pile_geometry_from_context(ctx)
+    xy_mask = sand_pile_xy_mask(p, ctx)
+    footprint = p[xy_mask]
+    if len(footprint) == 0:
+        return {
+            "ok": False,
+            "reason": "no_particles_in_sand_footprint",
+            "n": int(len(p)),
+            "footprint_count": 0,
+        }
+    high_air_z = floor_z + fill_height + float(SAND_SETTLED_Z_MARGIN)
+    settled_z_max = floor_z + fill_height + float(SAND_SETTLED_SURFACE_MARGIN)
+    in_expected = footprint[(footprint[:, 2] >= z_min) & (footprint[:, 2] <= high_air_z)]
+    footprint_fraction = float(len(footprint)) / max(1.0, float(len(p)))
+    high_air_fraction = float(np.count_nonzero(footprint[:, 2] > high_air_z)) / max(1.0, float(len(footprint)))
+    p50 = float(np.percentile(footprint[:, 2], 50.0))
+    p90 = float(np.percentile(footprint[:, 2], 90.0))
+    p95 = float(np.percentile(footprint[:, 2], 95.0))
+    z_max = float(np.max(footprint[:, 2]))
+    ok = (
+        footprint_fraction >= float(SAND_SETTLED_MIN_FRACTION_IN_FOOTPRINT)
+        and high_air_fraction <= float(SAND_SETTLED_HIGH_AIR_FRACTION_MAX)
+        and p90 <= settled_z_max
+        and len(in_expected) >= int(AUTO_PREFLIGHT_MIN_PARTICLES)
+    )
+    reason = "ok" if ok else (
+        f"not_settled footprint_fraction={footprint_fraction:.3f} "
+        f"high_air_fraction={high_air_fraction:.3f} p90={p90:.3f} "
+        f"limit={settled_z_max:.3f}"
+    )
+    return {
+        "ok": bool(ok),
+        "reason": reason,
+        "n": int(len(p)),
+        "footprint_count": int(len(footprint)),
+        "expected_count": int(len(in_expected)),
+        "footprint_fraction": footprint_fraction,
+        "high_air_fraction": high_air_fraction,
+        "floor_z": float(floor_z),
+        "fill_height": float(fill_height),
+        "z_expected_max": float(z_expected_max),
+        "z_p50": p50,
+        "z_p90": p90,
+        "z_p95": p95,
+        "z_max": z_max,
+    }
+
+
+def filter_settled_sand_particles(points, ctx=None):
+    if points is None or len(points) == 0:
+        return None
+    p = np.array(points, dtype=np.float32)
+    ctx = task_scene_context() if ctx is None else ctx
+    _, _, _, _, z_min, z_expected_max = sand_pile_geometry_from_context(ctx)
+    mask = sand_pile_xy_mask(p, ctx) & (p[:, 2] >= z_min) & (p[:, 2] <= z_expected_max)
+    return p[mask]
+
+
 def sand_region_masks(points):
     n = 0 if points is None else int(len(points))
     empty = np.zeros(n, dtype=bool)
     if points is None or n == 0:
         return empty, empty, empty
 
-    pile_center = np.array(SAND_PILE_CENTER, dtype=np.float32)
-    dx = (points[:, 0] - pile_center[0]) / max(1e-5, float(SAND_PILE_RADIUS_X))
-    dy = (points[:, 1] - pile_center[1]) / max(1e-5, float(SAND_PILE_RADIUS_Y))
-    pile_mask = (
-        (dx * dx + dy * dy <= 1.0)
-        & (points[:, 2] >= SAND_PILE_Z_MIN)
-        & (points[:, 2] <= SAND_PILE_Z_MAX)
-    )
+    ctx = task_scene_context()
+    _, _, _, _, z_min, z_expected_max = sand_pile_geometry_from_context(ctx)
+    pile_mask = sand_pile_xy_mask(points, ctx) & (points[:, 2] >= z_min) & (points[:, 2] <= z_expected_max)
 
     bucket_local = project_points_to_link_local(points, BUCKET_LINK)
     if bucket_local is None:
@@ -4378,7 +4774,6 @@ def sand_region_masks(points):
             bucket_local <= SAND_BUCKET_LOCAL_MAX.reshape(1, 3), axis=1
         )
 
-    ctx = task_scene_context()
     bin_center_3 = np.array(ctx["unload_bin_center"], dtype=np.float32)
     bin_center = np.array([float(bin_center_3[0]), float(bin_center_3[1]), 0.0], dtype=np.float32)
     bin_half = np.array(ctx["unload_bin_half_size"], dtype=np.float32)
@@ -4400,16 +4795,19 @@ def particle_ids_from_mask(mask):
 
 
 def capture_initial_pile_particle_ids():
-    points = sand_particle_positions()
+    snapshot = get_sand_snapshot(force=True, label="capture_initial_pile")
+    points = snapshot.get("points") if isinstance(snapshot, dict) else sand_particle_positions()
     pile_mask, _, _ = sand_region_masks(points)
     ids = particle_ids_from_mask(pile_mask)
     STATE["dataset_initial_pile_particle_ids"] = ids
+    STATE["dataset_initial_pile_particle_mask"] = np.array(pile_mask, dtype=bool).copy()
     STATE["dataset_initial_pile_particle_count"] = len(ids)
     return ids
 
 
-def sand_metrics_current(force=False):
+def sand_metrics_current(force=False, snapshot=None):
     now = time.time()
+    t0 = time.perf_counter()
     if (
         not force
         and STATE.get("sand_metrics_last") is not None
@@ -4417,7 +4815,10 @@ def sand_metrics_current(force=False):
     ):
         return dict(STATE["sand_metrics_last"])
 
-    points = sand_particle_positions()
+    if isinstance(snapshot, dict):
+        points = snapshot.get("points")
+    else:
+        points = sand_particle_positions()
     if points is None:
         metrics = {
             "available": False,
@@ -4426,21 +4827,42 @@ def sand_metrics_current(force=False):
         }
         STATE["sand_metrics_last"] = metrics
         STATE["sand_metrics_last_time"] = now
+        perf = dict(STATE.get("sand_perf_last", {}) or {})
+        perf["metrics_ms"] = (time.perf_counter() - t0) * 1000.0
+        perf["metrics_particles"] = 0
+        STATE["sand_perf_last"] = perf
         return metrics
 
     pile_mask, bucket_mask, bin_mask = sand_region_masks(points)
-    pile_ids = particle_ids_from_mask(pile_mask)
-    bucket_ids = particle_ids_from_mask(bucket_mask)
-    bin_ids = particle_ids_from_mask(bin_mask)
 
     initial_ids = STATE.get("dataset_initial_pile_particle_ids")
-    if initial_ids is None:
-        initial_ids = pile_ids
-    initial_ids = set(initial_ids)
-    from_pile_bucket = initial_ids & bucket_ids
-    from_pile_bin = initial_ids & bin_ids
-    from_pile_pile = initial_ids & pile_ids
-    from_pile_spill = initial_ids - from_pile_bucket - from_pile_bin - from_pile_pile
+    initial_mask = STATE.get("dataset_initial_pile_particle_mask")
+    if isinstance(initial_mask, np.ndarray) and len(initial_mask) == len(points):
+        initial_mask = np.array(initial_mask, dtype=bool, copy=False)
+    elif initial_ids is not None:
+        initial_mask = np.zeros(len(points), dtype=bool)
+        try:
+            idx = np.array(list(initial_ids), dtype=np.int64)
+            idx = idx[(idx >= 0) & (idx < len(points))]
+            initial_mask[idx] = True
+        except Exception:
+            initial_mask = np.array(pile_mask, dtype=bool).copy()
+    else:
+        initial_mask = np.array(pile_mask, dtype=bool).copy()
+        initial_ids = particle_ids_from_mask(pile_mask)
+
+    from_pile_bucket_mask = initial_mask & bucket_mask
+    from_pile_bin_mask = initial_mask & bin_mask
+    from_pile_pile_mask = initial_mask & pile_mask
+    from_pile_spill_mask = initial_mask & ~(bucket_mask | bin_mask | pile_mask)
+    pile_count = int(np.count_nonzero(pile_mask))
+    bucket_count = int(np.count_nonzero(bucket_mask))
+    bin_count = int(np.count_nonzero(bin_mask))
+    initial_count = int(np.count_nonzero(initial_mask))
+    from_pile_bucket_count = int(np.count_nonzero(from_pile_bucket_mask))
+    from_pile_bin_count = int(np.count_nonzero(from_pile_bin_mask))
+    from_pile_pile_count = int(np.count_nonzero(from_pile_pile_mask))
+    from_pile_spill_count = int(np.count_nonzero(from_pile_spill_mask))
     mass = sand_particle_mass()
     ctx = task_scene_context()
     metrics = {
@@ -4452,20 +4874,24 @@ def sand_metrics_current(force=False):
         "unload_bin_half_size": vec_list(ctx.get("unload_bin_half_size"), 2),
         "unload_bin_z_range": vec_list(ctx.get("unload_bin_z_range"), 2),
         "unload_point": vec_list(ctx.get("unload_point"), 3),
-        "initial_pile_count": int(len(initial_ids)),
-        "pile_count": int(len(pile_ids)),
-        "bucket_count": int(len(bucket_ids)),
-        "bucket_from_pile_count": int(len(from_pile_bucket)),
-        "bin_count": int(len(bin_ids)),
-        "bin_from_pile_count": int(len(from_pile_bin)),
-        "pile_from_initial_count": int(len(from_pile_pile)),
-        "spill_from_pile_count": int(len(from_pile_spill)),
-        "bucket_from_pile_mass": float(len(from_pile_bucket) * mass),
-        "bin_from_pile_mass": float(len(from_pile_bin) * mass),
-        "spill_from_pile_mass": float(len(from_pile_spill) * mass),
+        "initial_pile_count": int(initial_count),
+        "pile_count": int(pile_count),
+        "bucket_count": int(bucket_count),
+        "bucket_from_pile_count": int(from_pile_bucket_count),
+        "bin_count": int(bin_count),
+        "bin_from_pile_count": int(from_pile_bin_count),
+        "pile_from_initial_count": int(from_pile_pile_count),
+        "spill_from_pile_count": int(from_pile_spill_count),
+        "bucket_from_pile_mass": float(from_pile_bucket_count * mass),
+        "bin_from_pile_mass": float(from_pile_bin_count * mass),
+        "spill_from_pile_mass": float(from_pile_spill_count * mass),
     }
     STATE["sand_metrics_last"] = metrics
     STATE["sand_metrics_last_time"] = now
+    perf = dict(STATE.get("sand_perf_last", {}) or {})
+    perf["metrics_ms"] = (time.perf_counter() - t0) * 1000.0
+    perf["metrics_particles"] = int(len(points))
+    STATE["sand_perf_last"] = perf
     return dict(metrics)
 
 
@@ -4706,9 +5132,39 @@ def sand_contact_stage_can_advance(q_goal, label="", mode="auto", seconds_eff=0.
         return False
 
     max_err = max(err_deg) if err_deg else 0.0
+    if "curl_to_hold_material" in stage_name:
+        bucket_idx = CTRL.name_to_idx.get("bucket", 3)
+        bucket_real_deg = rad_to_deg(float(q_real[bucket_idx]))
+        metrics = sand_metrics_current(force=True)
+        bucket_loaded = int(metrics.get("bucket_from_pile_count", 0) or 0) if isinstance(metrics, dict) else 0
+        bucket_err = float(err_deg[bucket_idx]) if len(err_deg) > bucket_idx else float(max_err)
+        if (
+            bucket_loaded >= CURL_HOLD_MIN_BUCKET_PARTICLES
+            and bucket_real_deg <= CURL_HOLD_ACCEPT_BUCKET_DEG
+            and bucket_err <= CURL_HOLD_ACCEPT_MAX_ERR_DEG
+        ):
+            info_print(
+                "[CURL HOLD DONE]",
+                f"stage={stage_name}",
+                f"elapsed={elapsed:.2f}s",
+                f"bucket_real={bucket_real_deg:.2f}deg",
+                f"bucket_err={bucket_err:.2f}deg",
+                f"bucket_loaded={bucket_loaded}",
+                "reason=loaded_bucket_closed_enough",
+            )
+            return True
+
+    bad_cut, _bad_reason = sand_contact_bad_cut_geometry(stage_name, report)
+    if bad_cut:
+        return False
+    bucket_total = int(report.get("total_bucket_delta", 0))
+    pile_total = int(report.get("total_pile_delta", 0))
+    spill_total = int(report.get("total_spill_delta", 0))
+    moved_material = max(1, bucket_total + spill_total)
+    spill_ratio = float(spill_total) / float(moved_material)
     material_progress = (
-        int(report.get("total_bucket_delta", 0)) >= SAND_CONTACT_BUCKET_PROGRESS_MIN
-        or int(report.get("total_pile_delta", 0)) >= SAND_CONTACT_PILE_PROGRESS_MIN
+        bucket_total >= SAND_CONTACT_BUCKET_PROGRESS_MIN
+        or (pile_total >= SAND_CONTACT_PILE_PROGRESS_MIN and spill_ratio <= SAND_CONTACT_SPILL_RATIO_MAX)
     )
     tip_progress = float(report.get("total_tip_delta", 0.0) or 0.0) >= SAND_CONTACT_ACCEPT_TIP_PROGRESS_MIN_M
     q_close_enough = float(max_err) <= SAND_CONTACT_Q_LAG_ACCEPT_DEG
@@ -4760,29 +5216,75 @@ def sand_contact_stage_should_advance(stage_name, report, q_cmd=None, q_real=Non
     pile_total = int(report.get("total_pile_delta", 0) or 0)
     spill_total = int(report.get("total_spill_delta", 0) or 0)
     tip_total = float(report.get("total_tip_delta", 0.0) or 0.0)
+    if "curl_to_hold_material" in str(stage_name):
+        try:
+            bucket_idx = CTRL.name_to_idx.get("bucket", 3)
+            bucket_real_deg = rad_to_deg(float(q_real[bucket_idx])) if q_real is not None else 999.0
+            bucket_err = abs(rad_to_deg(wrap_angle(float(q_cmd[bucket_idx]) - float(q_real[bucket_idx])))) if q_cmd is not None and q_real is not None else max_err
+        except Exception:
+            bucket_real_deg = 999.0
+            bucket_err = max_err
+        metrics = sand_metrics_current(force=True)
+        bucket_loaded = int(metrics.get("bucket_from_pile_count", 0) or 0) if isinstance(metrics, dict) else 0
+        if (
+            bucket_loaded >= CURL_HOLD_MIN_BUCKET_PARTICLES
+            and bucket_real_deg <= CURL_HOLD_ACCEPT_BUCKET_DEG
+            and bucket_err <= CURL_HOLD_ACCEPT_MAX_ERR_DEG
+        ):
+            return True, (
+                f"loaded_bucket_closed_enough elapsed={elapsed:.2f}s "
+                f"bucket_real={bucket_real_deg:.2f}deg bucket_err={bucket_err:.2f}deg "
+                f"bucket_loaded={bucket_loaded}"
+            )
+
+    bad_cut, _bad_reason = sand_contact_bad_cut_geometry(stage_name, report)
+    if bad_cut:
+        return False, ""
+    moved_material = max(1, bucket_total + spill_total)
+    spill_ratio = float(spill_total) / float(moved_material)
 
     if (
         bucket_total >= SAND_CONTACT_ADVANCE_BUCKET_MIN
-        or pile_total >= SAND_CONTACT_ADVANCE_PILE_MIN
-        or tip_total >= SAND_CONTACT_ADVANCE_TIP_MIN_M
+        or (pile_total >= SAND_CONTACT_ADVANCE_PILE_MIN and spill_ratio <= SAND_CONTACT_SPILL_RATIO_MAX)
+        or (tip_total >= SAND_CONTACT_ADVANCE_TIP_MIN_M and bucket_total >= SAND_CONTACT_BUCKET_PROGRESS_MIN)
     ):
         return True, (
             f"material_progress elapsed={elapsed:.2f}s bucket={bucket_total} "
-            f"pile={pile_total} tip={tip_total:.3f}m spill={spill_total} "
+            f"pile={pile_total} tip={tip_total:.3f}m spill={spill_total} spill_ratio={spill_ratio:.2f} "
             f"max_err={max_err:.2f}deg boom_err={boom_err:.2f}deg"
         )
 
     if elapsed >= SAND_CONTACT_MAX_STAGE_WALL_SECONDS and (
         bucket_total >= SAND_CONTACT_ADVANCE_FALLBACK_BUCKET_MIN
-        or pile_total >= SAND_CONTACT_ADVANCE_FALLBACK_PILE_MIN
-        or tip_total >= SAND_CONTACT_ACCEPT_TIP_PROGRESS_MIN_M
+        or (pile_total >= SAND_CONTACT_ADVANCE_FALLBACK_PILE_MIN and spill_ratio <= SAND_CONTACT_SPILL_RATIO_MAX)
+        or (tip_total >= SAND_CONTACT_ACCEPT_TIP_PROGRESS_MIN_M and bucket_total >= SAND_CONTACT_BUCKET_PROGRESS_MIN)
     ):
         return True, (
             f"stage_time_cap elapsed={elapsed:.2f}s bucket={bucket_total} "
-            f"pile={pile_total} tip={tip_total:.3f}m spill={spill_total} "
+            f"pile={pile_total} tip={tip_total:.3f}m spill={spill_total} spill_ratio={spill_ratio:.2f} "
             f"max_err={max_err:.2f}deg boom_err={boom_err:.2f}deg"
         )
 
+    return False, ""
+
+
+def sand_contact_bad_cut_geometry(stage_name, report):
+    if not is_sand_contact_phase(stage_name) or not isinstance(report, dict):
+        return False, ""
+    if "curl_to_hold_material" in str(stage_name):
+        return False, ""
+    bucket_total = int(report.get("total_bucket_delta", 0) or 0)
+    pile_total = int(report.get("total_pile_delta", 0) or 0)
+    spill_total = int(report.get("total_spill_delta", 0) or 0)
+    if spill_total < SAND_CONTACT_SPILL_WITHOUT_LOAD_MIN:
+        return False, ""
+    moved_material = max(1, bucket_total + spill_total)
+    spill_ratio = float(spill_total) / float(moved_material)
+    if bucket_total <= max(8, int(SAND_CONTACT_BUCKET_PROGRESS_MIN * 0.25)) and spill_ratio > SAND_CONTACT_SPILL_RATIO_MAX:
+        return True, (
+            f"spilling_without_loading bucket={bucket_total} pile={pile_total} "
+            f"spill={spill_total} spill_ratio={spill_ratio:.2f}"
+        )
     return False, ""
 
 
@@ -5085,6 +5587,12 @@ def ensure_auto_collect_run_dir():
             "target_radius_x": AUTO_COLLECT_TARGET_RADIUS_X,
             "target_radius_y": AUTO_COLLECT_TARGET_RADIUS_Y,
             "target_depths": AUTO_COLLECT_TARGET_DEPTHS,
+            "target_strategy": "center_first_ring_full_plan",
+            "target_ring_radii": list(AUTO_DIG_RING_RADII),
+            "target_ring_points": list(AUTO_DIG_RING_POINTS),
+            "target_depth_priority": list(AUTO_DIG_DEPTH_PRIORITY),
+            "target_sweep_radius": AUTO_DIG_SWEEP_RADIUS,
+            "target_full_plan_topk_per_ring": AUTO_DIG_FULL_PLAN_TOPK_PER_RING,
             "initial_pose_family": AUTO_COLLECT_INITIAL_POSES_DEG,
             "dig_plan_candidate_family": [
                 {
@@ -5179,6 +5687,7 @@ def auto_collect_write_run_summary():
             "sand_site_stable_reset_done": bool(STATE.get("sand_site_stable_reset_done", False)),
             "sand_site_last_reset_label": STATE.get("sand_site_last_reset_label", ""),
             "auto_reset_sand_after_ui_ready": AUTO_RESET_SAND_AFTER_UI_READY,
+            "perf_last": dict(STATE.get("sand_perf_last", {}) or {}),
         },
     )
 
@@ -5291,9 +5800,13 @@ def record_phase_metrics(label, q_cmd=None, q_real=None, action=None):
 def auto_collect_preflight_report(target_successes=None):
     run_dir = ensure_auto_collect_run_dir()
     ctx = task_scene_context()
-    metrics = sand_metrics_current(force=True)
-    particles = sand_particle_positions()
+    t0 = time.perf_counter()
+    snapshot = get_sand_snapshot(force=True, label="auto_preflight")
+    metrics = sand_metrics_current(force=True, snapshot=snapshot)
+    particles = snapshot.get("points") if isinstance(snapshot, dict) else None
     particle_count = int(len(particles)) if particles is not None else int(metrics.get("particle_count", 0) or 0)
+    settle = snapshot.get("settle") if isinstance(snapshot, dict) and isinstance(snapshot.get("settle"), dict) else sand_settle_status(points=particles, ctx=ctx)
+    preflight_snapshot_ms = (time.perf_counter() - t0) * 1000.0
     api = get_sand_site_api()
     bucket_collider_ready = False
     try:
@@ -5333,15 +5846,17 @@ def auto_collect_preflight_report(target_successes=None):
     pile_center = np.array(ctx["pile_center"], dtype=np.float32).reshape(-1)[:3]
     pile_radius = np.array(ctx["pile_radius"], dtype=np.float32).reshape(-1)[:2]
 
+    ik_ready = ik_model_is_valid()
     checks = {
         "sand_site": api is not None and bool(sand_site_active()),
         "particle_system": sand_particle_prim() is not None,
         "particle_count": particle_count >= int(AUTO_PREFLIGHT_MIN_PARTICLES),
+        "sand_settled": bool(settle.get("ok", False)),
         "unload_bin": np.all(unload_inner > 0.05),
         "bucket_collider": bucket_collider_ready,
         "robot": ROBOT is not None and len(DOF_NAME_TO_REAL_IDX) >= 4,
         "action_channel": action_ready,
-        "ik": IK_MODEL is not None,
+        "ik": ik_ready,
         "safe_initial_pose": len(AUTO_COLLECT_INITIAL_POSES_DEG) > 0,
         "bucket_frame": bucket_frame_ready and bucket_tip_ready,
         "trace_cache": trace_cache_ready,
@@ -5356,11 +5871,12 @@ def auto_collect_preflight_report(target_successes=None):
         "sand_site": "preflight_failed/sand_missing",
         "particle_system": "preflight_failed/particle_system_missing",
         "particle_count": "preflight_failed/not_enough_particles",
+        "sand_settled": "preflight_failed/sand_not_settled",
         "unload_bin": "preflight_failed/unload_bin_missing",
         "bucket_collider": "preflight_failed/bucket_collider_not_ready",
         "robot": "preflight_failed/robot_not_ready",
         "action_channel": "preflight_failed/action_channel_not_ready",
-        "ik": "preflight_failed/ik_not_ready",
+        "ik": "preflight_failed/ik_calibration_invalid" if IK_MODEL is not None else "preflight_failed/ik_not_ready",
         "safe_initial_pose": "preflight_failed/safe_initial_pose_missing",
         "bucket_frame": "preflight_failed/bucket_frame_missing",
         "trace_cache": "preflight_failed/trace_cache_not_ready",
@@ -5379,12 +5895,17 @@ def auto_collect_preflight_report(target_successes=None):
         "reason": reason,
         "checks": checks,
         "sand": {
-            "ok": checks["sand_site"] and checks["particle_system"] and checks["particle_count"],
+            "ok": checks["sand_site"] and checks["particle_system"] and checks["particle_count"] and checks["sand_settled"],
             "center": vec_list(pile_center, 3),
             "radius": vec_list(pile_radius, 2),
             "particles": particle_count,
             "min_particles": int(AUTO_PREFLIGHT_MIN_PARTICLES),
+            "settled": bool(settle.get("ok", False)),
+            "settle_reason": str(settle.get("reason", "")),
+            "settle": settle,
             "status": dataset_sand_status(),
+            "snapshot_ms": float(preflight_snapshot_ms),
+            "snapshot_perf_ms": dict(snapshot.get("perf_ms", {}) if isinstance(snapshot, dict) else {}),
         },
         "bin": {
             "ok": checks["unload_bin"],
@@ -5397,6 +5918,7 @@ def auto_collect_preflight_report(target_successes=None):
             "action_ready": action_ready,
             "action_detail": action_detail,
             "ik_calibrated": checks["ik"],
+            "ik_report": dict(STATE.get("ik_calibration_report", {}) or {}),
             "bucket_collider_ready": bucket_collider_ready,
             "bucket_frame_ready": bucket_frame_ready,
             "bucket_tip_ready": bucket_tip_ready,
@@ -5419,6 +5941,8 @@ def auto_collect_preflight_report(target_successes=None):
     info_print(
         "[AUTO PREFLIGHT]",
         f"sand={'OK' if report['sand']['ok'] else 'BAD'} center={report['sand']['center']} radius={report['sand']['radius']} particles={particle_count}",
+        f"settled={report['sand'].get('settled')} settle_reason={report['sand'].get('settle_reason')}",
+        f"snapshot_ms={preflight_snapshot_ms:.1f}",
         f"bin={'OK' if report['bin']['ok'] else 'BAD'} center={report['bin']['center']} size={report['bin']['inner_size']}",
         f"robot={'OK' if report['robot']['ok'] else 'BAD'} IK={checks['ik']} action_ready={action_ready} bucket_collider={bucket_collider_ready}",
         f"planner={'OK' if report['planner']['ok'] else 'BAD'} trace_cache={trace_cache_ready}",
@@ -5444,6 +5968,65 @@ def auto_collect_preflight_report(target_successes=None):
 
 def clamp01(x):
     return max(0.0, min(1.0, float(x)))
+
+
+def truncate_text(value, limit=240):
+    text = str(value)
+    limit = max(16, int(limit))
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def compact_target_score_row(row):
+    row = row if isinstance(row, dict) else {}
+    keys = [
+        "target_xyz",
+        "ring_index",
+        "center_distance",
+        "surface_z",
+        "depth_candidate",
+        "swept_density_count",
+        "density_count",
+        "score",
+        "planned",
+        "failed_stage",
+        "reason",
+        "failure_reason",
+    ]
+    return {key: row.get(key) for key in keys if key in row}
+
+
+def compact_unload_score_row(row):
+    row = row if isinstance(row, dict) else {}
+    keys = ["landing", "cell_height", "cell_count", "center_norm", "motion_dist", "score", "route_hint"]
+    return {key: row.get(key) for key in keys if key in row}
+
+
+def compact_auto_plan_attempts(plan_attempts, limit=4):
+    if not isinstance(plan_attempts, list):
+        return []
+    rows = []
+    for item in plan_attempts[: max(0, int(limit))]:
+        item = item if isinstance(item, dict) else {}
+        rows.append(
+            {
+                "retry": item.get("retry"),
+                "ring_index": item.get("ring_index"),
+                "target_xyz": item.get("target_xyz"),
+                "selected_unload_landing_xyz": item.get("selected_unload_landing_xyz"),
+                "planned": bool(item.get("planned", False)),
+                "steps": item.get("steps"),
+                "failed_stage": item.get("failed_stage"),
+                "failure_reason": truncate_text(item.get("failure_reason", ""), 280),
+                "build_ms": item.get("build_ms"),
+                "wall_ms": item.get("wall_ms"),
+                "candidate_count": item.get("candidate_count"),
+                "target_score": compact_target_score_row(item.get("target_score", {})),
+                "best_failure": compact_plan_candidate(item.get("best_failure", {}), include_stages=False),
+            }
+        )
+    return rows
 
 
 def auto_collect_record_planning_diagnostic(attempt_index, target, plan_attempts, reason, initial_info=None):
@@ -5473,9 +6056,16 @@ def auto_collect_record_planning_diagnostic(attempt_index, target, plan_attempts
             "cost": shared_plan.get("total_plan_cost") if isinstance(shared_plan, dict) else None,
             "stage_count": shared_plan.get("stage_count") if isinstance(shared_plan, dict) else None,
         },
-        "plan_attempts": plan_attempts if isinstance(plan_attempts, list) else [],
-        "dig_target_candidates": STATE.get("last_auto_dig_target_scores", []),
-        "unload_flat_fill_candidates": STATE.get("last_auto_unload_scores", []),
+        "plan_attempts": compact_auto_plan_attempts(plan_attempts, limit=4),
+        "dig_target_candidates": [
+            compact_target_score_row(x)
+            for x in (STATE.get("last_auto_dig_target_scores", []) or [])[:12]
+        ],
+        "unload_flat_fill_candidates": [
+            compact_unload_score_row(x)
+            for x in (STATE.get("last_auto_unload_scores", []) or [])[:10]
+        ],
+        "perf_last": dict(STATE.get("sand_perf_last", {}) or {}),
     }
     append_jsonl(os.path.join(run_dir, "planning_diagnostics.jsonl"), row)
     debug_timeline_record(
@@ -5610,6 +6200,7 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
     STATE["sand_metrics_last_time"] = 0.0
     STATE["sand_metrics_last"] = None
     STATE["dataset_initial_pile_particle_ids"] = None
+    STATE["dataset_initial_pile_particle_mask"] = None
     STATE["dataset_initial_pile_particle_count"] = 0
     STATE["dataset_max_bucket_particles"] = 0
     STATE["dataset_max_bucket_from_pile_particles"] = 0
@@ -5893,27 +6484,28 @@ def auto_collect_finish_episode(meta, success, reason):
 
 
 def auto_collect_sample_target(attempt_index, retry_index=0):
-    k = max(1, int(attempt_index) * AUTO_COLLECT_MAX_PLAN_RETRIES + int(retry_index))
-    theta = k * 2.399963229728653
-    frac = (k * 0.6180339887498949) % 1.0
-    radius = math.sqrt(0.05 + 0.45 * frac)
     ctx = task_scene_context()
     center = np.array(ctx["pile_center"], dtype=np.float32)
     pile_radius = np.array(ctx["pile_radius"], dtype=np.float32)
     rx = min(float(AUTO_COLLECT_TARGET_RADIUS_X), max(0.12, float(pile_radius[0]) * 0.52))
     ry = min(float(AUTO_COLLECT_TARGET_RADIUS_Y), max(0.12, float(pile_radius[1]) * 0.52))
-    x = float(center[0]) + rx * radius * math.cos(theta)
-    y = float(center[1]) + ry * radius * math.sin(theta)
+    depths = auto_dig_depth_candidates()
+    retry = max(0, int(retry_index))
+    ring_index = min(retry // max(1, len(depths)), len(AUTO_DIG_RING_RADII) - 1)
+    radius_norm = float(AUTO_DIG_RING_RADII[ring_index])
+    if ring_index == 0:
+        x = float(center[0])
+        y = float(center[1])
+    else:
+        n = max(1, int(AUTO_DIG_RING_POINTS[min(ring_index, len(AUTO_DIG_RING_POINTS) - 1)]))
+        phase = 2.0 * math.pi * (((max(1, int(attempt_index)) - 1) * 0.3819660112501051) % 1.0)
+        angle = phase + 2.0 * math.pi * float(retry % n) / float(n)
+        x = float(center[0]) + rx * radius_norm * math.cos(angle)
+        y = float(center[1]) + ry * radius_norm * math.sin(angle)
 
-    surface_z = 0.75
-    api = get_sand_site_api()
-    fn = None if api is None else api.get("height_fn")
-    if callable(fn):
-        try:
-            surface_z = float(fn(x, y))
-        except Exception as e:
-            info_print("[WARN] [AUTO DATASET] sand height query failed:", type(e).__name__, e)
-    depth = float(AUTO_COLLECT_TARGET_DEPTHS[k % len(AUTO_COLLECT_TARGET_DEPTHS)])
+    snapshot = get_sand_snapshot(force=False, label="auto_sample_target", max_age=1.0)
+    surface_z = sand_surface_height_for_auto_target(x, y, snapshot=snapshot)
+    depth = float(depths[retry % max(1, len(depths))])
     z = auto_dig_target_z_from_surface(surface_z, depth)
     return np.array([x, y, z], dtype=np.float32)
 
@@ -5925,161 +6517,275 @@ def auto_dig_target_z_from_surface(surface_z, depth):
     return float(max(AUTO_COLLECT_TARGET_MIN_Z, min(dynamic_max_z, surface_z - depth)))
 
 
-def sand_surface_height_for_auto_target(x, y, particles=None):
-    surface_z = 0.75
+def sand_surface_height_for_auto_target(x, y, particles=None, snapshot=None):
+    ctx = task_scene_context()
+    _, _, floor_z, fill_height, _, z_expected_max = sand_pile_geometry_from_context(ctx)
+    z_snapshot = sand_snapshot_surface_height(snapshot, x, y)
+    if z_snapshot is not None:
+        return float(z_snapshot)
+    if particles is not None and len(particles) > 0:
+        p = filter_settled_sand_particles(particles, ctx=ctx)
+        if p is None or len(p) == 0:
+            return float(floor_z + 0.10)
+        d = np.linalg.norm(p[:, :2] - np.array([[float(x), float(y)]], dtype=np.float32), axis=1)
+        near = p[d <= float(SAND_SURFACE_QUERY_RADIUS)]
+        if len(near) > 0:
+            # Prefer the real settled particle surface. The sand-site height_fn is a reference
+            # shape used for generation and can describe empty air after particles settle.
+            return float(max(float(floor_z) + 0.02, min(float(np.percentile(near[:, 2], 90.0)), float(z_expected_max))))
+        return float(floor_z + 0.10)
+    surface_z = max(float(floor_z) + 0.10, min(float(floor_z) + float(fill_height), float(z_expected_max)))
     api = get_sand_site_api()
     fn = None if api is None else api.get("height_fn")
     if callable(fn):
         try:
-            surface_z = float(fn(float(x), float(y)))
+            surface_z = min(float(fn(float(x), float(y))), float(z_expected_max))
         except Exception:
             pass
-    if particles is not None and len(particles) > 0:
-        p = np.array(particles, dtype=np.float32)
-        d = np.linalg.norm(p[:, :2] - np.array([[float(x), float(y)]], dtype=np.float32), axis=1)
-        near = p[d <= 0.22]
-        if len(near) > 0:
-            surface_z = max(float(surface_z), float(np.percentile(near[:, 2], 85.0)))
     return float(surface_z)
 
 
+def auto_dig_depth_candidates():
+    values = []
+    for depth in list(AUTO_DIG_DEPTH_PRIORITY) + sorted([float(x) for x in AUTO_COLLECT_TARGET_DEPTHS], reverse=True):
+        depth = float(depth)
+        if depth > 0.24:
+            continue
+        if not any(abs(depth - old) < 1.0e-5 for old in values):
+            values.append(depth)
+    return values or [0.22, 0.18, 0.14, 0.10]
+
+
+def auto_dig_swept_density_count(target, surface_z, particles=None, snapshot=None):
+    if isinstance(snapshot, dict):
+        particles = snapshot.get("settled_points")
+    if particles is None or len(particles) == 0:
+        return 0
+    target = np.array(target, dtype=np.float32).reshape(-1)[:3]
+    p = np.asarray(particles, dtype=np.float32)
+    if p is None or len(p) == 0:
+        return 0
+    inward = dig_direction_unit(target)
+    if float(np.linalg.norm(inward)) < 1.0e-6:
+        inward = np.array([-1.0, 0.0], dtype=np.float32)
+    a = target[:2] - inward * 0.04
+    b = target[:2] + inward * 0.72
+    ab = b - a
+    ab2 = max(1.0e-6, float(np.dot(ab, ab)))
+    if isinstance(snapshot, dict):
+        center = 0.5 * (a + b)
+        search_radius = float(np.linalg.norm(ab)) * 0.5 + max(0.08, float(AUTO_DIG_SWEEP_RADIUS))
+        idx = sand_snapshot_local_indices(snapshot, float(center[0]), float(center[1]), search_radius)
+        if idx is None or len(idx) == 0:
+            return 0
+        p = p[idx]
+
+    rel = p[:, :2] - a.reshape(1, 2)
+    t = np.clip((rel @ ab.reshape(2, 1)).reshape(-1) / ab2, 0.0, 1.0)
+    closest = a.reshape(1, 2) + t.reshape(-1, 1) * ab.reshape(1, 2)
+    d2 = np.sum((p[:, :2] - closest) ** 2, axis=1)
+    radius = max(0.08, float(AUTO_DIG_SWEEP_RADIUS))
+    z_min = float(target[2]) - 0.20
+    z_max = float(surface_z) + 0.24
+    mask = (d2 <= radius * radius) & (p[:, 2] >= z_min) & (p[:, 2] <= z_max)
+    return int(np.count_nonzero(mask))
+
+
 def auto_collect_rank_dig_targets(attempt_index):
+    rank_t0 = time.perf_counter()
     ctx = task_scene_context()
     center = np.array(ctx["pile_center"], dtype=np.float32).reshape(-1)[:3]
     pile_radius = np.array(ctx["pile_radius"], dtype=np.float32).reshape(-1)[:2]
     rx = min(float(AUTO_COLLECT_TARGET_RADIUS_X), max(0.12, float(pile_radius[0]) * 0.56))
     ry = min(float(AUTO_COLLECT_TARGET_RADIUS_Y), max(0.12, float(pile_radius[1]) * 0.56))
-    grid = max(3, int(AUTO_DIG_GRID_SIZE))
-    values = np.linspace(-float(AUTO_DIG_CORE_NORM_MAX), float(AUTO_DIG_CORE_NORM_MAX), grid)
-    particles = sand_particle_positions()
+    snapshot = get_sand_snapshot(force=True, label="auto_rank_targets")
+    settled_status = snapshot.get("settle", {}) if isinstance(snapshot, dict) else {}
+    settled_particles = snapshot.get("settled_points") if isinstance(snapshot, dict) else None
     q_ref = CTRL.q_cmd.copy()
-    depth = float(AUTO_COLLECT_TARGET_DEPTHS[(max(1, int(attempt_index)) - 1) % len(AUTO_COLLECT_TARGET_DEPTHS)])
+    depths = auto_dig_depth_candidates()
+    phase = 2.0 * math.pi * (((max(1, int(attempt_index)) - 1) * 0.3819660112501051) % 1.0)
     rows = []
 
-    for ux in values:
-        for uy in values:
-            norm = float(ux * ux + uy * uy)
-            if norm > float(AUTO_DIG_CORE_NORM_MAX) * float(AUTO_DIG_CORE_NORM_MAX):
-                continue
-            x = float(center[0]) + rx * float(ux)
-            y = float(center[1]) + ry * float(uy)
-            surface_z = sand_surface_height_for_auto_target(x, y, particles=particles)
-            z = auto_dig_target_z_from_surface(surface_z, depth)
-            target = np.array([x, y, z], dtype=np.float32)
-            ok, reason = validate_dig_target(target, hard_block=False)
-            if not ok:
-                rows.append({"target_xyz": vec_list(target, 3), "planned": False, "score": -1.0e9, "reason": reason})
-                continue
-
-            density_count = 0
-            if particles is not None and len(particles) > 0:
-                dxy = np.linalg.norm(particles[:, :2] - np.array([[x, y]], dtype=np.float32), axis=1)
-                density_count = int(np.count_nonzero(dxy <= float(AUTO_DIG_DENSITY_RADIUS)))
-                if density_count < int(AUTO_DIG_MIN_LOCAL_PARTICLES):
-                    rows.append({
-                        "target_xyz": vec_list(target, 3),
-                        "surface_z": float(surface_z),
-                        "target_depth": float(surface_z - z),
-                        "density_count": density_count,
-                        "planned": False,
-                        "score": -1.0e9,
-                        "reason": f"low_local_sand_density:{density_count}",
-                    })
-                    continue
-            density_score = clamp01(density_count / 220.0)
-            depth_score = clamp01((surface_z - z) / max(0.01, max(AUTO_COLLECT_TARGET_DEPTHS)))
-            boundary_score = clamp01(1.0 - math.sqrt(norm) / max(0.01, float(AUTO_DIG_CORE_NORM_MAX)))
-            swing_goal = target_to_swing_angle(target)
-            swing_delta_deg_abs = abs(rad_to_deg(swing_delta(swing_goal, q_ref[CTRL.name_to_idx["swing"]])))
-            motion_score = clamp01(1.0 - swing_delta_deg_abs / 180.0)
-
-            ik_ok = True
-            ik_reason = "ok"
-            try:
-                q_probe, ik_info = solve_priority_ik_to_target(
-                    target,
-                    q_seed=q_ref,
-                    preferred_bucket_rad=deg_to_rad(-50.0),
-                    bucket_motion_weight=0.35,
-                    bucket_preference_weight=2.0,
-                    min_world_z=GROUND_TOP_Z - 0.02,
-                    accept_err=0.75,
-                    end_effector="tip",
-                    allow_end_below=True,
-                    min_end_z=GROUND_TOP_Z - DIG_MAX_TIP_DEPTH,
-                    phase_mode="approach_contact",
-                    use_refinement=False,
-                    bucket_candidate_span_deg=90.0,
-                    bucket_candidate_count=9,
-                )
-                if q_probe is None:
-                    ik_ok = False
-                    ik_reason = str(ik_info)
-            except Exception as e:
-                ik_ok = False
-                ik_reason = f"ik_check_failed:{type(e).__name__}:{e}"
-
-            reach_score = 1.0 if ik_ok else 0.0
-            score = (
-                35.0 * reach_score
-                + 24.0 * density_score
-                + 24.0 * depth_score
-                + 12.0 * motion_score
-                + 12.0 * boundary_score
-            )
-            rows.append(
-                {
+    for ring_index, radius_norm in enumerate(AUTO_DIG_RING_RADII):
+        point_count = 1 if ring_index == 0 else int(AUTO_DIG_RING_POINTS[min(ring_index, len(AUTO_DIG_RING_POINTS) - 1)])
+        for angle_index in range(max(1, point_count)):
+            if ring_index == 0:
+                angle = 0.0
+                x = float(center[0])
+                y = float(center[1])
+                norm = 0.0
+            else:
+                angle = phase + 2.0 * math.pi * float(angle_index) / float(point_count)
+                x = float(center[0]) + rx * float(radius_norm) * math.cos(angle)
+                y = float(center[1]) + ry * float(radius_norm) * math.sin(angle)
+                norm = float(radius_norm)
+            surface_z = sand_surface_height_for_auto_target(x, y, particles=settled_particles, snapshot=snapshot)
+            for depth in depths:
+                z = auto_dig_target_z_from_surface(surface_z, depth)
+                target = np.array([x, y, z], dtype=np.float32)
+                center_distance = float(np.linalg.norm(target[:2] - center[:2]))
+                ok, reason = validate_dig_target(target, hard_block=False)
+                base_row = {
                     "target_xyz": vec_list(target, 3),
+                    "ring_index": int(ring_index),
+                    "ring_radius_norm": float(radius_norm),
+                    "angle_index": int(angle_index),
+                    "angle_rad": float(angle),
+                    "center_distance": center_distance,
                     "surface_z": float(surface_z),
+                    "depth_candidate": float(depth),
                     "target_depth": float(surface_z - z),
-                    "density_count": density_count,
-                    "density_score": float(density_score),
-                    "depth_score": float(depth_score),
-                    "motion_score": float(motion_score),
-                    "boundary_score": float(boundary_score),
-                    "reach_score": float(reach_score),
-                    "score": float(score),
-                    "planned": bool(ik_ok),
-                    "reason": ik_reason,
+                    "full_plan_ok": None,
+                    "failed_stage": "",
+                    "failure_reason": "",
                 }
-            )
+                if not ok:
+                    row = dict(base_row)
+                    row.update({"planned": False, "score": -1.0e9, "reason": reason})
+                    rows.append(row)
+                    continue
 
-    rows.sort(key=lambda row: float(row.get("score", -1.0e9)), reverse=True)
+                density_count = 0
+                if settled_particles is not None and len(settled_particles) > 0:
+                    density_count = sand_snapshot_density_count(snapshot, x, y, float(AUTO_DIG_DENSITY_RADIUS))
+                    if density_count <= 0:
+                        dxy = np.linalg.norm(settled_particles[:, :2] - np.array([[x, y]], dtype=np.float32), axis=1)
+                        density_count = int(np.count_nonzero(dxy <= float(AUTO_DIG_DENSITY_RADIUS)))
+                swept_density_count = auto_dig_swept_density_count(target, surface_z, particles=settled_particles, snapshot=snapshot)
+                effective_density_count = max(int(density_count), int(swept_density_count))
+                min_local = int(AUTO_DIG_MIN_LOCAL_PARTICLES)
+                min_swept = int(AUTO_DIG_MIN_SWEPT_PARTICLES)
+                if settled_particles is not None and len(settled_particles) > 0 and (
+                    effective_density_count < min_local or int(swept_density_count) < min_swept
+                ):
+                    if int(swept_density_count) < min_swept:
+                        reject_reason = f"low_swept_sand_density:{swept_density_count}"
+                    else:
+                        reject_reason = f"low_local_sand_density:{effective_density_count}"
+                    row = dict(base_row)
+                    row.update(
+                        {
+                            "density_count": density_count,
+                            "swept_density_count": swept_density_count,
+                            "effective_density_count": effective_density_count,
+                            "planned": False,
+                            "score": -1.0e9,
+                            "reason": reject_reason,
+                        }
+                    )
+                    rows.append(row)
+                    continue
+
+                density_score = clamp01(effective_density_count / 320.0)
+                swept_density_score = clamp01(swept_density_count / 320.0)
+                depth_score = clamp01((surface_z - z) / max(0.01, max(AUTO_COLLECT_TARGET_DEPTHS)))
+                boundary_score = clamp01(1.0 - float(norm) / max(0.01, max(AUTO_DIG_RING_RADII)))
+                swing_goal = target_to_swing_angle(target)
+                swing_delta_deg_abs = abs(rad_to_deg(swing_delta(swing_goal, q_ref[CTRL.name_to_idx["swing"]])))
+                motion_score = clamp01(1.0 - swing_delta_deg_abs / 180.0)
+
+                ik_ok = True
+                ik_reason = "ok"
+                try:
+                    q_probe, ik_info = solve_priority_ik_to_target(
+                        target,
+                        q_seed=q_ref,
+                        preferred_bucket_rad=deg_to_rad(-50.0),
+                        bucket_motion_weight=0.35,
+                        bucket_preference_weight=2.0,
+                        min_world_z=GROUND_TOP_Z - 0.02,
+                        accept_err=0.75,
+                        end_effector="tip",
+                        allow_end_below=True,
+                        min_end_z=GROUND_TOP_Z - DIG_MAX_TIP_DEPTH,
+                        phase_mode="approach_contact",
+                        use_refinement=False,
+                        bucket_candidate_span_deg=90.0,
+                        bucket_candidate_count=9,
+                    )
+                    if q_probe is None:
+                        ik_ok = False
+                        ik_reason = str(ik_info)
+                except Exception as e:
+                    ik_ok = False
+                    ik_reason = f"ik_check_failed:{type(e).__name__}:{e}"
+
+                reach_score = 1.0 if ik_ok else 0.0
+                score = (
+                    35.0 * reach_score
+                    + 30.0 * swept_density_score
+                    + 24.0 * depth_score
+                    + 8.0 * motion_score
+                    + 8.0 * boundary_score
+                )
+                row = dict(base_row)
+                row.update(
+                    {
+                        "density_count": density_count,
+                        "swept_density_count": swept_density_count,
+                        "effective_density_count": effective_density_count,
+                        "density_score": float(density_score),
+                        "swept_density_score": float(swept_density_score),
+                        "depth_score": float(depth_score),
+                        "motion_score": float(motion_score),
+                        "boundary_score": float(boundary_score),
+                        "reach_score": float(reach_score),
+                        "score": float(score),
+                        "planned": bool(ik_ok),
+                        "reason": ik_reason,
+                    }
+                )
+                rows.append(row)
+
+    rows.sort(
+        key=lambda row: (
+            int(row.get("ring_index", 999)),
+            0 if bool(row.get("planned", False)) else 1,
+            -float(row.get("score", -1.0e9)),
+            float(row.get("center_distance", 1.0e9)),
+            -float(row.get("target_depth", 0.0) or 0.0),
+        )
+    )
     usable = [row for row in rows if bool(row.get("planned", False))]
+    rank_ms = (time.perf_counter() - rank_t0) * 1000.0
+    perf = dict(STATE.get("sand_perf_last", {}) or {})
+    perf["target_rank_ms"] = float(rank_ms)
+    perf["target_candidates"] = int(len(rows))
+    perf["target_usable"] = int(len(usable))
+    STATE["sand_perf_last"] = perf
     if not usable:
-        surface_z = sand_surface_height_for_auto_target(float(center[0]), float(center[1]), particles=particles)
-        fallback_depth = max(float(AUTO_COLLECT_TARGET_DEPTHS))
-        fallback = np.array([
-            float(center[0]),
-            float(center[1]),
-            auto_dig_target_z_from_surface(surface_z, fallback_depth),
-        ], dtype=np.float32)
-        fallback_density = 0
-        if particles is not None and len(particles) > 0:
-            dxy = particles[:, :2] - fallback[:2]
-            fallback_density = int(np.count_nonzero(np.sum(dxy * dxy, axis=1) <= float(AUTO_DIG_DENSITY_RADIUS) ** 2))
-        usable = [{
-            "target_xyz": vec_list(fallback, 3),
-            "surface_z": float(surface_z),
-            "target_depth": float(surface_z - float(fallback[2])),
-            "density_count": fallback_density,
-            "score": 0.0,
-            "planned": True,
-            "reason": "fallback_center_deep_after_no_usable_grid",
-        }]
-        rows.insert(0, usable[0])
+        STATE["last_auto_dig_target_scores"] = rows
+        info_print(
+            "[AUTO DIG TARGET SELECT]",
+            f"candidates={len(rows)}",
+            "usable=0",
+            "selected_for_plan=0",
+            "reason=no_candidate_with_swept_sand",
+            f"target_rank_ms={rank_ms:.1f}",
+        )
+        return []
     STATE["last_auto_dig_target_scores"] = rows
+    selected_usable = []
+    per_ring_limit = max(1, int(AUTO_DIG_FULL_PLAN_TOPK_PER_RING))
+    for ring_index in sorted({int(row.get("ring_index", 999)) for row in usable}):
+        ring_rows = [row for row in usable if int(row.get("ring_index", 999)) == ring_index]
+        selected_usable.extend(ring_rows[:per_ring_limit])
     info_print(
         "[AUTO DIG TARGET SELECT]",
         f"candidates={len(rows)}",
         f"usable={len(usable)}",
+        f"selected_for_plan={len(selected_usable)}",
         f"best={usable[0].get('target_xyz')}",
+        f"ring_index={usable[0].get('ring_index')}",
+        f"center_distance={fmt_optional(usable[0].get('center_distance'))}",
         f"score={fmt_optional(usable[0].get('score'))}",
         f"depth={fmt_optional(usable[0].get('target_depth'))}",
-        f"density={usable[0].get('density_count')}",
+        f"swept_density={usable[0].get('swept_density_count')}",
+        f"target_rank_ms={rank_ms:.1f}",
+        f"snapshot_ms={fmt_optional((snapshot.get('perf_ms') or {}).get('total') if isinstance(snapshot, dict) else None)}",
         f"reason={usable[0].get('reason')}",
     )
-    return usable[: max(1, int(AUTO_DIG_TOPK_TARGETS))]
+    return selected_usable[: max(1, len(AUTO_DIG_RING_RADII) * per_ring_limit)]
 
 
 def set_target_models_from_xyz(p):
@@ -6155,14 +6861,21 @@ def update_unload_models_only(p):
 async def auto_collect_prepare_environment():
     was_recording = bool(STATE.get("dataset_recording", False))
     STATE["dataset_recording"] = False
+    STATE["auto_collect_prepare_failure_reason"] = ""
     reset_dig_plan()
     if handle_timeline_stop_if_needed("auto_collect_prepare_start"):
         STATE["dataset_recording"] = was_recording
         return False
 
-    if IK_MODEL is None:
+    if not ik_model_is_valid():
         update_status("[AUTO DATASET] calibrating IK", force=True)
-        await calibrate_ik()
+        ok_ik = await calibrate_ik()
+        if not ok_ik or not ik_model_is_valid():
+            reason = "preflight_failed/ik_calibration_invalid"
+            STATE["auto_collect_prepare_failure_reason"] = reason
+            update_status(f"[AUTO DATASET] {reason}", force=True)
+            STATE["dataset_recording"] = was_recording
+            return False
 
     task_id = start_task("auto_collect_prepare")
     q_home = safe_home_q()
@@ -6233,15 +6946,19 @@ async def auto_collect_one_episode():
 
     prepared = await auto_collect_prepare_environment()
     if not prepared:
+        prepare_reason = str(
+            STATE.pop("auto_collect_prepare_failure_reason", "")
+            or "preflight_failed/prepare_environment_failed"
+        )
         target = auto_collect_sample_target(attempt, 0)
         meta = auto_collect_begin_episode(attempt, target, [{"prepared": False}], None, initial_info=None)
         info_print(
             "[AUTO DATASET ATTEMPT]",
             f"attempt={attempt}",
-            "result=prepare_failed",
+            f"result={prepare_reason}",
             "executed=False",
         )
-        return auto_collect_finish_episode(meta, False, "preflight_failed/prepare_environment_failed")
+        return auto_collect_finish_episode(meta, False, prepare_reason)
 
     initial_ok, initial_info = await auto_collect_move_to_initial_pose(attempt)
     if not initial_ok:
@@ -8545,9 +9262,8 @@ def set_trace_mode(mode, reset_real=False):
 def trace_auto_carry_bucket_world(q0, q1, mode):
     level_mode = str(mode).lower()
     auto_carry_bucket = (
-        ("lift_carry" in level_mode)
-        or ("carry" in level_mode and "unload" not in level_mode)
-        or ("unload_to_bin" in level_mode)
+        ("unload_to_bin" in level_mode)
+        or ("carry" in level_mode and "lift_carry" not in level_mode and "unload" not in level_mode)
     )
     if not auto_carry_bucket:
         return None
@@ -8920,6 +9636,10 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
         CTRL.q_safe = q0.copy()
         STATE["dataset_current_q_goal"] = q0.copy()
     q1 = clip_command_near(q_goal, reference=q0)
+    if "lift_carry" in str(label or mode).lower():
+        bucket_idx = CTRL.name_to_idx.get("bucket", 3)
+        q1[bucket_idx] = float(q0[bucket_idx])
+        q1 = CTRL.clip_limits(q1)
     q_final_cmd = q1.copy()
     contact_stage_name = str(label or mode)
     if is_sand_contact_phase(contact_stage_name):
@@ -8947,9 +9667,8 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
     carry_limited = False
     level_mode = str(mode).lower()
     auto_carry_bucket = (
-        ("lift_carry" in level_mode)
-        or ("carry" in level_mode and "unload" not in level_mode)
-        or ("unload_to_bin" in level_mode)
+        ("unload_to_bin" in level_mode)
+        or ("carry" in level_mode and "lift_carry" not in level_mode and "unload" not in level_mode)
     )
     if auto_carry_bucket:
         start_angles = chain_angles_from_q(q0, end_effector="load")
@@ -9031,6 +9750,31 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                 force=False,
                 log=True,
             )
+            bad_cut, bad_reason = sand_contact_bad_cut_geometry(contact_stage_name, contact_report)
+            if bad_cut:
+                reason_text = f"execution_failed/bad_cut_geometry:{contact_stage_name}:{bad_reason}"
+                set_execution_failure_reason(reason_text)
+                info_print(
+                    "[DIG EXEC FAILED]",
+                    f"label={label}",
+                    "reason=bad_cut_geometry",
+                    bad_reason,
+                )
+                debug_timeline_record(
+                    "BAD_CUT_GEOMETRY",
+                    stage=contact_stage_name,
+                    result="failed",
+                    reason=bad_reason,
+                    q_cmd=CTRL.q_cmd.copy(),
+                    q_real=q_contact_real,
+                    data={
+                        "bucket_total": int(contact_report.get("total_bucket_delta", 0) or 0),
+                        "pile_total": int(contact_report.get("total_pile_delta", 0) or 0),
+                        "spill_total": int(contact_report.get("total_spill_delta", 0) or 0),
+                    },
+                    include_sand=True,
+                )
+                return False
             should_advance, advance_reason = sand_contact_stage_should_advance(
                 contact_stage_name,
                 contact_report,
@@ -9112,6 +9856,11 @@ BUCKET_POUR_LOCAL = np.array([
 
 IK_MAX_DQ = np.array([0.075, 0.070, 0.080, 0.090], dtype=np.float32)
 IK_CALIBRATION_STEP = 0.08
+IK_CALIBRATION_MIN_DELTA_RAD = 0.018
+IK_CALIBRATION_REACH_TOL_DEG = 2.0
+IK_CALIBRATION_RESTORE_TOL_DEG = 2.0
+IK_CALIBRATION_SAFE_SETTLE_FRAMES = 24
+IK_SANITY_MAX_POS_ERR_M = 0.45
 IK_MIN_SEGMENT_LENGTH = 1e-4
 IK_BUCKET_CANDIDATE_SPAN_DEG = 70.0
 IK_BUCKET_CANDIDATE_COUNT = 17
@@ -9147,12 +9896,18 @@ PATH_CHECK_SAMPLES = 24
 PATH_CLEARANCE_BODY_Z = 0.06
 PATH_CLEARANCE_END_Z = 0.18
 PATH_CLEARANCE_HEIGHTS = [0.22, 0.38, 0.60, 0.85, 1.15, 1.55, 2.05, 2.75, 3.45]
+PATH_FAST_SIDE_HEIGHTS = [0.38, 0.75, 1.10]
+PATH_FAST_SIDE_PADDING_XY = 0.48
+PATH_FAST_CORNER_EXTRA_PADS_XY = [0.35, 0.75, 1.15]
+PATH_FAST_SIDE_MAX_BLOCKERS = 3
 PATH_CLEARANCE_FRACTIONS = [0.25, 0.40, 0.60, 0.75]
 PATH_CLEARANCE_DURATION = 0.85
 PATH_OBSTACLE_MARGIN_XY = 0.18
 PATH_OBSTACLE_MARGIN_Z = 0.10
 PATH_OBSTACLE_OVER_CLEARANCE_Z = 0.45
+PATH_OBSTACLE_CACHE_SECONDS = 2.50
 PATH_ROUTE_SIDE_OFFSETS = [0.65, 1.10, 1.65, 2.25]
+PATH_ROUTE_PLANNING_SAMPLE_COUNT = 8
 PRE_DIG_SWING_ALIGN_THRESHOLD_DEG = 8.0
 MOVE_FINAL_SWING_TOL_DEG = 3.0
 MOVE_FINAL_JOINT_TOL_DEG = 8.0
@@ -9175,6 +9930,20 @@ PATH_RIGID_OBSTACLE_PATHS = [
     "/SandSite/UnloadBin/WallRight",
     "/SandSite/UnloadBin/WallFront",
     "/SandSite/UnloadBin/WallBack",
+    "/World/truck",
+    "/truck",
+]
+PATH_VISUAL_OBSTACLE_PATHS = {"/World/truck", "/truck"}
+PATH_OBSTACLE_EXCLUDE_TOKENS = [
+    "/controlrig",
+    "/realsandparticles",
+    "/particlesystem",
+    "/target",
+    "/tracepath",
+    "rangeguide",
+    "selectedrange",
+    "parkingground",
+    "groundplane",
 ]
 
 def clamp(x, lo, hi):
@@ -9308,18 +10077,56 @@ def is_curl_phase(mode):
     return "curl" in str(mode).lower()
 
 
+def strict_path_precheck_phase(mode):
+    m = str(mode).lower()
+    if is_sand_contact_phase(m) or is_curl_phase(m):
+        return False
+    if "dump" in m:
+        return False
+    return True
+
+
 def is_calibrate_phase(mode):
     return "calibrate" in str(mode).lower()
 
 
-def sand_surface_z_at_xy(x, y):
+def sand_surface_query_at_xy(x, y):
     api = get_sand_site_api()
     ctx = task_scene_context()
     center = np.array(ctx.get("pile_center", [0.0, 0.0, GROUND_TOP_Z]), dtype=np.float32).reshape(-1)[:3]
     radius = np.array(ctx.get("pile_radius", [0.0, 0.0]), dtype=np.float32).reshape(-1)[:2]
     if len(radius) >= 2 and float(radius[0]) > 0.0 and float(radius[1]) > 0.0:
         if abs(float(x) - float(center[0])) > float(radius[0]) or abs(float(y) - float(center[1])) > float(radius[1]):
-            return None
+            return None, "outside"
+
+    snapshot = get_sand_snapshot(force=False, label="surface_query", max_age=0.75)
+    z_snapshot = sand_snapshot_surface_height(snapshot, x, y)
+    if z_snapshot is not None:
+        return float(z_snapshot), "particle_snapshot"
+
+    fn = api.get("particle_surface_height_fn") if isinstance(api, dict) else None
+    if callable(fn):
+        try:
+            z = float(fn(float(x), float(y)))
+            if math.isfinite(z):
+                return z, "particle_fn"
+        except Exception:
+            pass
+
+    particles = sand_particle_positions()
+    settled = sand_settle_status(points=particles, ctx=ctx)
+    settled_particles = filter_settled_sand_particles(particles, ctx=ctx) if bool(settled.get("ok", False)) else None
+    if settled_particles is not None and len(settled_particles) > 0:
+        dxy = np.linalg.norm(
+            settled_particles[:, :2] - np.array([[float(x), float(y)]], dtype=np.float32),
+            axis=1,
+        )
+        near = settled_particles[dxy <= float(SAND_SURFACE_QUERY_RADIUS)]
+        if len(near) > 0:
+            _, _, floor_z, _fill_height, _expected_min, z_expected_max = sand_pile_geometry_from_context(ctx)
+            z = float(np.percentile(near[:, 2], 90.0))
+            z = max(float(floor_z) + 0.02, min(z, float(z_expected_max)))
+            return z, "particle_p90"
 
     for fn_key in ["height_fn", "initial_height_fn"]:
         fn = api.get(fn_key) if isinstance(api, dict) else None
@@ -9327,27 +10134,32 @@ def sand_surface_z_at_xy(x, y):
             try:
                 z = float(fn(float(x), float(y)))
                 if math.isfinite(z):
-                    return z
+                    return z, fn_key
             except Exception:
                 pass
     if len(center) >= 3:
-        return float(center[2])
-    return None
+        return float(center[2]), "fallback_center"
+    return None, "missing"
+
+
+def sand_surface_z_at_xy(x, y):
+    z, _source = sand_surface_query_at_xy(x, y)
+    return z
 
 
 def sand_depth_for_point(point):
     if point is None:
-        return None, None
+        return None, None, "missing_point"
     try:
         p = np.array(point, dtype=np.float32).reshape(-1)
         if len(p) < 3:
-            return None, None
-        surface_z = sand_surface_z_at_xy(float(p[0]), float(p[1]))
+            return None, None, "invalid_point"
+        surface_z, source = sand_surface_query_at_xy(float(p[0]), float(p[1]))
         if surface_z is None:
-            return None, None
-        return max(0.0, float(surface_z) - float(p[2])), float(surface_z)
+            return None, None, str(source)
+        return max(0.0, float(surface_z) - float(p[2])), float(surface_z), str(source)
     except Exception:
-        return None, None
+        return None, None, "error"
 
 
 def phase_ground_report(mode):
@@ -9355,10 +10167,10 @@ def phase_ground_report(mode):
     load = bucket_load_pos()
     pour = bucket_pour_pos()
     bucket_mid = bucket_mid_pos()
-    tip_sand_depth, tip_sand_surface = sand_depth_for_point(tip)
-    load_sand_depth, load_sand_surface = sand_depth_for_point(load)
-    pour_sand_depth, pour_sand_surface = sand_depth_for_point(pour)
-    mid_sand_depth, mid_sand_surface = sand_depth_for_point(bucket_mid)
+    tip_sand_depth, tip_sand_surface, tip_sand_source = sand_depth_for_point(tip)
+    load_sand_depth, load_sand_surface, load_sand_source = sand_depth_for_point(load)
+    pour_sand_depth, pour_sand_surface, pour_sand_source = sand_depth_for_point(pour)
+    mid_sand_depth, mid_sand_surface, mid_sand_source = sand_depth_for_point(bucket_mid)
     return {
         "mode": str(mode),
         "base_min": bbox_min_z(LINK_PATHS["base_link"]),
@@ -9377,6 +10189,10 @@ def phase_ground_report(mode):
         "load_sand_surface_z": load_sand_surface,
         "pour_sand_surface_z": pour_sand_surface,
         "bucket_mid_sand_surface_z": mid_sand_surface,
+        "tip_sand_surface_source": tip_sand_source,
+        "load_sand_surface_source": load_sand_source,
+        "pour_sand_surface_source": pour_sand_source,
+        "bucket_mid_sand_surface_source": mid_sand_source,
     }
 
 
@@ -9387,35 +10203,11 @@ def min_existing(values):
     return min(valid)
 
 
-def predicted_chain_world_z(q, end_effector="tip"):
-    if IK_MODEL is None:
-        return None
-
-    boom = get_joint_anchor_world("boom")
-    if boom is None:
-        return None
-
-    part = ik_model_part(end_effector=end_effector)
-    if part is None:
-        return None
-
-    lengths = np.array(part.get("lengths", []), dtype=np.float32)
-    if len(lengths) != 3 or float(np.min(lengths)) < IK_MIN_SEGMENT_LENGTH:
-        chain = current_planar_chain(end_effector=end_effector)
-        if chain is None:
-            return None
-        lengths = np.array(chain["lengths"], dtype=np.float32)
-
-    pts = planar_points_from_q(
-        CTRL.clip_limits(q),
-        lengths,
-        end_effector=end_effector,
-    )
+def predicted_chain_world_z(q, end_effector="tip", reference_q=None):
+    pts = predicted_chain_world_points(q, end_effector=end_effector, reference_q=reference_q)
     if pts is None:
         return None
-
-    root_z = float(boom[2])
-    return [root_z + float(p[1]) for p in pts]
+    return [float(p[2]) for p in pts]
 
 
 def predicted_chain_world_points(q, end_effector="mid", reference_q=None):
@@ -9477,41 +10269,44 @@ def predicted_end_world_point(q, end_effector="mid", reference_q=None):
     return pts[-1]
 
 
-def predicted_phase_ground_report(q, mode):
-    tip_pts = predicted_chain_world_points(q, "tip")
-    mid_pts = predicted_chain_world_points(q, "mid")
-    load_pts = predicted_chain_world_points(q, "load")
-    pour_pts = predicted_chain_world_points(q, "pour")
-    tip_zs = predicted_chain_world_z(q, "tip")
-    mid_zs = predicted_chain_world_z(q, "mid")
-    load_zs = predicted_chain_world_z(q, "load")
-    pour_zs = predicted_chain_world_z(q, "pour")
+def predicted_phase_ground_report(q, mode, reference_q=None):
+    tip_pts = predicted_chain_world_points(q, "tip", reference_q=reference_q)
+    mid_pts = predicted_chain_world_points(q, "mid", reference_q=reference_q)
+    load_pts = predicted_chain_world_points(q, "load", reference_q=reference_q)
+    pour_pts = predicted_chain_world_points(q, "pour", reference_q=reference_q)
 
-    def z_at(zs, idx):
-        if zs is None or len(zs) <= idx:
+    def point_at(points, idx):
+        if points is None or len(points) <= idx:
             return None
-        return float(zs[idx])
+        return points[idx]
 
-    boom_root_z = z_at(tip_zs, 0)
-    arm_joint_z = z_at(tip_zs, 1)
-    bucket_joint_z = z_at(tip_zs, 2)
-    tip_z = z_at(tip_zs, 3)
-    mid_z = z_at(mid_zs, 3)
-    load_z = z_at(load_zs, 3)
-    pour_z = z_at(pour_zs, 3)
-    tip_point = None if tip_pts is None or len(tip_pts) <= 3 else tip_pts[3]
-    mid_point = None if mid_pts is None or len(mid_pts) <= 3 else mid_pts[3]
-    load_point = None if load_pts is None or len(load_pts) <= 3 else load_pts[3]
-    pour_point = None if pour_pts is None or len(pour_pts) <= 3 else pour_pts[3]
-    tip_sand_depth, tip_sand_surface = sand_depth_for_point(tip_point)
-    load_sand_depth, load_sand_surface = sand_depth_for_point(load_point)
-    pour_sand_depth, pour_sand_surface = sand_depth_for_point(pour_point)
-    mid_sand_depth, mid_sand_surface = sand_depth_for_point(mid_point)
+    def z_at(points, idx):
+        p = point_at(points, idx)
+        if p is None:
+            return None
+        return float(p[2])
+
+    boom_root_z = z_at(tip_pts, 0)
+    arm_joint_z = z_at(tip_pts, 1)
+    bucket_joint_z = z_at(tip_pts, 2)
+    tip_z = z_at(tip_pts, 3)
+    mid_z = z_at(mid_pts, 3)
+    load_z = z_at(load_pts, 3)
+    pour_z = z_at(pour_pts, 3)
+    tip_point = point_at(tip_pts, 3)
+    mid_point = point_at(mid_pts, 3)
+    load_point = point_at(load_pts, 3)
+    pour_point = point_at(pour_pts, 3)
+    tip_sand_depth, tip_sand_surface, tip_sand_source = sand_depth_for_point(tip_point)
+    load_sand_depth, load_sand_surface, load_sand_source = sand_depth_for_point(load_point)
+    pour_sand_depth, pour_sand_surface, pour_sand_source = sand_depth_for_point(pour_point)
+    mid_sand_depth, mid_sand_surface, mid_sand_source = sand_depth_for_point(mid_point)
 
     base_path = LINK_PATHS.get("base_link")
 
     return {
         "mode": str(mode),
+        "reference_q_deg": None if reference_q is None else q_deg_values(reference_q, wrap_swing_for_display=True),
         "base_min": bbox_min_z(base_path) if base_path else None,
         "boom_min": min_existing([boom_root_z, arm_joint_z]),
         "arm_min": min_existing([arm_joint_z, bucket_joint_z]),
@@ -9528,6 +10323,10 @@ def predicted_phase_ground_report(q, mode):
         "load_sand_surface_z": load_sand_surface,
         "pour_sand_surface_z": pour_sand_surface,
         "bucket_mid_sand_surface_z": mid_sand_surface,
+        "tip_sand_surface_source": tip_sand_source,
+        "load_sand_surface_source": load_sand_source,
+        "pour_sand_surface_source": pour_sand_source,
+        "bucket_mid_sand_surface_source": mid_sand_source,
     }
 
 
@@ -9554,6 +10353,10 @@ def format_ground_report(mode, report, reason):
         phase_kind = "curl"
     else:
         phase_kind = "free"
+    ref_q = report.get("reference_q_deg") if isinstance(report, dict) else None
+    ref_text = "" if ref_q is None else f" ref_q={ref_q}"
+    surface_source = report.get("tip_sand_surface_source") if isinstance(report, dict) else None
+    source_text = "" if surface_source is None else f" surface_source={surface_source}"
     return (
         f"phase={mode} kind={phase_kind} {reason}; "
         f"tip_z={fmt_optional(report.get('tip_z'))} tip_hard_depth={fmt_optional(tip_hard_depth)} tip_sand_depth={fmt_optional(report.get('tip_sand_depth'))} "
@@ -9561,8 +10364,10 @@ def format_ground_report(mode, report, reason):
         f"pour_z={fmt_optional(report.get('pour_z'))} pour_hard_depth={fmt_optional(pour_hard_depth)} pour_sand_depth={fmt_optional(report.get('pour_sand_depth'))} "
         f"bucket_mid_z={fmt_optional(report.get('bucket_mid_z'))} mid_hard_depth={fmt_optional(mid_hard_depth)} mid_sand_depth={fmt_optional(report.get('bucket_mid_sand_depth'))} "
         f"sand_surface_z={fmt_optional(report.get('tip_sand_surface_z'))} "
+        f"{source_text} "
         f"bucket_min={fmt_optional(report.get('bucket_min'))} "
         f"arm_min={fmt_optional(report.get('arm_min'))} boom_min={fmt_optional(report.get('boom_min'))}"
+        f"{ref_text}"
     )
 
 
@@ -9571,8 +10376,8 @@ def log_phase_ground(prefix, mode):
     info_print(f"{prefix} " + format_ground_report(mode, report, "check"))
 
 
-def log_predicted_phase_ground(prefix, mode, q):
-    report = predicted_phase_ground_report(q, mode)
+def log_predicted_phase_ground(prefix, mode, q, reference_q=None):
+    report = predicted_phase_ground_report(q, mode, reference_q=reference_q)
     if report.get("tip_z") is None:
         ok, reason = False, "missing predicted phase report"
     else:
@@ -9619,48 +10424,171 @@ def phase_ground_ok(mode, report):
     return True, "ok"
 
 
+def cut_front_edge_quality(mode, report):
+    if not is_cutting_phase(mode):
+        return True, "ok", 0.0
+    if not isinstance(report, dict):
+        return False, "missing cut quality report", 100.0
+    tip_depth = report.get("tip_sand_depth")
+    if tip_depth is None:
+        return False, "missing tip sand depth", 100.0
+    tip_depth = float(tip_depth)
+    body_depths = [
+        float(v)
+        for v in [
+            report.get("bucket_mid_sand_depth"),
+            report.get("pour_sand_depth"),
+            report.get("load_sand_depth"),
+        ]
+        if v is not None
+    ]
+    if not body_depths:
+        return True, "ok", 0.0
+    deepest_body = max(body_depths)
+    body_over_tip = float(deepest_body - tip_depth)
+    mode_l = str(mode).lower()
+    if "pull_exit_cut" in mode_l:
+        if deepest_body > float(EXIT_BODY_DEPTH_HARD_MARGIN):
+            return False, f"exit bucket body still too deep: body={deepest_body:.3f}", 90.0
+        exit_penalty = max(0.0, deepest_body - float(EXIT_BODY_DEPTH_SOFT_MARGIN)) * 18.0
+        return True, f"exit_ok tip={tip_depth:.3f} body={deepest_body:.3f}", float(exit_penalty)
+    if tip_depth < float(FRONT_EDGE_MIN_TIP_DEPTH):
+        return False, f"front tip not engaged enough: tip={tip_depth:.3f}", 80.0
+    if body_over_tip > float(FRONT_EDGE_BODY_DEPTH_HARD_MARGIN):
+        return False, f"bucket body much deeper than front tip: tip={tip_depth:.3f} body={deepest_body:.3f}", 100.0
+    attack_penalty = max(0.0, body_over_tip - float(FRONT_EDGE_BODY_DEPTH_SOFT_MARGIN)) * 28.0
+    return True, f"front_edge_ok tip={tip_depth:.3f} body={deepest_body:.3f} body_over_tip={body_over_tip:.3f}", float(attack_penalty)
+
+
 def path_phase_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES):
+    t0 = time.perf_counter()
     samples = max(2, int(samples))
     last_report = None
 
-    for i in range(1, samples + 1):
-        s = float(i) / float(samples)
-        q = interpolate_q_shortest(q_start, q_goal, s)
-        report = predicted_phase_ground_report(q, mode)
-        last_report = report
+    try:
+        for i in range(1, samples + 1):
+            s = float(i) / float(samples)
+            q = interpolate_q_shortest(q_start, q_goal, s)
+            report = predicted_phase_ground_report(q, mode, reference_q=q_start)
+            last_report = report
 
-        if report.get("tip_z") is None:
-            return False, "missing predicted phase report", i, report
+            if report.get("tip_z") is None:
+                return False, "missing predicted phase report", i, report
 
-        ok, reason = phase_ground_ok(mode, report)
-        if not ok:
-            return False, reason, i, report
+            ok, reason = phase_ground_ok(mode, report)
+            if not ok:
+                return False, reason, i, report
 
-    return True, "ok", samples, last_report
+        return True, "ok", samples, last_report
+    finally:
+        perf = dict(STATE.get("sand_perf_last", {}) or {})
+        total = float(perf.get("path_check_ms", 0.0) or 0.0)
+        count = int(perf.get("path_check_count", 0) or 0)
+        perf["path_check_ms"] = total + (time.perf_counter() - t0) * 1000.0
+        perf["path_check_count"] = count + 1
+        STATE["sand_perf_last"] = perf
 
 
-def rigid_obstacle_bboxes():
-    roots = ["/SandSite", "/World/SandSite"]
-    bboxes = []
-    for base_path in PATH_RIGID_OBSTACLE_PATHS:
-        suffix = base_path[len("/SandSite"):] if base_path.startswith("/SandSite") else base_path
-        for root in roots:
-            path = f"{root}{suffix}" if suffix.startswith("/") else f"{root}/{suffix}"
-            prim = get_prim(path)
+def obstacle_path_excluded(path):
+    text = str(path).lower()
+    try:
+        robot_base = str(ROBOT_BASE or "").lower()
+        if robot_base and text.startswith(robot_base):
+            return True
+    except Exception:
+        pass
+    for token in PATH_OBSTACLE_EXCLUDE_TOKENS:
+        if str(token).lower() in text:
+            return True
+    return False
+
+
+def append_obstacle_bbox(bboxes, seen_paths, path, source="collision_api", collision_required=True):
+    path = str(path)
+    if not path or path in seen_paths or obstacle_path_excluded(path):
+        return
+    prim = get_prim(path)
+    if not prim or not prim.IsValid():
+        return
+    if collision_required and not prim_collision_enabled(prim):
+        return
+    mn, mx = bbox_min_max(path)
+    if mn is None or mx is None:
+        return
+    if not bbox_values_are_valid(mn, mx):
+        return
+    size = np.array(mx, dtype=np.float32) - np.array(mn, dtype=np.float32)
+    if float(np.max(size)) <= 1.0e-4:
+        return
+    seen_paths.add(path)
+    bboxes.append({
+        "path": path,
+        "min": np.array(mn, dtype=np.float32),
+        "max": np.array(mx, dtype=np.float32),
+        "collision_required": bool(collision_required),
+        "source": str(source),
+    })
+
+
+def collect_collision_api_obstacles(bboxes, seen_paths):
+    try:
+        prim_iter = stage.Traverse()
+    except Exception:
+        return
+    for prim in prim_iter:
+        try:
             if not prim or not prim.IsValid():
+                continue
+            path = str(prim.GetPath())
+            if obstacle_path_excluded(path):
+                continue
+            if not prim.HasAPI(UsdPhysics.CollisionAPI):
                 continue
             if not prim_collision_enabled(prim):
                 continue
-            mn, mx = bbox_min_max(path)
-            if mn is None or mx is None:
-                continue
-            if not bbox_values_are_valid(mn, mx):
-                continue
-            bboxes.append({
-                "path": path,
-                "min": np.array(mn, dtype=np.float32),
-                "max": np.array(mx, dtype=np.float32),
-            })
+            append_obstacle_bbox(
+                bboxes,
+                seen_paths,
+                path,
+                source="collision_api",
+                collision_required=False,
+            )
+        except Exception:
+            continue
+
+
+def rigid_obstacle_bboxes(force=False):
+    now = time.time()
+    if not force:
+        cached = STATE.get("rigid_obstacle_cache")
+        cached_time = float(STATE.get("rigid_obstacle_cache_time", 0.0) or 0.0)
+        if cached is not None and now - cached_time <= PATH_OBSTACLE_CACHE_SECONDS:
+            return cached
+
+    roots = ["/SandSite", "/World/SandSite"]
+    bboxes = []
+    seen_paths = set()
+    collect_collision_api_obstacles(bboxes, seen_paths)
+    for base_path in PATH_RIGID_OBSTACLE_PATHS:
+        if str(base_path).startswith("/SandSite"):
+            suffix = base_path[len("/SandSite"):]
+            candidate_paths = [f"{root}{suffix}" if suffix.startswith("/") else f"{root}/{suffix}" for root in roots]
+            collision_required = True
+            source = "configured_collision_path"
+        else:
+            candidate_paths = [str(base_path)]
+            collision_required = str(base_path) not in PATH_VISUAL_OBSTACLE_PATHS
+            source = "visual_bbox_fallback" if not collision_required else "configured_collision_path"
+        for path in candidate_paths:
+            append_obstacle_bbox(
+                bboxes,
+                seen_paths,
+                path,
+                source=source,
+                collision_required=collision_required,
+            )
+    STATE["rigid_obstacle_cache"] = bboxes
+    STATE["rigid_obstacle_cache_time"] = now
     return bboxes
 
 
@@ -9707,9 +10635,11 @@ def format_obstacle_report(mode, report, reason):
     min_text = "None" if bbox_min is None else f"({float(bbox_min[0]):.3f},{float(bbox_min[1]):.3f},{float(bbox_min[2]):.3f})"
     max_text = "None" if bbox_max is None else f"({float(bbox_max[0]):.3f},{float(bbox_max[1]):.3f},{float(bbox_max[2]):.3f})"
     obstacle = report.get("obstacle", "unknown") if isinstance(report, dict) else "unknown"
+    source = report.get("obstacle_source", "") if isinstance(report, dict) else ""
+    source_text = "" if not source else f" source={source}"
     return (
         f"phase={mode} kind=rigid_obstacle {reason}; "
-        f"obstacle={obstacle} point={point_text} bbox_min={min_text} bbox_max={max_text}"
+        f"obstacle={obstacle}{source_text} point={point_text} bbox_min={min_text} bbox_max={max_text}"
     )
 
 
@@ -9766,6 +10696,7 @@ def path_obstacle_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES):
                     report = {
                         "mode": str(mode),
                         "obstacle": obstacle["path"],
+                        "obstacle_source": obstacle.get("source", ""),
                         "point": p,
                         "bbox_min": obstacle["min"],
                         "bbox_max": obstacle["max"],
@@ -9815,6 +10746,33 @@ def obstacle_top_z_for_segment(p_start, p_goal):
         if overlap:
             top = float(mx[2]) if top is None else max(top, float(mx[2]))
     return top
+
+
+def obstacle_bboxes_for_segment_xy(p_start, p_goal):
+    obstacles = rigid_obstacle_bboxes()
+    if not obstacles or p_start is None or p_goal is None:
+        return []
+
+    a = np.array(p_start, dtype=np.float32)
+    b = np.array(p_goal, dtype=np.float32)
+    seg_min = np.minimum(a[:2], b[:2]) - PATH_OBSTACLE_MARGIN_XY
+    seg_max = np.maximum(a[:2], b[:2]) + PATH_OBSTACLE_MARGIN_XY
+    rows = []
+    for obstacle in obstacles:
+        mn = obstacle["min"]
+        mx = obstacle["max"]
+        overlap = (
+            float(seg_max[0]) >= float(mn[0] - PATH_OBSTACLE_MARGIN_XY)
+            and float(seg_min[0]) <= float(mx[0] + PATH_OBSTACLE_MARGIN_XY)
+            and float(seg_max[1]) >= float(mn[1] - PATH_OBSTACLE_MARGIN_XY)
+            and float(seg_min[1]) <= float(mx[1] + PATH_OBSTACLE_MARGIN_XY)
+        )
+        if not overlap:
+            continue
+        size_xy = float(max(abs(float(mx[0] - mn[0])), abs(float(mx[1] - mn[1]))))
+        rows.append((size_xy, obstacle))
+    rows.sort(key=lambda item: float(item[0]), reverse=True)
+    return [item[1] for item in rows]
 
 
 def wrap_angle(x):
@@ -10462,7 +11420,61 @@ def default_ik_model():
         "signs": signs,
         "effectors": effectors,
         "calibrated": False,
+        "valid": False,
     }
+
+
+def ik_model_is_valid(model=None):
+    model = IK_MODEL if model is None else model
+    if not isinstance(model, dict):
+        return False
+    if not bool(model.get("calibrated", False)) or not bool(model.get("valid", False)):
+        return False
+    signs = model.get("signs", None)
+    effectors = model.get("effectors", None)
+    if signs is None or len(signs) != 3 or not isinstance(effectors, dict):
+        return False
+    for key in ["mid", "tip"]:
+        part = effectors.get(key)
+        if not isinstance(part, dict):
+            return False
+        lengths = np.array(part.get("lengths", []), dtype=np.float32)
+        offsets = np.array(part.get("offsets", []), dtype=np.float32)
+        if len(lengths) != 3 or len(offsets) != 3:
+            return False
+        if not np.all(np.isfinite(lengths)) or not np.all(np.isfinite(offsets)):
+            return False
+        if float(np.min(lengths)) < IK_MIN_SEGMENT_LENGTH:
+            return False
+    return True
+
+
+def validate_ik_model_against_current_pose(model, q_reference):
+    errors = {}
+    for end_effector, actual_fn in [
+        ("mid", bucket_mid_pos),
+        ("tip", bucket_tip_pos),
+        ("load", bucket_load_pos),
+        ("pour", bucket_pour_pos),
+    ]:
+        if end_effector not in model.get("effectors", {}):
+            continue
+        pred = predicted_end_world_point(q_reference, end_effector=end_effector, reference_q=q_reference)
+        try:
+            actual = actual_fn()
+        except Exception:
+            actual = None
+        if pred is None or actual is None:
+            errors[end_effector] = None
+            continue
+        errors[end_effector] = float(np.linalg.norm(np.array(pred, dtype=np.float32) - np.array(actual, dtype=np.float32)))
+    finite = [v for v in errors.values() if v is not None and math.isfinite(float(v))]
+    if not finite:
+        return False, "no effector sanity samples", errors
+    worst = max(float(v) for v in finite)
+    if worst > IK_SANITY_MAX_POS_ERR_M:
+        return False, f"effector FK sanity error {worst:.3f}m", errors
+    return True, f"ok worst={worst:.3f}m", errors
 
 
 def solve_priority_ik_to_target(
@@ -10571,6 +11583,16 @@ def solve_priority_ik_to_target(
             for a in np.linspace(preferred_abs - local_span, preferred_abs + local_span, 7):
                 candidate_angles.append(float(a))
 
+    unique_candidate_angles = []
+    seen_candidate_angles = set()
+    for angle in candidate_angles:
+        key = round(float(wrap_angle(angle)), 4)
+        if key in seen_candidate_angles:
+            continue
+        seen_candidate_angles.add(key)
+        unique_candidate_angles.append(float(angle))
+    candidate_angles = unique_candidate_angles
+
     best = None
     solution_rows = []
     reject_counts = {}
@@ -10615,7 +11637,7 @@ def solve_priority_ik_to_target(
 
             phase_report = None
             if phase_mode is not None:
-                phase_report = predicted_phase_ground_report(q_candidate, phase_mode)
+                phase_report = predicted_phase_ground_report(q_candidate, phase_mode, reference_q=q_now)
                 if phase_report.get("tip_z") is None:
                     reject("missing predicted phase report")
                     continue
@@ -10948,6 +11970,8 @@ def path_end_effector_for_mode(mode):
     m = str(mode).lower()
     if "dump" in m:
         return "pour"
+    if "clearance" in m:
+        return "load"
     if "lift" in m or "carry" in m or "unload" in m:
         return "load"
     return "tip"
@@ -10975,24 +11999,40 @@ def solve_clearance_pose(point, q_seed, end_effector, clearance_z):
     )
 
 
-def route_segments_ok(q_start, route, q_goal, mode):
+def route_segments_ok(q_start, route, q_goal, mode, samples=None):
+    sample_count = PATH_CHECK_SAMPLES if samples is None else max(2, int(samples))
     q_prev = q_start
     for idx, q_next in enumerate(route):
-        ok, kind, reason, sample, report = path_segment_check(q_prev, q_next, "clearance")
+        ok, kind, reason, sample, report = path_segment_check(q_prev, q_next, "clearance", samples=sample_count)
         if not ok:
             text = path_block_report_text("clearance", kind, report, reason)
-            return False, f"segment {idx + 1} blocked at {sample}/{PATH_CHECK_SAMPLES}: {text}"
+            return False, f"segment {idx + 1} blocked at {sample}/{sample_count}: {text}"
         q_prev = q_next
 
-    ok, kind, reason, sample, report = path_segment_check(q_prev, q_goal, mode)
+    ok, kind, reason, sample, report = path_segment_check(q_prev, q_goal, mode, samples=sample_count)
     if not ok:
         text = path_block_report_text(mode, kind, report, reason)
-        return False, f"final segment blocked at {sample}/{PATH_CHECK_SAMPLES}: {text}"
+        return False, f"final segment blocked at {sample}/{sample_count}: {text}"
 
     return True, "ok"
 
 
-def find_clearance_route(q_start, q_goal, mode, label):
+def clearance_route_cost(q_start, route, q_goal, duration=0.0, clearance_z=0.0, side_offset=0.0):
+    q_prev = np.array(q_start, dtype=np.float32).copy()
+    total = 0.0
+    total_angle = 0.0
+    for q_next in list(route) + [q_goal]:
+        motion = plan_joint_motion_metrics(q_next, q_prev, duration=duration)
+        total += float(motion.get("cost", 0.0))
+        total_angle += float(motion.get("weighted_angle", 0.0))
+        q_prev = np.array(q_next, dtype=np.float32).copy()
+    total += 0.16 * max(0.0, float(clearance_z) - GROUND_TOP_Z)
+    total += 0.08 * abs(float(side_offset))
+    total += 1.8 * max(0, len(route) - 1)
+    return float(total), float(total_angle)
+
+
+def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=None):
     end_effector = path_end_effector_for_mode(mode)
     p_start = predicted_end_world_point(q_start, end_effector=end_effector, reference_q=q_start)
     p_goal = predicted_end_world_point(q_goal, end_effector=end_effector, reference_q=q_start)
@@ -11004,13 +12044,171 @@ def find_clearance_route(q_start, q_goal, mode, label):
 
     last_reason = "no candidate tried"
     obstacle_top = obstacle_top_z_for_segment(p_start, p_goal)
+    blockers = obstacle_bboxes_for_segment_xy(p_start, p_goal)
+    candidates = []
+    sample_count = PATH_CHECK_SAMPLES if samples is None else max(2, int(samples))
 
-    for height in PATH_CLEARANCE_HEIGHTS:
+    def budget_expired():
+        return deadline is not None and time.time() > float(deadline)
+
+    def add_route(route, route_type, clearance_z, detail="", side_offset=0.0):
+        nonlocal last_reason
+        if budget_expired():
+            last_reason = "planning budget exceeded"
+            return
+        ok_route, route_reason = route_segments_ok(q_start, route, q_goal, mode, samples=sample_count)
+        if not ok_route:
+            last_reason = route_reason
+            return
+        cost, weighted_angle = clearance_route_cost(
+            q_start,
+            route,
+            q_goal,
+            duration=PATH_CLEARANCE_DURATION,
+            clearance_z=clearance_z,
+            side_offset=side_offset,
+        )
+        candidates.append({
+            "route": [np.array(q, dtype=np.float32).copy() for q in route],
+            "type": str(route_type),
+            "z": float(clearance_z),
+            "cost": float(cost),
+            "weighted_angle": float(weighted_angle),
+            "detail": str(detail),
+            "side_offset": float(side_offset),
+        })
+
+    def choose_best_candidate():
+        if not candidates:
+            return None
+        return sorted(candidates, key=lambda row: (float(row["cost"]), float(row["weighted_angle"]), len(row["route"])))[0]
+
+    midpoint = 0.5 * (np.array(p_start, dtype=np.float32) + np.array(p_goal, dtype=np.float32))
+
+    def info_planar_err(info):
+        if isinstance(info, dict):
+            try:
+                return float(info.get("planar_err", 0.0))
+            except Exception:
+                return 0.0
+        return 0.0
+
+    def solve_clearance_waypoints(points, q_seed, clearance_z):
+        route = []
+        infos = []
+        q_cursor = np.array(q_seed, dtype=np.float32).copy()
+        for point in points:
+            q_next, info_next = solve_clearance_pose(point, q_cursor, end_effector, clearance_z)
+            if q_next is None:
+                return None, info_next, infos
+            route.append(np.array(q_next, dtype=np.float32).copy())
+            infos.append(info_next)
+            q_cursor = np.array(q_next, dtype=np.float32).copy()
+        return route, "ok", infos
+
+    def obstacle_corner_route_points(obstacle, clearance_z):
+        mn = obstacle["min"]
+        mx = obstacle["max"]
+        start_xy = np.array(p_start[:2], dtype=np.float32)
+        goal_xy = np.array(p_goal[:2], dtype=np.float32)
+        out = []
+        pad_values = [
+            float(PATH_FAST_SIDE_PADDING_XY) + float(extra_pad)
+            for extra_pad in PATH_FAST_CORNER_EXTRA_PADS_XY
+        ]
+        for pad in pad_values:
+            left_x = float(mn[0]) - float(PATH_OBSTACLE_MARGIN_XY) - pad
+            right_x = float(mx[0]) + float(PATH_OBSTACLE_MARGIN_XY) + pad
+            bottom_y = float(mn[1]) - float(PATH_OBSTACLE_MARGIN_XY) - pad
+            top_y = float(mx[1]) + float(PATH_OBSTACLE_MARGIN_XY) + pad
+            x_sides = [("bbox_left_corner", left_x), ("bbox_right_corner", right_x)]
+            y_sides = [("north", top_y), ("south", bottom_y)]
+            x_sides = sorted(
+                x_sides,
+                key=lambda item: abs(float(start_xy[0]) - item[1]) + abs(float(goal_xy[0]) - item[1]),
+            )
+            y_sides = sorted(
+                y_sides,
+                key=lambda item: abs(float(start_xy[1]) - item[1]) + abs(float(goal_xy[1]) - item[1]),
+            )
+            for x_name, side_x in x_sides:
+                for y_name, side_y in y_sides:
+                    corner = np.array([float(side_x), float(side_y), float(clearance_z)], dtype=np.float32)
+                    side_goal = np.array([float(side_x), float(goal_xy[1]), float(clearance_z)], dtype=np.float32)
+                    if np.linalg.norm(side_goal[:2] - corner[:2]) < 0.35:
+                        route_points = [corner]
+                    else:
+                        route_points = [corner, side_goal]
+                    route_len = float(np.linalg.norm(start_xy - corner[:2]))
+                    for a, b in zip(route_points[:-1], route_points[1:]):
+                        route_len += float(np.linalg.norm(a[:2] - b[:2]))
+                    route_len += float(np.linalg.norm(route_points[-1][:2] - goal_xy))
+                    out.append(
+                        {
+                            "type": f"{x_name}_{y_name}",
+                            "points": route_points,
+                            "pad": float(pad),
+                            "side_offset": float(side_x - midpoint[0]),
+                            "route_len": float(route_len),
+                            "detail": (
+                                f"bbox={obstacle.get('path', '')} "
+                                f"corner=({float(side_x):.2f},{float(side_y):.2f}) "
+                                f"pad={float(pad):.2f}"
+                            ),
+                        }
+                    )
+        return sorted(out, key=lambda row: (float(row["route_len"]), abs(float(row["side_offset"])), float(row["pad"])))
+
+    for height in PATH_FAST_SIDE_HEIGHTS:
+        if budget_expired():
+            break
         clearance_z = max(float(p_start[2]), float(p_goal[2]), GROUND_TOP_Z + float(height))
+        for obstacle in blockers[: max(1, int(PATH_FAST_SIDE_MAX_BLOCKERS))]:
+            for route_candidate in obstacle_corner_route_points(obstacle, clearance_z)[:10]:
+                if budget_expired():
+                    break
+                route, fail_info, infos = solve_clearance_waypoints(
+                    route_candidate["points"],
+                    q_start,
+                    clearance_z,
+                )
+                if route is None:
+                    last_reason = f"{route_candidate['type']} route IK failed: {fail_info}"
+                    continue
+                add_route(
+                    route,
+                    route_candidate["type"],
+                    clearance_z,
+                    detail=(
+                        f"{route_candidate['detail']} "
+                        f"waypoints={len(route)} "
+                        f"planar_err={max([info_planar_err(info) for info in infos] or [0.0]):.3f}"
+                    ),
+                    side_offset=float(route_candidate["side_offset"]),
+                )
+        best = choose_best_candidate()
+        if best is not None:
+            info_print(
+                f"[PATH ROUTE SELECTED] {label}: end={end_effector} type={best['type']} "
+                f"z={best['z']:.2f} cost={best['cost']:.2f} weighted_angle={best['weighted_angle']:.2f} "
+                f"waypoints={len(best['route'])} {best['detail']}"
+            )
+            return best["route"], "ok"
+
+    fallback_heights = PATH_CLEARANCE_HEIGHTS if deadline is None else PATH_CLEARANCE_HEIGHTS[:4]
+    fallback_fractions = PATH_CLEARANCE_FRACTIONS if deadline is None else [0.40, 0.60]
+    fallback_side_offsets = PATH_ROUTE_SIDE_OFFSETS if deadline is None else PATH_ROUTE_SIDE_OFFSETS[:2]
+    for height in fallback_heights:
+        if budget_expired():
+            break
+        base_clearance_z = max(float(p_start[2]), float(p_goal[2]), GROUND_TOP_Z + float(height))
+        clearance_z = base_clearance_z
         if obstacle_top is not None:
             clearance_z = max(clearance_z, float(obstacle_top) + PATH_OBSTACLE_OVER_CLEARANCE_Z)
 
-        for frac in PATH_CLEARANCE_FRACTIONS:
+        for frac in fallback_fractions:
+            if budget_expired():
+                break
             p_via = (1.0 - float(frac)) * np.array(p_start, dtype=np.float32) + float(frac) * np.array(p_goal, dtype=np.float32)
             p_via[2] = clearance_z
 
@@ -11020,18 +12218,12 @@ def find_clearance_route(q_start, q_goal, mode, label):
                 last_reason = f"clearance IK failed: {info}"
                 continue
 
-            ok_route, route_reason = route_segments_ok(q_start, [q_via], q_goal, mode)
-            if not ok_route:
-                last_reason = route_reason
-                continue
-
-            info_print(
-                f"[PATH VIA FOUND] {label}: end={end_effector} frac={float(frac):.2f} "
-                f"z={clearance_z:.2f} planar_err={info['planar_err']:.3f} "
-                f"q=({rad_to_deg(q_via[0]):.2f},{rad_to_deg(q_via[1]):.2f},"
-                f"{rad_to_deg(q_via[2]):.2f},{rad_to_deg(q_via[3]):.2f})"
+            add_route(
+                [q_via],
+                "over_via",
+                clearance_z,
+                detail=f"frac={float(frac):.2f} planar_err={info['planar_err']:.3f}",
             )
-            return [q_via], "ok"
 
         q_up_start, info_start = solve_clearance_pose(p_start, q_start, end_effector, clearance_z)
         if q_up_start is None:
@@ -11044,36 +12236,38 @@ def find_clearance_route(q_start, q_goal, mode, label):
             continue
 
         route = [q_up_start, q_up_goal]
-        ok_route, route_reason = route_segments_ok(q_start, route, q_goal, mode)
-        if ok_route:
-            info_print(
-                f"[PATH ROUTE FOUND] {label}: end={end_effector} type=lift_cross_drop "
-                f"z={clearance_z:.2f} waypoints={len(route)}"
-            )
-            return route, "ok"
-        last_reason = route_reason
+        add_route(route, "lift_cross_drop", clearance_z, detail=f"waypoints={len(route)}")
 
         direction_xy = np.array(p_goal[:2], dtype=np.float32) - np.array(p_start[:2], dtype=np.float32)
         perp = safe_norm(np.array([-float(direction_xy[1]), float(direction_xy[0])], dtype=np.float32), default=(1.0, 0.0))
-        midpoint = 0.5 * (np.array(p_start, dtype=np.float32) + np.array(p_goal, dtype=np.float32))
-        for side_offset in PATH_ROUTE_SIDE_OFFSETS:
+        for side_offset in fallback_side_offsets:
             for sign in [-1.0, 1.0]:
+                if budget_expired():
+                    break
                 p_side = midpoint.copy()
                 p_side[:2] += float(sign) * float(side_offset) * perp
-                p_side[2] = clearance_z
-                q_side, info_side = solve_clearance_pose(p_side, q_up_start, end_effector, clearance_z)
+                p_side[2] = base_clearance_z
+                q_side, info_side = solve_clearance_pose(p_side, q_up_start, end_effector, base_clearance_z)
                 if q_side is None:
                     last_reason = f"side route IK failed: {info_side}"
                     continue
                 route = [q_up_start, q_side, q_up_goal]
-                ok_route, route_reason = route_segments_ok(q_start, route, q_goal, mode)
-                if ok_route:
-                    info_print(
-                        f"[PATH ROUTE FOUND] {label}: end={end_effector} type=lift_side_cross_drop "
-                        f"z={clearance_z:.2f} side={float(sign) * float(side_offset):.2f} waypoints={len(route)}"
-                    )
-                    return route, "ok"
-                last_reason = route_reason
+                add_route(
+                    route,
+                    "lift_side_cross_drop",
+                    clearance_z,
+                    detail=f"side={float(sign) * float(side_offset):.2f} waypoints={len(route)}",
+                    side_offset=float(sign) * float(side_offset),
+                )
+
+    best = choose_best_candidate()
+    if best is not None:
+        info_print(
+            f"[PATH ROUTE SELECTED] {label}: end={end_effector} type={best['type']} "
+            f"z={best['z']:.2f} cost={best['cost']:.2f} weighted_angle={best['weighted_angle']:.2f} "
+            f"waypoints={len(best['route'])} {best['detail']}"
+        )
+        return best["route"], "ok"
 
     return None, last_reason
 
@@ -11175,8 +12369,15 @@ async def prepare_pre_dig_swing_align(q_goal, label="", task_id=None, mode="pre_
     return True
 
 
-async def move_to_profile_with_clearance(q_goal, seconds=1.0, label="", task_id=None, mode="auto"):
-    q_goal = clip_command_near(q_goal, reference=CTRL.q_cmd)
+async def move_to_profile_with_clearance(q_goal, seconds=1.0, label="", task_id=None, mode="auto", q_start_override=None):
+    if q_start_override is not None:
+        try:
+            q_reference = CTRL.clip_limits(np.array(q_start_override, dtype=np.float32).reshape(-1)[:4].copy())
+        except Exception:
+            q_reference = CTRL.q_cmd.copy()
+    else:
+        q_reference = CTRL.q_cmd.copy()
+    q_goal = clip_command_near(q_goal, reference=q_reference)
     if not await prepare_pre_dig_swing_align(q_goal, label=label, task_id=task_id, mode=mode):
         return False
     q_goal = clip_command_near(q_goal, reference=CTRL.q_cmd)
@@ -11226,12 +12427,29 @@ async def move_to_profile_with_clearance(q_goal, seconds=1.0, label="", task_id=
     route, route_reason = find_clearance_route(q_start, q_goal, mode, label)
     if route is None:
         if not obstacle_ok:
+            reason_text = f"execution_failed/path_precheck_failed:{label}:no_collision_free_route:{route_reason}"
+            set_execution_failure_reason(reason_text)
             info_print(
                 f"[PATH OBSTACLE NO ROUTE] {label}: predicted obstacle but no route found; "
-                f"{route_reason}; executing guarded direct motion and relying on live FREEZE diagnostics"
+                f"{route_reason}; hard_stop=True"
             )
-            update_status(f"[PATH OBSTACLE NO ROUTE] {label}: executing guarded direct motion", force=True)
-            return await move_to_profile(q_goal, seconds=seconds, label=label, task_id=task_id, mode=mode)
+            update_status(f"[PATH OBSTACLE NO ROUTE] {label}: {route_reason}", force=True)
+            debug_timeline_record(
+                "PATH_OBSTACLE_NO_ROUTE",
+                stage=label,
+                result="failed",
+                reason=reason_text,
+                q_cmd=q_goal,
+                q_real=get_real_joint_positions(),
+                include_sand=True,
+            )
+            return False
+        if strict_path_precheck_phase(mode) and not phase_ok:
+            reason_text = f"execution_failed/path_precheck_failed:{label}:no_clearance_route:{route_reason}"
+            set_execution_failure_reason(reason_text)
+            info_print(f"[PATH PHASE NO ROUTE] {label}: {route_reason}; hard_stop=True")
+            update_status(f"[PATH PHASE NO ROUTE] {label}: {route_reason}", force=True)
+            return False
         info_print(
             f"[PATH PREDICTED CONTACT IGNORED] {label}: route_failed={route_reason}; "
             "executing direct command and using live freeze/contact diagnostics"
@@ -11265,20 +12483,31 @@ def dig_plan_specs_from_candidate(target_xyz, candidate):
     if surface_z is None:
         surface_z = max(float(target[2]) + 0.35, GROUND_TOP_Z + 0.35)
     surface_z = max(float(surface_z), float(target[2]) + 0.05)
-    target_depth = max(0.0, float(surface_z) - float(target[2]))
+    target_depth = max(0.0, min(0.24, float(surface_z) - float(target[2])))
     inward = dig_direction_unit(target)
     if float(np.linalg.norm(inward)) < 1e-6:
         inward = np.array([-1.0, 0.0], dtype=np.float32)
     outward = -inward
 
-    pre_clearance = max(0.28, float(candidate.get("pre_z", 0.60)) - min(0.50, target_depth))
+    def cut_z(depth, min_clearance=0.035):
+        depth = max(0.0, float(depth))
+        return max(GROUND_TOP_Z + float(min_clearance), float(surface_z) - depth)
+
+    cut_depth = max(0.08, min(0.22, target_depth))
+    insert_depth = max(0.035, min(float(candidate.get("insert_depth", 0.08)), cut_depth * 0.55))
+    mid_depth = max(insert_depth + 0.025, min(float(candidate.get("mid_depth", 0.14)), cut_depth))
+    exit_depth = max(0.015, min(float(candidate.get("exit_depth", 0.04)), insert_depth))
+
+    pre_clearance = max(0.26, float(candidate.get("pre_z", 0.46)) - min(0.24, target_depth))
     contact_clearance = max(0.015, min(0.08, float(candidate.get("contact_z", 0.03))))
     pre = offset_xy(target, outward, float(candidate.get("approach_offset", 0.25)), float(surface_z) + pre_clearance)
-    contact = offset_xy(target, outward, 0.02, float(surface_z) + contact_clearance)
-    insert = offset_xy(target, outward, 0.00, float(target[2]) - float(candidate.get("insert_depth", 0.08)))
-    mid_cut = offset_xy(target, inward, float(candidate.get("mid_pull", 0.35)), float(target[2]) - float(candidate.get("mid_depth", 0.18)))
-    exit_cut = offset_xy(target, inward, float(candidate.get("exit_pull", 0.55)), float(target[2]) - float(candidate.get("exit_depth", 0.05)))
-    curl = offset_xy(target, inward, float(candidate.get("exit_pull", 0.55)), float(target[2]) + float(candidate.get("curl_z", 0.08)))
+    contact = offset_xy(target, outward, max(0.16, float(candidate.get("approach_offset", 0.25)) * 0.70), float(surface_z) + contact_clearance)
+    insert = offset_xy(target, outward, max(0.10, float(candidate.get("approach_offset", 0.25)) * 0.42), cut_z(insert_depth))
+    mid_cut = offset_xy(target, inward, float(candidate.get("mid_pull", 0.35)), cut_z(mid_depth))
+    exit_lift_z = max(0.03, float(candidate.get("exit_lift_z", 0.08)))
+    exit_cut_z = max(cut_z(exit_depth), float(surface_z) + exit_lift_z)
+    exit_cut = offset_xy(target, inward, float(candidate.get("exit_pull", 0.55)), exit_cut_z)
+    curl = offset_xy(exit_cut, inward, 0.02, max(float(surface_z) + 0.22, float(exit_cut[2]) + float(candidate.get("curl_z", 0.18))))
     lift_z = float(exit_cut[2]) + float(candidate.get("lift_height", 0.70))
     lift_z = max(lift_z, float(target[2]) + float(candidate.get("lift_above_target", 0.50)))
     lift_z = max(lift_z, float(candidate.get("min_lift_z", GROUND_TOP_Z + 1.05)))
@@ -11300,8 +12529,8 @@ def dig_plan_specs_from_candidate(target_xyz, candidate):
         ("insert_cut", insert, bucket_cut_deg, bucket_insert_world, "tip", 0.9, True),
         ("pull_mid_cut", mid_cut, bucket_mid_cut_deg, bucket_mid_world, "tip", 2.0, True),
         ("pull_exit_cut", exit_cut, float(candidate.get("bucket_exit", -70.0)), bucket_exit_world, "tip", 1.5, True),
-        ("curl_to_hold_material", curl, float(candidate.get("bucket_curl", -105.0)), None, "tip", 0.9, True),
-        ("lift_carry", lift, None, "carry", "load", 1.2, True),
+        ("curl_to_hold_material", curl, float(candidate.get("bucket_curl", CURL_HOLD_TARGET_DEG)), None, "tip", 0.9, True),
+        ("lift_carry", lift, None, "hold", "load", 1.2, True),
         ("unload_to_bin", unload, None, "carry", "load", 1.35, True),
     ]
 
@@ -11435,14 +12664,98 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                         f"close_xy={drop.get('close_xy')} "
                         f"source_clearance={fmt_optional(drop.get('source_clearance'))}",
                     )
-                motion = plan_joint_motion_metrics(q_pre_dump, q_seed, duration)
-                path_penalty, path_detail = plan_path_penalty(q_seed, q_pre_dump, label)
+
+                direct_phase_ok, direct_phase_reason, direct_phase_sample, direct_phase_report = path_phase_check(q_seed, q_pre_dump, label)
+                direct_obstacle_ok, direct_obstacle_reason, direct_obstacle_sample, direct_obstacle_report = path_obstacle_check(q_seed, q_pre_dump, label)
+                route_waypoints = []
+                route_reason = "direct_ok"
+                route_required = not (direct_phase_ok and direct_obstacle_ok)
+                if route_required:
+                    route_waypoints, route_reason = find_clearance_route(
+                        q_seed,
+                        q_pre_dump,
+                        label,
+                        f"plan_{candidate.get('id', 'candidate')}_{label}",
+                        deadline=deadline,
+                        samples=PATH_ROUTE_PLANNING_SAMPLE_COUNT,
+                    )
+                    if route_waypoints is None:
+                        detail = []
+                        if not direct_phase_ok:
+                            detail.append(
+                                f"phase sample={direct_phase_sample}/{PATH_CHECK_SAMPLES} "
+                                + format_ground_report(label, direct_phase_report, direct_phase_reason)
+                            )
+                        if not direct_obstacle_ok:
+                            detail.append(
+                                f"obstacle sample={direct_obstacle_sample}/{PATH_CHECK_SAMPLES} "
+                                + format_obstacle_report(label, direct_obstacle_report, direct_obstacle_reason)
+                            )
+                        fail_reasons.append(
+                            f"{label}: no collision-free route: {route_reason}; " + "; ".join(detail)
+                        )
+                        continue
+
+                route_seq = []
+                route_points = []
+                route_stages = []
+                route_cost = 0.0
+                route_weighted_angle = 0.0
+                route_estimated_time = 0.0
+                q_motion_seed = q_seed.copy()
+                route_end_effector = path_end_effector_for_mode(label)
+                for route_idx, q_route_raw in enumerate(route_waypoints or []):
+                    q_route = np.array(q_route_raw, dtype=np.float32).copy()
+                    route_label = f"clearance_route_{route_idx + 1}"
+                    route_duration = max(0.45, min(PATH_CLEARANCE_DURATION, float(duration) * 0.65))
+                    route_motion = plan_joint_motion_metrics(q_route, q_motion_seed, route_duration)
+                    route_duration = max(route_duration, float(route_motion.get("estimated_time", route_duration) or route_duration))
+                    route_motion = plan_joint_motion_metrics(q_route, q_motion_seed, route_duration)
+                    route_path_penalty, route_path_detail = plan_path_penalty(q_motion_seed, q_route, "clearance")
+                    route_target = predicted_end_world_point(q_route, end_effector=route_end_effector, reference_q=q_motion_seed)
+                    if route_target is None:
+                        route_target = np.array(landing, dtype=np.float32).copy()
+                    route_stage_cost = float(route_motion["cost"] + route_path_penalty)
+                    route_seq.append((route_label, q_route.copy(), float(route_duration)))
+                    route_points.append(np.array(route_target, dtype=np.float32).copy())
+                    route_stages.append(
+                        {
+                            "phase": route_label,
+                            "planned": True,
+                            "required": True,
+                            "target_point": vec_list(route_target, 3),
+                            "q_goal_rad": vec_list(q_route, 4),
+                            "q_goal_deg": q_deg_values(q_route, wrap_swing_for_display=True),
+                            "duration": float(route_duration),
+                            "effector": route_end_effector,
+                            "route_source": "obstacle_clearance",
+                            "route_reason": str(route_reason),
+                            "motion": route_motion,
+                            "path": route_path_detail,
+                            "stage_cost": route_stage_cost,
+                        }
+                    )
+                    route_cost += route_stage_cost
+                    route_weighted_angle += float(route_motion["weighted_angle"])
+                    route_estimated_time += float(route_motion["estimated_time"])
+                    q_motion_seed = q_route.copy()
+
+                motion = plan_joint_motion_metrics(q_pre_dump, q_motion_seed, duration)
+                path_penalty, path_detail = plan_path_penalty(q_motion_seed, q_pre_dump, label)
+                if route_required:
+                    path_detail["route_inserted"] = bool(route_waypoints)
+                    path_detail["route_waypoints"] = len(route_waypoints or [])
+                    path_detail["route_reason"] = str(route_reason)
+                    path_detail["direct_phase_ok"] = bool(direct_phase_ok)
+                    path_detail["direct_phase_reason"] = str(direct_phase_reason)
+                    path_detail["direct_obstacle_ok"] = bool(direct_obstacle_ok)
+                    path_detail["direct_obstacle_reason"] = str(direct_obstacle_reason)
                 xy_err = float(drop.get("xy_err", 1.0) or 1.0)
                 clearance_short = max(0.0, UNLOAD_DROP_SOURCE_MIN_CLEARANCE_Z - float(drop.get("source_clearance", 0.0) or 0.0))
                 outside_penalty = 0.0 if bool(drop.get("inside_xy", False)) else 8.0
                 close_penalty = 0.0 if bool(drop.get("close_xy", False)) else 6.0
                 unload_penalty = float(DIG_PLAN_UNLOAD_XY_COST) * xy_err + 18.0 * clearance_short + outside_penalty + close_penalty
-                total_cost = float(beam["cost"]) + motion["cost"] + path_penalty + unload_penalty
+                total_cost = float(beam["cost"]) + route_cost + motion["cost"] + path_penalty + unload_penalty
                 stage_row = {
                     "phase": label,
                     "planned": True,
@@ -11457,6 +12770,12 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                     "drop": compact_unload_drop(drop),
                     "drop_alignment_ready": bool(drop_ready),
                     "drop_alignment_policy": "diagnostic_only_execute_then_score",
+                    "clearance_route": {
+                        "inserted": bool(route_waypoints),
+                        "required": bool(route_required),
+                        "waypoints": len(route_waypoints or []),
+                        "reason": str(route_reason),
+                    },
                     "motion": motion,
                     "path": path_detail,
                     "stage_cost": float(motion["cost"] + path_penalty + unload_penalty),
@@ -11464,23 +12783,63 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                 new_beams.append(
                     {
                         "q": q_pre_dump.copy(),
-                        "seq": beam["seq"] + [(label, q_pre_dump.copy(), float(duration))],
-                        "points": beam["points"] + [np.array(landing, dtype=np.float32).copy()],
-                        "stages": beam["stages"] + [stage_row],
+                        "seq": beam["seq"] + route_seq + [(label, q_pre_dump.copy(), float(duration))],
+                        "points": beam["points"] + route_points + [np.array(landing, dtype=np.float32).copy()],
+                        "stages": beam["stages"] + route_stages + [stage_row],
                         "cost": total_cost,
-                        "weighted_angle": float(beam["weighted_angle"]) + float(motion["weighted_angle"]),
-                        "estimated_time": float(beam["estimated_time"]) + float(motion["estimated_time"]),
+                        "weighted_angle": float(beam["weighted_angle"]) + route_weighted_angle + float(motion["weighted_angle"]),
+                        "estimated_time": float(beam["estimated_time"]) + route_estimated_time + float(motion["estimated_time"]),
                     }
                 )
                 continue
 
             if label == "curl_to_hold_material":
-                q_goal = q_seed.copy()
                 bucket_idx = CTRL.name_to_idx["bucket"]
-                q_goal[bucket_idx] = deg_to_rad(float(bucket_deg if bucket_deg is not None else candidate.get("bucket_curl", -105.0)))
+                q_goal = None
+                pose_info = {}
+                try:
+                    curl_rows, curl_reason = solve_dig_pose_candidates(
+                        label,
+                        point,
+                        float(bucket_deg if bucket_deg is not None else candidate.get("bucket_curl", CURL_HOLD_TARGET_DEG)),
+                        duration,
+                        q_seed,
+                        bucket_world_deg=None,
+                        ik_effector="tip",
+                        accept_err=0.62,
+                        soft_accept_err=0.90,
+                        bucket_motion_weight=0.50,
+                        bucket_preference_weight=1.2,
+                        max_solutions=2,
+                    )
+                except Exception as e:
+                    curl_rows = []
+                    curl_reason = f"{type(e).__name__}:{e}"
+                if curl_rows:
+                    best_curl = sorted(
+                        curl_rows,
+                        key=lambda row: (
+                            float((row.get("info") or {}).get("planar_err", 999.0) or 999.0),
+                            sum(q_delta_abs_deg(np.array(row.get("q_goal"), dtype=np.float32), q_seed)),
+                        ),
+                    )[0]
+                    q_goal = np.array(best_curl["q_goal"], dtype=np.float32).copy()
+                    pose_info = dict(best_curl.get("info", {}) or {})
+                    pose_info["source"] = "curl_lift_tip_ik"
+                if q_goal is None:
+                    q_goal = q_seed.copy()
+                    boom_idx = CTRL.name_to_idx.get("boom", 1)
+                    q_goal[boom_idx] = float(q_goal[boom_idx]) + deg_to_rad(float(candidate.get("curl_boom_lift_deg", 4.5)))
+                    q_goal[bucket_idx] = deg_to_rad(float(bucket_deg if bucket_deg is not None else candidate.get("bucket_curl", CURL_HOLD_TARGET_DEG)))
+                    pose_info = {"source": "bucket_plus_boom_lift_fallback", "reason": str(curl_reason)}
                 q_goal = clip_command_near(q_goal, reference=q_seed)
                 motion = plan_joint_motion_metrics(q_goal, q_seed, duration)
                 path_penalty, path_detail = plan_path_penalty(q_seed, q_goal, label)
+                curl_report = predicted_phase_ground_report(q_goal, label, reference_q=q_seed)
+                curl_ok, curl_reason = phase_ground_ok(label, curl_report)
+                if not curl_ok:
+                    fail_reasons.append(f"{label}: {curl_reason}")
+                    continue
                 target_point = predicted_end_world_point(q_goal, end_effector="tip", reference_q=q_seed)
                 if target_point is None:
                     target_point = point
@@ -11493,9 +12852,19 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                     "q_goal_rad": vec_list(q_goal, 4),
                     "q_goal_deg": q_deg_values(q_goal, wrap_swing_for_display=True),
                     "duration": float(duration),
-                    "effector": "bucket_only_seal",
+                    "effector": "tip_curl_lift" if pose_info.get("source") == "curl_lift_tip_ik" else "bucket_plus_boom_lift",
                     "seal_bucket_first": True,
                     "bucket_target_deg": float(rad_to_deg(q_goal[bucket_idx])),
+                    "curl_pose": pose_info,
+                    "ground": {
+                        "ok": bool(curl_ok),
+                        "reason": str(curl_reason),
+                        "tip_depth": curl_report.get("tip_sand_depth"),
+                        "bucket_mid_depth": curl_report.get("bucket_mid_sand_depth"),
+                        "pour_depth": curl_report.get("pour_sand_depth"),
+                        "load_depth": curl_report.get("load_sand_depth"),
+                        "surface_source": curl_report.get("tip_sand_surface_source"),
+                    },
                     "motion": motion,
                     "path": path_detail,
                     "stage_cost": float(motion["cost"] + path_penalty),
@@ -11554,12 +12923,20 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
 
             for pose in pose_rows:
                 q_goal = np.array(pose["q_goal"], dtype=np.float32).copy()
+                if label == "lift_carry":
+                    bucket_idx = CTRL.name_to_idx.get("bucket", 3)
+                    q_goal[bucket_idx] = float(q_seed[bucket_idx])
                 info = pose.get("info", {})
                 motion = plan_joint_motion_metrics(q_goal, q_seed, duration)
                 path_penalty, path_detail = plan_path_penalty(q_seed, q_goal, label)
+                front_report = predicted_phase_ground_report(q_goal, label, reference_q=q_seed)
+                front_ok, front_reason, front_penalty = cut_front_edge_quality(label, front_report)
+                if not front_ok:
+                    fail_reasons.append(f"{label}: {front_reason}")
+                    continue
                 ik_penalty = float(DIG_PLAN_IK_ERR_COST) * float(info.get("planar_err", 0.0) or 0.0)
                 angle_penalty = 0.35 * max(0.0, float(info.get("world_angle_err_deg", 0.0) or 0.0))
-                total_cost = float(beam["cost"]) + motion["cost"] + path_penalty + ik_penalty + angle_penalty
+                total_cost = float(beam["cost"]) + motion["cost"] + path_penalty + ik_penalty + angle_penalty + front_penalty
                 stage_row = {
                     "phase": label,
                     "planned": True,
@@ -11575,7 +12952,16 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                     "min_z": float(info.get("min_z", 0.0) or 0.0),
                     "motion": motion,
                     "path": path_detail,
-                    "stage_cost": float(motion["cost"] + path_penalty + ik_penalty + angle_penalty),
+                    "front_edge": {
+                        "ok": bool(front_ok),
+                        "reason": str(front_reason),
+                        "tip_depth": front_report.get("tip_sand_depth"),
+                        "bucket_mid_depth": front_report.get("bucket_mid_sand_depth"),
+                        "pour_depth": front_report.get("pour_sand_depth"),
+                        "load_depth": front_report.get("load_sand_depth"),
+                        "surface_source": front_report.get("tip_sand_surface_source"),
+                    },
+                    "stage_cost": float(motion["cost"] + path_penalty + ik_penalty + angle_penalty + front_penalty),
                 }
                 if bucket_world_use is not None:
                     stage_row["bucket_world_deg"] = float(bucket_world_use)
@@ -12309,7 +13695,8 @@ async def execute_unload_sequence(stage_name, q_goal, duration, task_id=None):
             "[PLAN EXEC TRACE]",
             f"stage={stage_name}",
             f"points={len(trace_points)}",
-            "source=active_command_remaining",
+            "source=active_stage_diagnostic",
+            f"blue_trace_source={STATE.get('trace_plan_source', '')}",
         )
     except Exception as e:
         info_print("[WARN] [PLAN EXEC TRACE] unload cache failed:", stage_name, type(e).__name__, e)
@@ -12331,16 +13718,51 @@ async def execute_unload_sequence(stage_name, q_goal, duration, task_id=None):
                     f"obstacle sample={obstacle_sample}/{PATH_CHECK_SAMPLES} "
                     + format_obstacle_report(stage_name, obstacle_report, obstacle_reason)
                 )
-            info_print(
-                "[PLAN EXEC DIRECT WARN]",
-                f"stage={stage_name}",
-                "; ".join(detail),
-                "following cached plan without hidden route injection",
-            )
+            detail_text = "; ".join(detail)
+            strict_needs_route = strict_path_precheck_phase(stage_name)
+            if strict_needs_route:
+                info_print(
+                    "[PLAN EXEC PRECHECK ROUTE]",
+                    f"stage={stage_name}",
+                    detail_text,
+                    "route_required=True",
+                )
+                try:
+                    debug_timeline_record(
+                        "PATH_PRECHECK_ROUTE",
+                        stage=stage_name,
+                        result="route_required",
+                        reason=detail_text,
+                        q_cmd=q_goal,
+                        q_real=get_real_joint_positions(),
+                        data={
+                            "phase_ok": bool(phase_ok),
+                            "phase_reason": str(phase_reason),
+                            "phase_sample": int(phase_sample),
+                            "obstacle_ok": bool(obstacle_ok),
+                            "obstacle_reason": str(obstacle_reason),
+                            "obstacle_sample": int(obstacle_sample),
+                        },
+                        include_sand=True,
+                    )
+                except Exception:
+                    pass
+            else:
+                info_print(
+                    "[PLAN EXEC DIRECT WARN]",
+                    f"stage={stage_name}",
+                    detail_text,
+                    "sand_contact_or_curl_allowance=True",
+                )
     except Exception as e:
+        if strict_path_precheck_phase(stage_name):
+            reason_text = f"execution_failed/path_precheck_failed:{stage_name}:{type(e).__name__}:{e}"
+            set_execution_failure_reason(reason_text)
+            info_print("[PLAN EXEC PRECHECK FAILED]", f"stage={stage_name}", reason_text, "hard_stop=True")
+            return False
         info_print("[WARN] [PLAN EXEC DIRECT] unload path precheck failed:", stage_name, type(e).__name__, e)
 
-    success = await move_to_profile(
+    success = await move_to_profile_with_clearance(
         q_goal,
         seconds=duration,
         label=stage_name,
@@ -12674,7 +14096,16 @@ async def execute_dig_plan_step(step_index=None):
     task_id = start_task(f"dig_step_{stage_name}")
 
     log_phase_ground("[DIG GUARD CURRENT]", stage_name)
-    ok, reason, report = log_predicted_phase_ground("[DIG GUARD TARGET]", stage_name, q_goal)
+    try:
+        guard_reference_q = q_real_near_command(get_real_joint_positions(), CTRL.q_cmd)
+    except Exception:
+        guard_reference_q = CTRL.q_cmd.copy()
+    ok, reason, report = log_predicted_phase_ground(
+        "[DIG GUARD TARGET]",
+        stage_name,
+        q_goal,
+        reference_q=guard_reference_q,
+    )
     if not ok:
         msg = format_ground_report(stage_name, report, reason)
         update_status(
@@ -12739,7 +14170,16 @@ async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"
             return False
 
         log_phase_ground("[DIG GUARD CURRENT]", stage_name)
-        ok, reason, report = log_predicted_phase_ground("[DIG GUARD TARGET]", stage_name, q_goal)
+        try:
+            guard_reference_q = q_real_near_command(get_real_joint_positions(), CTRL.q_cmd)
+        except Exception:
+            guard_reference_q = CTRL.q_cmd.copy()
+        ok, reason, report = log_predicted_phase_ground(
+            "[DIG GUARD TARGET]",
+            stage_name,
+            q_goal,
+            reference_q=guard_reference_q,
+        )
         if not ok:
             msg = format_ground_report(stage_name, report, reason)
             update_status(
@@ -12799,13 +14239,34 @@ async def calibrate_ik():
     global IK_MODEL
 
     update_status("Calibrating planar IK...", force=True)
+    IK_MODEL = None
+    STATE["ik_calibration_valid"] = False
+    STATE["ik_calibration_report"] = {"status": "running"}
+
+    async def fail(reason, data=None):
+        IK_MODEL_STATE = {"status": "failed", "reason": str(reason)}
+        if isinstance(data, dict):
+            IK_MODEL_STATE.update(data)
+        STATE["ik_calibration_valid"] = False
+        STATE["ik_calibration_report"] = IK_MODEL_STATE
+        update_status(f"[IK CALIBRATE FAILED] {reason}", force=True)
+        debug_timeline_record("IK_CALIBRATE", result="failed", reason=str(reason), data=IK_MODEL_STATE, include_sand=False)
+        return False
+
+    safe_ok = await set_joint_pose_direct_and_settle(
+        safe_home_q(),
+        label="ik_calibration_safe_pose",
+        mode="calibrate_safe_pose",
+        settle_frames=IK_CALIBRATION_SAFE_SETTLE_FRAMES,
+    )
+    if not safe_ok:
+        return await fail("safe pose not reached")
 
     update_q_cmd_from_real()
     q0 = CTRL.q_cmd.copy()
     base_chain = current_planar_chain()
     if base_chain is None:
-        update_status("[IK CALIBRATE FAILED] cannot read current chain.", force=True)
-        return
+        return await fail("cannot read current chain")
 
     base_angles = base_chain["angles"]
     h = IK_CALIBRATION_STEP
@@ -12824,11 +14285,20 @@ async def calibrate_ik():
 
         await move_to(q_probe, 0.55, mode="calibrate")
         await step_updates(24)
+        reached, reach_detail, _blocked, _swing_err, max_err, _q_real = motion_reach_report(q_probe)
+        if (not reached) and float(max_err) > IK_CALIBRATION_REACH_TOL_DEG:
+            return await fail(
+                f"{joint_name} probe not reached",
+                {
+                    "joint": joint_name,
+                    "max_err_deg": round(float(max_err), 3),
+                    "detail": reach_detail,
+                },
+            )
 
         chain = current_planar_chain()
         if chain is None:
-            signs.append(1.0)
-            info_print("[WARN] IK sign probe failed:", joint_name)
+            return await fail(f"{joint_name} sign probe failed")
         else:
             angles = chain["angles"]
             if angle_idx == 0:
@@ -12838,12 +14308,32 @@ async def calibrate_ik():
             else:
                 delta = wrap_angle((angles[2] - angles[1]) - (base_angles[2] - base_angles[1]))
 
+            if abs(float(delta)) < IK_CALIBRATION_MIN_DELTA_RAD:
+                return await fail(
+                    f"{joint_name} probe response too small",
+                    {
+                        "joint": joint_name,
+                        "delta_rad": float(delta),
+                        "min_delta_rad": float(IK_CALIBRATION_MIN_DELTA_RAD),
+                        "requested_step_rad": float(h),
+                    },
+                )
             sign = 1.0 if delta >= 0.0 else -1.0
             signs.append(sign)
             info_print(f"[IK CAL] {joint_name}: delta={delta:.6f} rad for +{h:.3f}, sign={sign:+.0f}")
 
         await move_to(q0, 0.55, mode="calibrate")
         await step_updates(24)
+        restored, restore_detail, _blocked, _swing_err, restore_max_err, _q_real = motion_reach_report(q0)
+        if (not restored) and float(restore_max_err) > IK_CALIBRATION_RESTORE_TOL_DEG:
+            return await fail(
+                f"{joint_name} restore pose not reached",
+                {
+                    "joint": joint_name,
+                    "max_err_deg": round(float(restore_max_err), 3),
+                    "detail": restore_detail,
+                },
+            )
 
     await move_to(q0, 0.65, mode="calibrate")
     await step_updates(30)
@@ -12851,8 +14341,7 @@ async def calibrate_ik():
     q_rest = CTRL.q_cmd.copy()
     chain0 = current_planar_chain("mid")
     if chain0 is None:
-        update_status("[IK CALIBRATE FAILED] cannot restore chain.", force=True)
-        return
+        return await fail("cannot restore chain")
 
     signs = np.array(signs, dtype=np.float32)
     effectors = {}
@@ -12867,13 +14356,33 @@ async def calibrate_ik():
         }
 
     if "mid" not in effectors or "tip" not in effectors:
-        update_status("[IK CALIBRATE FAILED] missing mid/tip effector geometry.", force=True)
-        return
+        return await fail("missing mid/tip effector geometry")
 
     IK_MODEL = {
         "signs": signs,
         "effectors": effectors,
         "calibrated": True,
+        "valid": False,
+    }
+    sanity_ok, sanity_reason, sanity_errors = validate_ik_model_against_current_pose(IK_MODEL, q_rest)
+    if not sanity_ok:
+        IK_MODEL = None
+        return await fail(
+            sanity_reason,
+            {
+                "effector_errors_m": {
+                    k: None if v is None else round(float(v), 4)
+                    for k, v in sanity_errors.items()
+                }
+            },
+        )
+    IK_MODEL["valid"] = True
+    IK_MODEL["validation"] = {
+        "sanity": sanity_reason,
+        "effector_errors_m": {
+            k: None if v is None else round(float(v), 4)
+            for k, v in sanity_errors.items()
+        },
     }
 
     CTRL.q_cmd = q_rest.copy()
@@ -12883,7 +14392,15 @@ async def calibrate_ik():
     for end_effector, part in IK_MODEL["effectors"].items():
         info_print(f"[IK CAL] {end_effector}.lengths:", [float(x) for x in part["lengths"]])
         info_print(f"[IK CAL] {end_effector}.offsets:", [float(x) for x in part["offsets"]])
+    STATE["ik_calibration_valid"] = True
+    STATE["ik_calibration_report"] = {
+        "status": "ok",
+        "signs": [float(x) for x in IK_MODEL["signs"]],
+        "validation": IK_MODEL.get("validation", {}),
+    }
+    debug_timeline_record("IK_CALIBRATE", result="ok", reason="ok", data=STATE["ik_calibration_report"], include_sand=False)
     update_status("Planar IK calibrated.", force=True)
+    return True
 
 
 def follow_step():

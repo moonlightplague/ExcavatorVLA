@@ -112,7 +112,8 @@ def adaptive_dig_plan_candidates(rt, target_xyz):
                         "mid_depth": mid_depth,
                         "exit_pull": exit_pull,
                         "exit_depth": exit_depth,
-                        "curl_z": max(0.08, min(0.24, requested_depth * 0.52 + 0.06)),
+                        "exit_lift_z": max(0.08, min(0.14, requested_depth * 0.32 + 0.04)),
+                        "curl_z": max(0.28, min(0.46, requested_depth * 0.72 + 0.18)),
                         "lift_height": lift_height,
                         "min_lift_z": max(rt.GROUND_TOP_Z + 1.05, float(target[2]) + 0.48),
                         "lift_above_target": max(0.48, lift_height),
@@ -123,10 +124,11 @@ def adaptive_dig_plan_candidates(rt, target_xyz):
                         "bucket_cut": -58.0 - 4.0 * depth_scale,
                         "bucket_attack_world": float(rt.BUCKET_DIG_APPROACH_WORLD_DEG + 0.5 * angle_bias),
                         "bucket_cut_world": float(rt.BUCKET_DIG_INSERT_WORLD_DEG + angle_bias),
-                        "bucket_mid_cut_world": float(rt.BUCKET_DIG_PULL_WORLD_DEG + angle_bias),
-                        "bucket_exit_world": float(rt.BUCKET_DIG_EXIT_WORLD_DEG + 0.5 * angle_bias),
+                        "bucket_mid_cut_world": float(rt.BUCKET_DIG_PULL_WORLD_DEG + 0.6 * angle_bias),
+                        "bucket_exit_world": float(rt.BUCKET_DIG_EXIT_WORLD_DEG + 0.35 * angle_bias),
                         "bucket_exit": -70.0,
-                        "bucket_curl": -104.0,
+                        "bucket_curl": float(rt.CURL_HOLD_TARGET_DEG),
+                        "curl_boom_lift_deg": max(4.0, min(6.0, 4.0 + 2.0 * depth_scale)),
                     }
                 )
                 idx += 1

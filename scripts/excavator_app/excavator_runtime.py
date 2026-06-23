@@ -9562,7 +9562,8 @@ def plan_path_penalty(q_start, q_goal, mode, deadline=None):
 
 
 def planning_deadline_exceeded(deadline):
-    if bool(STATE.get("planning_cancel_requested", False)):
+    source = str(STATE.get("dig_plan_planning_source", ""))
+    if bool(STATE.get("planning_cancel_requested", False)) and source != "loaded_route_test":
         return True
     if bool(STATE.get("auto_collect_stop_requested", False)) and str(STATE.get("dig_plan_planning_source", "")) == "auto_collect":
         return True
@@ -19865,6 +19866,7 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
             f"budget={float(LOADED_ROUTE_TEST_PLAN_BUDGET_SECONDS):.1f}s",
             "mode=finite_search_with_debug",
             "reason=avoid_main_thread_candidate_explosion",
+            f"cleared_stale_cancel={bool(STATE.get('loaded_route_test_cleared_stale_cancel', False))}",
             force_log=True,
         )
     info_print(
@@ -20699,6 +20701,9 @@ def install_loaded_unload_route_test_plan_from_current():
     previous_perf_deadline = STATE.get("dig_plan_active_perf_deadline")
     previous_cache = STATE.get("planning_path_penalty_cache")
     previous_swing_cache = STATE.get("planning_swing_corridor_cache")
+    stale_planning_cancel = bool(STATE.get("planning_cancel_requested", False))
+    STATE["planning_cancel_requested"] = False
+    STATE["loaded_route_test_cleared_stale_cancel"] = stale_planning_cancel
     STATE["planning_path_penalty_cache"] = {}
     STATE["planning_path_penalty_cache_hits"] = 0
     STATE["planning_path_penalty_cache_misses"] = 0

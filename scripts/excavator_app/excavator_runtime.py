@@ -611,6 +611,7 @@ BUCKET_DIG_INSERT_WORLD_DEG = -78.0
 BUCKET_DIG_PULL_WORLD_DEG = -92.0
 BUCKET_DIG_EXIT_WORLD_DEG = -96.0
 BUCKET_UNLOAD_DUMP_DEG = 82.0
+LOADED_ROUTE_UNLOAD_DUMP_DEG = 45.0
 UNLOAD_DUMP_BUCKET_TOL_DEG = 18.0
 UNLOAD_DUMP_ACCEPT_ERR = 0.45
 UNLOAD_DUMP_SECONDS = 0.90
@@ -629,6 +630,10 @@ UNLOAD_FORCE_CENTER_HIGH_RELEASE = True
 UNLOAD_CENTER_RELEASE_XY_TOL = 0.16
 UNLOAD_CENTER_RELEASE_SOFT_XY_TOL = 0.50
 UNLOAD_CENTER_RELEASE_CORRECTION_GAIN = 0.45
+UNLOAD_CENTER_RELEASE_DRIFT_COMPENSATION_GAIN = 0.45
+UNLOAD_CENTER_RELEASE_DRIFT_COMPENSATION_MAX = 0.45
+UNLOAD_CENTER_RELEASE_LANDING_CORRECTION_WEIGHT = 0.55
+UNLOAD_CENTER_RELEASE_RADIAL_SHIFT_M = -0.18  # negative = slightly closer to excavator
 UNLOAD_RELEASE_SOURCE_BLEND = 0.50
 UNLOAD_DROP_SOURCE_MIN_CLEARANCE_Z = 0.18
 UNLOAD_PREFERRED_RELEASE_ABOVE_WALL_Z = 1.65
@@ -646,6 +651,7 @@ UNLOAD_DROP_IK_CORRECTION_ITERS = 5
 UNLOAD_PRE_DUMP_ALIGN_MIN_SECONDS = 0.35
 UNLOAD_PRE_DUMP_ALIGN_MAX_SECONDS = 1.80
 UNLOAD_PRE_DUMP_NON_BUCKET_TOL_DEG = 0.75
+UNLOAD_DUMP_METRIC_SAMPLE_STRIDE_LOADED = 3
 UNLOAD_ACTUAL_BUCKET_XY_MARGIN = 0.08
 UNLOAD_ACTUAL_LOAD_MARKER_XY_TOL = 0.42
 UNLOAD_ACTUAL_MIN_ABOVE_WALL_Z = 0.04
@@ -12046,6 +12052,11 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
         )
         seconds_eff = max(float(seconds_eff), loaded_floor)
     steps = max(4, int(seconds_eff * CONTROL_HZ))
+    loaded_route_fast_motion = False
+    try:
+        loaded_route_fast_motion = bool(active_loaded_route_fast_exec(label or mode))
+    except Exception:
+        loaded_route_fast_motion = False
     STATE["dataset_current_q_goal"] = q1.copy()
     STATE["trace_active_motion"] = {
         "label": str(label),
@@ -12053,7 +12064,7 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
         "q_goal": q1.copy(),
         "expires_at": time.time() + seconds_eff + 1.0,
     }
-    if current_trace_mode() == 2:
+    if current_trace_mode() == 2 and not loaded_route_fast_motion:
         draw_trace(force=False)
 
     update_status(f"[MOVE] {label} phase={mode} duration={seconds_eff:.2f}s speed={sm:.2f}", force=True)
@@ -12186,8 +12197,9 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
         if motion_cancel_requested(task_id):
             update_status(f"[MOVE STOPPED] {label}", force=True)
             return False
-        dataset_record_sample(mode, q_cmd=CTRL.q_cmd.copy(), label=label)
-        notify_sand_site_tool_sample(mode)
+        if not loaded_route_fast_motion:
+            dataset_record_sample(mode, q_cmd=CTRL.q_cmd.copy(), label=label)
+            notify_sand_site_tool_sample(mode)
         if is_sand_contact_phase(contact_stage_name):
             try:
                 q_contact_real = q_real_near_command(get_real_joint_positions(), CTRL.q_cmd)
@@ -20688,7 +20700,7 @@ def install_loaded_unload_route_test_plan_from_current():
         "unload_landing_xyz": vec_list(landing, 3),
         "unload_release_xyz": vec_list(release, 3),
         "unload_point_xyz": vec_list(release, 3),
-        "unload_dump_deg": float(BUCKET_UNLOAD_DUMP_DEG),
+        "unload_dump_deg": float(LOADED_ROUTE_UNLOAD_DUMP_DEG),
         "planner_cost": 0.0,
         "rank_cost": 0.0,
         "score": 0.0,
@@ -20912,13 +20924,14 @@ def plan_dump_pose_to_bin(
         except Exception:
             pass
     center_release_mode = bool(UNLOAD_FORCE_CENTER_HIGH_RELEASE)
+    drift_compensation_xy = np.zeros(2, dtype=np.float32)
+    radial_shift_xy = np.zeros(2, dtype=np.float32)
     if center_release_mode:
         release_target = np.array(drop_target, dtype=np.float32).reshape(-1)[:3].copy()
         release_target[2] = float(min_release_z)
         # In center-release mode the controlled quantity is the bucket opening center.
-        # A precomputed pour->opening offset is brittle across IK poses, so use the
-        # desired opening center directly and close the residual with release_xy feedback.
-        pour_target = release_target.copy()
+        # Keep it near the unload center, but bias it slightly upstream by the
+        # predicted falling drift so high releases land closer to the bin center.
         load = bucket_point_world("load", q=q_seed_dump, reference_q=q_seed)
         initial_drift = unload_drop_drift_model(
             q=q_seed_dump,
@@ -20927,6 +20940,38 @@ def plan_dump_pose_to_bin(
             load=load,
             wall_z=wall_z,
         )
+        try:
+            center_xy = get_swing_xy_center()
+            target_xy = np.array(drop_target, dtype=np.float32).reshape(-1)[:2]
+            radial_xy = target_xy - center_xy
+            radial_norm = float(np.linalg.norm(radial_xy))
+            if radial_norm > 1e-4:
+                radial_shift_xy = radial_xy * float(UNLOAD_CENTER_RELEASE_RADIAL_SHIFT_M / radial_norm)
+                release_target[0] += float(radial_shift_xy[0])
+                release_target[1] += float(radial_shift_xy[1])
+            comp_gain = clamp(float(UNLOAD_CENTER_RELEASE_DRIFT_COMPENSATION_GAIN), 0.0, 1.0)
+            drift_xy = np.array(initial_drift.get("drift_xy", [0.0, 0.0]), dtype=np.float32).reshape(-1)[:2]
+            drift_compensation_xy = drift_xy * float(comp_gain)
+            comp_norm = float(np.linalg.norm(drift_compensation_xy))
+            max_comp = max(0.0, float(UNLOAD_CENTER_RELEASE_DRIFT_COMPENSATION_MAX))
+            if comp_norm > max_comp > 0.0:
+                drift_compensation_xy *= float(max_comp / comp_norm)
+            release_target[0] -= float(drift_compensation_xy[0])
+            release_target[1] -= float(drift_compensation_xy[1])
+            initial_drift = unload_drop_drift_model(
+                q=q_seed_dump,
+                reference_q=q_seed,
+                release=release_target,
+                load=load,
+                wall_z=wall_z,
+            )
+            initial_drift["drift_compensation_xy"] = drift_compensation_xy.copy()
+            initial_drift["drift_compensation_gain"] = float(comp_gain)
+            initial_drift["radial_shift_xy"] = radial_shift_xy.copy()
+        except Exception:
+            drift_compensation_xy = np.zeros(2, dtype=np.float32)
+            radial_shift_xy = np.zeros(2, dtype=np.float32)
+        pour_target = release_target.copy()
     else:
         release_target, initial_drift = unload_release_target_for_landing(
             drop_target,
@@ -20948,7 +20993,6 @@ def plan_dump_pose_to_bin(
         or (
             center_release_mode
             and unload_drop_execution_ready(seed_drop)
-            and bool(seed_drop.get("close_xy", False))
             and float(seed_drop.get("release_xy_err", 999.0) or 999.0) <= float(UNLOAD_CENTER_RELEASE_SOFT_XY_TOL)
         )
     )
@@ -20996,9 +21040,11 @@ def plan_dump_pose_to_bin(
             f"landing_target={vec_list(drop_target, 3)} "
             f"required_release={vec_list(initial_release_target, 3)} "
             f"ik_pour_target={vec_list(initial_pour_target, 3)} "
-            f"release_policy={'opening_center_high_no_drift_compensation' if center_release_mode else 'drift_compensated'} "
+            f"release_policy={'opening_center_high_light_drift_compensation' if center_release_mode else 'drift_compensated'} "
             f"ik_target_policy={'direct_opening_center_iterative' if center_release_mode else 'pour_offset_from_release'} "
             f"release_source=bucket_opening_center "
+            f"radial_shift_xy={vec_list(radial_shift_xy, 2)} "
+            f"drift_comp_xy={vec_list(drift_compensation_xy, 2)} "
             f"release_align_deg={release_alignment_bucket_deg:.2f} "
             f"final_dump_deg={final_dump_deg:.2f} "
             f"preferred_release_z={fmt_optional(preferred_release_z)} "
@@ -21222,16 +21268,23 @@ def plan_dump_pose_to_bin(
                 correction_q = q_dump
                 correction_target = release_target.copy()
 
-            err_xy = np.array(
+            release_err_xy = np.array(
                 [float(correction_drop.get("release_dx", 0.0)), float(correction_drop.get("release_dy", 0.0))],
                 dtype=np.float32,
             )
+            landing_err_xy = np.array(
+                [float(correction_drop.get("dx", 0.0)), float(correction_drop.get("dy", 0.0))],
+                dtype=np.float32,
+            )
+            landing_weight = clamp(float(UNLOAD_CENTER_RELEASE_LANDING_CORRECTION_WEIGHT), 0.0, 1.0)
+            err_xy = release_err_xy * float(1.0 - landing_weight) + landing_err_xy * float(landing_weight)
             err_norm = float(np.linalg.norm(err_xy))
             last_reason = (
                 f"center opening release failed: release_xy_err={fmt_optional(correction_drop.get('release_xy_err'))} "
                 f"release_centered_ok={correction_drop.get('release_centered_ok')} "
                 f"xy_err={fmt_optional(correction_drop.get('xy_err'))} "
-                f"acceptance={correction_drop.get('landing_acceptance')}"
+                f"acceptance={correction_drop.get('landing_acceptance')} "
+                f"landing_correction_weight={landing_weight:.2f}"
             )
             if err_norm < 0.01:
                 break
@@ -21636,10 +21689,12 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
     step_rad = deg_to_rad(max(2.0, float(UNLOAD_DUMP_STEP_DEG)))
     max_steps = max(8, int(math.ceil(abs(target_bucket - float(q0[bucket_idx])) / max(1e-4, step_rad))) + 4)
     wait_frames = max(3, int(float(UNLOAD_DUMP_STEP_SECONDS) * 60))
+    loaded_route_dump = str(STATE.get("active_task_name", "")) == "loaded_unload_route_test"
+    metric_stride = max(1, int(UNLOAD_DUMP_METRIC_SAMPLE_STRIDE_LOADED if loaded_route_dump else 1))
     start_metrics = record_phase_metrics("before_dump_direct")
     start_bucket_count = int(start_metrics.get("bucket_from_pile_count", 0)) if isinstance(start_metrics, dict) else 0
     start_bin_count = int(start_metrics.get("bin_from_pile_count", 0)) if isinstance(start_metrics, dict) else 0
-    if str(STATE.get("active_task_name", "")) == "loaded_unload_route_test":
+    if loaded_route_dump and bool(LOADED_ROUTE_STAGE_PARTICLE_DIAGNOSTICS):
         bucket_particle_diagnostic("before_dump_direct")
     info_print(
         "[UNLOAD DUMP DIRECT START]",
@@ -21651,6 +21706,7 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
         f"bucket_target={rad_to_deg(target_bucket):.2f}deg",
         f"bucket_start_particles={start_bucket_count}",
         f"bin_start_particles={start_bin_count}",
+        f"metric_stride={metric_stride}",
         force_log=True,
     )
 
@@ -21678,19 +21734,22 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
             set_execution_failure_reason(f"execution_failed/unload_dump_action_failed:{stage_name}:{send_reason}")
             return False
         await step_updates(wait_frames)
-        last_metrics = record_phase_metrics("during_dump_direct")
+        do_metric_sample = (i == 0) or ((i + 1) >= max_steps) or ((i + 1) % metric_stride == 0)
+        if do_metric_sample:
+            last_metrics = record_phase_metrics("during_dump_direct")
         bucket_now = int(last_metrics.get("bucket_from_pile_count", 0)) if isinstance(last_metrics, dict) else 0
         bin_now = int(last_metrics.get("bin_from_pile_count", 0)) if isinstance(last_metrics, dict) else 0
-        info_print(
-            "[UNLOAD DUMP DIRECT SAMPLE]",
-            f"stage={stage_name}",
-            f"i={i + 1}/{max_steps}",
-            f"bucket_cmd={rad_to_deg(float(q[bucket_idx])):.2f}deg",
-            f"bucket_real={rad_to_deg(real_bucket):.2f}deg",
-            f"bucket_delta={bucket_now - start_bucket_count}",
-            f"bin_delta={bin_now - start_bin_count}",
-            force_log=True,
-        )
+        if do_metric_sample:
+            info_print(
+                "[UNLOAD DUMP DIRECT SAMPLE]",
+                f"stage={stage_name}",
+                f"i={i + 1}/{max_steps}",
+                f"bucket_cmd={rad_to_deg(float(q[bucket_idx])):.2f}deg",
+                f"bucket_real={rad_to_deg(real_bucket):.2f}deg",
+                f"bucket_delta={bucket_now - start_bucket_count}",
+                f"bin_delta={bin_now - start_bin_count}",
+                force_log=True,
+            )
         stop_bucket_count = max(0, int(start_bucket_count * float(UNLOAD_DUMP_STOP_BUCKET_FRACTION)))
         if (
             bin_now - start_bin_count >= max(QUALITY_MIN_DUMP_PARTICLES, 8)
@@ -21714,7 +21773,7 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
         end_metrics = record_phase_metrics("after_dump_direct")
         bucket_end = int(end_metrics.get("bucket_from_pile_count", 0)) if isinstance(end_metrics, dict) else 0
         bin_end = int(end_metrics.get("bin_from_pile_count", 0)) if isinstance(end_metrics, dict) else 0
-        if str(STATE.get("active_task_name", "")) == "loaded_unload_route_test":
+        if loaded_route_dump and bool(LOADED_ROUTE_STAGE_PARTICLE_DIAGNOSTICS):
             bucket_particle_diagnostic("after_dump_direct")
         info_print(
             "[UNLOAD DUMP DIRECT DONE]",

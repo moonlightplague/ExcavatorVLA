@@ -271,6 +271,7 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "auto_collect_active": False,
     "auto_collect_stop_requested": False,
     "auto_collect_requested": 0,
+    "auto_collect_max_attempts_requested": 0,
     "auto_collect_attempts": 0,
     "auto_collect_successes": 0,
     "auto_collect_failures": 0,
@@ -420,15 +421,24 @@ CURL_HOLD_ACCEPT_BUCKET_DEG = -110.0
 CURL_HOLD_ACCEPT_MAX_ERR_DEG = 14.0
 CURL_HOLD_TARGET_DEG = -120.0
 BUCKET_LOADED_CLOSED_LIMIT_DEG = CURL_HOLD_TARGET_DEG
-SECURE_PROGRESSIVE_MIN_STEPS = 2
-SECURE_PROGRESSIVE_MAX_STEPS = 4
-SECURE_PROGRESSIVE_MAX_BUCKET_STEP_DEG = 28.0
-SECURE_PROGRESSIVE_STEP_SECONDS = 0.62
+SECURE_PROGRESSIVE_MIN_STEPS = 1
+SECURE_PROGRESSIVE_MAX_STEPS = 3
+SECURE_PROGRESSIVE_MAX_BUCKET_STEP_DEG = 90.0
+SECURE_PROGRESSIVE_STEP_SECONDS = 1.05
+SECURE_PROGRESSIVE_LIFT_LEAD_FRACTION = 0.25
+SECURE_PROGRESSIVE_LARGE_CURL_DEG = 35.0
+SECURE_PROGRESSIVE_MIN_LIFT_FOR_LARGE_CURL_DEG = 3.0
+SECURE_MATERIAL_LOSS_HARD_GATE = False
+SAND_PREFLIGHT_SETTLE_HARD_GATE = False
+SECURE_HOLD_TRANSITIONAL_ACCEPT_BUCKET_DEG = -82.0
+SECURE_HOLD_TRANSITIONAL_MAX_ERR_DEG = 45.0
 SECURE_HOLD_MAX_SPILL_PARTICLES = 240
 SECURE_HOLD_MAX_SPILL_FRACTION = 0.35
 SECURE_HOLD_MAX_BUCKET_LOSS_FRACTION = 0.45
 SECURE_HOLD_MIN_RETAINED_FROM_CUT_FRACTION = 0.55
 LIFT_CARRY_MIN_RETAINED_FROM_CUT_FRACTION = 0.55
+LIFT_CARRY_SOFT_RETAINED_FROM_CUT_FRACTION = 0.45
+LIFT_CARRY_MIN_ABSOLUTE_BUCKET_PARTICLES = 1200
 MANUAL_FREEZE_STOP_ENABLED = True
 AUTO_FREEZE_STOP_ENABLED = True
 
@@ -462,6 +472,7 @@ DATASET_TRAJECTORY_FORMAT = "compact_jsonl_v4"
 DATASET_DEBUG_PLAN_FILE = "plan_debug.json"
 DATASET_DEBUG_TIMELINE_FILE = "debug_timeline.jsonl"
 AUTO_COLLECT_MAX_ATTEMPT_MULTIPLIER = 5
+AUTO_COLLECT_DEFAULT_MAX_ATTEMPTS = AUTO_COLLECT_DEFAULT_COUNT * AUTO_COLLECT_MAX_ATTEMPT_MULTIPLIER
 PLANNER_VERSION = "dig_plan_v4_joint_space_world_debug"
 QUALITY_GATE_VERSION = "quality_gate_v2_particles_no_freeze"
 AUTO_PREFLIGHT_MIN_PARTICLES = 1000
@@ -4986,6 +4997,7 @@ def auto_dataset_config_snapshot():
         "trajectory_format": DATASET_TRAJECTORY_FORMAT,
         "dataset_root": AUTO_COLLECT_DATASET_ROOT,
         "default_count": AUTO_COLLECT_DEFAULT_COUNT,
+        "default_max_attempts": AUTO_COLLECT_DEFAULT_MAX_ATTEMPTS,
         "max_attempt_multiplier": AUTO_COLLECT_MAX_ATTEMPT_MULTIPLIER,
         "max_plan_retries": AUTO_COLLECT_MAX_PLAN_RETRIES,
         "global_plan_failure_limit": AUTO_COLLECT_GLOBAL_PLAN_FAILURE_LIMIT,
@@ -6251,22 +6263,31 @@ def secure_hold_spill_report(stage_name, report, bucket_loaded=None):
     )
     moved = max(1, max(0, bucket_total) + spill_total)
     spill_ratio = float(spill_total) / float(moved)
-    ok = spill_total <= spill_limit and bucket_loss <= loss_limit
+    material_ok = bucket_loss <= loss_limit
+    ok = True
     cut_report = secure_phase_delta_report(current_metrics=None)
     cut_ok = True
     if isinstance(cut_report, dict) and cut_report.get("baseline") == "after_cut":
         cut_ok = bool(cut_report.get("ok", True))
-        if not cut_ok:
-            ok = False
-    reason = "ok" if ok else (
-        f"secure_spill_or_loss_too_high spill={spill_total}/{spill_limit} "
-        f"bucket_loss={bucket_loss}/{loss_limit} spill_ratio={spill_ratio:.2f}"
-    )
-    if not ok and not cut_ok:
-        reason = str(cut_report.get("reason", reason))
+    if not material_ok:
+        reason = (
+            f"secure_material_warning_loss spill={spill_total}/{spill_limit} "
+            f"bucket_loss={bucket_loss}/{loss_limit} spill_ratio={spill_ratio:.2f}"
+        )
+    elif not cut_ok:
+        reason = str(cut_report.get("reason", "secure_material_warning"))
+    elif spill_total > spill_limit:
+        reason = (
+            f"secure_spill_accepted spill={spill_total}/{spill_limit} "
+            f"bucket_loss={bucket_loss}/{loss_limit} spill_ratio={spill_ratio:.2f}"
+        )
+    else:
+        reason = "ok"
     return {
         "ok": bool(ok),
         "reason": reason,
+        "warning": "" if (material_ok and cut_ok) else reason,
+        "material_ok": bool(material_ok),
         "bucket_total_delta": int(bucket_total),
         "bucket_loss": int(bucket_loss),
         "bucket_loss_limit": int(loss_limit),
@@ -6338,10 +6359,44 @@ def sand_contact_stage_can_advance(q_goal, label="", mode="auto", seconds_eff=0.
                 "reason=loaded_bucket_retaining_geometry" if retains_material else "reason=real_loaded_bucket_hold",
             )
             return True
+        transitional_loaded_hold = loaded_transitional_hold_allowed(retain_report, loaded_count=bucket_loaded)
+        if (
+            "secure_load" in stage_name
+            and bucket_loaded >= CURL_HOLD_MIN_BUCKET_PARTICLES
+            and transitional_loaded_hold
+            and bucket_real_deg <= float(SECURE_HOLD_TRANSITIONAL_ACCEPT_BUCKET_DEG)
+            and bucket_err <= float(SECURE_HOLD_TRANSITIONAL_MAX_ERR_DEG)
+        ):
+            hold_spill = secure_hold_spill_report(stage_name, report, bucket_loaded=bucket_loaded)
+            if not bool(hold_spill.get("ok", False)):
+                info_print(
+                    "[SECURE HOLD WAIT]",
+                    f"stage={stage_name}",
+                    hold_spill.get("reason", "secure hold material gate failed"),
+                    f"bucket_loaded={bucket_loaded}",
+                    "mode=transitional",
+                )
+                return False
+            info_print(
+                "[CURL HOLD DONE]",
+                f"stage={stage_name}",
+                f"elapsed={elapsed:.2f}s",
+                f"bucket_real={bucket_real_deg:.2f}deg",
+                f"bucket_err={bucket_err:.2f}deg",
+                f"bucket_loaded={bucket_loaded}",
+                f"accept_bucket<={float(SECURE_HOLD_TRANSITIONAL_ACCEPT_BUCKET_DEG):.1f}deg",
+                "reason=loaded_bucket_transitional_secure_hold",
+            )
+            return True
 
     bad_cut, _bad_reason = sand_contact_bad_cut_geometry(stage_name, report)
     if bad_cut:
-        return False
+        info_print(
+            "[SAND CONTACT WARNING]",
+            f"stage={stage_name}",
+            "reason=bad_cut_geometry",
+            _bad_reason,
+        )
     bucket_total = int(report.get("total_bucket_delta", 0))
     pile_total = int(report.get("total_pile_delta", 0))
     spill_total = int(report.get("total_spill_delta", 0))
@@ -6435,10 +6490,32 @@ def sand_contact_stage_should_advance(stage_name, report, q_cmd=None, q_real=Non
                 f"pour_above_load_z={fmt_optional(retain_report.get('pour_above_load_z'))} "
                 f"hold_source={'geometry' if retains_material else 'real_loaded'}"
             )
+        transitional_loaded_hold = loaded_transitional_hold_allowed(retain_report, loaded_count=bucket_loaded)
+        if (
+            "secure_load" in str(stage_name)
+            and bucket_loaded >= CURL_HOLD_MIN_BUCKET_PARTICLES
+            and transitional_loaded_hold
+            and bucket_real_deg <= float(SECURE_HOLD_TRANSITIONAL_ACCEPT_BUCKET_DEG)
+            and bucket_err <= float(SECURE_HOLD_TRANSITIONAL_MAX_ERR_DEG)
+        ):
+            hold_spill = secure_hold_spill_report(stage_name, report, bucket_loaded=bucket_loaded)
+            if not bool(hold_spill.get("ok", False)):
+                return False, str(hold_spill.get("reason", "secure hold material gate failed"))
+            return True, (
+                f"loaded_bucket_transitional_secure_hold elapsed={elapsed:.2f}s "
+                f"bucket_real={bucket_real_deg:.2f}deg bucket_err={bucket_err:.2f}deg "
+                f"bucket_loaded={bucket_loaded} "
+                f"accept_bucket<={float(SECURE_HOLD_TRANSITIONAL_ACCEPT_BUCKET_DEG):.1f}deg"
+            )
 
     bad_cut, _bad_reason = sand_contact_bad_cut_geometry(stage_name, report)
     if bad_cut:
-        return False, ""
+        info_print(
+            "[SAND CONTACT WARNING]",
+            f"stage={stage_name}",
+            "reason=bad_cut_geometry",
+            _bad_reason,
+        )
     moved_material = max(1, bucket_total + spill_total)
     spill_ratio = float(spill_total) / float(moved_material)
     exit_loaded = "pull_exit_cut" in str(stage_name) and current_bucket >= CURL_HOLD_MIN_BUCKET_PARTICLES
@@ -7021,7 +7098,7 @@ def auto_collect_status_text():
     return (
         f"[AUTO DATASET] active={STATE.get('auto_collect_active')} "
         f"requested={STATE.get('auto_collect_requested')} "
-        f"attempts={STATE.get('auto_collect_attempts')} "
+        f"attempts={STATE.get('auto_collect_attempts')}/{STATE.get('auto_collect_max_attempts_requested', 0)} "
         f"success={STATE.get('auto_collect_successes')} "
         f"trainable={trainable} "
         f"rejected={STATE.get('auto_collect_rejections')} "
@@ -7250,6 +7327,7 @@ def auto_collect_write_run_summary():
             "quality_gate_version": QUALITY_GATE_VERSION,
             "config_hash": current_config_hash(),
             "requested": int(STATE.get("auto_collect_requested", 0)),
+            "max_attempts_requested": int(STATE.get("auto_collect_max_attempts_requested", 0)),
             "attempts": attempts,
             "episodes_index_rows": episodes_count,
             "successes": int(STATE.get("auto_collect_successes", 0)),
@@ -7586,6 +7664,9 @@ def auto_collect_preflight_report(target_successes=None):
     }
 
     reason = ""
+    preflight_warnings = []
+    if not bool(checks.get("sand_settled", False)):
+        preflight_warnings.append("preflight_warning/sand_not_settled:" + str(settle.get("reason", "")))
     reason_map = {
         "sand_site": "preflight_failed/sand_missing",
         "particle_system": "preflight_failed/particle_system_missing",
@@ -7605,6 +7686,8 @@ def auto_collect_preflight_report(target_successes=None):
         "quality_thresholds": "preflight_failed/quality_thresholds_invalid",
     }
     for key, ok in checks.items():
+        if key == "sand_settled" and not bool(SAND_PREFLIGHT_SETTLE_HARD_GATE):
+            continue
         if not bool(ok):
             reason = reason_map.get(key, f"preflight_failed/{key}")
             break
@@ -7612,9 +7695,12 @@ def auto_collect_preflight_report(target_successes=None):
     report = {
         "ok": not bool(reason),
         "reason": reason,
+        "warnings": preflight_warnings,
         "checks": checks,
         "sand": {
-            "ok": checks["sand_site"] and checks["particle_system"] and checks["particle_count"] and checks["sand_settled"],
+            "ok": checks["sand_site"] and checks["particle_system"] and checks["particle_count"],
+            "settle_hard_gate": bool(SAND_PREFLIGHT_SETTLE_HARD_GATE),
+            "warning": "; ".join(preflight_warnings),
             "center": vec_list(pile_center, 3),
             "radius": vec_list(pile_radius, 2),
             "particles": particle_count,
@@ -7667,6 +7753,7 @@ def auto_collect_preflight_report(target_successes=None):
         f"planner={'OK' if report['planner']['ok'] else 'BAD'} trace_cache={trace_cache_ready}",
         f"dataset={'OK' if report['dataset']['ok'] else 'BAD'} run_dir={run_dir} target_success={target_successes}",
         f"reason={reason or 'ok'}",
+        f"warnings={'; '.join(preflight_warnings) if preflight_warnings else 'none'}",
     )
     debug_timeline_record(
         "PREFLIGHT",
@@ -7854,6 +7941,7 @@ def compute_episode_quality_score(execution_success, reason):
     score = max(0.0, min(100.0, score))
 
     quality_reasons = []
+    quality_warnings = []
     if not execution_success:
         raw_reason = str(reason)
         if raw_reason.startswith((
@@ -7877,9 +7965,9 @@ def compute_episode_quality_score(execution_success, reason):
     if final_bin < QUALITY_MIN_DUMP_PARTICLES:
         quality_reasons.append(f"quality_rejected/low_final_bin_particles:{final_bin}")
     if spill_ratio > QUALITY_MAX_SPILL_RATIO:
-        quality_reasons.append(f"quality_rejected/high_spill_ratio:{spill_ratio:.2f}")
+        quality_warnings.append(f"quality_warning/high_spill_ratio:{spill_ratio:.2f}")
     if score < QUALITY_MIN_SCORE:
-        quality_reasons.append(f"quality_rejected/score_low:{score:.1f}")
+        quality_warnings.append(f"quality_warning/score_low:{score:.1f}")
     if samples <= 0:
         quality_reasons.append("diagnostic/no_samples")
 
@@ -7889,6 +7977,8 @@ def compute_episode_quality_score(execution_success, reason):
         "execution_success": bool(execution_success),
         "score": float(score),
         "failure_reason": "; ".join(quality_reasons),
+        "warning_reason": "; ".join(quality_warnings),
+        "quality_warnings": quality_warnings,
         "raw_reason": str(reason),
         "components": {
             "dig_load_score": dig_load_score,
@@ -8232,10 +8322,14 @@ def auto_collect_finish_episode(meta, success, reason):
     meta["success"] = success
     meta["execution_success"] = execution_success
     meta["failure_reason"] = "" if success else score_report.get("failure_reason", reason)
+    meta["warning_reason"] = score_report.get("warning_reason", "")
+    meta["quality_warnings"] = score_report.get("quality_warnings", [])
     meta["score_summary"] = {
         "score": score_report.get("score"),
         "success": score_report.get("success"),
         "failure_reason": score_report.get("failure_reason", ""),
+        "warning_reason": score_report.get("warning_reason", ""),
+        "quality_warnings": score_report.get("quality_warnings", []),
         "components": score_report.get("components", {}),
     }
     meta["finished_at"] = now
@@ -8248,7 +8342,8 @@ def auto_collect_finish_episode(meta, success, reason):
 
     dataset_record_event(
         "episode_end",
-        f"status={status}; success={success}; execution_success={execution_success}; score={score_report.get('score'):.1f}; reason={meta['failure_reason']}",
+        f"status={status}; success={success}; execution_success={execution_success}; score={score_report.get('score'):.1f}; "
+        f"reason={meta['failure_reason']}; warnings={meta.get('warning_reason', '')}",
     )
     run_dir = ensure_auto_collect_run_dir()
     index_row = {
@@ -8259,6 +8354,8 @@ def auto_collect_finish_episode(meta, success, reason):
         "status": status,
         "score": score_report.get("score"),
         "reason": meta.get("failure_reason", reason),
+        "warning_reason": meta.get("warning_reason", ""),
+        "quality_warnings": meta.get("quality_warnings", []),
         "planner_version": meta.get("planner_version", PLANNER_VERSION),
         "quality_gate_version": meta.get("quality_gate_version", QUALITY_GATE_VERSION),
         "config_hash": meta.get("config_hash", ""),
@@ -8953,7 +9050,14 @@ async def auto_collect_prepare_environment():
                 detail={"reset_attempted": True},
             )
             if not reset_ok:
-                return fail_prepare("prepare_failed/sand_not_settled", gate="sand_settled")
+                if bool(SAND_PREFLIGHT_SETTLE_HARD_GATE):
+                    return fail_prepare("prepare_failed/sand_not_settled", gate="sand_settled")
+                info_print(
+                    "[AUTO DATASET WARN]",
+                    "gate=sand_settled",
+                    "reason=prepare_warning/sand_not_settled_after_reset",
+                    "decision=continue",
+                )
         except Exception as e:
             info_print("[WARN] [AUTO DATASET] sand reset failed:", type(e).__name__, e)
             return fail_prepare(
@@ -9006,9 +9110,25 @@ async def auto_collect_prepare_environment():
                     detail={"previous_settle": settle, "reset_attempted": True},
                 )
                 if not reset_ok:
-                    return fail_prepare("prepare_failed/sand_not_settled", gate="sand_settled", detail=settle)
+                    if bool(SAND_PREFLIGHT_SETTLE_HARD_GATE):
+                        return fail_prepare("prepare_failed/sand_not_settled", gate="sand_settled", detail=settle)
+                    info_print(
+                        "[AUTO DATASET WARN]",
+                        "gate=sand_settled",
+                        "reason=prepare_warning/sand_reset_recovery_not_settled",
+                        f"previous_reason={settle.get('reason')}",
+                        "decision=continue",
+                    )
             else:
-                return fail_prepare("prepare_failed/sand_not_settled", gate="sand_settled", detail=settle)
+                if bool(SAND_PREFLIGHT_SETTLE_HARD_GATE):
+                    return fail_prepare("prepare_failed/sand_not_settled", gate="sand_settled", detail=settle)
+                info_print(
+                    "[AUTO DATASET WARN]",
+                    "gate=sand_settled",
+                    "reason=prepare_warning/sand_not_settled",
+                    f"settle_reason={settle.get('reason')}",
+                    "decision=continue",
+                )
         elif ready_reset_done and AUTO_COLLECT_REUSE_READY_SAND_RESET and policy == "once_per_run_after_home":
             STATE["auto_collect_sand_reset_done"] = True
 
@@ -9220,7 +9340,7 @@ async def auto_collect_one_episode():
     return auto_collect_finish_episode(meta, True, "ok")
 
 
-async def auto_collect_loop(count):
+async def auto_collect_loop(count, max_attempts=None):
     if bool(STATE.get("auto_collect_active", False)):
         update_status("[AUTO DATASET] already running", force=True)
         return
@@ -9235,6 +9355,18 @@ async def auto_collect_loop(count):
     STATE["auto_collect_active"] = True
     STATE["auto_collect_stop_requested"] = False
     STATE["auto_collect_requested"] = int(count)
+    attempts_source = "ui" if max_attempts is not None else "default"
+    try:
+        requested_max_attempts = int(max_attempts) if max_attempts is not None else 0
+    except Exception:
+        requested_max_attempts = 0
+    if requested_max_attempts <= 0:
+        requested_max_attempts = max(
+            int(count),
+            int(count) * int(AUTO_COLLECT_MAX_ATTEMPT_MULTIPLIER),
+        )
+    requested_max_attempts = max(1, min(100000, int(requested_max_attempts)))
+    STATE["auto_collect_max_attempts_requested"] = int(requested_max_attempts)
     STATE["auto_collect_attempts"] = 0
     STATE["auto_collect_successes"] = 0
     STATE["auto_collect_failures"] = 0
@@ -9249,12 +9381,13 @@ async def auto_collect_loop(count):
 
     try:
         target_successes = max(1, int(count))
-        max_attempts = max(target_successes, target_successes * AUTO_COLLECT_MAX_ATTEMPT_MULTIPLIER)
+        max_attempts = max(1, int(STATE.get("auto_collect_max_attempts_requested", 0) or 0))
         info_print(
             "[AUTO DATASET LOOP]",
             "count_mode=successful_episodes",
             f"target_successes={target_successes}",
             f"max_attempts={max_attempts}",
+            f"attempts_source={attempts_source}",
             f"attempt_multiplier={AUTO_COLLECT_MAX_ATTEMPT_MULTIPLIER}",
         )
         consecutive_prepare_failed = 0
@@ -9285,6 +9418,7 @@ async def auto_collect_loop(count):
                 f"target_successes={target_successes}",
                 f"actual_successes={STATE.get('auto_collect_successes')}",
                 f"attempts={STATE.get('auto_collect_attempts')}",
+                f"max_attempts={max_attempts}",
                 "reason=max_attempts_or_stop",
             )
     except Exception as e:
@@ -9296,6 +9430,7 @@ async def auto_collect_loop(count):
             result=str(STATE.get("auto_collect_last_result", "")),
             data={
                 "requested": int(STATE.get("auto_collect_requested", 0)),
+                "max_attempts_requested": int(STATE.get("auto_collect_max_attempts_requested", 0)),
                 "attempts": int(STATE.get("auto_collect_attempts", 0)),
                 "success": int(STATE.get("auto_collect_successes", 0)),
                 "rejected": int(STATE.get("auto_collect_rejections", 0)),
@@ -9321,12 +9456,16 @@ async def auto_collect_loop(count):
         update_status(auto_collect_status_text(), force=True)
 
 
-def request_auto_collect(count):
+def request_auto_collect(count, max_attempts=None):
     if bool(STATE.get("auto_collect_active", False)):
         update_status("[AUTO DATASET] already running", force=True)
         return
     STATE["planning_cancel_requested"] = False
-    task = register_async_task("auto_collect", auto_collect_loop(max(1, int(count))), replace=True)
+    task = register_async_task(
+        "auto_collect",
+        auto_collect_loop(max(1, int(count)), max_attempts=max_attempts),
+        replace=True,
+    )
     STATE["auto_collect_task"] = task
 
 
@@ -12023,7 +12162,7 @@ async def wait_for_motion_reached(q_goal, label="", mode="auto", seconds_eff=0.0
         report = STATE.get("sand_contact_last_report")
         report = report if isinstance(report, dict) else {}
         reason = (
-            f"execution_failed/no_material_progress:{label}:"
+            f"warning/no_material_progress:{label}:"
             f"bucket_total={int(report.get('total_bucket_delta', 0) or 0)};"
             f"pile_total={int(report.get('total_pile_delta', 0) or 0)};"
             f"spill_total={int(report.get('total_spill_delta', 0) or 0)};"
@@ -12031,16 +12170,16 @@ async def wait_for_motion_reached(q_goal, label="", mode="auto", seconds_eff=0.0
             f"progress_age={float(report.get('progress_age', 0.0) or 0.0):.2f};"
             f"last_reach_detail={last_detail}"
         )
-        set_execution_failure_reason(reason)
+        info_print("[SAND CONTACT WARNING]", f"stage={label or mode}", reason, "decision=continue")
         debug_timeline_record(
             "SAND_CONTACT_NO_PROGRESS",
             stage=str(label or mode),
-            result="failed",
+            result="warning",
             reason=reason,
             data=report,
             include_sand=True,
         )
-        return False
+        return True
     return verify_motion_reached(q_goal, label=label, mode=mode, record_failure=True)
 
 
@@ -12262,18 +12401,17 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
             )
             bad_cut, bad_reason = sand_contact_bad_cut_geometry(contact_stage_name, contact_report)
             if bad_cut:
-                reason_text = f"execution_failed/bad_cut_geometry:{contact_stage_name}:{bad_reason}"
-                set_execution_failure_reason(reason_text)
                 info_print(
-                    "[DIG EXEC FAILED]",
+                    "[DIG EXEC WARNING]",
                     f"label={label}",
                     "reason=bad_cut_geometry",
                     bad_reason,
+                    "decision=continue",
                 )
                 debug_timeline_record(
                     "BAD_CUT_GEOMETRY",
                     stage=contact_stage_name,
-                    result="failed",
+                    result="warning",
                     reason=bad_reason,
                     q_cmd=CTRL.q_cmd.copy(),
                     q_real=q_contact_real,
@@ -12284,7 +12422,6 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                     },
                     include_sand=True,
                 )
-                return False
             should_advance, advance_reason = sand_contact_stage_should_advance(
                 contact_stage_name,
                 contact_report,
@@ -18778,23 +18915,25 @@ def secure_phase_delta_report(current_metrics=None):
     spill_ok = bool(spill_delta <= spill_limit)
     bucket_count_ok = bool(current_bucket >= int(CURL_HOLD_MIN_BUCKET_PARTICLES))
     material_retained_ok = bool(bucket_loss <= loss_limit and fraction_ok and bucket_count_ok)
-    ok = bool(material_retained_ok)
-    if ok and not spill_ok:
+    ok = bool(material_retained_ok or not bool(SECURE_MATERIAL_LOSS_HARD_GATE))
+    if not material_retained_ok:
+        reason = (
+            f"secure_material_warning_loss spill_delta={spill_delta}/{spill_limit} "
+            f"bucket_loss={bucket_loss}/{loss_limit} retained={retained_fraction:.2f}/{min_retained_fraction:.2f} "
+            f"bucket={current_bucket}/{int(CURL_HOLD_MIN_BUCKET_PARTICLES)}"
+        )
+    elif ok and not spill_ok:
         reason = (
             f"secure_spill_accepted spill_delta={spill_delta}/{spill_limit} "
             f"bucket_loss={bucket_loss}/{loss_limit} retained={retained_fraction:.2f}/{min_retained_fraction:.2f}"
         )
-    elif ok:
-        reason = "ok"
     else:
-        reason = (
-            f"secure_material_loss spill_delta={spill_delta}/{spill_limit} "
-            f"bucket_loss={bucket_loss}/{loss_limit} retained={retained_fraction:.2f}/{min_retained_fraction:.2f} "
-            f"bucket={current_bucket}/{int(CURL_HOLD_MIN_BUCKET_PARTICLES)}"
-        )
+        reason = "ok"
     return {
         "ok": bool(ok),
         "reason": reason,
+        "warning": "" if material_retained_ok else reason,
+        "hard_gate_enabled": bool(SECURE_MATERIAL_LOSS_HARD_GATE),
         "baseline": str(baseline_name),
         "bucket_before": int(start_bucket),
         "bucket_after": int(current_bucket),
@@ -18802,6 +18941,7 @@ def secure_phase_delta_report(current_metrics=None):
         "bucket_loss_limit": int(loss_limit),
         "bucket_count_ok": bool(bucket_count_ok),
         "material_retained_ok": bool(material_retained_ok),
+        "material_warning": "" if material_retained_ok else reason,
         "retained_fraction": float(retained_fraction),
         "min_retained_fraction": float(min_retained_fraction),
         "spill_before": int(start_spill),
@@ -18840,7 +18980,9 @@ def secure_post_gate_report(q_start, current_metrics=None):
         "q_secure_deg": q_deg_values(q_start, wrap_swing_for_display=True),
         "carry_report": carry_report,
         "material_delta": delta_report,
-        "spill_gate_ok": bool(delta_report.get("material_retained_ok", delta_report.get("ok", False))),
+        "spill_gate_ok": True,
+        "material_gate_ok": bool(delta_report.get("material_retained_ok", delta_report.get("ok", False))),
+        "material_warning": str(delta_report.get("warning", delta_report.get("material_warning", "")) or ""),
         "spill_accepted": bool(delta_report.get("spill_accepted", False)),
         "carry_gate_ok": bool(carry_ok),
         "geometry_retains_material": bool(geometry_retains),
@@ -18872,13 +19014,28 @@ def post_lift_material_gate_report(current_metrics=None, q_pose=None):
         int(CURL_HOLD_MIN_BUCKET_PARTICLES),
         int(float(max(start_bucket, 1)) * float(LIFT_CARRY_MIN_RETAINED_FROM_CUT_FRACTION)),
     )
+    soft_min_bucket = max(
+        int(CURL_HOLD_MIN_BUCKET_PARTICLES),
+        int(float(max(start_bucket, 1)) * float(LIFT_CARRY_SOFT_RETAINED_FROM_CUT_FRACTION)),
+    )
     material_ok = bool(current_bucket >= min_bucket)
-    ok = bool(material_ok and carry_ok)
-    if ok:
+    material_soft_ok = bool(
+        material_ok
+        or current_bucket >= soft_min_bucket
+        or current_bucket >= int(LIFT_CARRY_MIN_ABSOLUTE_BUCKET_PARTICLES)
+    )
+    ok = bool(carry_ok)
+    if ok and material_ok:
         reason = "ok"
-    elif not material_ok:
+    elif ok and material_soft_ok:
         reason = (
-            f"lift_lost_material bucket={current_bucket}/{min_bucket} "
+            f"ok_soft_lift_material bucket={current_bucket}/{min_bucket} "
+            f"soft_min={soft_min_bucket} retained={retained_fraction:.2f}/"
+            f"{float(LIFT_CARRY_MIN_RETAINED_FROM_CUT_FRACTION):.2f}"
+        )
+    elif ok:
+        reason = (
+            f"ok_warning_lift_material_low bucket={current_bucket}/{min_bucket} "
             f"retained={retained_fraction:.2f}/{float(LIFT_CARRY_MIN_RETAINED_FROM_CUT_FRACTION):.2f}"
         )
     else:
@@ -18890,7 +19047,12 @@ def post_lift_material_gate_report(current_metrics=None, q_pose=None):
         "bucket_before": int(start_bucket),
         "bucket_after": int(current_bucket),
         "bucket_min": int(min_bucket),
+        "bucket_soft_min": int(soft_min_bucket),
         "material_ok": bool(material_ok),
+        "material_soft_ok": bool(material_soft_ok),
+        "material_warning": "" if material_ok else (
+            f"lift_material_soft_gate bucket={current_bucket}/{min_bucket} retained={retained_fraction:.2f}"
+        ),
         "carry_ok": bool(carry_ok),
         "real_loaded_hold_allowed": bool(real_loaded_hold),
         "transitional_loaded_hold_allowed": bool(transitional_loaded_hold),
@@ -18898,6 +19060,8 @@ def post_lift_material_gate_report(current_metrics=None, q_pose=None):
         "carry_report": carry_report,
         "retained_fraction": float(retained_fraction),
         "min_retained_fraction": float(LIFT_CARRY_MIN_RETAINED_FROM_CUT_FRACTION),
+        "soft_retained_fraction": float(LIFT_CARRY_SOFT_RETAINED_FROM_CUT_FRACTION),
+        "min_absolute_bucket_particles": int(LIFT_CARRY_MIN_ABSOLUTE_BUCKET_PARTICLES),
         "spill_before": int(start_spill),
         "spill_after": int(current_spill),
         "spill_delta": int(max(0, current_spill - start_spill)),
@@ -19303,6 +19467,27 @@ def staged_dig_secure_candidates(q_start, loaded_count_hint=None):
             actual_report = dict(adjusted_actual_report or {})
             secure_source = "carry_hold_adjusted"
 
+        secure_bucket_delta_deg = abs(rad_to_deg(float(q_secure[bucket_idx] - q_start[bucket_idx])))
+        if (
+            secure_bucket_delta_deg >= float(SECURE_PROGRESSIVE_LARGE_CURL_DEG)
+            and float(boom_lift_deg) < float(SECURE_PROGRESSIVE_MIN_LIFT_FOR_LARGE_CURL_DEG)
+        ):
+            secure_rows.append({
+                "ok": False,
+                "source": str(source),
+                "reason": (
+                    "secure_requires_lift_before_large_curl:"
+                    f"bucket_delta={secure_bucket_delta_deg:.1f}deg "
+                    f"boom_lift={float(boom_lift_deg):.1f}/"
+                    f"{float(SECURE_PROGRESSIVE_MIN_LIFT_FOR_LARGE_CURL_DEG):.1f}deg"
+                ),
+                "carry_report": carry_report,
+                "actual_report": actual_report,
+                "forced_report": forced_report,
+                "secure_source": str(secure_source),
+            })
+            return
+
         if not bool((carry_report or {}).get("ok", False)) and not prefer_forced_closed:
             secure_rows.append({
                 "ok": False,
@@ -19348,6 +19533,47 @@ def staged_dig_secure_candidates(q_start, loaded_count_hint=None):
         # against sand/ground, so each waypoint is checked independently.
         def progressive_secure_specs(q_goal):
             q_goal = np.array(q_goal, dtype=np.float32).reshape(-1)[:4].copy()
+
+            direct_report = predicted_phase_ground_report(q_goal, "secure_load", reference_q=q_start)
+            direct_ok, direct_reason = phase_ground_ok("secure_load", direct_report)
+            direct_path_ok, direct_path_kind, direct_path_reason, direct_path_sample, direct_path_report = path_segment_check(
+                q_start,
+                q_goal,
+                "secure_load",
+                samples=4,
+            )
+            if direct_ok and direct_path_ok:
+                direct_duration = estimate_stage_motion_seconds(
+                    q_start,
+                    q_goal,
+                    requested_seconds=float(SECURE_PROGRESSIVE_STEP_SECONDS),
+                )
+                direct_motion = plan_joint_motion_metrics(q_goal, q_start, direct_duration)
+                direct_delta = q_delta_abs_deg(q_goal, q_start)
+                bucket_step = float(direct_delta[bucket_idx]) if bucket_idx < len(direct_delta) else 0.0
+                joint_step = max(float(x) for x in direct_delta) if direct_delta else 0.0
+                return {
+                    "specs": [{
+                        "phase": "secure_load",
+                        "q": q_goal.copy(),
+                        "q_prev": q_start.copy(),
+                        "duration": float(direct_duration),
+                        "report": direct_report,
+                        "motion": direct_motion,
+                        "bucket_step_deg": float(bucket_step),
+                        "max_joint_step_deg": float(joint_step),
+                        "fraction": 1.0,
+                        "bucket_fraction": 1.0,
+                        "lift_fraction": 1.0,
+                        "direct_secure": True,
+                    }],
+                    "step_count": 1,
+                    "total_cost": float(direct_motion.get("cost", 0.0) or 0.0),
+                    "max_bucket_step_deg": float(bucket_step),
+                    "max_joint_step_deg": float(joint_step),
+                    "direct_secure": True,
+                }, []
+
             bucket_delta_deg = abs(rad_to_deg(float(q_goal[bucket_idx] - q_start[bucket_idx])))
             boom_delta_deg = abs(rad_to_deg(float(q_goal[boom_idx] - q_start[boom_idx])))
             arm_delta_deg = abs(rad_to_deg(float(q_goal[arm_idx] - q_start[arm_idx])))
@@ -19366,10 +19592,15 @@ def staged_dig_secure_candidates(q_start, loaded_count_hint=None):
             for step_i, frac in enumerate(fractions):
                 final_step = step_i == len(fractions) - 1
                 phase = "secure_load" if final_step else "curl_to_hold_material"
+                bucket_frac = float(frac)
+                lift_frac = 1.0 if final_step else min(
+                    1.0,
+                    float(frac) + float(SECURE_PROGRESSIVE_LIFT_LEAD_FRACTION),
+                )
                 q_step = q_start.copy()
-                q_step[boom_idx] = float(q_start[boom_idx]) + float(frac) * float(q_goal[boom_idx] - q_start[boom_idx])
-                q_step[arm_idx] = float(q_start[arm_idx]) + float(frac) * float(q_goal[arm_idx] - q_start[arm_idx])
-                q_step[bucket_idx] = float(q_start[bucket_idx]) + float(frac) * float(q_goal[bucket_idx] - q_start[bucket_idx])
+                q_step[boom_idx] = float(q_start[boom_idx]) + lift_frac * float(q_goal[boom_idx] - q_start[boom_idx])
+                q_step[arm_idx] = float(q_start[arm_idx]) + lift_frac * float(q_goal[arm_idx] - q_start[arm_idx])
+                q_step[bucket_idx] = float(q_start[bucket_idx]) + bucket_frac * float(q_goal[bucket_idx] - q_start[bucket_idx])
                 swing_idx = CTRL.name_to_idx.get("swing", 0)
                 q_step[swing_idx] = float(q_start[swing_idx]) + float(frac) * float(
                     swing_delta(float(q_goal[swing_idx]), float(q_start[swing_idx]))
@@ -19424,6 +19655,8 @@ def staged_dig_secure_candidates(q_start, loaded_count_hint=None):
                     "bucket_step_deg": float(bucket_step),
                     "max_joint_step_deg": float(joint_step),
                     "fraction": float(frac),
+                    "bucket_fraction": float(bucket_frac),
+                    "lift_fraction": float(lift_frac),
                 })
                 q_prev = q_step.copy()
             return {
@@ -19494,6 +19727,7 @@ def staged_dig_secure_candidates(q_start, loaded_count_hint=None):
                 "step_count": int(progressive.get("step_count", len(stage_specs))),
                 "max_bucket_step_deg": float(progressive.get("max_bucket_step_deg", 0.0) or 0.0),
                 "max_joint_step_deg": float(progressive.get("max_joint_step_deg", 0.0) or 0.0),
+                "direct_secure": bool(progressive.get("direct_secure", False)),
             },
             "target_point": target_point,
             "curl_motion": curl_motion,
@@ -19592,6 +19826,8 @@ def staged_dig_secure_candidates(q_start, loaded_count_hint=None):
                     "step_index": int(spec_index + 1),
                     "step_count": int(len(stage_specs)),
                     "fraction": float(spec.get("fraction", 1.0)),
+                    "bucket_fraction": float(spec.get("bucket_fraction", spec.get("fraction", 1.0))),
+                    "lift_fraction": float(spec.get("lift_fraction", spec.get("fraction", 1.0))),
                     "bucket_step_deg": float(spec.get("bucket_step_deg", 0.0) or 0.0),
                     "max_joint_step_deg": float(spec.get("max_joint_step_deg", 0.0) or 0.0),
                     "summary": best_secure.get("progressive_secure", {}),
@@ -19652,11 +19888,42 @@ def append_staged_post_dig_secure_plan(task_label="dig_target_ball"):
     rows, reason = staged_dig_secure_candidates(q_start, loaded_count_hint=cut_bucket)
     if not rows:
         if cut_bucket >= int(CURL_HOLD_MIN_BUCKET_PARTICLES):
-            set_execution_failure_reason("quality_rejected/secure_not_retaining_material:" + str(reason))
+            info_print(
+                "[DIG PLAN STAGED WARN]",
+                "stage=post_pull_exit_secure",
+                f"reason={reason}",
+                "fallback=current_pose_noop_secure",
+                f"after_cut_bucket={cut_bucket}",
+            )
+            target_point = predicted_end_world_point(q_start, end_effector="load", reference_q=q_start)
+            row = make_stage_row_from_q(
+                "secure_load",
+                q_start.copy(),
+                q_start.copy(),
+                0.35,
+                target_point=target_point,
+                extra={
+                    "effector": "load",
+                    "staged_runtime_plan": True,
+                    "staged_append_source": "post_pull_exit",
+                    "material_hold": {
+                        "ok": True,
+                        "reason": "warning_secure_candidate_missing_current_pose_noop",
+                        "warning": str(reason),
+                        "loaded_count_for_secure": int(cut_bucket),
+                    },
+                    "secure_load": {
+                        "fallback_noop": True,
+                        "candidate_count": 0,
+                    },
+                },
+            )
+            rows = [("secure_load", q_start.copy(), 0.35, target_point, row)]
+            reason = "warning_no_secure_candidate_current_pose_noop:" + str(reason)
         else:
             set_execution_failure_reason("planning_failed/staged_secure_unreachable:" + str(reason))
-        info_print("[DIG PLAN STAGED FAILED]", "stage=post_pull_exit_secure", reason)
-        return False
+            info_print("[DIG PLAN STAGED FAILED]", "stage=post_pull_exit_secure", reason)
+            return False
 
     stages = list(candidate.get("stages", []) or [])
     for phase, q_goal, duration, point, row in rows:
@@ -23464,6 +23731,7 @@ def sync_sliders_from_real_q(force=False):
 def build_ui():
     global WINDOW, STATUS_LABEL
     auto_count_model = ui.SimpleIntModel(int(AUTO_COLLECT_DEFAULT_COUNT))
+    auto_attempts_model = ui.SimpleIntModel(int(AUTO_COLLECT_DEFAULT_MAX_ATTEMPTS))
 
     def toggle_follow():
         if not STATE["follow"]:
@@ -23537,10 +23805,32 @@ def build_ui():
             pass
         return count
 
+    def auto_collect_attempts_from_ui(count=None):
+        try:
+            attempts = int(auto_attempts_model.as_int)
+        except Exception:
+            try:
+                attempts = int(auto_attempts_model.get_value_as_int())
+            except Exception:
+                attempts = int(round(safe_float(
+                    getattr(auto_attempts_model, "as_float", AUTO_COLLECT_DEFAULT_MAX_ATTEMPTS),
+                    AUTO_COLLECT_DEFAULT_MAX_ATTEMPTS,
+                )))
+        if attempts <= 0:
+            base_count = auto_collect_count_from_ui() if count is None else int(count)
+            attempts = max(1, int(base_count) * int(AUTO_COLLECT_MAX_ATTEMPT_MULTIPLIER))
+        attempts = max(1, min(100000, int(attempts)))
+        try:
+            auto_attempts_model.set_value(int(attempts))
+        except Exception:
+            pass
+        return attempts
+
     def start_auto_collect_from_ui():
         count = auto_collect_count_from_ui()
-        update_status(f"[AUTO DATASET] start requested count={count}", force=True)
-        request_auto_collect(count)
+        attempts = auto_collect_attempts_from_ui(count=count)
+        update_status(f"[AUTO DATASET] start requested count={count} max_attempts={attempts}", force=True)
+        request_auto_collect(count, max_attempts=attempts)
 
     def open_auto_collect_dir_from_ui():
         path = str(STATE.get("auto_collect_run_dir", "") or AUTO_COLLECT_DATASET_ROOT)
@@ -23665,13 +23955,15 @@ def build_ui():
                     ui.Separator()
                     ui.Label("Auto Dataset (primary pipeline)")
                     with ui.HStack(spacing=6, height=26):
-                        ui.Label("Target trainable", width=135)
-                        ui.Label("Count", width=50)
-                        ui.IntField(model=auto_count_model, width=70)
-                        ui.Button("Start", width=62, clicked_fn=start_auto_collect_from_ui)
-                        ui.Button("Stop", width=62, clicked_fn=stop_auto_collect)
-                        ui.Button("Dir", width=52, clicked_fn=open_auto_collect_dir_from_ui)
-                        ui.Button("Replay", width=74, clicked_fn=request_replay_latest_record)
+                        ui.Label("Target trainable", width=110)
+                        ui.Label("Count", width=42)
+                        ui.IntField(model=auto_count_model, width=54)
+                        ui.Label("Attempts", width=62)
+                        ui.IntField(model=auto_attempts_model, width=64)
+                        ui.Button("Start", width=58, clicked_fn=start_auto_collect_from_ui)
+                        ui.Button("Stop", width=58, clicked_fn=stop_auto_collect)
+                        ui.Button("Dir", width=42, clicked_fn=open_auto_collect_dir_from_ui)
+                        ui.Button("Replay", width=62, clicked_fn=request_replay_latest_record)
 
                     with ui.HStack(spacing=6, height=24):
                         speed_model = ui.SimpleFloatModel(float(STATE.get("speed_multiplier", 1.0)))

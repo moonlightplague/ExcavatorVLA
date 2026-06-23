@@ -71,7 +71,7 @@ def _carry_world_angle(rt, q_start, q_goal, mode):
         return None
 
 
-def _project_carry_bucket(rt, q, reference, carry_world_rad):
+def _project_carry_bucket(rt, q, reference, carry_world_rad, mode=None):
     q = _clip_near(rt, q, reference)
     if carry_world_rad is None:
         return q
@@ -81,34 +81,45 @@ def _project_carry_bucket(rt, q, reference, carry_world_rad):
             return q
         bucket_idx = rt.CTRL.name_to_idx.get("bucket", 3)
         q[bucket_idx] = float(calc["bucket"])
+        q = _clip_near(rt, q, reference)
+        require_loaded = False
+        try:
+            if hasattr(rt, "mode_requires_loaded_carry_bucket"):
+                require_loaded = bool(rt.mode_requires_loaded_carry_bucket(mode or "", "joint_space_route"))
+        except Exception:
+            require_loaded = False
+        if require_loaded and hasattr(rt, "force_loaded_carry_bucket_q"):
+            q = rt.force_loaded_carry_bucket_q(q, reference=reference, label="joint_space_route")
+        elif require_loaded and hasattr(rt, "set_bucket_loaded_carry_joint"):
+            q = rt.set_bucket_loaded_carry_joint(q, reference=reference)
         return _clip_near(rt, q, reference)
     except Exception:
         return q
 
 
-def _steer(rt, q_from, q_to, max_step, carry_world_rad=None):
+def _steer(rt, q_from, q_to, max_step, carry_world_rad=None, mode=None):
     q_from = _as_q(q_from)
     q_to = _clip_near(rt, q_to, q_from)
     d = _delta(rt, q_to, q_from)
     norm = float(np.linalg.norm(d))
     if norm <= max(1.0e-6, float(max_step)):
-        return _project_carry_bucket(rt, q_to, q_from, carry_world_rad), True
+        return _project_carry_bucket(rt, q_to, q_from, carry_world_rad, mode=mode), True
     q_next = q_from + d * (float(max_step) / norm)
-    return _project_carry_bucket(rt, q_next, q_from, carry_world_rad), False
+    return _project_carry_bucket(rt, q_next, q_from, carry_world_rad, mode=mode), False
 
 
 def _edge_ok(rt, q_from, q_to, mode, samples, carry_world_rad=None, deadline=None):
     if deadline is not None and time.time() > float(deadline):
         return False, "planning_deadline"
     if carry_world_rad is not None:
-        q_prev = _project_carry_bucket(rt, q_from, q_from, carry_world_rad)
-        q_to = _project_carry_bucket(rt, q_to, q_prev, carry_world_rad)
+        q_prev = _project_carry_bucket(rt, q_from, q_from, carry_world_rad, mode=mode)
+        q_to = _project_carry_bucket(rt, q_to, q_prev, carry_world_rad, mode=mode)
         for i in range(1, max(2, int(samples)) + 1):
             if deadline is not None and time.time() > float(deadline):
                 return False, "planning_deadline"
             s = float(i) / float(max(2, int(samples)))
             q = rt.interpolate_q_shortest(q_from, q_to, s)
-            q = _project_carry_bucket(rt, q, q_prev, carry_world_rad)
+            q = _project_carry_bucket(rt, q, q_prev, carry_world_rad, mode=mode)
             ok, kind, reason, sample, report = rt.path_segment_check(q_prev, q, mode, samples=2, deadline=deadline)
             if not ok:
                 try:
@@ -154,9 +165,9 @@ def _joint_bounds(rt, q_start, q_goal):
     return bounds
 
 
-def _sample(rt, rng, q_start, q_goal, bounds, goal_bias, carry_world_rad=None):
+def _sample(rt, rng, q_start, q_goal, bounds, goal_bias, carry_world_rad=None, mode=None):
     if float(rng.random()) < float(goal_bias):
-        return _project_carry_bucket(rt, q_goal, q_start, carry_world_rad)
+        return _project_carry_bucket(rt, q_goal, q_start, carry_world_rad, mode=mode)
     q = np.zeros(4, dtype=np.float32)
     for i, (lo, hi) in enumerate(bounds):
         q[i] = float(rng.uniform(float(lo), float(hi)))
@@ -164,7 +175,7 @@ def _sample(rt, rng, q_start, q_goal, bounds, goal_bias, carry_world_rad=None):
     if float(rng.random()) < 0.35:
         base = q_goal if float(rng.random()) < 0.5 else q_start
         q[swing_idx] = float(base[swing_idx]) + float(rng.uniform(-math.pi, math.pi))
-    return _project_carry_bucket(rt, q, q_start, carry_world_rad)
+    return _project_carry_bucket(rt, q, q_start, carry_world_rad, mode=mode)
 
 
 def _extend(rt, tree, q_target, mode, max_step, samples, weights, carry_world_rad=None, deadline=None):
@@ -172,7 +183,7 @@ def _extend(rt, tree, q_target, mode, max_step, samples, weights, carry_world_ra
         return "trapped", None, "planning_deadline"
     nearest_idx, _dist = _nearest(rt, tree, q_target, weights)
     q_near = tree["nodes"][nearest_idx]["q"]
-    q_next, reached = _steer(rt, q_near, q_target, max_step, carry_world_rad=carry_world_rad)
+    q_next, reached = _steer(rt, q_near, q_target, max_step, carry_world_rad=carry_world_rad, mode=mode)
     if np.linalg.norm(_delta(rt, q_next, q_near)) < 1.0e-5:
         return "trapped", nearest_idx, "zero_step"
     ok, reason = _edge_ok(rt, q_near, q_next, mode, samples, carry_world_rad=carry_world_rad, deadline=deadline)
@@ -293,7 +304,7 @@ def _elastic_smooth(rt, path, mode, samples, deadline, rng, carry_world_rad=None
             q_next = out[idx + 1]
             q_mid = q_prev + 0.5 * _delta(rt, q_next, q_prev)
             proposal = q_curr + alpha * _delta(rt, q_mid, q_curr)
-            proposal = _project_carry_bucket(rt, proposal, q_curr, carry_world_rad)
+            proposal = _project_carry_bucket(rt, proposal, q_curr, carry_world_rad, mode=mode)
             if float(np.linalg.norm(_delta(rt, proposal, q_curr))) < 1.0e-5:
                 rejects += 1
                 continue
@@ -335,8 +346,8 @@ def plan_joint_space_route(
     q_start = _as_q(q_start)
     q_goal = _clip_near(rt, q_goal, q_start)
     carry_world_rad = _carry_world_angle(rt, q_start, q_goal, mode)
-    q_start = _project_carry_bucket(rt, q_start, q_start, carry_world_rad)
-    q_goal = _project_carry_bucket(rt, q_goal, q_start, carry_world_rad)
+    q_start = _project_carry_bucket(rt, q_start, q_start, carry_world_rad, mode=mode)
+    q_goal = _project_carry_bucket(rt, q_goal, q_start, carry_world_rad, mode=mode)
     sample_count = max(2, int(samples if samples is not None else getattr(rt, "PATH_ROUTE_PLANNING_SAMPLE_COUNT", 8)))
     max_iters = int(getattr(rt, "PATH_RRT_MAX_ITERS", 220))
     if deadline is not None:
@@ -413,7 +424,7 @@ def plan_joint_space_route(
         active_start = iteration % 2 == 0
         tree_a = tree_start if active_start else tree_goal
         tree_b = tree_goal if active_start else tree_start
-        q_rand = _sample(rt, rng, q_start, q_goal, bounds, goal_bias, carry_world_rad=carry_world_rad)
+        q_rand = _sample(rt, rng, q_start, q_goal, bounds, goal_bias, carry_world_rad=carry_world_rad, mode=mode)
         status, idx_a, reason = _extend(
             rt,
             tree_a,

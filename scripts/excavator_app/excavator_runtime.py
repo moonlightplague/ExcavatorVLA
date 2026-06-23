@@ -422,7 +422,7 @@ SECURE_HOLD_MAX_SPILL_PARTICLES = 240
 SECURE_HOLD_MAX_SPILL_FRACTION = 0.35
 SECURE_HOLD_MAX_BUCKET_LOSS_FRACTION = 0.45
 SECURE_HOLD_MIN_RETAINED_FROM_CUT_FRACTION = 0.55
-LIFT_CARRY_MIN_RETAINED_FROM_CUT_FRACTION = 0.12
+LIFT_CARRY_MIN_RETAINED_FROM_CUT_FRACTION = 0.55
 MANUAL_FREEZE_STOP_ENABLED = True
 AUTO_FREEZE_STOP_ENABLED = True
 
@@ -10979,10 +10979,12 @@ def set_trace_mode(mode, reset_real=False):
 def trace_auto_carry_bucket_world(q0, q1, mode):
     level_mode = str(mode).lower()
     auto_carry_bucket = (
-        ("unload_to_bin" in level_mode)
-        or ("clearance_route_post" in level_mode)
-        or ("lift_carry" in level_mode)
-        or ("carry" in level_mode and "unload" not in level_mode)
+        "lift_carry" not in level_mode
+        and (
+            ("unload_to_bin" in level_mode)
+            or ("clearance_route_post" in level_mode)
+            or ("carry" in level_mode and "unload" not in level_mode)
+        )
     )
     if not auto_carry_bucket:
         return None
@@ -11013,6 +11015,8 @@ def planned_bucket_segment_points(q_start, q_goal, mode="auto", samples=None):
             if carry_calc is not None:
                 q[CTRL.name_to_idx["bucket"]] = carry_calc["bucket"]
                 q = CTRL.clip_limits(q)
+                if mode_requires_loaded_carry_bucket(mode):
+                    q = force_loaded_carry_bucket_q(q, reference=q, label=mode)
         p = predicted_end_world_point(q, end_effector="tip", reference_q=q0)
         if p is not None:
             points.append(np.array(p, dtype=np.float32).reshape(-1)[:3].copy())
@@ -11423,6 +11427,8 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
         bucket_idx = CTRL.name_to_idx.get("bucket", 3)
         q1[bucket_idx] = float(q0[bucket_idx])
         q1 = CTRL.clip_limits(q1)
+    if mode_requires_loaded_carry_bucket(mode, label):
+        q1 = force_loaded_carry_bucket_q(q1, reference=q0, label=label or mode)
     q_final_cmd = q1.copy()
     contact_stage_name = str(label or mode)
     if is_sand_contact_phase(contact_stage_name):
@@ -11449,11 +11455,14 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
     carry_max_err_rad = 0.0
     carry_limited = False
     level_mode = str(mode).lower()
+    stage_text = f"{label} {mode}".lower()
     auto_carry_bucket = (
-        ("unload_to_bin" in level_mode)
-        or ("clearance_route_post" in level_mode)
-        or ("lift_carry" in level_mode)
-        or ("carry" in level_mode and "unload" not in level_mode)
+        "lift_carry" not in stage_text
+        and (
+            ("unload_to_bin" in level_mode)
+            or ("clearance_route_post" in level_mode)
+            or ("carry" in level_mode and "unload" not in level_mode)
+        )
     )
     if auto_carry_bucket:
         start_angles = chain_angles_from_q(q0, end_effector="load")
@@ -11498,12 +11507,28 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                             f"max_carry_dump_branch={float(BUCKET_CARRY_MAX_DUMP_BRANCH_DEG):.2f}deg",
                             "reason=avoid_dump_branch_during_carry",
                         )
-                    # Keep the planned/interpolated bucket command. Dumping is
-                    # allowed only in dump_bucket_at_target(), not while carrying.
+                # Keep the planned/interpolated bucket command when the world
+                # angle branch would open the bucket. Dumping is allowed only in
+                # dump_bucket_at_target(), not while carrying.
                 if not skip_auto_carry_adjust:
                     q[CTRL.name_to_idx["bucket"]] = carry_calc["bucket"]
                     q = CTRL.clip_limits(q)
                     q, loaded_limited, old_bucket_deg = apply_loaded_bucket_closed_limit(q, label=label)
+                    if mode_requires_loaded_carry_bucket(mode, label):
+                        before_force_deg = rad_to_deg(float(q[CTRL.name_to_idx["bucket"]]))
+                        q = force_loaded_carry_bucket_q(q, reference=q, label=label or mode)
+                        after_force_deg = rad_to_deg(float(q[CTRL.name_to_idx["bucket"]]))
+                        if abs(after_force_deg - before_force_deg) > 0.25:
+                            carry_limited = True
+                            if not carry_loaded_limit_logged:
+                                carry_loaded_limit_logged = True
+                                info_print(
+                                    "[LOADED BUCKET LIMIT]",
+                                    f"stage={label}",
+                                    f"requested={before_force_deg:.2f}deg",
+                                    f"forced_to={after_force_deg:.2f}deg",
+                                    "reason=loaded_carry_contract",
+                                )
                     if loaded_limited:
                         carry_limited = True
                         if not carry_loaded_limit_logged:
@@ -14731,20 +14756,26 @@ def solve_clearance_pose(point, q_seed, end_effector, clearance_z, deadline=None
 
 def route_segments_ok(q_start, route, q_goal, mode, samples=None, deadline=None):
     sample_count = PATH_CHECK_SAMPLES if samples is None else max(2, int(samples))
-    q_prev = q_start
+    carry_locked = mode_requires_loaded_carry_bucket(mode)
+    check_mode = mode if carry_locked else "clearance"
+    q_prev = force_loaded_carry_bucket_q(q_start, reference=q_start, label="route_segments_start") if carry_locked else q_start
     for idx, q_next in enumerate(route):
         if planning_deadline_exceeded(deadline):
             return False, "planning budget exceeded"
+        if carry_locked:
+            q_next = force_loaded_carry_bucket_q(q_next, reference=q_prev, label="route_segments_waypoint")
         ok, kind, reason, sample, report = path_segment_check(
-            q_prev, q_next, "clearance", samples=sample_count, deadline=deadline
+            q_prev, q_next, check_mode, samples=sample_count, deadline=deadline
         )
         if not ok:
-            text = path_block_report_text("clearance", kind, report, reason)
+            text = path_block_report_text(check_mode, kind, report, reason)
             return False, f"segment {idx + 1} blocked at {sample}/{sample_count}: {text}"
         q_prev = q_next
 
     if planning_deadline_exceeded(deadline):
         return False, "planning budget exceeded"
+    if carry_locked:
+        q_goal = force_loaded_carry_bucket_q(q_goal, reference=q_prev, label="route_segments_goal")
     ok, kind, reason, sample, report = path_segment_check(q_prev, q_goal, mode, samples=sample_count, deadline=deadline)
     if not ok:
         text = path_block_report_text(mode, kind, report, reason)
@@ -14832,6 +14863,8 @@ def swing_corridor_summary(q_start, q_goal, mode, samples=25, deadline=None):
     swing_idx = CTRL.name_to_idx.get("swing", 0)
     base_pose = PATH_DETERMINISTIC_ROUTE_POSES_DEG[0] if PATH_DETERMINISTIC_ROUTE_POSES_DEG else {}
     q_probe_base = clip_route_command_near(q_with_joint_degrees(q_start, base_pose), reference=q_start)
+    if mode_requires_loaded_carry_bucket(mode):
+        q_probe_base = force_loaded_carry_bucket_q(q_probe_base, reference=q_start, label="swing_corridor_probe")
     center = float(q_start[swing_idx]) + 0.5 * float(swing_delta(float(q_goal[swing_idx]), float(q_start[swing_idx])))
     span = math.radians(220.0)
     rows = []
@@ -14900,6 +14933,10 @@ def swing_corridor_summary(q_start, q_goal, mode, samples=25, deadline=None):
 
 def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=None):
     end_effector = path_end_effector_for_mode(mode)
+    carry_locked_route = mode_requires_loaded_carry_bucket(mode, label)
+    if carry_locked_route:
+        q_start = force_loaded_carry_bucket_q(q_start, reference=q_start, label=f"{label}_route_start")
+        q_goal = force_loaded_carry_bucket_q(q_goal, reference=q_start, label=f"{label}_route_goal")
     p_start = predicted_end_world_point(q_start, end_effector=end_effector, reference_q=q_start)
     p_goal = predicted_end_world_point(q_goal, end_effector=end_effector, reference_q=q_start)
 
@@ -14923,9 +14960,30 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
         samples=17 if deadline is not None else 25,
         deadline=corridor_deadline,
     )
+    corridor_intervals = list((corridor or {}).get("free_intervals_deg", []) or [])
 
     def budget_expired():
         return planning_deadline_exceeded(deadline)
+
+    def swing_corridor_distance_deg(q_pose):
+        if not corridor_intervals:
+            return 0.0
+        try:
+            swing_deg = rad_to_deg(float(np.array(q_pose, dtype=np.float32).reshape(-1)[CTRL.name_to_idx["swing"]]))
+        except Exception:
+            return 0.0
+        best = None
+        for interval in corridor_intervals:
+            try:
+                lo = float(interval[0])
+                hi = float(interval[1])
+            except Exception:
+                continue
+            if lo <= swing_deg <= hi:
+                return 0.0
+            dist = min(abs(swing_deg - lo), abs(swing_deg - hi))
+            best = dist if best is None else min(best, dist)
+        return 0.0 if best is None else float(best)
 
     def add_route(route, route_type, clearance_z, detail="", side_offset=0.0):
         nonlocal last_reason
@@ -14936,6 +14994,8 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
         q_ref = np.array(q_start, dtype=np.float32).reshape(-1)[:4].copy()
         for q_raw in route or []:
             q_next = clip_route_command_near(q_raw, reference=q_ref)
+            if carry_locked_route:
+                q_next = force_loaded_carry_bucket_q(q_next, reference=q_ref, label=f"{label}_route_waypoint")
             route_clipped.append(q_next.copy())
             q_ref = q_next.copy()
         route = route_clipped
@@ -14951,6 +15011,10 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
             clearance_z=clearance_z,
             side_offset=side_offset,
         )
+        corridor_miss = max([swing_corridor_distance_deg(q) for q in [q_start] + list(route) + [q_goal]] or [0.0])
+        if carry_locked_route and corridor_miss > 0.0:
+            cost += 0.65 * float(corridor_miss)
+            detail = f"{detail} corridor_miss={float(corridor_miss):.1f}deg"
         candidates.append({
             "route": [np.array(q, dtype=np.float32).copy() for q in route],
             "type": str(route_type),
@@ -17260,6 +17324,29 @@ def set_bucket_loaded_carry_joint(q_pose, reference=None):
     return clip_command_near(q, reference=(q_pose if reference is None else reference))
 
 
+def force_loaded_carry_bucket_q(q_pose, reference=None, label=""):
+    """Force a loaded bucket pose for carry/unload route planning.
+
+    The world-angle carry solver can choose a geometrically level branch near
+    -90 deg. That branch may look stable kinematically, but with real sand it
+    behaves like an open bucket. For loaded carry stages, keep the joint on the
+    closed carry branch and let boom/arm routing solve clearance.
+    """
+    q = set_bucket_loaded_carry_joint(q_pose, reference=(q_pose if reference is None else reference))
+    q, _limited, _old_bucket_deg = apply_loaded_bucket_closed_limit(q, label=label)
+    return q
+
+
+def mode_requires_loaded_carry_bucket(mode, label=""):
+    text = f"{mode} {label}".lower()
+    return (
+        "unload_to_bin" in text
+        or "clearance_route_post" in text
+        or "staged_unload" in text
+        or "high_carry" in text
+    )
+
+
 def phase_metric_sand_counts(name):
     phase_metrics = STATE.get("dataset_phase_metrics")
     if not isinstance(phase_metrics, dict):
@@ -17407,11 +17494,18 @@ def secure_post_gate_report(q_start, current_metrics=None):
     }
 
 
-def post_lift_material_gate_report(current_metrics=None):
+def post_lift_material_gate_report(current_metrics=None, q_pose=None):
     current_metrics = sand_metrics_current(force=True) if current_metrics is None else current_metrics
     current_metrics = current_metrics if isinstance(current_metrics, dict) else {}
     current_bucket = int(current_metrics.get("bucket_from_pile_count", 0) or 0)
     current_spill = int(current_metrics.get("spill_from_pile_count", 0) or 0)
+    try:
+        q_check = get_real_joint_positions() if q_pose is None else q_pose
+        q_check = CTRL.clip_limits(np.array(q_check, dtype=np.float32).reshape(-1)[:4].copy())
+    except Exception:
+        q_check = CTRL.q_cmd.copy()
+    carry_report = carry_material_report_for_q(q_check, end_effector="load")
+    carry_ok = bool(real_loaded_secure_hold_allowed(carry_report, loaded_count=current_bucket))
     baseline_name, baseline_sand = secure_material_baseline_sand()
     baseline_sand = baseline_sand if isinstance(baseline_sand, dict) else {}
     start_bucket = int(baseline_sand.get("bucket_from_pile", current_bucket) or 0)
@@ -17421,17 +17515,28 @@ def post_lift_material_gate_report(current_metrics=None):
         int(CURL_HOLD_MIN_BUCKET_PARTICLES),
         int(float(max(start_bucket, 1)) * float(LIFT_CARRY_MIN_RETAINED_FROM_CUT_FRACTION)),
     )
-    ok = bool(current_bucket >= min_bucket)
-    return {
-        "ok": bool(ok),
-        "reason": "ok" if ok else (
+    material_ok = bool(current_bucket >= min_bucket)
+    ok = bool(material_ok and carry_ok)
+    if ok:
+        reason = "ok"
+    elif not material_ok:
+        reason = (
             f"lift_lost_material bucket={current_bucket}/{min_bucket} "
             f"retained={retained_fraction:.2f}/{float(LIFT_CARRY_MIN_RETAINED_FROM_CUT_FRACTION):.2f}"
-        ),
+        )
+    else:
+        reason = "lift_bucket_not_carry_safe:" + str((carry_report or {}).get("reason", "unknown"))
+    return {
+        "ok": bool(ok),
+        "reason": reason,
         "baseline": str(baseline_name),
         "bucket_before": int(start_bucket),
         "bucket_after": int(current_bucket),
         "bucket_min": int(min_bucket),
+        "material_ok": bool(material_ok),
+        "carry_ok": bool(carry_ok),
+        "q_lift_real_deg": q_deg_values(q_check, wrap_swing_for_display=True),
+        "carry_report": carry_report,
         "retained_fraction": float(retained_fraction),
         "min_retained_fraction": float(LIFT_CARRY_MIN_RETAINED_FROM_CUT_FRACTION),
         "spill_before": int(start_spill),
@@ -17466,6 +17571,15 @@ def staged_carry_safe_projection_candidates(q_start):
         q[arm_idx] = float(q[arm_idx]) + deg_to_rad(float(arm_retract_deg))
         q = clip_command_near(q, reference=q_start)
         q, carry_report = carry_hold_adjusted_q(q, q_reference=q_start, end_effector="load")
+        q_forced = force_loaded_carry_bucket_q(q, reference=q_start, label="secure_carry_safe_projection")
+        forced_report = carry_material_report_for_q(q_forced, end_effector="load")
+        if bool((forced_report or {}).get("retains_material", False)):
+            q = q_forced.copy()
+            carry_report = dict(forced_report)
+            carry_report["projection_source"] = "forced_loaded_carry_joint"
+        elif isinstance(carry_report, dict):
+            carry_report = dict(carry_report)
+            carry_report["forced_loaded_carry_report"] = forced_report
         actual_report = carry_material_report_for_q(q, end_effector="load")
         retains_material = bool((carry_report or {}).get("retains_material", False)) and bool(
             actual_report.get("retains_material", False)
@@ -17545,11 +17659,27 @@ def staged_lift_candidates(q_start):
         q[arm_idx] = float(q[arm_idx]) + deg_to_rad(arm_retract_deg)
         q[bucket_idx] = float(q_start[bucket_idx])
         q = clip_command_near(q, reference=q_start)
-        q, carry_report = carry_hold_adjusted_q(q, q_reference=q_start, end_effector="load")
+        preserved_report = carry_material_report_for_q(q, end_effector="load")
+        preserve_loaded_bucket = bool(loaded_transitional_hold_allowed(preserved_report, loaded_count=loaded_now))
+        if preserve_loaded_bucket:
+            carry_report = dict(preserved_report)
+            carry_report["transitional_load"] = True
+            carry_report["lift_preserves_bucket"] = True
+        else:
+            q, carry_report = carry_hold_adjusted_q(q, q_reference=q_start, end_effector="load")
+            q_forced = force_loaded_carry_bucket_q(q, reference=q_start, label="lift_carry_candidate")
+            forced_report = carry_material_report_for_q(q_forced, end_effector="load")
+            if bool((forced_report or {}).get("retains_material", False)):
+                q = q_forced.copy()
+                carry_report = dict(forced_report)
+                carry_report["projection_source"] = "forced_loaded_carry_joint"
+            elif isinstance(carry_report, dict):
+                carry_report = dict(carry_report)
+                carry_report["forced_loaded_carry_report"] = forced_report
         if not bool((carry_report or {}).get("ok", False)):
             continue
         retains_material = bool((carry_report or {}).get("retains_material", False))
-        transitional_material_hold = bool(real_loaded_secure_hold_allowed(carry_report, loaded_count=loaded_now))
+        transitional_material_hold = bool(loaded_transitional_hold_allowed(carry_report, loaded_count=loaded_now))
         if not (retains_material or transitional_material_hold):
             rows.append({
                 "ok": False,
@@ -17582,7 +17712,8 @@ def staged_lift_candidates(q_start):
         score = (
             float(motion.get("cost", 0.0) or 0.0)
             + carry_spill_risk_penalty(carry_report)
-            + (24.0 if transitional_material_hold and not retains_material else 0.0)
+            + (8.0 if preserve_loaded_bucket else 0.0)
+            + (24.0 if transitional_material_hold and not retains_material and not preserve_loaded_bucket else 0.0)
         )
         rows.append({
             "ok": True,
@@ -17593,6 +17724,7 @@ def staged_lift_candidates(q_start):
             "carry_report": carry_report,
             "retains_material": bool(retains_material),
             "transitional_material_hold": bool(transitional_material_hold and not retains_material),
+            "preserve_loaded_bucket": bool(preserve_loaded_bucket),
             "loaded_now": int(loaded_now),
             "boom_lift_deg": float(boom_lift_deg),
             "arm_retract_deg": float(arm_retract_deg),
@@ -17622,6 +17754,15 @@ def staged_high_carry_unload_fallback(q_lift, q_pre_dump, deadline=None):
         q_high[bucket_idx] = float(q_lift[bucket_idx])
         q_high = clip_command_near(q_high, reference=q_lift)
         q_high, carry_report = carry_hold_adjusted_q(q_high, q_reference=q_lift, end_effector="load")
+        q_high_forced = force_loaded_carry_bucket_q(q_high, reference=q_lift, label="staged_high_carry_route")
+        forced_report = carry_material_report_for_q(q_high_forced, end_effector="load")
+        if bool((forced_report or {}).get("retains_material", False)):
+            q_high = q_high_forced.copy()
+            carry_report = dict(forced_report)
+            carry_report["projection_source"] = "forced_loaded_carry_joint"
+        elif isinstance(carry_report, dict):
+            carry_report = dict(carry_report)
+            carry_report["forced_loaded_carry_report"] = forced_report
         if not bool((carry_report or {}).get("ok", False)):
             failures.append(f"carry_hold_failed:{(carry_report or {}).get('reason', 'unknown')}")
             continue
@@ -17643,7 +17784,7 @@ def staged_high_carry_unload_fallback(q_lift, q_pre_dump, deadline=None):
             if carry_calc is not None:
                 q_pre[bucket_idx] = float(carry_calc["bucket"])
         q_pre = clip_command_near(q_pre, reference=q_high)
-        q_pre, _limited_pre, _old_pre = apply_loaded_bucket_closed_limit(q_pre, label="staged_high_carry_pre_dump")
+        q_pre = force_loaded_carry_bucket_q(q_pre, reference=q_high, label="staged_high_carry_pre_dump")
 
         ok1, kind1, reason1, sample1, report1 = path_segment_check(
             q_lift,
@@ -18194,13 +18335,41 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
         return False
 
     q_start = sync_motion_start_q("staged_post_secure_load")
-    secure_metrics = record_phase_metrics("after_secure_load")
-    secure_gate = secure_post_gate_report(q_start, current_metrics=secure_metrics)
+    post_lift_reentry = bool(candidate.get("staged_lift_before_bucket_safe_appended", False)) and not bool(
+        candidate.get("staged_post_secure_load_appended", False)
+    )
+    if post_lift_reentry:
+        lift_metrics = record_phase_metrics("after_lift")
+        lift_gate = post_lift_material_gate_report(current_metrics=lift_metrics, q_pose=q_start)
+        candidate["post_lift_gate"] = lift_gate
+        if not bool(lift_gate.get("ok", False)):
+            reason = str(lift_gate.get("reason", "lift_lost_material"))
+            candidate["post_secure_projection"] = {
+                "ok": False,
+                "reason": reason,
+                "stage": "post_lift_reentry",
+            }
+            STATE["dig_plan_candidate"] = candidate
+            set_execution_failure_reason("quality_rejected/lift_lost_material:" + reason)
+            info_print("[POST LIFT GATE FAILED]", reason)
+            return False
+        secure_gate = {
+            "ok": True,
+            "reason": "post_lift_ready_for_unload",
+            "q_secure_deg": q_deg_values(q_start, wrap_swing_for_display=True),
+            "spill_gate_ok": True,
+            "carry_gate_ok": True,
+            "post_lift_reentry": True,
+            "lift_material_gate": lift_gate,
+        }
+    else:
+        secure_metrics = record_phase_metrics("after_secure_load")
+        secure_gate = secure_post_gate_report(q_start, current_metrics=secure_metrics)
     candidate["post_secure_gate"] = secure_gate
     STATE["dig_plan_candidate"] = candidate
     debug_timeline_record(
         "SECURE_GATE",
-        stage="secure_load",
+        stage="post_lift" if post_lift_reentry else "secure_load",
         result="ok" if bool(secure_gate.get("ok", False)) else "project_required",
         reason=str(secure_gate.get("reason", "")),
         q_cmd=q_start,
@@ -18235,6 +18404,7 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
                 include_sand=True,
             )
             return False
+    if not bool(secure_gate.get("ok", False)):
         if bool(candidate.get("staged_secure_carry_safe_appended", False)):
             reason = "secure_carry_safe_still_not_retaining:" + str(
                 secure_gate.get("reason", "current pose does not retain material")
@@ -18387,33 +18557,40 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
         )
         return True
 
-    lift_rows = staged_lift_candidates(q_lift_start)
-    valid_lift = [row for row in lift_rows if bool(row.get("ok", False))]
-    if not valid_lift:
-        reason = "; ".join(str(row.get("reason", "")) for row in lift_rows[:3]) or "no lift candidate"
-        set_execution_failure_reason("planning_failed/staged_lift_unreachable:" + reason)
-        info_print("[DIG PLAN STAGED FAILED]", "stage=lift_carry", reason)
-        return False
+    lift = None
+    lift_row = None
+    lift_duration = 0.0
+    q_lift = q_lift_start.copy()
+    if not post_lift_reentry:
+        lift_rows = staged_lift_candidates(q_lift_start)
+        valid_lift = [row for row in lift_rows if bool(row.get("ok", False))]
+        if not valid_lift:
+            reason = "; ".join(str(row.get("reason", "")) for row in lift_rows[:3]) or "no lift candidate"
+            set_execution_failure_reason("planning_failed/staged_lift_unreachable:" + reason)
+            info_print("[DIG PLAN STAGED FAILED]", "stage=lift_carry", reason)
+            return False
 
-    lift = sorted(valid_lift, key=lambda row: float(row.get("score", 1.0e9)))[0]
-    q_lift = np.array(lift["q"], dtype=np.float32).copy()
-    lift_duration = float(lift.get("duration", 1.1) or 1.1)
-    lift_row = make_stage_row_from_q(
-        "lift_carry",
-        q_lift,
-        q_lift_start,
-        lift_duration,
-        target_point=lift.get("target_point"),
-        extra={
-            "material_hold": lift.get("carry_report", {}),
-            "staged_runtime_plan": True,
-            "secure_load_runtime_append": {
-                "source_task": str(task_label),
-                "boom_lift_deg": float(lift.get("boom_lift_deg", 0.0)),
-                "arm_retract_deg": float(lift.get("arm_retract_deg", 0.0)),
+        lift = sorted(valid_lift, key=lambda row: float(row.get("score", 1.0e9)))[0]
+        q_lift = np.array(lift["q"], dtype=np.float32).copy()
+        lift_duration = float(lift.get("duration", 1.1) or 1.1)
+        lift_row = make_stage_row_from_q(
+            "lift_carry",
+            q_lift,
+            q_lift_start,
+            lift_duration,
+            target_point=lift.get("target_point"),
+            extra={
+                "material_hold": lift.get("carry_report", {}),
+                "staged_runtime_plan": True,
+                "secure_load_runtime_append": {
+                    "source_task": str(task_label),
+                    "boom_lift_deg": float(lift.get("boom_lift_deg", 0.0)),
+                    "arm_retract_deg": float(lift.get("arm_retract_deg", 0.0)),
+                    "preserve_loaded_bucket": bool(lift.get("preserve_loaded_bucket", False)),
+                    "deferred_bucket_safe_until_after_lift": False,
+                },
             },
-        },
-    )
+        )
 
     deadline = time.time() + 10.0
     q_dump, dump_info = plan_dump_pose_to_bin(
@@ -18441,17 +18618,16 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
     else:
         q_pre_dump[bucket_idx] = float(q_lift[bucket_idx])
     q_pre_dump = clip_command_near(q_pre_dump, reference=q_lift)
-    q_pre_dump, pre_dump_loaded_limited, pre_dump_old_bucket_deg = apply_loaded_bucket_closed_limit(
-        q_pre_dump,
-        label="staged_unload_to_bin",
-    )
-    if pre_dump_loaded_limited:
+    pre_dump_old_bucket_deg = rad_to_deg(float(q_pre_dump[bucket_idx]))
+    q_pre_dump = force_loaded_carry_bucket_q(q_pre_dump, reference=q_lift, label="staged_unload_to_bin")
+    pre_dump_new_bucket_deg = rad_to_deg(float(q_pre_dump[bucket_idx]))
+    if abs(pre_dump_new_bucket_deg - pre_dump_old_bucket_deg) > 0.25:
         info_print(
             "[LOADED BUCKET LIMIT]",
             "stage=staged_unload_to_bin",
             f"requested={pre_dump_old_bucket_deg:.2f}deg",
-            f"limited_to={float(BUCKET_LOADED_CLOSED_LIMIT_DEG):.2f}deg",
-            "reason=pre_dump_carry_executable_limit",
+            f"forced_to={pre_dump_new_bucket_deg:.2f}deg",
+            "reason=pre_dump_loaded_carry_contract",
         )
 
     direct_ok, kind, reason, sample, report = path_segment_check(
@@ -18559,8 +18735,15 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
 
     seq.extend(carry_safe_seq)
     points.extend(carry_safe_points)
-    seq.extend([("lift_carry", q_lift.copy(), lift_duration)])
-    points.append(np.array(lift.get("target_point") if lift.get("target_point") is not None else unload_bin_landing_point(), dtype=np.float32).reshape(-1)[:3].copy())
+    if not post_lift_reentry:
+        seq.extend([("lift_carry", q_lift.copy(), lift_duration)])
+        lift_target = lift.get("target_point") if isinstance(lift, dict) else None
+        points.append(
+            np.array(
+                lift_target if lift_target is not None else unload_bin_landing_point(),
+                dtype=np.float32,
+            ).reshape(-1)[:3].copy()
+        )
     seq.extend(route_seq)
     points.extend(route_points)
     seq.append(("unload_to_bin", q_pre_dump.copy(), unload_duration))
@@ -18568,7 +18751,8 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
 
     stages = list(candidate.get("stages", []) or [])
     stages.extend(carry_safe_stages)
-    stages.append(lift_row)
+    if lift_row is not None:
+        stages.append(lift_row)
     stages.extend(route_stages)
     stages.append(unload_row)
     candidate["stages"] = stages
@@ -18598,12 +18782,19 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
         draw_trace(force=True)
     info_print(
         "[DIG PLAN STAGED APPEND]",
-        "added=lift_carry,unload_to_bin",
+        "added=unload_to_bin" if post_lift_reentry else "added=lift_carry,unload_to_bin",
         f"route_waypoints={len(route_seq)}",
         f"drop_xy_err={fmt_optional(drop.get('xy_err'))}",
         f"inside_xy={drop.get('inside_xy')}",
     )
     return True
+
+
+def should_append_staged_post_secure_load_after_stage(stage_name):
+    semantic = dig_plan_semantic_phase_name(stage_name)
+    if semantic in ("secure_load", "secure_carry_safe"):
+        return True
+    return False
 
 
 def plan_dig_sequence_from_target(target_xyz, max_seconds=None):
@@ -19698,7 +19889,7 @@ async def execute_dig_plan_step(step_index=None):
             record_phase_metrics("after_dig")
         elif stage_name == "lift_carry":
             lift_metrics = record_phase_metrics("after_lift")
-            lift_gate = post_lift_material_gate_report(current_metrics=lift_metrics)
+            lift_gate = post_lift_material_gate_report(current_metrics=lift_metrics, q_pose=get_real_joint_positions())
             debug_timeline_record(
                 "LIFT_MATERIAL_GATE",
                 stage=stage_name,
@@ -19746,7 +19937,7 @@ async def execute_dig_plan_step(step_index=None):
                 include_sand=True,
             )
             return
-    if dig_plan_semantic_phase_name(stage_name) in ("secure_load", "secure_carry_safe"):
+    if should_append_staged_post_secure_load_after_stage(stage_name):
         if not append_staged_post_secure_load_plan(task_label="debug_step"):
             update_status(execution_failure_status_text(stage_name), force=True)
             record_stage_audit(
@@ -19894,7 +20085,7 @@ async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"
                 record_phase_metrics("after_dig")
             elif stage_name == "lift_carry":
                 lift_metrics = record_phase_metrics("after_lift")
-                lift_gate = post_lift_material_gate_report(current_metrics=lift_metrics)
+                lift_gate = post_lift_material_gate_report(current_metrics=lift_metrics, q_pose=get_real_joint_positions())
                 debug_timeline_record(
                     "LIFT_MATERIAL_GATE",
                     stage=stage_name,
@@ -19941,7 +20132,7 @@ async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"
                     include_sand=True,
                 )
                 return False
-        if dig_plan_semantic_phase_name(stage_name) in ("secure_load", "secure_carry_safe"):
+        if should_append_staged_post_secure_load_after_stage(stage_name):
             if not append_staged_post_secure_load_plan(task_label=task_name):
                 update_status(execution_failure_status_text(stage_name), force=True)
                 record_stage_audit(

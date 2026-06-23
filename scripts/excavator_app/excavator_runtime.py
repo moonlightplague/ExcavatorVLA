@@ -627,6 +627,7 @@ UNLOAD_DROP_XY_TOL = 0.22
 UNLOAD_DROP_SCATTER_MARGIN_XY = 0.58
 UNLOAD_FORCE_CENTER_HIGH_RELEASE = True
 UNLOAD_CENTER_RELEASE_XY_TOL = 0.16
+UNLOAD_CENTER_RELEASE_SOFT_XY_TOL = 0.50
 UNLOAD_CENTER_RELEASE_CORRECTION_GAIN = 0.45
 UNLOAD_RELEASE_SOURCE_BLEND = 0.50
 UNLOAD_DROP_SOURCE_MIN_CLEARANCE_Z = 0.18
@@ -20944,6 +20945,12 @@ def plan_dump_pose_to_bin(
             bool(seed_drop.get("release_centered_ok", False))
             and float(seed_drop.get("release_xy_err", 999.0) or 999.0) <= float(UNLOAD_CENTER_RELEASE_XY_TOL)
         )
+        or (
+            center_release_mode
+            and unload_drop_execution_ready(seed_drop)
+            and bool(seed_drop.get("close_xy", False))
+            and float(seed_drop.get("release_xy_err", 999.0) or 999.0) <= float(UNLOAD_CENTER_RELEASE_SOFT_XY_TOL)
+        )
     )
     if allow_unaligned and unload_drop_execution_ready(seed_drop) and seed_center_ready:
         info = {
@@ -21094,13 +21101,22 @@ def plan_dump_pose_to_bin(
         )
         overflow_xy = float(drop.get("bin_overflow_xy", xy_err) or 0.0)
         release_xy_err = float(drop.get("release_xy_err", xy_err) or 0.0)
+        center_soft_ready = bool(
+            center_ready
+            or (
+                center_release_mode
+                and drop_ready
+                and bool(drop.get("close_xy", False))
+                and release_xy_err <= float(UNLOAD_CENTER_RELEASE_SOFT_XY_TOL)
+            )
+        )
         effective_xy_err = release_xy_err if center_release_mode else (overflow_xy if drop_ready else xy_err)
         source_penalty = max(0.0, UNLOAD_DROP_SOURCE_MIN_CLEARANCE_Z - source_clearance)
         bucket_penalty = max(0.0, bucket_err - UNLOAD_DUMP_BUCKET_TOL_DEG)
         ik_bucket_penalty = max(0.0, ik_bucket_err - UNLOAD_DUMP_BUCKET_TOL_DEG)
         planar_err = float(info.get("planar_err", 0.0)) if isinstance(info, dict) else 0.0
         height_bonus = min(2.5, max(0.0, source_clearance - float(UNLOAD_DROP_SOURCE_MIN_CLEARANCE_Z))) * 7.5
-        acceptance_penalty = 0.0 if (drop_ready and center_ready) else 35.0
+        acceptance_penalty = 0.0 if (drop_ready and center_soft_ready) else 35.0
         cost = (
             65.0 * effective_xy_err
             + 35.0 * source_penalty
@@ -21121,6 +21137,7 @@ def plan_dump_pose_to_bin(
             "release_target": release_target.copy(),
             "pour_target": pour_target.copy(),
             "center_ready": bool(center_ready),
+            "center_soft_ready": bool(center_soft_ready),
         }
         if best is None or row["cost"] < best["cost"]:
             best = row
@@ -21137,6 +21154,7 @@ def plan_dump_pose_to_bin(
                 f"release_xy_err={fmt_optional(drop.get('release_xy_err'))} "
                 f"center_required={center_release_mode} "
                 f"center_ready={center_ready} "
+                f"center_soft_ready={center_soft_ready} "
                 f"release_align_deg={release_alignment_bucket_deg:.2f} "
                 f"final_dump_deg={final_dump_deg:.2f} "
                 f"acceptance={drop.get('landing_acceptance')} "
@@ -21147,7 +21165,7 @@ def plan_dump_pose_to_bin(
                 force_log=True,
             )
 
-        if drop_ready and center_ready:
+        if drop_ready and center_soft_ready:
             row["info"]["drop"] = drop
             row["info"]["drop_target"] = vec_list(drop_target, 3)
             row["info"]["pour_target"] = vec_list(pour_target, 3)
@@ -21160,7 +21178,12 @@ def plan_dump_pose_to_bin(
             row["info"]["dump_bucket_err_deg"] = float(bucket_err)
             row["info"]["ik_bucket_err_deg"] = float(ik_bucket_err)
             row["info"]["drop_alignment_ready"] = True
-            row["info"]["drop_alignment_policy"] = str(drop.get("landing_acceptance", "scatter_tolerant_high_release"))
+            row["info"]["drop_alignment_policy"] = str(
+                drop.get(
+                    "landing_acceptance",
+                    "center_soft_close_xy_high_release" if center_release_mode and not center_ready else "scatter_tolerant_high_release",
+                )
+            )
             if log:
                 raw_swing = row["info"].get("raw_swing_goal")
                 swing_goal = row["info"].get("swing_goal")
@@ -21250,7 +21273,7 @@ def plan_dump_pose_to_bin(
     if (
         best is not None
         and unload_drop_execution_ready(best.get("drop", {}))
-        and (not center_release_mode or bool(best.get("center_ready", False)))
+        and (not center_release_mode or bool(best.get("center_soft_ready", False)))
     ):
         drop = best["drop"]
         best["info"]["drop"] = drop
@@ -21290,7 +21313,7 @@ def plan_dump_pose_to_bin(
             f"scatter_xy_ok={drop.get('scatter_xy_ok')} acceptance={drop.get('landing_acceptance')} "
             f"source_clearance={fmt_optional(drop.get('source_clearance'))}"
         )
-        if allow_unaligned and unload_drop_execution_ready(drop) and (not center_release_mode or bool(best.get("center_ready", False))):
+        if allow_unaligned and unload_drop_execution_ready(drop) and (not center_release_mode or bool(best.get("center_soft_ready", False))):
             best["info"]["drop"] = drop
             best["info"]["drop_target"] = vec_list(drop_target, 3)
             best["info"]["pour_target"] = vec_list(best.get("pour_target"), 3)

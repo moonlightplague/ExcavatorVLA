@@ -420,6 +420,10 @@ CURL_HOLD_ACCEPT_BUCKET_DEG = -110.0
 CURL_HOLD_ACCEPT_MAX_ERR_DEG = 14.0
 CURL_HOLD_TARGET_DEG = -120.0
 BUCKET_LOADED_CLOSED_LIMIT_DEG = CURL_HOLD_TARGET_DEG
+SECURE_PROGRESSIVE_MIN_STEPS = 2
+SECURE_PROGRESSIVE_MAX_STEPS = 4
+SECURE_PROGRESSIVE_MAX_BUCKET_STEP_DEG = 28.0
+SECURE_PROGRESSIVE_STEP_SECONDS = 0.62
 SECURE_HOLD_MAX_SPILL_PARTICLES = 240
 SECURE_HOLD_MAX_SPILL_FRACTION = 0.35
 SECURE_HOLD_MAX_BUCKET_LOSS_FRACTION = 0.45
@@ -18816,10 +18820,13 @@ def secure_post_gate_report(q_start, current_metrics=None):
     bucket_after = int(delta_report.get("bucket_after", 0) or 0)
     geometry_retains = bool(carry_report.get("ok", False)) and bool(carry_report.get("retains_material", False))
     real_loaded_hold = real_loaded_secure_hold_allowed(carry_report, loaded_count=bucket_after)
-    carry_ok = bool(geometry_retains or real_loaded_hold)
+    transitional_loaded_hold = loaded_transitional_hold_allowed(carry_report, loaded_count=bucket_after)
+    carry_ok = bool(geometry_retains or real_loaded_hold or transitional_loaded_hold)
     delta_ok = bool(delta_report.get("ok", False))
     ok = carry_ok and delta_ok
-    if ok:
+    if ok and transitional_loaded_hold and not (geometry_retains or real_loaded_hold):
+        reason = "ok_transitional_loaded_hold"
+    elif ok:
         reason = "ok"
     elif not delta_ok:
         reason = str(delta_report.get("reason", "secure_material_loss"))
@@ -18838,6 +18845,7 @@ def secure_post_gate_report(q_start, current_metrics=None):
         "carry_gate_ok": bool(carry_ok),
         "geometry_retains_material": bool(geometry_retains),
         "real_loaded_hold_allowed": bool(real_loaded_hold),
+        "transitional_loaded_hold_allowed": bool(transitional_loaded_hold),
     }
 
 
@@ -18852,7 +18860,9 @@ def post_lift_material_gate_report(current_metrics=None, q_pose=None):
     except Exception:
         q_check = CTRL.q_cmd.copy()
     carry_report = carry_material_report_for_q(q_check, end_effector="load")
-    carry_ok = bool(real_loaded_secure_hold_allowed(carry_report, loaded_count=current_bucket))
+    real_loaded_hold = real_loaded_secure_hold_allowed(carry_report, loaded_count=current_bucket)
+    transitional_loaded_hold = loaded_transitional_hold_allowed(carry_report, loaded_count=current_bucket)
+    carry_ok = bool(real_loaded_hold or transitional_loaded_hold)
     baseline_name, baseline_sand = secure_material_baseline_sand()
     baseline_sand = baseline_sand if isinstance(baseline_sand, dict) else {}
     start_bucket = int(baseline_sand.get("bucket_from_pile", current_bucket) or 0)
@@ -18882,6 +18892,8 @@ def post_lift_material_gate_report(current_metrics=None, q_pose=None):
         "bucket_min": int(min_bucket),
         "material_ok": bool(material_ok),
         "carry_ok": bool(carry_ok),
+        "real_loaded_hold_allowed": bool(real_loaded_hold),
+        "transitional_loaded_hold_allowed": bool(transitional_loaded_hold),
         "q_lift_real_deg": q_deg_values(q_check, wrap_swing_for_display=True),
         "carry_report": carry_report,
         "retained_fraction": float(retained_fraction),
@@ -18935,6 +18947,10 @@ def staged_carry_safe_projection_candidates(q_start):
             carry_report,
             loaded_count=loaded_now,
         )
+        transitional_hold = loaded_transitional_hold_allowed(actual_report, loaded_count=loaded_now) or loaded_transitional_hold_allowed(
+            carry_report,
+            loaded_count=loaded_now,
+        )
         if not bool((carry_report or {}).get("ok", False)):
             rows.append({
                 "ok": False,
@@ -18943,7 +18959,7 @@ def staged_carry_safe_projection_candidates(q_start):
                 "actual_report": actual_report,
             })
             continue
-        if not (retains_material or real_loaded_hold):
+        if not (retains_material or real_loaded_hold or transitional_hold):
             rows.append({
                 "ok": False,
                 "reason": f"carry_would_spill:{actual_report.get('reason', carry_report.get('reason', 'unknown'))}",
@@ -18970,7 +18986,7 @@ def staged_carry_safe_projection_candidates(q_start):
         duration = estimate_stage_motion_seconds(q_start, q, requested_seconds=0.75)
         motion = plan_joint_motion_metrics(q, q_start, duration)
         score = float(motion.get("cost", 0.0) or 0.0)
-        if real_loaded_hold and not retains_material:
+        if (real_loaded_hold or transitional_hold) and not retains_material:
             score += carry_spill_risk_penalty(actual_report)
         rows.append({
             "ok": True,
@@ -18982,6 +18998,7 @@ def staged_carry_safe_projection_candidates(q_start):
             "actual_report": actual_report,
             "retains_material": bool(retains_material),
             "real_loaded_hold_allowed": bool(real_loaded_hold),
+            "transitional_loaded_hold_allowed": bool(transitional_hold),
             "motion": motion,
             "boom_lift_deg": float(boom_lift_deg),
             "arm_retract_deg": float(arm_retract_deg),
@@ -19245,9 +19262,12 @@ def staged_dig_secure_candidates(q_start, loaded_count_hint=None):
         )
         forced_report = carry_material_report_for_q(q_forced, end_effector="load")
         forced_loaded_hold = bool(real_loaded_secure_hold_allowed(forced_report, loaded_count=loaded_count_for_secure))
+        forced_transitional_hold = bool(loaded_transitional_hold_allowed(forced_report, loaded_count=loaded_count_for_secure))
         adjusted_loaded_hold = bool(
             real_loaded_secure_hold_allowed(adjusted_actual_report, loaded_count=loaded_count_for_secure)
             or real_loaded_secure_hold_allowed(adjusted_carry_report, loaded_count=loaded_count_for_secure)
+            or loaded_transitional_hold_allowed(adjusted_actual_report, loaded_count=loaded_count_for_secure)
+            or loaded_transitional_hold_allowed(adjusted_carry_report, loaded_count=loaded_count_for_secure)
         )
         forced_joint_safe = bool((forced_report or {}).get("ok", False)) and bool(
             (forced_report or {}).get("loaded_carry_joint_ok", False)
@@ -19298,9 +19318,10 @@ def staged_dig_secure_candidates(q_start, loaded_count_hint=None):
         )
         transitional_material_hold = bool(
             forced_loaded_hold
+            or forced_transitional_hold
             or adjusted_loaded_hold
-            or real_loaded_secure_hold_allowed(actual_report, loaded_count=loaded_count_for_secure)
-            or real_loaded_secure_hold_allowed(carry_report, loaded_count=loaded_count_for_secure)
+            or loaded_transitional_hold_allowed(actual_report, loaded_count=loaded_count_for_secure)
+            or loaded_transitional_hold_allowed(carry_report, loaded_count=loaded_count_for_secure)
         )
         if not (retains_material or transitional_material_hold):
             secure_rows.append({
@@ -19322,70 +19343,100 @@ def staged_dig_secure_candidates(q_start, loaded_count_hint=None):
             })
             return
 
-        # Close the bucket first, but do not hold boom/arm fixed if that would
-        # drive the bucket through hard ground or into a rigid obstacle. Try a
-        # small lattice of synchronized boom/arm corrections before rejecting
-        # the secure pose.
-        curl_attempts = []
-        selected_curl = None
-        for boom_fraction, arm_fraction in [
-            (0.25, 0.10),
-            (0.35, 0.20),
-            (0.45, 0.25),
-            (0.55, 0.35),
-            (0.65, 0.45),
-            (0.75, 0.55),
-            (0.85, 0.65),
-            (0.95, 0.75),
-            (1.00, 0.85),
-            (1.00, 1.00),
-        ]:
-            q_curl = q_start.copy()
-            q_curl[bucket_idx] = float(q_secure[bucket_idx])
-            q_curl[boom_idx] = float(q_start[boom_idx]) + float(boom_fraction) * float(q_secure[boom_idx] - q_start[boom_idx])
-            q_curl[arm_idx] = float(q_start[arm_idx]) + float(arm_fraction) * float(q_secure[arm_idx] - q_start[arm_idx])
-            q_curl = clip_command_near(q_curl, reference=q_start)
-            curl_bucket_deg = float(rad_to_deg(q_curl[bucket_idx]))
+        # Close and lift as one progressive motion. A single large curl at low
+        # height tends to either spill particles or let PhysX wedge the bucket
+        # against sand/ground, so each waypoint is checked independently.
+        def progressive_secure_specs(q_goal):
+            q_goal = np.array(q_goal, dtype=np.float32).reshape(-1)[:4].copy()
+            bucket_delta_deg = abs(rad_to_deg(float(q_goal[bucket_idx] - q_start[bucket_idx])))
+            boom_delta_deg = abs(rad_to_deg(float(q_goal[boom_idx] - q_start[boom_idx])))
+            arm_delta_deg = abs(rad_to_deg(float(q_goal[arm_idx] - q_start[arm_idx])))
+            max_step_deg = max(1.0, float(SECURE_PROGRESSIVE_MAX_BUCKET_STEP_DEG))
+            step_count = int(math.ceil(bucket_delta_deg / max_step_deg))
+            if max(boom_delta_deg, arm_delta_deg) > 18.0:
+                step_count = max(step_count, int(math.ceil(max(boom_delta_deg, arm_delta_deg) / 18.0)))
+            step_count = max(int(SECURE_PROGRESSIVE_MIN_STEPS), min(int(SECURE_PROGRESSIVE_MAX_STEPS), step_count))
+            fractions = [(i + 1) / float(step_count) for i in range(step_count)]
+            specs = []
+            failures = []
+            q_prev = q_start.copy()
+            total_cost = 0.0
+            max_bucket_step = 0.0
+            max_joint_step = 0.0
+            for step_i, frac in enumerate(fractions):
+                final_step = step_i == len(fractions) - 1
+                phase = "secure_load" if final_step else "curl_to_hold_material"
+                q_step = q_start.copy()
+                q_step[boom_idx] = float(q_start[boom_idx]) + float(frac) * float(q_goal[boom_idx] - q_start[boom_idx])
+                q_step[arm_idx] = float(q_start[arm_idx]) + float(frac) * float(q_goal[arm_idx] - q_start[arm_idx])
+                q_step[bucket_idx] = float(q_start[bucket_idx]) + float(frac) * float(q_goal[bucket_idx] - q_start[bucket_idx])
+                swing_idx = CTRL.name_to_idx.get("swing", 0)
+                q_step[swing_idx] = float(q_start[swing_idx]) + float(frac) * float(
+                    swing_delta(float(q_goal[swing_idx]), float(q_start[swing_idx]))
+                )
+                q_step = clip_command_near(q_step, reference=q_prev)
+                step_report = predicted_phase_ground_report(q_step, phase, reference_q=q_prev)
+                step_ok, step_reason = phase_ground_ok(phase, step_report)
+                if not step_ok:
+                    failures.append({
+                        "ok": False,
+                        "phase": phase,
+                        "step": int(step_i + 1),
+                        "reason": f"{phase}_ground:{step_reason}",
+                        "report": step_report,
+                    })
+                    return None, failures
+                path_ok, path_kind, path_reason, path_sample, path_report = path_segment_check(
+                    q_prev,
+                    q_step,
+                    phase,
+                    samples=3,
+                )
+                if not path_ok:
+                    failures.append({
+                        "ok": False,
+                        "phase": phase,
+                        "step": int(step_i + 1),
+                        "reason": f"{phase}_{path_kind}:{path_reason}",
+                        "sample": path_sample,
+                        "report": path_report,
+                    })
+                    return None, failures
+                duration = estimate_stage_motion_seconds(
+                    q_prev,
+                    q_step,
+                    requested_seconds=float(SECURE_PROGRESSIVE_STEP_SECONDS),
+                )
+                motion = plan_joint_motion_metrics(q_step, q_prev, duration)
+                step_delta = q_delta_abs_deg(q_step, q_prev)
+                bucket_step = float(step_delta[bucket_idx]) if bucket_idx < len(step_delta) else 0.0
+                joint_step = max(float(x) for x in step_delta) if step_delta else 0.0
+                max_bucket_step = max(max_bucket_step, bucket_step)
+                max_joint_step = max(max_joint_step, joint_step)
+                total_cost += float(motion.get("cost", 0.0) or 0.0)
+                specs.append({
+                    "phase": phase,
+                    "q": q_step.copy(),
+                    "q_prev": q_prev.copy(),
+                    "duration": float(duration),
+                    "report": step_report,
+                    "motion": motion,
+                    "bucket_step_deg": float(bucket_step),
+                    "max_joint_step_deg": float(joint_step),
+                    "fraction": float(frac),
+                })
+                q_prev = q_step.copy()
+            return {
+                "specs": specs,
+                "step_count": int(step_count),
+                "total_cost": float(total_cost),
+                "max_bucket_step_deg": float(max_bucket_step),
+                "max_joint_step_deg": float(max_joint_step),
+            }, failures
 
-            curl_report = predicted_phase_ground_report(q_curl, "curl_to_hold_material", reference_q=q_start)
-            curl_ok, curl_reason = phase_ground_ok("curl_to_hold_material", curl_report)
-            if not curl_ok:
-                curl_attempts.append({
-                    "ok": False,
-                    "reason": f"curl_ground:{curl_reason}",
-                    "boom_fraction": float(boom_fraction),
-                    "arm_fraction": float(arm_fraction),
-                    "curl_report": curl_report,
-                })
-                continue
-            curl_path_ok, curl_kind, curl_path_reason, curl_sample, curl_path_report = path_segment_check(
-                q_start,
-                q_curl,
-                "curl_to_hold_material",
-                samples=2,
-            )
-            if not curl_path_ok:
-                curl_attempts.append({
-                    "ok": False,
-                    "reason": f"curl_{curl_kind}:{curl_path_reason}",
-                    "sample": curl_sample,
-                    "report": curl_path_report,
-                    "boom_fraction": float(boom_fraction),
-                    "arm_fraction": float(arm_fraction),
-                    "curl_report": curl_report,
-                })
-                continue
-            selected_curl = {
-                "q": q_curl.copy(),
-                "bucket_deg": float(curl_bucket_deg),
-                "report": curl_report,
-                "boom_fraction": float(boom_fraction),
-                "arm_fraction": float(arm_fraction),
-                "attempts": curl_attempts,
-            }
-            break
-        if selected_curl is None:
-            best_reason = "; ".join(str(row.get("reason", "")) for row in curl_attempts[:3]) or "curl no executable boom/arm adjustment"
+        progressive, curl_attempts = progressive_secure_specs(q_secure)
+        if progressive is None:
+            best_reason = "; ".join(str(row.get("reason", "")) for row in curl_attempts[:3]) or "curl no executable progressive lift/curl path"
             secure_rows.append({
                 "ok": False,
                 "source": str(source),
@@ -19399,58 +19450,32 @@ def staged_dig_secure_candidates(q_start, loaded_count_hint=None):
                 "forced_bucket_deg": float(rad_to_deg(q_forced[bucket_idx])),
             })
             return
-        q_curl = selected_curl["q"].copy()
-        curl_bucket_deg = float(selected_curl["bucket_deg"])
-        curl_report = selected_curl["report"]
-
-        secure_report = predicted_phase_ground_report(q_secure, "secure_load", reference_q=q_curl)
-        secure_ok, secure_reason = phase_ground_ok("secure_load", secure_report)
-        if not secure_ok:
+        stage_specs = list(progressive.get("specs", []) or [])
+        if not stage_specs:
             secure_rows.append({
                 "ok": False,
                 "source": str(source),
-                "reason": (
-                    f"secure_ground:{secure_reason}; "
-                    f"secure_source={secure_source} "
-                    f"q_secure_bucket={rad_to_deg(float(q_secure[bucket_idx])):.2f}deg "
-                    f"forced_bucket={rad_to_deg(float(q_forced[bucket_idx])):.2f}deg"
-                ),
-                "carry_report": carry_report,
-                "actual_report": actual_report,
-                "forced_report": forced_report,
-                "ground_report": secure_report,
-                "secure_source": str(secure_source),
-            })
-            return
-        ok, kind, reason, sample, report = path_segment_check(
-            q_curl,
-            q_secure,
-            "secure_load",
-            samples=2,
-        )
-        if not ok:
-            secure_rows.append({
-                "ok": False,
-                "source": str(source),
-                "reason": f"{kind}:{reason}",
-                "sample": sample,
-                "report": report,
+                "reason": "progressive_secure_empty",
                 "carry_report": carry_report,
                 "actual_report": actual_report,
                 "forced_report": forced_report,
                 "secure_source": str(secure_source),
-                "q_secure_bucket_deg": float(rad_to_deg(q_secure[bucket_idx])),
             })
             return
-        curl_duration = estimate_stage_motion_seconds(q_start, q_curl, requested_seconds=0.90)
-        secure_duration = estimate_stage_motion_seconds(q_curl, q_secure, requested_seconds=0.85)
-        curl_motion = plan_joint_motion_metrics(q_curl, q_start, curl_duration)
-        secure_motion = plan_joint_motion_metrics(q_secure, q_curl, secure_duration)
+        q_curl = np.array(stage_specs[0]["q"], dtype=np.float32).copy()
+        curl_bucket_deg = float(rad_to_deg(q_curl[bucket_idx]))
+        curl_report = stage_specs[0].get("report") or {}
+        secure_report = stage_specs[-1].get("report") or {}
+        curl_duration = float(stage_specs[0].get("duration", SECURE_PROGRESSIVE_STEP_SECONDS))
+        secure_duration = float(stage_specs[-1].get("duration", SECURE_PROGRESSIVE_STEP_SECONDS))
+        curl_motion = stage_specs[0].get("motion") or {}
+        secure_motion = stage_specs[-1].get("motion") or {}
         target_point = predicted_end_world_point(q_secure, end_effector="load", reference_q=q_curl)
         score = (
-            float(curl_motion.get("cost", 0.0) or 0.0)
-            + float(secure_motion.get("cost", 0.0) or 0.0)
+            float(progressive.get("total_cost", 0.0) or 0.0)
             + carry_spill_risk_penalty(carry_report)
+            + 1.5 * float(progressive.get("max_bucket_step_deg", 0.0) or 0.0)
+            + 0.7 * float(progressive.get("max_joint_step_deg", 0.0) or 0.0)
             - 16.0 * max(0.0, float(actual_report.get("pour_above_load_z", (carry_report or {}).get("pour_above_load_z", 0.0)) or 0.0))
         )
         secure_rows.append({
@@ -19464,6 +19489,12 @@ def staged_dig_secure_candidates(q_start, loaded_count_hint=None):
             "q": q_secure.copy(),
             "curl_duration": float(curl_duration),
             "duration": float(secure_duration),
+            "stage_specs": stage_specs,
+            "progressive_secure": {
+                "step_count": int(progressive.get("step_count", len(stage_specs))),
+                "max_bucket_step_deg": float(progressive.get("max_bucket_step_deg", 0.0) or 0.0),
+                "max_joint_step_deg": float(progressive.get("max_joint_step_deg", 0.0) or 0.0),
+            },
             "target_point": target_point,
             "curl_motion": curl_motion,
             "motion": secure_motion,
@@ -19478,8 +19509,8 @@ def staged_dig_secure_candidates(q_start, loaded_count_hint=None):
             "ground_report": secure_report,
             "curl_bucket_deg": float(curl_bucket_deg),
             "curl_joint_closed_ok_deprecated": bool(curl_bucket_deg <= float(CURL_HOLD_ACCEPT_BUCKET_DEG) + 0.25),
-            "curl_boom_fraction": float(selected_curl.get("boom_fraction", 0.0)),
-            "curl_arm_fraction": float(selected_curl.get("arm_fraction", 0.0)),
+            "curl_boom_fraction": float(stage_specs[0].get("fraction", 0.0) if stage_specs else 0.0),
+            "curl_arm_fraction": float(stage_specs[0].get("fraction", 0.0) if stage_specs else 0.0),
             "boom_lift_deg": float(boom_lift_deg),
             "arm_retract_deg": float(arm_retract_deg),
         })
@@ -19520,81 +19551,82 @@ def staged_dig_secure_candidates(q_start, loaded_count_hint=None):
         )
 
     best_secure = sorted(valid_secure, key=lambda row: float(row.get("score", 1.0e9)))[0]
-    q_curl = np.array(best_secure["q_curl"], dtype=np.float32).copy()
     q_secure = np.array(best_secure["q"], dtype=np.float32).copy()
-    curl_duration = float(best_secure.get("curl_duration", 0.90))
-    curl_target = predicted_end_world_point(q_curl, end_effector="tip", reference_q=q_start)
-    curl_report = best_secure.get("curl_report") or {}
-    curl_row = make_stage_row_from_q(
-        "curl_to_hold_material",
-        q_curl,
-        q_start,
-        curl_duration,
-        target_point=curl_target,
-        extra={
-            "staged_runtime_plan": True,
-            "staged_append_source": "post_pull_exit",
-            "seal_bucket_first": True,
-            "material_hold": {
-                "ok": True,
-                "reason": "curl_bucket_toward_retaining_secure_pose"
-                if bool(best_secure.get("retains_material", False))
-                else "curl_bucket_toward_real_loaded_secure_pose",
-                "bucket_deg": float(rad_to_deg(q_curl[bucket_idx])),
-                "joint_closed_ok_deprecated": bool(best_secure.get("curl_joint_closed_ok_deprecated", False)),
-                "target_secure_bucket_deg": float(rad_to_deg(q_secure[bucket_idx])),
-                "retaining_secure_report": best_secure.get("actual_report", best_secure.get("carry_report", {})),
-                "real_loaded_hold_allowed": bool(best_secure.get("transitional_material_hold", False)),
-                "loaded_count_for_secure": int(best_secure.get("loaded_count_for_secure", 0) or 0),
-                "curl_boom_fraction": float(best_secure.get("curl_boom_fraction", 0.0) or 0.0),
-                "curl_arm_fraction": float(best_secure.get("curl_arm_fraction", 0.0) or 0.0),
+    stage_specs = list(best_secure.get("stage_specs", []) or [])
+    if not stage_specs:
+        stage_specs = [
+            {
+                "phase": "secure_load",
+                "q": q_secure.copy(),
+                "q_prev": q_start.copy(),
+                "duration": float(best_secure.get("duration", SECURE_PROGRESSIVE_STEP_SECONDS)),
+                "report": best_secure.get("ground_report", {}),
+                "fraction": 1.0,
+            }
+        ]
+    rows = []
+    for spec_index, spec in enumerate(stage_specs):
+        phase = str(spec.get("phase", "secure_load"))
+        q_step = np.array(spec.get("q"), dtype=np.float32).reshape(-1)[:4].copy()
+        q_prev = np.array(spec.get("q_prev", q_start), dtype=np.float32).reshape(-1)[:4].copy()
+        duration = float(spec.get("duration", SECURE_PROGRESSIVE_STEP_SECONDS) or SECURE_PROGRESSIVE_STEP_SECONDS)
+        report = spec.get("report") or {}
+        effector = "load" if "secure_load" in phase else "tip"
+        target_point = predicted_end_world_point(q_step, end_effector=effector, reference_q=q_prev)
+        material_reason = (
+            "progressive_secure_loaded_pose"
+            if "secure_load" in phase
+            else "progressive_curl_lift_toward_secure"
+        )
+        stage_row = make_stage_row_from_q(
+            phase,
+            q_step,
+            q_prev,
+            duration,
+            target_point=target_point,
+            extra={
+                "effector": effector,
+                "staged_runtime_plan": True,
+                "staged_append_source": "post_pull_exit",
+                "progressive_secure": {
+                    "step_index": int(spec_index + 1),
+                    "step_count": int(len(stage_specs)),
+                    "fraction": float(spec.get("fraction", 1.0)),
+                    "bucket_step_deg": float(spec.get("bucket_step_deg", 0.0) or 0.0),
+                    "max_joint_step_deg": float(spec.get("max_joint_step_deg", 0.0) or 0.0),
+                    "summary": best_secure.get("progressive_secure", {}),
+                },
+                "secure_load": {
+                    "boom_lift_deg": float(best_secure.get("boom_lift_deg", 0.0)),
+                    "arm_retract_deg": float(best_secure.get("arm_retract_deg", 0.0)),
+                    "candidate_count": len(secure_rows),
+                    "source": str(best_secure.get("source", "")),
+                    "retains_material": bool(best_secure.get("retains_material", False)),
+                    "transitional_material_hold": bool(best_secure.get("transitional_material_hold", False)),
+                },
+                "material_hold": {
+                    "ok": True,
+                    "reason": material_reason,
+                    "bucket_deg": float(rad_to_deg(q_step[bucket_idx])),
+                    "target_secure_bucket_deg": float(rad_to_deg(q_secure[bucket_idx])),
+                    "retaining_secure_report": best_secure.get("actual_report", best_secure.get("carry_report", {})),
+                    "real_loaded_hold_allowed": bool(best_secure.get("transitional_material_hold", False)),
+                    "loaded_count_for_secure": int(best_secure.get("loaded_count_for_secure", 0) or 0),
+                },
+                "carry_projection": best_secure.get("carry_report", {}),
+                "ground": {
+                    "ok": True,
+                    "reason": "ok",
+                    "tip_depth": report.get("tip_sand_depth"),
+                    "bucket_mid_depth": report.get("bucket_mid_sand_depth"),
+                    "pour_depth": report.get("pour_sand_depth"),
+                    "load_depth": report.get("load_sand_depth"),
+                    "surface_source": report.get("tip_sand_surface_source"),
+                },
             },
-            "ground": {
-                "ok": True,
-                "reason": "ok",
-                "tip_depth": curl_report.get("tip_sand_depth"),
-                "bucket_mid_depth": curl_report.get("bucket_mid_sand_depth"),
-                "pour_depth": curl_report.get("pour_sand_depth"),
-                "load_depth": curl_report.get("load_sand_depth"),
-                "surface_source": curl_report.get("tip_sand_surface_source"),
-            },
-        },
-    )
-    secure_row = make_stage_row_from_q(
-        "secure_load",
-        q_secure,
-        q_curl,
-        float(best_secure.get("duration", 0.85)),
-        target_point=best_secure.get("target_point"),
-        extra={
-            "effector": "load",
-            "staged_runtime_plan": True,
-            "staged_append_source": "post_pull_exit",
-            "secure_load": {
-                "boom_lift_deg": float(best_secure.get("boom_lift_deg", 0.0)),
-                "arm_retract_deg": float(best_secure.get("arm_retract_deg", 0.0)),
-                "candidate_count": len(secure_rows),
-                "source": str(best_secure.get("source", "")),
-                "retains_material": bool(best_secure.get("retains_material", False)),
-                "transitional_material_hold": bool(best_secure.get("transitional_material_hold", False)),
-            },
-            "material_hold": best_secure.get("actual_report", best_secure.get("carry_report", {})),
-            "carry_projection": best_secure.get("carry_report", {}),
-            "ground": {
-                "ok": True,
-                "reason": "ok",
-                "tip_depth": (best_secure.get("ground_report") or {}).get("tip_sand_depth"),
-                "bucket_mid_depth": (best_secure.get("ground_report") or {}).get("bucket_mid_sand_depth"),
-                "pour_depth": (best_secure.get("ground_report") or {}).get("pour_sand_depth"),
-                "load_depth": (best_secure.get("ground_report") or {}).get("load_sand_depth"),
-                "surface_source": (best_secure.get("ground_report") or {}).get("tip_sand_surface_source"),
-            },
-        },
-    )
-    return [
-        ("curl_to_hold_material", q_curl.copy(), float(curl_duration), curl_target, curl_row),
-        ("secure_load", q_secure.copy(), float(best_secure.get("duration", 0.85)), best_secure.get("target_point"), secure_row),
-    ], "ok"
+        )
+        rows.append((phase, q_step.copy(), duration, target_point, stage_row))
+    return rows, "ok_progressive_secure"
 
 
 def append_staged_post_dig_secure_plan(task_label="dig_target_ball"):

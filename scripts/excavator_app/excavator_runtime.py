@@ -310,6 +310,8 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "perf_block_last": None,
     "rigid_obstacle_cache_time": 0.0,
     "rigid_obstacle_cache": None,
+    "rigid_obstacle_cache_hits": 0,
+    "rigid_obstacle_cache_misses": 0,
     "sand_site_stable_reset_done": False,
     "sand_site_reset_active": False,
     "sand_site_last_reset_label": "",
@@ -13095,10 +13097,13 @@ def rigid_obstacle_bboxes(force=False):
             bool(STATE.get("dig_plan_planning_active", False))
             or bool(STATE.get("auto_collect_active", False))
         ):
+            STATE["rigid_obstacle_cache_hits"] = int(STATE.get("rigid_obstacle_cache_hits", 0)) + 1
             return cached
         if cached is not None and now - cached_time <= PATH_OBSTACLE_CACHE_SECONDS:
+            STATE["rigid_obstacle_cache_hits"] = int(STATE.get("rigid_obstacle_cache_hits", 0)) + 1
             return cached
 
+    STATE["rigid_obstacle_cache_misses"] = int(STATE.get("rigid_obstacle_cache_misses", 0)) + 1
     roots = ["/SandSite", "/World/SandSite"]
     bboxes = []
     seen_paths = set()
@@ -13126,6 +13131,24 @@ def rigid_obstacle_bboxes(force=False):
     STATE["rigid_obstacle_cache"] = bboxes
     STATE["rigid_obstacle_cache_time"] = now
     return bboxes
+
+
+def clear_rigid_obstacle_cache(reason=""):
+    STATE["rigid_obstacle_cache"] = None
+    STATE["rigid_obstacle_cache_time"] = 0.0
+    STATE["rigid_obstacle_cache_hits"] = 0
+    STATE["rigid_obstacle_cache_misses"] = 0
+    if reason:
+        info_print("[OBSTACLE CACHE CLEAR]", f"reason={reason}")
+
+
+def store_excavator_runtime_api():
+    builtins._EXCAVATOR_RUNTIME = {
+        "clear_rigid_obstacle_cache": clear_rigid_obstacle_cache,
+    }
+
+
+store_excavator_runtime_api()
 
 
 def compact_obstacle_bbox(row):
@@ -20687,11 +20710,17 @@ def install_loaded_unload_route_test_plan_from_current():
     STATE["dig_plan_active_perf_deadline"] = None
     try:
         t_obstacles = time.perf_counter()
-        obstacles = rigid_obstacle_bboxes(force=True)
+        hit_before = int(STATE.get("rigid_obstacle_cache_hits", 0))
+        miss_before = int(STATE.get("rigid_obstacle_cache_misses", 0))
+        obstacles = rigid_obstacle_bboxes(force=False)
+        hit_delta = int(STATE.get("rigid_obstacle_cache_hits", 0)) - hit_before
+        miss_delta = int(STATE.get("rigid_obstacle_cache_misses", 0)) - miss_before
         info_print(
             "[LOADED ROUTE TEST SNAPSHOT]",
             f"rigid_obstacles={len(obstacles)}",
             f"obstacle_snapshot_ms={(time.perf_counter() - t_obstacles) * 1000.0:.1f}",
+            f"cache_hit={bool(hit_delta > 0)}",
+            f"cache_miss={bool(miss_delta > 0)}",
             force_log=True,
         )
         ok = append_staged_post_secure_load_plan(task_label="loaded_unload_route_test")

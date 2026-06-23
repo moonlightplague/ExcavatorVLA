@@ -2948,6 +2948,19 @@ def store_runtime_api():
     info("Stored runtime API in builtins._SAND_SITE")
 
 
+def notify_excavator_obstacle_cache_dirty(reason):
+    api = getattr(builtins, "_EXCAVATOR_RUNTIME", None)
+    if not isinstance(api, dict):
+        return
+    fn = api.get("clear_rigid_obstacle_cache")
+    if not callable(fn):
+        return
+    try:
+        fn(str(reason))
+    except Exception as exc:
+        info("[WARN] obstacle cache invalidate failed:", type(exc).__name__, exc)
+
+
 def build_sand_site():
     root = root_path()
     clear_previous_site(root)
@@ -2968,6 +2981,7 @@ def build_sand_site():
         info("[SAND SITE] initial real particle sand creation delayed until stable reset")
     make_unload_bin(root)
     store_runtime_api()
+    notify_excavator_obstacle_cache_dirty("sand_site_rebuilt")
     if STATE.get("real_sand_enabled", False):
         update_status(f"Sand site ready: real PhysX particle sand ({STATE['real_sand_particle_count']} particles); unload uses unload bin")
     else:
@@ -3019,12 +3033,14 @@ def build_ui():
         apply_parameter_models_to_globals()
         make_sand_retaining_walls(root_path())
         store_runtime_api()
+        notify_excavator_obstacle_cache_dirty("sand_walls_generated")
         set_clean("Walls generated")
         update_status("Sand walls generated from wall point XYZ", force=True)
 
     def clean_walls_clicked():
         clean_sand_retaining_walls(root_path())
         store_runtime_api()
+        notify_excavator_obstacle_cache_dirty("sand_walls_cleaned")
         set_clean("Walls cleaned")
 
     def apply_clicked():

@@ -8957,8 +8957,6 @@ async def auto_collect_prepare_environment():
                 gate="sand_settled",
             )
     else:
-        if ready_reset_done and AUTO_COLLECT_REUSE_READY_SAND_RESET and policy == "once_per_run_after_home":
-            STATE["auto_collect_sand_reset_done"] = True
         info_print(
             "[AUTO DATASET RESET]",
             f"policy={AUTO_COLLECT_SAND_RESET_POLICY}",
@@ -8982,7 +8980,33 @@ async def auto_collect_prepare_environment():
             detail={"settle": settle},
         )
         if not sand_ok:
-            return fail_prepare("prepare_failed/sand_not_settled", gate="sand_settled", detail=settle)
+            can_recover_reset = (
+                ready_reset_done
+                and AUTO_COLLECT_REUSE_READY_SAND_RESET
+                and policy == "once_per_run_after_home"
+                and callable((get_sand_site_api() or {}).get("reset"))
+            )
+            if can_recover_reset:
+                info_print(
+                    "[AUTO DATASET RESET]",
+                    "action=recover_stale_ready_reset",
+                    f"previous_reason={settle.get('reason')}",
+                    f"footprint_fraction={fmt_optional(settle.get('footprint_fraction'))}",
+                )
+                reset_ok = await reset_sand_site_stably("auto_collect_prepare_recover_stale_ready")
+                STATE["auto_collect_sand_reset_done"] = bool(reset_ok)
+                record_gate(
+                    "sand_reset_recovery",
+                    bool(reset_ok),
+                    "ok" if reset_ok else "prepare_failed/sand_not_settled",
+                    detail={"previous_settle": settle, "reset_attempted": True},
+                )
+                if not reset_ok:
+                    return fail_prepare("prepare_failed/sand_not_settled", gate="sand_settled", detail=settle)
+            else:
+                return fail_prepare("prepare_failed/sand_not_settled", gate="sand_settled", detail=settle)
+        elif ready_reset_done and AUTO_COLLECT_REUSE_READY_SAND_RESET and policy == "once_per_run_after_home":
+            STATE["auto_collect_sand_reset_done"] = True
 
     STATE["dataset_recording"] = was_recording
     if handle_timeline_stop_if_needed("auto_collect_prepare_done"):

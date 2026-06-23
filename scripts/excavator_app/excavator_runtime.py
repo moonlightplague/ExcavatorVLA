@@ -376,7 +376,7 @@ BUCKET_SAND_USE_VISUAL_MESH_COLLISION = True
 
 MANUAL_UI_SYNC_HOLD_SECONDS = 1.0
 MANUAL_SPEED_SCALE = 0.18
-MANUAL_SPEED_MULTIPLIER_CAP = 1.0
+MANUAL_SPEED_MULTIPLIER_CAP = 10.0
 MANUAL_SPEED_MULTIPLIER_FLOOR = 0.04
 MANUAL_TARGET_DEADBAND_DEG = 0.35
 MANUAL_STATUS_INTERVAL = 0.75
@@ -516,6 +516,9 @@ SAND_RESET_ESCAPE_CHECK_FRAMES = 150
 SAND_RESET_MAX_NATIVE_ATTEMPTS = 2
 SAND_BUCKET_LOCAL_MIN = np.array([-0.12, -0.58, -0.30], dtype=np.float32)
 SAND_BUCKET_LOCAL_MAX = np.array([0.90, 0.58, 0.55], dtype=np.float32)
+SAND_BUCKET_DIAG_EXPAND_LOCAL = np.array([0.40, 0.30, 0.45], dtype=np.float32)
+SAND_SOURCE_FALLBACK_MIN_REGION_COUNT = 32
+SAND_SOURCE_FALLBACK_MIN_RATIO = 0.60
 SAND_PILE_CENTER = AUTO_COLLECT_TARGET_CENTER.copy()
 SAND_PILE_RADIUS_X = 1.18
 SAND_PILE_RADIUS_Y = 1.18
@@ -619,13 +622,23 @@ UNLOAD_TARGET_MIN_Z = 1.35
 UNLOAD_BIN_DUMP_WALL_CLEARANCE_Z = 0.35
 UNLOAD_BIN_SAFE_XY_MARGIN = 0.08
 UNLOAD_DROP_XY_TOL = 0.22
+UNLOAD_DROP_SCATTER_MARGIN_XY = 0.58
+UNLOAD_FORCE_CENTER_HIGH_RELEASE = True
+UNLOAD_CENTER_RELEASE_XY_TOL = 0.16
+UNLOAD_CENTER_RELEASE_CORRECTION_GAIN = 0.45
+UNLOAD_RELEASE_SOURCE_BLEND = 0.50
 UNLOAD_DROP_SOURCE_MIN_CLEARANCE_Z = 0.18
+UNLOAD_PREFERRED_RELEASE_ABOVE_WALL_Z = 1.65
 UNLOAD_DROP_GRAVITY = 9.81
 UNLOAD_DROP_ROLL_OFFSET_BASE = 0.24
 UNLOAD_DROP_ROLL_OFFSET_PER_M = 0.10
 UNLOAD_DROP_TANGENTIAL_GAIN = 0.36
 UNLOAD_DROP_MAX_ROLL_OFFSET = 1.25
 UNLOAD_DROP_MAX_XY_CORRECTION = 1.35
+UNLOAD_DUMP_STEP_DEG = 10.0
+UNLOAD_DUMP_STEP_SECONDS = 0.12
+UNLOAD_DUMP_STOP_BUCKET_FRACTION = 0.15
+UNLOAD_DUMP_FLOW_CENTER_BUCKET_DEG = -25.0
 UNLOAD_DROP_IK_CORRECTION_ITERS = 5
 UNLOAD_PRE_DUMP_ALIGN_MIN_SECONDS = 0.35
 UNLOAD_PRE_DUMP_ALIGN_MAX_SECONDS = 1.80
@@ -753,7 +766,7 @@ FINAL_LIMITS_RAD = {}
 
 WINDOW = None
 STATUS_LABEL = None
-UI_STATUS_MAX_CHARS = 132
+UI_STATUS_MAX_CHARS = 72
 
 ROBOT = None
 DOF_ORDER = ["swing", "boom", "arm", "bucket"]
@@ -2973,6 +2986,243 @@ def ensure_unload_marker(point=None, label=""):
     return prim
 
 
+def update_sphere_marker(path, point, radius, color):
+    if point is None:
+        hide_debug_prim(path)
+        return None
+    p = np.array(point, dtype=np.float32).reshape(-1)[:3]
+    prim = get_prim(path)
+    if not prim or not prim.IsValid():
+        prim = make_sphere(
+            path,
+            translate=(float(p[0]), float(p[1]), float(p[2])),
+            radius=float(radius),
+            color=color,
+            collision=False,
+        )
+    else:
+        set_xform(prim, translate=(float(p[0]), float(p[1]), float(p[2])))
+        set_color(prim, color)
+        disable_collision(prim, "debug_marker")
+    try:
+        UsdGeom.Imageable(prim).GetVisibilityAttr().Set(UsdGeom.Tokens.inherited)
+    except Exception:
+        pass
+    return prim
+
+
+def hide_debug_prim(path):
+    try:
+        prim = get_prim(path)
+        if prim and prim.IsValid():
+            UsdGeom.Imageable(prim).GetVisibilityAttr().Set(UsdGeom.Tokens.invisible)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def update_debug_line(path, points, color, width=0.035):
+    pts = []
+    for point in points or []:
+        if point is None:
+            continue
+        p = np.array(point, dtype=np.float32).reshape(-1)[:3]
+        pts.append(Gf.Vec3f(float(p[0]), float(p[1]), float(p[2])))
+    if len(pts) < 2:
+        hide_debug_prim(path)
+        return None
+    prim = get_prim(path)
+    if not prim.IsValid() or not prim.IsA(UsdGeom.BasisCurves):
+        try:
+            stage.RemovePrim(Sdf.Path(path))
+        except Exception:
+            pass
+        curve = UsdGeom.BasisCurves.Define(stage, path)
+    else:
+        curve = UsdGeom.BasisCurves(prim)
+    try:
+        curve.GetPointsAttr().Set(pts) if curve.GetPointsAttr().IsValid() else curve.CreatePointsAttr(pts)
+        counts = [len(pts)]
+        curve.GetCurveVertexCountsAttr().Set(counts) if curve.GetCurveVertexCountsAttr().IsValid() else curve.CreateCurveVertexCountsAttr(counts)
+        curve.CreateTypeAttr(UsdGeom.Tokens.linear)
+        try:
+            curve.GetBasisAttr().Clear()
+        except Exception:
+            pass
+        curve.CreateWrapAttr(UsdGeom.Tokens.nonperiodic)
+        curve.CreateWidthsAttr([float(width)])
+    except Exception:
+        pass
+    prim = curve.GetPrim()
+    set_color(prim, color)
+    disable_collision(prim, "debug_line")
+    try:
+        UsdGeom.Imageable(prim).GetVisibilityAttr().Set(UsdGeom.Tokens.inherited)
+    except Exception:
+        pass
+    return prim
+
+
+def update_debug_rect_loop(path, center_xy, half_xy, z, color, width=0.025):
+    try:
+        c = np.array(center_xy, dtype=np.float32).reshape(-1)[:2]
+        h = np.maximum(np.array(half_xy, dtype=np.float32).reshape(-1)[:2], np.array([0.02, 0.02], dtype=np.float32))
+        zz = float(z)
+        pts = [
+            [float(c[0] - h[0]), float(c[1] - h[1]), zz],
+            [float(c[0] + h[0]), float(c[1] - h[1]), zz],
+            [float(c[0] + h[0]), float(c[1] + h[1]), zz],
+            [float(c[0] - h[0]), float(c[1] + h[1]), zz],
+            [float(c[0] - h[0]), float(c[1] - h[1]), zz],
+        ]
+        return update_debug_line(path, pts, color, width=width)
+    except Exception:
+        hide_debug_prim(path)
+        return None
+
+
+def draw_unload_dump_debug(
+    label,
+    landing_target=None,
+    release_target=None,
+    q_seed=None,
+    q_seed_dump=None,
+    best_drop=None,
+    reason="",
+    best_reachable_point=None,
+    rejected_segment=None,
+):
+    if CONTROL_ROOT is None:
+        return
+    root = f"{CONTROL_ROOT}/LoadedRouteDebug"
+    if not get_prim(root).IsValid():
+        UsdGeom.Xform.Define(stage, root)
+    ctx = None
+    wall_z = None
+    overpass_z = None
+    preferred_z = None
+    try:
+        ctx = task_scene_context()
+        bin_center = np.array(ctx["unload_bin_center"], dtype=np.float32).reshape(-1)[:3]
+        bin_half = np.array(ctx["unload_bin_half_size"], dtype=np.float32).reshape(-1)[:2]
+        bin_z_range = np.array(ctx["unload_bin_z_range"], dtype=np.float32).reshape(-1)
+        wall_z = float(bin_z_range[1]) if len(bin_z_range) >= 2 else float(GROUND_TOP_Z)
+        overpass_z = wall_z + float(UNLOAD_BIN_WALL_OVERPASS_CLEARANCE_Z)
+        preferred_z = preferred_unload_release_z(ctx=ctx, wall_z=wall_z)
+        update_debug_rect_loop(
+            f"{root}/WallOverpassClearanceOutline",
+            bin_center[:2],
+            bin_half,
+            overpass_z,
+            (1.0, 0.92, 0.05),
+            width=0.035,
+        )
+        update_debug_rect_loop(
+            f"{root}/PreferredHighReleaseOutline",
+            bin_center[:2],
+            bin_half,
+            preferred_z,
+            (0.10, 0.95, 1.0),
+            width=0.028,
+        )
+    except Exception:
+        hide_debug_prim(f"{root}/WallOverpassClearanceOutline")
+        hide_debug_prim(f"{root}/PreferredHighReleaseOutline")
+    landing = None if landing_target is None else np.array(landing_target, dtype=np.float32).reshape(-1)[:3]
+    release = None if release_target is None else np.array(release_target, dtype=np.float32).reshape(-1)[:3]
+    current_drop = None
+    try:
+        q_eval = q_seed_dump if q_seed_dump is not None else q_seed
+        if q_eval is not None:
+            current_drop = unload_drop_report(q=q_eval, reference_q=q_seed)
+    except Exception:
+        current_drop = None
+    current_release = None
+    current_landing = None
+    drop_for_log = best_drop if isinstance(best_drop, dict) else current_drop
+    if isinstance(drop_for_log, dict):
+        current_release = drop_for_log.get("release")
+        current_landing = drop_for_log.get("landing")
+
+    update_sphere_marker(f"{root}/LandingTarget", landing, 0.105, (0.05, 1.0, 0.25))
+    update_sphere_marker(f"{root}/RequiredRelease", release, 0.090, (0.95, 0.10, 1.0))
+    update_sphere_marker(f"{root}/PredictedRelease", current_release, 0.080, (1.0, 0.55, 0.05))
+    update_sphere_marker(f"{root}/PredictedLanding", current_landing, 0.080, (1.0, 0.05, 0.05))
+    update_sphere_marker(f"{root}/BestReachableCarry", best_reachable_point, 0.075, (0.20, 0.55, 1.0))
+    update_debug_line(f"{root}/RequiredDropLine", [release, landing], (0.05, 1.0, 0.25), width=0.040)
+    update_debug_line(f"{root}/PredictedDropLine", [current_release, current_landing], (1.0, 0.35, 0.05), width=0.050)
+    update_debug_line(f"{root}/ReleaseErrorLine", [current_release, release], (0.95, 0.10, 1.0), width=0.026)
+    update_debug_line(f"{root}/LandingErrorLine", [current_landing, landing], (1.0, 0.05, 0.05), width=0.030)
+    if overpass_z is not None:
+        release_floor = None if release is None else [float(release[0]), float(release[1]), float(overpass_z)]
+        current_release_floor = None if current_release is None else [
+            float(np.array(current_release, dtype=np.float32).reshape(-1)[0]),
+            float(np.array(current_release, dtype=np.float32).reshape(-1)[1]),
+            float(overpass_z),
+        ]
+        landing_floor = None if landing is None else [float(landing[0]), float(landing[1]), float(overpass_z)]
+        update_debug_line(f"{root}/RequiredReleaseHeightLine", [release_floor, release], (0.95, 0.10, 1.0), width=0.022)
+        update_debug_line(f"{root}/PredictedReleaseHeightLine", [current_release_floor, current_release], (1.0, 0.55, 0.05), width=0.020)
+        update_debug_line(f"{root}/LandingTargetHeightLine", [landing_floor, landing], (0.05, 1.0, 0.25), width=0.020)
+    else:
+        hide_debug_prim(f"{root}/RequiredReleaseHeightLine")
+        hide_debug_prim(f"{root}/PredictedReleaseHeightLine")
+        hide_debug_prim(f"{root}/LandingTargetHeightLine")
+    if rejected_segment is not None:
+        try:
+            a, b = rejected_segment
+            update_debug_line(f"{root}/RejectedWallSegment", [a, b], (1.0, 0.05, 0.05), width=0.070)
+        except Exception:
+            pass
+    else:
+        hide_debug_prim(f"{root}/RejectedWallSegment")
+
+    now = time.time()
+    if now - float(STATE.get("last_unload_debug_legend_time", 0.0) or 0.0) > 4.0:
+        STATE["last_unload_debug_legend_time"] = now
+        info_print(
+            "[UNLOAD DEBUG LEGEND]",
+            f"path={root}",
+            "green=landing_target/required_drop",
+            "magenta=required_high_release",
+            "orange=predicted_release/drop",
+            "red=predicted_landing/error",
+            "blue=best_reachable_carry",
+            "yellow=wall_overpass_clearance",
+            "cyan=preferred_release_height",
+        )
+
+    if isinstance(drop_for_log, dict):
+        info_print(
+            "[UNLOAD DUMP DEBUG]",
+            f"label={label}",
+            f"path={root}",
+            f"reason={reason}",
+            f"landing_target={vec_list(landing, 3)}",
+            f"required_release={vec_list(release, 3)}",
+            f"predicted_release={drop_for_log.get('release')}",
+            f"predicted_landing={drop_for_log.get('landing')}",
+            f"xy_err={fmt_optional(drop_for_log.get('xy_err'))}",
+            f"inside_xy={drop_for_log.get('inside_xy')}",
+            f"above_wall={drop_for_log.get('above_wall')}",
+            f"scatter_xy_ok={drop_for_log.get('scatter_xy_ok')}",
+            f"execution_ok={drop_for_log.get('execution_ok')}",
+            f"acceptance={drop_for_log.get('landing_acceptance')}",
+            f"release_centered_ok={drop_for_log.get('release_centered_ok')}",
+            f"release_xy_err={fmt_optional(drop_for_log.get('release_xy_err'))}",
+            f"overflow={fmt_optional(drop_for_log.get('bin_overflow_xy'))}",
+            f"source_clearance={fmt_optional(drop_for_log.get('source_clearance'))}",
+            f"wall_z={fmt_optional(wall_z)}",
+            f"overpass_z={fmt_optional(overpass_z)}",
+            f"preferred_release_z={fmt_optional(preferred_z)}",
+            f"drift={fmt_optional(drop_for_log.get('drift_distance'))}",
+            f"best_reachable={vec_list(best_reachable_point, 3)}",
+            f"q_seed={q_deg_values(q_seed, wrap_swing_for_display=True) if q_seed is not None else None}",
+            f"q_seed_dump={q_deg_values(q_seed_dump, wrap_swing_for_display=True) if q_seed_dump is not None else None}",
+        )
+
+
 def manual_unload_radius():
     try:
         return max(0.05, float(STATE.get("manual_unload_radius", UNLOAD_POINT_DEFAULT_RADIUS)))
@@ -3198,6 +3448,34 @@ def bucket_dump_forward_xy(q=None, reference_q=None):
     return safe_norm(radial * sign, default=(1.0, 0.0))
 
 
+def bucket_unload_release_point_world(q=None, reference_q=None):
+    q_eval = CTRL.q_cmd.copy() if q is None else np.array(q, dtype=np.float32).reshape(-1)[:4].copy()
+    q_ref = CTRL.q_cmd.copy() if reference_q is None else np.array(reference_q, dtype=np.float32).reshape(-1)[:4].copy()
+    load = bucket_point_world("load", q=q_eval, reference_q=q_ref)
+    pour = bucket_point_world("pour", q=q_eval, reference_q=q_ref)
+    if pour is None:
+        return None
+    pour = np.array(pour, dtype=np.float32).reshape(-1)[:3]
+    if load is None:
+        return pour
+    load = np.array(load, dtype=np.float32).reshape(-1)[:3]
+    blend = clamp(float(UNLOAD_RELEASE_SOURCE_BLEND), 0.0, 1.0)
+    return load * (1.0 - blend) + pour * blend
+
+
+def pour_target_for_unload_release_source(release_target, q_estimate=None, q_start=None):
+    release = np.array(release_target, dtype=np.float32).reshape(-1)[:3].copy()
+    q_eval = CTRL.q_cmd.copy() if q_estimate is None else np.array(q_estimate, dtype=np.float32).reshape(-1)[:4].copy()
+    q_ref = q_eval.copy() if q_start is None else np.array(q_start, dtype=np.float32).reshape(-1)[:4].copy()
+    source = bucket_unload_release_point_world(q=q_eval, reference_q=q_ref)
+    pour = bucket_point_world("pour", q=q_eval, reference_q=q_ref)
+    if source is None or pour is None:
+        return release
+    source = np.array(source, dtype=np.float32).reshape(-1)[:3]
+    pour = np.array(pour, dtype=np.float32).reshape(-1)[:3]
+    return release + (pour - source)
+
+
 def unload_drop_drift_model(q=None, reference_q=None, release=None, load=None, wall_z=None):
     q_eval = CTRL.q_cmd.copy() if q is None else np.array(q, dtype=np.float32).reshape(-1)[:4].copy()
     q_ref = CTRL.q_cmd.copy() if reference_q is None else np.array(reference_q, dtype=np.float32).reshape(-1)[:4].copy()
@@ -3206,7 +3484,7 @@ def unload_drop_drift_model(q=None, reference_q=None, release=None, load=None, w
     release_arr = None if release is None else np.array(release, dtype=np.float32).reshape(-1)[:3]
     load_arr = None if load is None else np.array(load, dtype=np.float32).reshape(-1)[:3]
     if release_arr is None:
-        release_arr = bucket_point_world("pour", q=q_eval, reference_q=q_ref)
+        release_arr = bucket_unload_release_point_world(q=q_eval, reference_q=q_ref)
         release_arr = None if release_arr is None else np.array(release_arr, dtype=np.float32).reshape(-1)[:3]
     if load_arr is None:
         load_arr = bucket_point_world("load", q=q_eval, reference_q=q_ref)
@@ -3260,11 +3538,32 @@ def unload_release_target_for_landing(landing_target, q_estimate=None, q_start=N
     return release, drift
 
 
+def preferred_unload_release_z(ctx=None, wall_z=None):
+    ctx = task_scene_context() if ctx is None else ctx
+    wall = float(GROUND_TOP_Z if wall_z is None else wall_z)
+    try:
+        bin_z_range = np.array(ctx["unload_bin_z_range"], dtype=np.float32).reshape(-1)
+        if len(bin_z_range) >= 2:
+            wall = float(bin_z_range[1])
+    except Exception:
+        pass
+    try:
+        nominal = float(np.array(unload_bin_dump_point(ctx=ctx), dtype=np.float32).reshape(-1)[2])
+    except Exception:
+        nominal = float(GROUND_TOP_Z + UNLOAD_TARGET_MIN_Z)
+    return max(
+        float(nominal),
+        float(wall) + float(UNLOAD_PREFERRED_RELEASE_ABOVE_WALL_Z),
+        float(GROUND_TOP_Z) + float(UNLOAD_TARGET_MIN_Z),
+    )
+
+
 def predict_unload_drop(q=None, reference_q=None):
     ctx = task_scene_context()
     q_ref = CTRL.q_cmd if reference_q is None else reference_q
-    release = bucket_point_world("pour", q=q, reference_q=q_ref)
+    release = bucket_unload_release_point_world(q=q, reference_q=q_ref)
     load = bucket_point_world("load", q=q, reference_q=q_ref)
+    pour = bucket_point_world("pour", q=q, reference_q=q_ref)
     if release is None:
         return None
 
@@ -3281,6 +3580,9 @@ def predict_unload_drop(q=None, reference_q=None):
     return {
         "release": release,
         "load": None if load is None else np.array(load, dtype=np.float32).reshape(-1)[:3],
+        "pour": None if pour is None else np.array(pour, dtype=np.float32).reshape(-1)[:3],
+        "release_source": "bucket_opening_center",
+        "release_source_blend": float(clamp(float(UNLOAD_RELEASE_SOURCE_BLEND), 0.0, 1.0)),
         "landing": landing,
         "forward_xy": forward_xy,
         "drift_xy": np.array(drift["drift_xy"], dtype=np.float32),
@@ -3305,6 +3607,7 @@ def unload_drop_report(q=None, reference_q=None):
     bin_center = np.array(ctx["unload_bin_center"], dtype=np.float32).reshape(-1)[:3]
     bin_half = np.array(ctx["unload_bin_half_size"], dtype=np.float32).reshape(-1)[:2]
     safe_half = np.maximum(bin_half - UNLOAD_BIN_SAFE_XY_MARGIN, np.array([0.02, 0.02], dtype=np.float32))
+    scatter_margin = max(0.0, float(UNLOAD_DROP_SCATTER_MARGIN_XY))
     drop = predict_unload_drop(q=q, reference_q=reference_q)
     if drop is None:
         return {
@@ -3321,23 +3624,60 @@ def unload_drop_report(q=None, reference_q=None):
     dx = float(landing[0] - target[0])
     dy = float(landing[1] - target[1])
     xy_err = float(math.sqrt(dx * dx + dy * dy))
+    release_dx = float(release[0] - target[0])
+    release_dy = float(release[1] - target[1])
+    release_xy_err = float(math.sqrt(release_dx * release_dx + release_dy * release_dy))
     bin_dx = float(landing[0] - bin_center[0])
     bin_dy = float(landing[1] - bin_center[1])
     inside_xy = abs(bin_dx) <= float(safe_half[0]) and abs(bin_dy) <= float(safe_half[1])
     above_wall = float(drop["source_clearance"]) >= UNLOAD_DROP_SOURCE_MIN_CLEARANCE_Z
     close_xy = xy_err <= UNLOAD_DROP_XY_TOL
+    overflow_x = max(0.0, abs(bin_dx) - float(safe_half[0]))
+    overflow_y = max(0.0, abs(bin_dy) - float(safe_half[1]))
+    overflow_xy = float(math.sqrt(overflow_x * overflow_x + overflow_y * overflow_y))
+    scatter_center_tol = float(np.linalg.norm(safe_half + scatter_margin))
+    scatter_xy_ok = bool(above_wall and overflow_xy <= scatter_margin and xy_err <= scatter_center_tol)
+    release_center_tol = max(float(UNLOAD_CENTER_RELEASE_XY_TOL), 0.12)
+    release_centered_ok = bool(above_wall and release_xy_err <= release_center_tol)
+    execution_ok = bool(above_wall and (inside_xy or scatter_xy_ok or close_xy or release_centered_ok))
+    if close_xy:
+        acceptance = "close_xy"
+    elif release_centered_ok:
+        acceptance = "center_high_release"
+    elif inside_xy:
+        acceptance = "inside_bin"
+    elif scatter_xy_ok:
+        acceptance = "scatter_margin"
+    else:
+        acceptance = "outside_scatter_margin"
 
     ok = bool(inside_xy and above_wall)
     return {
         "ok": ok,
         "reason": "ok" if ok else "landing_outside_bin_or_too_low",
+        "execution_ok": bool(execution_ok),
+        "landing_acceptance": acceptance,
         "inside_xy": bool(inside_xy),
         "above_wall": bool(above_wall),
         "close_xy": bool(close_xy),
+        "scatter_xy_ok": bool(scatter_xy_ok),
+        "scatter_margin_xy": float(scatter_margin),
+        "release_centered_ok": bool(release_centered_ok),
+        "release_center_tol": float(release_center_tol),
+        "release_dx": float(release_dx),
+        "release_dy": float(release_dy),
+        "release_xy_err": float(release_xy_err),
+        "bin_overflow_xy": float(overflow_xy),
+        "bin_overflow_x": float(overflow_x),
+        "bin_overflow_y": float(overflow_y),
+        "scatter_center_tol": float(scatter_center_tol),
         "target": vec_list(target, 3),
         "landing": vec_list(landing, 3),
         "release": vec_list(release, 3),
         "load": vec_list(drop.get("load"), 3),
+        "pour": vec_list(drop.get("pour"), 3),
+        "release_source": str(drop.get("release_source", "bucket_opening_center")),
+        "release_source_blend": float(drop.get("release_source_blend", UNLOAD_RELEASE_SOURCE_BLEND)),
         "forward_xy": vec_list(drop.get("forward_xy"), 2),
         "drift_xy": vec_list(drop.get("drift_xy"), 2),
         "drift_distance": float(drop.get("drift_distance", drop.get("roll_offset", 0.0))),
@@ -3365,6 +3705,14 @@ def log_unload_drop(label, q=None, reference_q=None):
         f"inside_xy={report.get('inside_xy')} "
         f"above_wall={report.get('above_wall')} "
         f"close_xy={report.get('close_xy')} "
+        f"scatter_xy_ok={report.get('scatter_xy_ok')} "
+        f"execution_ok={report.get('execution_ok')} "
+        f"acceptance={report.get('landing_acceptance')} "
+        f"release_centered_ok={report.get('release_centered_ok')} "
+        f"release_xy_err={fmt_optional(report.get('release_xy_err'))} "
+        f"release_source={report.get('release_source')} "
+        f"overflow={fmt_optional(report.get('bin_overflow_xy'))} "
+        f"scatter_margin={fmt_optional(report.get('scatter_margin_xy'))} "
         f"target={report.get('target')} "
         f"landing={report.get('landing')} "
         f"release={report.get('release')} "
@@ -3443,8 +3791,7 @@ def actual_unload_position_report():
         }
     release_report = point_report("release", drop_report.get("release"))
     ok = bool(
-        drop_report.get("ok", False)
-        and drop_report.get("close_xy", False)
+        unload_drop_execution_ready(drop_report)
         and release_report.get("inside_gate", False)
         and release_report.get("above_wall", False)
     )
@@ -3487,6 +3834,8 @@ def log_actual_unload_position(label):
         f"drop_ok={drop.get('ok')} drop_target={drop.get('target')} "
         f"drop_landing={drop.get('landing')} drop_xy_err={fmt_optional(drop.get('xy_err'))} "
         f"drop_close_xy={drop.get('close_xy')} "
+        f"drop_scatter_xy_ok={drop.get('scatter_xy_ok')} "
+        f"drop_acceptance={drop.get('landing_acceptance')} "
         f"drop_drift={fmt_optional(drop.get('drift_distance'))} "
         f"drop_drift_xy={drop.get('drift_xy')} "
         f"drop_source_clearance={fmt_optional(drop.get('source_clearance'))} "
@@ -3554,7 +3903,7 @@ def unload_arrival_report(q_goal=None):
 
     q_dump = bucket_only_dump_pose(q_real, unload_dump_target_deg())
     drop = unload_drop_report(q=q_dump, reference_q=q_real)
-    drop_ok = bool(drop.get("ok", False) and drop.get("close_xy", False))
+    drop_ok = unload_drop_execution_ready(drop)
     release_inside_gate = False
     release_z_clearance = None
     release_xy_err = None
@@ -3826,9 +4175,14 @@ def compact_sand_metrics(metrics):
         "pile": int(metrics.get("pile_count", 0)),
         "bucket": int(metrics.get("bucket_count", 0)),
         "bucket_from_pile": int(metrics.get("bucket_from_pile_count", 0)),
+        "bucket_from_initial": int(metrics.get("bucket_from_initial_count", metrics.get("bucket_from_pile_count", 0))),
         "bin": int(metrics.get("bin_count", 0)),
         "bin_from_pile": int(metrics.get("bin_from_pile_count", 0)),
+        "bin_from_initial": int(metrics.get("bin_from_initial_count", metrics.get("bin_from_pile_count", 0))),
         "spill_from_pile": int(metrics.get("spill_from_pile_count", 0)),
+        "spill_from_initial": int(metrics.get("spill_from_initial_count", metrics.get("spill_from_pile_count", 0))),
+        "source_tracking": str(metrics.get("source_tracking", "unknown")),
+        "source_tracking_notes": str(metrics.get("source_tracking_notes", "")),
         "bucket_from_pile_mass": float(metrics.get("bucket_from_pile_mass", 0.0)),
         "bin_from_pile_mass": float(metrics.get("bin_from_pile_mass", 0.0)),
         "spill_from_pile_mass": float(metrics.get("spill_from_pile_mass", 0.0)),
@@ -3857,10 +4211,18 @@ def compact_unload_drop(report=None):
         return {"ok": False}
     return {
         "ok": bool(report.get("ok", False)),
+        "execution_ok": bool(report.get("execution_ok", False)),
         "reason": str(report.get("reason", "")),
+        "landing_acceptance": str(report.get("landing_acceptance", "")),
         "inside_xy": bool(report.get("inside_xy", False)),
         "above_wall": bool(report.get("above_wall", False)),
         "close_xy": bool(report.get("close_xy", False)),
+        "scatter_xy_ok": bool(report.get("scatter_xy_ok", False)),
+        "release_centered_ok": bool(report.get("release_centered_ok", False)),
+        "release_xy_err": None if report.get("release_xy_err") is None else float(report.get("release_xy_err")),
+        "release_center_tol": None if report.get("release_center_tol") is None else float(report.get("release_center_tol")),
+        "bin_overflow_xy": None if report.get("bin_overflow_xy") is None else float(report.get("bin_overflow_xy")),
+        "scatter_margin_xy": None if report.get("scatter_margin_xy") is None else float(report.get("scatter_margin_xy")),
         "dx": None if report.get("dx") is None else float(report.get("dx")),
         "dy": None if report.get("dy") is None else float(report.get("dy")),
         "xy_err": None if report.get("xy_err") is None else float(report.get("xy_err")),
@@ -3882,6 +4244,21 @@ def compact_unload_drop(report=None):
         "safe_half": vec_list(report.get("safe_half"), 2),
         "source": str(report.get("source", "")),
     }
+
+
+def unload_drop_execution_ready(report):
+    if not isinstance(report, dict):
+        return False
+    return bool(
+        report.get("above_wall", False)
+        and (
+            report.get("close_xy", False)
+            or report.get("inside_xy", False)
+            or report.get("scatter_xy_ok", False)
+            or report.get("release_centered_ok", False)
+            or report.get("execution_ok", False)
+        )
+    )
 
 
 def stage_constraint_summary(row):
@@ -5172,6 +5549,140 @@ def project_points_to_link_local(points, link_path):
     return np.stack([d @ axes[0], d @ axes[1], d @ axes[2]], axis=1)
 
 
+def initial_pile_mask_for_points(points, fallback_pile_mask=None):
+    n = 0 if points is None else int(len(points))
+    if n <= 0:
+        return np.zeros(0, dtype=bool)
+    initial_mask = STATE.get("dataset_initial_pile_particle_mask")
+    if isinstance(initial_mask, np.ndarray) and len(initial_mask) == n:
+        return np.array(initial_mask, dtype=bool, copy=False)
+
+    initial_ids = STATE.get("dataset_initial_pile_particle_ids")
+    if initial_ids is not None:
+        mask = np.zeros(n, dtype=bool)
+        try:
+            idx = np.array(list(initial_ids), dtype=np.int64)
+            idx = idx[(idx >= 0) & (idx < n)]
+            mask[idx] = True
+            return mask
+        except Exception:
+            pass
+
+    if fallback_pile_mask is not None and len(fallback_pile_mask) == n:
+        return np.array(fallback_pile_mask, dtype=bool, copy=True)
+    return np.zeros(n, dtype=bool)
+
+
+def bucket_particle_diagnostic(label, points=None, force_log=True):
+    points = sand_particle_positions() if points is None else points
+    if points is None or len(points) == 0:
+        row = {"available": False, "reason": "missing_particle_points", "label": str(label)}
+        info_print("[BUCKET SAND DIAG]", f"label={label}", "available=False", "reason=missing_particle_points", force_log=force_log)
+        return row
+
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+    local = project_points_to_link_local(points, BUCKET_LINK)
+    if local is None or len(local) != len(points):
+        row = {"available": False, "reason": "bucket_local_projection_failed", "label": str(label), "particles": int(len(points))}
+        info_print(
+            "[BUCKET SAND DIAG]",
+            f"label={label}",
+            "available=False",
+            "reason=bucket_local_projection_failed",
+            f"particles={len(points)}",
+            force_log=force_log,
+        )
+        return row
+
+    ctx = task_scene_context()
+    _, _, _, _, z_min, z_expected_max = sand_pile_geometry_from_context(ctx)
+    pile_mask = sand_pile_xy_mask(points, ctx) & (points[:, 2] >= z_min) & (points[:, 2] <= z_expected_max)
+    initial_mask = initial_pile_mask_for_points(points, fallback_pile_mask=pile_mask)
+    strict_mask = np.all(local >= SAND_BUCKET_LOCAL_MIN.reshape(1, 3), axis=1) & np.all(
+        local <= SAND_BUCKET_LOCAL_MAX.reshape(1, 3),
+        axis=1,
+    )
+    expand = SAND_BUCKET_DIAG_EXPAND_LOCAL.reshape(3)
+    expanded_min = SAND_BUCKET_LOCAL_MIN - expand
+    expanded_max = SAND_BUCKET_LOCAL_MAX + expand
+    expanded_mask = np.all(local >= expanded_min.reshape(1, 3), axis=1) & np.all(
+        local <= expanded_max.reshape(1, 3),
+        axis=1,
+    )
+
+    strict_from_pile = initial_mask & strict_mask
+    expanded_from_pile = initial_mask & expanded_mask
+    expanded_idx = np.nonzero(expanded_from_pile)[0]
+    strict_idx = np.nonzero(strict_from_pile)[0]
+    expanded_all_idx = np.nonzero(expanded_mask)[0]
+    strict_all_idx = np.nonzero(strict_mask)[0]
+    expanded_local_min = None
+    expanded_local_max = None
+    expanded_all_local_min = None
+    expanded_all_local_max = None
+    expanded_world_center = None
+    strict_world_center = None
+    expanded_all_world_center = None
+    strict_all_world_center = None
+    if len(expanded_idx) > 0:
+        expanded_local = local[expanded_idx]
+        expanded_local_min = vec_list(np.min(expanded_local, axis=0), 3)
+        expanded_local_max = vec_list(np.max(expanded_local, axis=0), 3)
+        expanded_world_center = vec_list(np.mean(points[expanded_idx], axis=0), 3)
+    if len(strict_idx) > 0:
+        strict_world_center = vec_list(np.mean(points[strict_idx], axis=0), 3)
+    if len(expanded_all_idx) > 0:
+        expanded_all_local = local[expanded_all_idx]
+        expanded_all_local_min = vec_list(np.min(expanded_all_local, axis=0), 3)
+        expanded_all_local_max = vec_list(np.max(expanded_all_local, axis=0), 3)
+        expanded_all_world_center = vec_list(np.mean(points[expanded_all_idx], axis=0), 3)
+    if len(strict_all_idx) > 0:
+        strict_all_world_center = vec_list(np.mean(points[strict_all_idx], axis=0), 3)
+
+    row = {
+        "available": True,
+        "label": str(label),
+        "particles": int(len(points)),
+        "strict_total": int(np.count_nonzero(strict_mask)),
+        "strict_from_pile": int(np.count_nonzero(strict_from_pile)),
+        "expanded_total": int(np.count_nonzero(expanded_mask)),
+        "expanded_from_pile": int(np.count_nonzero(expanded_from_pile)),
+        "expanded_local_min": expanded_local_min,
+        "expanded_local_max": expanded_local_max,
+        "expanded_all_local_min": expanded_all_local_min,
+        "expanded_all_local_max": expanded_all_local_max,
+        "expanded_world_center": expanded_world_center,
+        "strict_world_center": strict_world_center,
+        "expanded_all_world_center": expanded_all_world_center,
+        "strict_all_world_center": strict_all_world_center,
+        "strict_box_min": vec_list(SAND_BUCKET_LOCAL_MIN, 3),
+        "strict_box_max": vec_list(SAND_BUCKET_LOCAL_MAX, 3),
+        "expanded_box_min": vec_list(expanded_min, 3),
+        "expanded_box_max": vec_list(expanded_max, 3),
+        "q_real_deg": q_deg_values(get_real_joint_positions(), wrap_swing_for_display=True),
+    }
+    info_print(
+        "[BUCKET SAND DIAG]",
+        f"label={label}",
+        f"particles={row['particles']}",
+        f"strict_total={row['strict_total']}",
+        f"strict_from_pile={row['strict_from_pile']}",
+        f"expanded_total={row['expanded_total']}",
+        f"expanded_from_pile={row['expanded_from_pile']}",
+        f"expanded_local_min={row['expanded_local_min']}",
+        f"expanded_local_max={row['expanded_local_max']}",
+        f"expanded_all_local_min={row['expanded_all_local_min']}",
+        f"expanded_all_local_max={row['expanded_all_local_max']}",
+        f"strict_center={row['strict_world_center']}",
+        f"expanded_center={row['expanded_world_center']}",
+        f"strict_all_center={row['strict_all_world_center']}",
+        f"expanded_all_center={row['expanded_all_world_center']}",
+        f"q_real={row['q_real_deg']}",
+        force_log=force_log,
+    )
+    return row
+
+
 def mask_points_in_box(points, center, half_xy, z_min, z_max):
     if points is None:
         return np.zeros(0, dtype=bool)
@@ -5375,10 +5886,35 @@ def sand_metrics_current(force=False, snapshot=None):
     bucket_count = int(np.count_nonzero(bucket_mask))
     bin_count = int(np.count_nonzero(bin_mask))
     initial_count = int(np.count_nonzero(initial_mask))
-    from_pile_bucket_count = int(np.count_nonzero(from_pile_bucket_mask))
-    from_pile_bin_count = int(np.count_nonzero(from_pile_bin_mask))
-    from_pile_pile_count = int(np.count_nonzero(from_pile_pile_mask))
-    from_pile_spill_count = int(np.count_nonzero(from_pile_spill_mask))
+    raw_from_pile_bucket_count = int(np.count_nonzero(from_pile_bucket_mask))
+    raw_from_pile_bin_count = int(np.count_nonzero(from_pile_bin_mask))
+    raw_from_pile_pile_count = int(np.count_nonzero(from_pile_pile_mask))
+    raw_from_pile_spill_count = int(np.count_nonzero(from_pile_spill_mask))
+
+    source_tracking = "initial_mask"
+    fallback_notes = []
+
+    def effective_region_count(region_name, raw_count, region_count):
+        nonlocal source_tracking
+        raw_count = int(raw_count)
+        region_count = int(region_count)
+        if region_count < int(SAND_SOURCE_FALLBACK_MIN_REGION_COUNT):
+            return raw_count
+        ratio = float(raw_count) / max(1.0, float(region_count))
+        if ratio >= float(SAND_SOURCE_FALLBACK_MIN_RATIO):
+            return raw_count
+        source_tracking = "region_fallback"
+        fallback_notes.append(f"{region_name}:raw={raw_count}/region={region_count}/ratio={ratio:.2f}")
+        return region_count
+
+    from_pile_bucket_count = effective_region_count("bucket", raw_from_pile_bucket_count, bucket_count)
+    from_pile_bin_count = effective_region_count("bin", raw_from_pile_bin_count, bin_count)
+    from_pile_pile_count = raw_from_pile_pile_count
+    if source_tracking == "region_fallback":
+        occupied = bucket_mask | bin_mask | pile_mask
+        from_pile_spill_count = int(max(0, len(points) - int(np.count_nonzero(occupied))))
+    else:
+        from_pile_spill_count = raw_from_pile_spill_count
     mass = sand_particle_mass()
     ctx = task_scene_context()
     metrics = {
@@ -5394,10 +5930,15 @@ def sand_metrics_current(force=False, snapshot=None):
         "pile_count": int(pile_count),
         "bucket_count": int(bucket_count),
         "bucket_from_pile_count": int(from_pile_bucket_count),
+        "bucket_from_initial_count": int(raw_from_pile_bucket_count),
         "bin_count": int(bin_count),
         "bin_from_pile_count": int(from_pile_bin_count),
+        "bin_from_initial_count": int(raw_from_pile_bin_count),
         "pile_from_initial_count": int(from_pile_pile_count),
         "spill_from_pile_count": int(from_pile_spill_count),
+        "spill_from_initial_count": int(raw_from_pile_spill_count),
+        "source_tracking": str(source_tracking),
+        "source_tracking_notes": "; ".join(fallback_notes),
         "bucket_from_pile_mass": float(from_pile_bucket_count * mass),
         "bin_from_pile_mass": float(from_pile_bin_count * mass),
         "spill_from_pile_mass": float(from_pile_spill_count * mass),
@@ -6434,7 +6975,7 @@ def dataset_record_event(event, detail="", data=None):
             result="event",
             reason=detail,
             data=data,
-            include_sand=str(event) in {"phase_metrics", "episode_end", "freeze", "execution_failure"},
+            include_sand=str(event) in {"phase_metrics", "episode_end", "execution_failure"},
         )
     except Exception as e:
         info_print("[WARN] dataset event failed:", type(e).__name__, e)
@@ -6745,6 +7286,10 @@ def auto_collect_plan_summary(seq):
                 row["q_dump_rad"] = vec_list(stage.get("q_dump_rad"), 4)
             if stage.get("q_dump_deg") is not None:
                 row["q_dump_deg"] = stage.get("q_dump_deg")
+            if stage.get("q_release_align_rad") is not None:
+                row["q_release_align_rad"] = vec_list(stage.get("q_release_align_rad"), 4)
+            if stage.get("q_release_align_deg") is not None:
+                row["q_release_align_deg"] = stage.get("q_release_align_deg")
             if stage.get("drop") is not None:
                 row["drop"] = stage.get("drop")
             for key in [
@@ -6756,6 +7301,7 @@ def auto_collect_plan_summary(seq):
                 "stage_cost",
                 "drop_alignment_ready",
                 "drop_alignment_policy",
+                "release_alignment_bucket_deg",
                 "planar_err",
                 "world_angle_err_deg",
                 "bucket_world_deg",
@@ -6830,7 +7376,8 @@ def record_phase_metrics(label, q_cmd=None, q_real=None, action=None):
                 f"{label}: "
                 f"bucket_from_pile={int(metrics.get('bucket_from_pile_count', 0))} "
                 f"bin_from_pile={int(metrics.get('bin_from_pile_count', 0))} "
-                f"spill_from_pile={int(metrics.get('spill_from_pile_count', 0))}"
+                f"spill_from_pile={int(metrics.get('spill_from_pile_count', 0))} "
+                f"source_tracking={metrics.get('source_tracking', 'unknown')}"
             ),
             data=row,
         )
@@ -9165,8 +9712,23 @@ def stop_auto_motion_after_freeze(q_real, detail="", action_mode=""):
     )
 
 
-def freeze_contact_detail(mode="freeze"):
+def freeze_contact_detail(mode="freeze", light=False):
     details = []
+    if light:
+        try:
+            bucket_min = bbox_min_z(BUCKET_LINK)
+            if bucket_min is not None and float(bucket_min) < GROUND_TOP_Z - 0.02:
+                details.append(f"bucket_below_ground={float(bucket_min):.3f}")
+                if float(bucket_min) < GROUND_TOP_Z - MANUAL_RECOVERY_BUCKET_PENETRATION_Z:
+                    details.append("bucket_penetration_locks_swing=True")
+        except Exception as e:
+            details.append(f"bucket_ground_check_failed={type(e).__name__}")
+        if sand_site_active():
+            details.append("sand_site_active=True")
+        if not details:
+            details.append("light_check_no_below_ground_bucket")
+        return "; ".join(details)
+
     try:
         report = phase_ground_report(mode)
         for label, key, margin in [
@@ -9337,6 +9899,7 @@ def log_freeze(reason, mode="", q_cmd=None, q_real=None, extra="", force=False):
         args.append(f"detail={extra}")
     info_print(*args)
     STATE["dataset_episode_freezes"] = int(STATE.get("dataset_episode_freezes", 0)) + 1
+    include_sand = bool(STATE.get("dataset_recording", False)) and not mode.lower().startswith("manual")
     debug_timeline_record(
         "FREEZE",
         stage=mode,
@@ -9344,7 +9907,7 @@ def log_freeze(reason, mode="", q_cmd=None, q_real=None, extra="", force=False):
         reason=f"{reason}; {extra}",
         q_cmd=q_cmd,
         q_real=q_real,
-        include_sand=True,
+        include_sand=include_sand,
     )
     dataset_record_event("freeze", f"reason={reason}; mode={mode}; {extra[:500]}")
     STATE["freeze_last_signature"] = signature
@@ -9446,7 +10009,7 @@ def check_freeze_state(label="loop"):
         f"max_real_step={max_step:.3f}deg; "
         f"last_action_age={now - action_time:.2f}s; "
         f"candidate_age={candidate_age:.2f}s; "
-        f"{freeze_contact_detail(label)}"
+        f"{freeze_contact_detail(label, light=action_mode.startswith('manual'))}"
     )
     if contact_report is not None:
         detail += (
@@ -10131,9 +10694,25 @@ class ArticulationActionController:
     def send_action(self, q, mode="action"):
         global ROBOT, JOINT_INDICES
 
-        q = clip_command_near(q, reference=self.q_cmd)
+        dump_motion = is_unload_dump_motion(mode=mode)
+        q = (
+            clip_unload_dump_command(q, reference=self.q_cmd)
+            if dump_motion
+            else clip_command_near(q, reference=self.q_cmd)
+        )
         q = maybe_rebase_swing_for_bounded_joint(q)
         q_action = self.clip_action_limits(q)
+        if dump_motion:
+            bucket_idx = self.name_to_idx.get("bucket", 3)
+            bucket_cmd = float(q[bucket_idx])
+            bucket_action = float(q_action[bucket_idx])
+            if abs(bucket_action - bucket_cmd) > deg_to_rad(0.25):
+                info_print(
+                    "[UNLOAD DUMP ACTION CLIP]",
+                    f"cmd={rad_to_deg(bucket_cmd):.2f}deg",
+                    f"action={rad_to_deg(bucket_action):.2f}deg",
+                    force_log=True,
+                )
         swing_idx = self.name_to_idx["swing"]
         lo, hi = FINAL_LIMITS_RAD["swing"]
         if float(q[swing_idx]) < lo or float(q[swing_idx]) > hi:
@@ -10242,7 +10821,11 @@ class ArticulationActionController:
 
     def apply_target_direct(self, q_target, mode="manual"):
         # direct articulation command without velocity projection (for sliders)
-        q = clip_command_near(q_target, reference=self.q_cmd)
+        q = (
+            clip_unload_dump_command(q_target, reference=self.q_cmd)
+            if is_unload_dump_motion(mode=mode)
+            else clip_command_near(q_target, reference=self.q_cmd)
+        )
         ok, reason = self.command_ground_ok(q, mode=mode)
         if not ok:
             update_status("[GUARD] " + reason, force=True)
@@ -11422,7 +12005,19 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
         CTRL.q_cmd = q0.copy()
         CTRL.q_safe = q0.copy()
         STATE["dataset_current_q_goal"] = q0.copy()
-    q1 = clip_command_near(q_goal, reference=q0)
+    is_dump_motion = is_unload_dump_motion(mode=mode, label=label)
+    q1 = clip_unload_dump_command(q_goal, reference=q0) if is_dump_motion else clip_command_near(q_goal, reference=q0)
+    if is_dump_motion:
+        bucket_idx = CTRL.name_to_idx.get("bucket", 3)
+        info_print(
+            "[UNLOAD DUMP COMMAND]",
+            f"label={label}",
+            f"mode={mode}",
+            f"bucket_start={rad_to_deg(float(q0[bucket_idx])):.2f}deg",
+            f"bucket_target={rad_to_deg(float(q1[bucket_idx])):.2f}deg",
+            f"bucket_delta={rad_to_deg(float(q1[bucket_idx] - q0[bucket_idx])):.2f}deg",
+            force_log=True,
+        )
     if "lift_carry" in str(label or mode).lower():
         bucket_idx = CTRL.name_to_idx.get("bucket", 3)
         q1[bucket_idx] = float(q0[bucket_idx])
@@ -11438,6 +12033,14 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
     apply_speed_to_physx_joint_limits()
 
     seconds_eff = estimate_stage_motion_seconds(q0, q1, requested_seconds=seconds)
+    if mode_requires_loaded_carry_bucket(mode, label):
+        loaded_motion_text = f"{mode} {label}".lower()
+        loaded_floor = (
+            float(LOADED_ROUTE_FINAL_STAGE_SECONDS)
+            if "unload_to_bin" in loaded_motion_text and "clearance_route_post" not in loaded_motion_text
+            else float(LOADED_ROUTE_MIN_STAGE_SECONDS)
+        )
+        seconds_eff = max(float(seconds_eff), loaded_floor)
     steps = max(4, int(seconds_eff * CONTROL_HZ))
     STATE["dataset_current_q_goal"] = q1.copy()
     STATE["trace_active_motion"] = {
@@ -11488,7 +12091,7 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
 
         u = float(i + 1) / steps
         s = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u)
-        q = interpolate_q_shortest(q0, q1, s)
+        q = interpolate_q_motion(q0, q1, s, mode=mode, label=label)
         if carry_bucket_world_rad is not None:
             carry_calc = bucket_joint_for_world_angle(q, carry_bucket_world_rad, end_effector="load")
             if carry_calc is not None:
@@ -11762,6 +12365,8 @@ PATH_CLEARANCE_DURATION = 0.85
 PATH_OBSTACLE_MARGIN_XY = 0.18
 PATH_OBSTACLE_MARGIN_Z = 0.10
 PATH_OBSTACLE_OVER_CLEARANCE_Z = 0.45
+UNLOAD_BIN_WALL_OVERPASS_CLEARANCE_Z = 0.055
+UNLOAD_BIN_WALL_EXEC_EXTRA_CLEARANCE_Z = 0.28
 PATH_OBSTACLE_CACHE_SECONDS = 2.50
 PATH_OBSTACLE_MESH_PROXY_MIN_AREA = 1.0e-4
 PATH_OBSTACLE_MESH_PROXY_MAX_FACES = 32
@@ -11780,6 +12385,9 @@ PATH_RRT_SMOOTH_BEND_WEIGHT = 0.35
 PATH_RRT_SMOOTH_MIN_IMPROVEMENT = 1.0e-4
 PATH_LINK_COLLISION_SEGMENT_SAMPLES = 4
 PATH_LINK_COLLISION_RADIUS_M = 0.10
+LOADED_ROUTE_TEST_PLAN_BUDGET_SECONDS = 30.0
+LOADED_ROUTE_MIN_STAGE_SECONDS = 2.40
+LOADED_ROUTE_FINAL_STAGE_SECONDS = 2.80
 PATH_DETERMINISTIC_ROUTE_POSES_DEG = [
     {"boom": 72.0, "arm": -88.0, "bucket": -56.0},
     {"boom": 72.0, "arm": -88.0, "bucket": -46.0},
@@ -12950,6 +13558,34 @@ def actual_rigid_obstacle_contact_detail():
     return ""
 
 
+def is_unload_bin_wall_obstacle(obstacle):
+    path = str((obstacle or {}).get("path", "")).lower()
+    return ("unloadbin" in path or "unload_bin" in path) and "wall" in path
+
+
+def unload_bin_wall_overpass_allowed(mode, obstacle, *points):
+    if "unload_to_bin" not in str(mode).lower():
+        return False
+    if not is_unload_bin_wall_obstacle(obstacle):
+        return False
+    try:
+        wall_top = float(np.array(obstacle.get("max"), dtype=np.float32).reshape(-1)[2])
+    except Exception:
+        return False
+    min_z = None
+    for point in points:
+        if point is None:
+            continue
+        try:
+            z = float(np.array(point, dtype=np.float32).reshape(-1)[2])
+        except Exception:
+            return False
+        min_z = z if min_z is None else min(min_z, z)
+    if min_z is None:
+        return False
+    return float(min_z) >= wall_top + float(UNLOAD_BIN_WALL_OVERPASS_CLEARANCE_Z)
+
+
 def path_obstacle_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadline=None):
     t0 = time.perf_counter()
     obstacles = rigid_obstacle_bboxes()
@@ -12968,6 +13604,8 @@ def path_obstacle_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadl
                 for obstacle in obstacles:
                     if planning_deadline_exceeded(deadline):
                         return False, "planning budget exceeded", i, None
+                    if unload_bin_wall_overpass_allowed(mode, obstacle, pa, pb):
+                        continue
                     if not obstacle_aabb_overlaps_segment(
                         pa,
                         pb,
@@ -13010,6 +13648,8 @@ def path_obstacle_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadl
                     for obstacle in obstacles:
                         if planning_deadline_exceeded(deadline):
                             return False, "planning budget exceeded", i, None
+                        if unload_bin_wall_overpass_allowed(mode, obstacle, p):
+                            continue
                         if not obstacle_aabb_overlaps_segment(
                             p,
                             p,
@@ -13058,6 +13698,405 @@ def path_segment_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadli
         return False, "obstacle", reason, sample, report
 
     return True, "ok", "ok", samples, report
+
+
+def unload_bin_wall_clearance_required_z(ctx=None):
+    ctx = task_scene_context() if ctx is None else ctx
+    try:
+        bin_z_range = np.array(ctx["unload_bin_z_range"], dtype=np.float32).reshape(-1)
+        wall_top = float(bin_z_range[1]) if len(bin_z_range) >= 2 else float(GROUND_TOP_Z)
+    except Exception:
+        wall_top = float(GROUND_TOP_Z)
+    return wall_top, wall_top + float(UNLOAD_BIN_WALL_OVERPASS_CLEARANCE_Z)
+
+
+def unload_goal_pose_collision_report(q_goal, reference_q=None, mode="unload_to_bin"):
+    obstacles = rigid_obstacle_bboxes()
+    if not obstacles:
+        return None
+    q_goal = np.array(q_goal, dtype=np.float32).reshape(-1)[:4].copy()
+    q_ref = q_goal if reference_q is None else np.array(reference_q, dtype=np.float32).reshape(-1)[:4].copy()
+    segments = predicted_obstacle_check_segments(q_goal, reference_q=q_ref)
+    for link_name, pa, pb in segments:
+        for obstacle in obstacles:
+            if unload_bin_wall_overpass_allowed(mode, obstacle, pa, pb):
+                continue
+            if not obstacle_aabb_overlaps_segment(
+                pa,
+                pb,
+                obstacle,
+                margin_xy=PATH_OBSTACLE_MARGIN_XY,
+                margin_z=PATH_OBSTACLE_MARGIN_Z,
+                radius=PATH_LINK_COLLISION_RADIUS_M,
+            ):
+                continue
+            hit, hit_point = segment_intersects_obstacle_proxy(
+                pa,
+                pb,
+                obstacle,
+                margin_xy=PATH_OBSTACLE_MARGIN_XY,
+                margin_z=PATH_OBSTACLE_MARGIN_Z,
+                radius=PATH_LINK_COLLISION_RADIUS_M,
+            )
+            if not hit:
+                continue
+            wall_top = None
+            required_z = None
+            min_segment_z = None
+            if is_unload_bin_wall_obstacle(obstacle):
+                try:
+                    wall_top = float(np.array(obstacle.get("max"), dtype=np.float32).reshape(-1)[2])
+                    required_z = wall_top + float(UNLOAD_BIN_WALL_OVERPASS_CLEARANCE_Z)
+                    min_segment_z = min(float(pa[2]), float(pb[2]))
+                except Exception:
+                    pass
+            return {
+                "mode": str(mode),
+                "obstacle": obstacle.get("path", ""),
+                "obstacle_source": obstacle.get("source", ""),
+                "obstacle_proxy": obstacle.get("proxy", "aabb"),
+                "obstacle_footprint_faces": obstacle.get("footprint_faces", 0),
+                "obstacle_footprint_source_vertices": obstacle.get("footprint_source_vertices", 0),
+                "link_name": link_name,
+                "point": hit_point,
+                "segment": (pa, pb),
+                "bbox_min": obstacle.get("min"),
+                "bbox_max": obstacle.get("max"),
+                "is_unload_bin_wall": bool(is_unload_bin_wall_obstacle(obstacle)),
+                "wall_top_z": wall_top,
+                "required_clearance_z": required_z,
+                "min_segment_z": min_segment_z,
+            }
+    return None
+
+
+def unload_collision_report_from_path_obstacle(report, mode="unload_to_bin"):
+    if not isinstance(report, dict):
+        return None
+    obstacle_path = str(report.get("obstacle", ""))
+    obstacle = {
+        "path": obstacle_path,
+        "source": report.get("obstacle_source", ""),
+        "proxy": report.get("obstacle_proxy", "aabb"),
+        "footprint_faces": report.get("obstacle_footprint_faces", 0),
+        "footprint_source_vertices": report.get("obstacle_footprint_source_vertices", 0),
+        "min": report.get("bbox_min"),
+        "max": report.get("bbox_max"),
+    }
+    wall_top = None
+    required_z = None
+    min_segment_z = None
+    if is_unload_bin_wall_obstacle(obstacle):
+        try:
+            wall_top = float(np.array(obstacle.get("max"), dtype=np.float32).reshape(-1)[2])
+            required_z = wall_top + float(UNLOAD_BIN_WALL_OVERPASS_CLEARANCE_Z)
+        except Exception:
+            wall_top = None
+            required_z = None
+    try:
+        segment = report.get("segment")
+        if segment is not None:
+            a, b = segment
+            min_segment_z = min(float(np.array(a, dtype=np.float32).reshape(-1)[2]), float(np.array(b, dtype=np.float32).reshape(-1)[2]))
+    except Exception:
+        min_segment_z = None
+    out = {
+        "mode": str(mode),
+        "obstacle": obstacle_path,
+        "obstacle_source": obstacle.get("source", ""),
+        "obstacle_proxy": obstacle.get("proxy", "aabb"),
+        "obstacle_footprint_faces": obstacle.get("footprint_faces", 0),
+        "obstacle_footprint_source_vertices": obstacle.get("footprint_source_vertices", 0),
+        "link_name": report.get("link_name", ""),
+        "point": report.get("point"),
+        "segment": report.get("segment"),
+        "bbox_min": report.get("bbox_min"),
+        "bbox_max": report.get("bbox_max"),
+        "is_unload_bin_wall": bool(is_unload_bin_wall_obstacle(obstacle)),
+        "wall_top_z": wall_top,
+        "required_clearance_z": required_z,
+        "min_segment_z": min_segment_z,
+    }
+    return out
+
+
+def unload_goal_reachability_report(q_seed, landing_target=None, label="", deadline=None):
+    ctx = task_scene_context()
+    landing = unload_bin_landing_point(ctx=ctx) if landing_target is None else np.array(landing_target, dtype=np.float32).reshape(-1)[:3]
+    bin_center = np.array(ctx["unload_bin_center"], dtype=np.float32).reshape(-1)[:3]
+    bin_half = np.array(ctx["unload_bin_half_size"], dtype=np.float32).reshape(-1)[:2]
+    safe_half = np.maximum(bin_half - UNLOAD_BIN_SAFE_XY_MARGIN, np.array([0.02, 0.02], dtype=np.float32))
+    wall_top, required_z = unload_bin_wall_clearance_required_z(ctx)
+    q_seed = np.array(q_seed, dtype=np.float32).reshape(-1)[:4].copy()
+    swing_idx = CTRL.name_to_idx["swing"]
+    boom_idx = CTRL.name_to_idx["boom"]
+    arm_idx = CTRL.name_to_idx["arm"]
+    target_xy = np.array([float(landing[0]), float(landing[1])], dtype=np.float32)
+    try:
+        boom_anchor = get_joint_anchor_world("boom")
+        if boom_anchor is None:
+            boom_anchor = np.zeros(3, dtype=np.float32)
+        bearing = math.atan2(float(target_xy[1] - boom_anchor[1]), float(target_xy[0] - boom_anchor[0]))
+    except Exception:
+        bearing = float(q_seed[swing_idx])
+
+    def unique_values(values, ndigits=6):
+        out = []
+        seen = set()
+        for value in values:
+            try:
+                v = float(value)
+            except Exception:
+                continue
+            key = round(v, ndigits)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(v)
+        return out
+
+    boom_lo, boom_hi = planner_effective_joint_bounds_rad("boom")
+    arm_lo, arm_hi = planner_effective_joint_bounds_rad("arm")
+    swing_values = unique_values(
+        [
+            bearing,
+            float(q_seed[swing_idx]),
+            bearing + deg_to_rad(8.0),
+            bearing - deg_to_rad(8.0),
+        ]
+    )
+    boom_values = unique_values(
+        list(np.linspace(float(boom_lo), float(boom_hi), 6))
+        + [float(q_seed[boom_idx]), float(q_seed[boom_idx]) + deg_to_rad(10.0), float(q_seed[boom_idx]) + deg_to_rad(22.0)]
+    )
+    arm_values = unique_values(
+        list(np.linspace(float(arm_lo), float(arm_hi), 7))
+        + [float(q_seed[arm_idx]), float(q_seed[arm_idx]) - deg_to_rad(8.0), float(q_seed[arm_idx]) - deg_to_rad(18.0)]
+    )
+    xy_accept = max(float(np.max(safe_half)) + 0.45, 0.65)
+    rows = []
+    accepted = []
+    sample_count = 0
+    for swing in swing_values:
+        if planning_deadline_exceeded(deadline):
+            break
+        for boom in boom_values:
+            if planning_deadline_exceeded(deadline):
+                break
+            for arm in arm_values:
+                if planning_deadline_exceeded(deadline):
+                    break
+                sample_count += 1
+                q = q_seed.copy()
+                q[swing_idx] = float(swing)
+                q[boom_idx] = float(boom)
+                q[arm_idx] = float(arm)
+                q = clip_route_command_near(q, reference=q_seed)
+                try:
+                    q_carry, carry_report = carry_hold_adjusted_q(
+                        q,
+                        q_reference=q_seed,
+                        end_effector="load",
+                        max_bucket_adjust_deg=105.0,
+                    )
+                except Exception:
+                    q_carry, carry_report = q.copy(), {"ok": False, "reason": "carry_adjust_exception"}
+                tip = predicted_end_world_point(q_carry, end_effector="tip", reference_q=q_seed)
+                load = predicted_end_world_point(q_carry, end_effector="load", reference_q=q_seed)
+                pour = predicted_end_world_point(q_carry, end_effector="pour", reference_q=q_seed)
+                pts = [p for p in [tip, load, pour] if p is not None]
+                if len(pts) < 2:
+                    continue
+                pts = [np.array(p, dtype=np.float32).reshape(-1)[:3] for p in pts]
+                xy_err = min(float(np.linalg.norm(p[:2] - target_xy)) for p in pts)
+                min_bucket_z = min(float(p[2]) for p in pts)
+                max_bucket_z = max(float(p[2]) for p in pts)
+                tip_z = None if tip is None else float(np.array(tip, dtype=np.float32).reshape(-1)[2])
+                row = {
+                    "q": q_carry.copy(),
+                    "carry_report": carry_report if isinstance(carry_report, dict) else {"reason": str(carry_report)},
+                    "xy_err": float(xy_err),
+                    "tip_z": tip_z,
+                    "load_z": None if load is None else float(np.array(load, dtype=np.float32).reshape(-1)[2]),
+                    "pour_z": None if pour is None else float(np.array(pour, dtype=np.float32).reshape(-1)[2]),
+                    "min_bucket_z": float(min_bucket_z),
+                    "max_bucket_z": float(max_bucket_z),
+                    "best_point": max(pts, key=lambda p: float(p[2])),
+                }
+                rows.append(row)
+                if xy_err <= xy_accept:
+                    accepted.append(row)
+    pool = accepted if accepted else rows
+    best = None
+    if pool:
+        best = sorted(pool, key=lambda r: (-float(r.get("min_bucket_z", -999.0)), float(r.get("xy_err", 999.0))))[0]
+    max_tip_z = None
+    max_min_bucket_z = None
+    if accepted:
+        tip_values = [float(r["tip_z"]) for r in accepted if r.get("tip_z") is not None]
+        min_values = [float(r["min_bucket_z"]) for r in accepted if r.get("min_bucket_z") is not None]
+        if tip_values:
+            max_tip_z = max(tip_values)
+        if min_values:
+            max_min_bucket_z = max(min_values)
+    elif best is not None:
+        max_tip_z = best.get("tip_z")
+        max_min_bucket_z = best.get("min_bucket_z")
+    can_clear = bool(max_min_bucket_z is not None and float(max_min_bucket_z) >= float(required_z))
+    report = {
+        "ok": bool(best is not None),
+        "reason": "ok" if best is not None else "no_reachability_sample",
+        "label": str(label),
+        "sample_count": int(sample_count),
+        "accepted_count": int(len(accepted)),
+        "xy_accept": float(xy_accept),
+        "bin_center": vec_list(bin_center, 3),
+        "bin_safe_half": vec_list(safe_half, 2),
+        "bin_radius": float(np.linalg.norm(bin_center[:2])),
+        "landing_target": vec_list(landing, 3),
+        "wall_top_z": float(wall_top),
+        "required_clearance_z": float(required_z),
+        "max_reachable_tip_z": None if max_tip_z is None else float(max_tip_z),
+        "max_reachable_bucket_min_z": None if max_min_bucket_z is None else float(max_min_bucket_z),
+        "reach_margin": None if max_min_bucket_z is None else float(max_min_bucket_z) - float(required_z),
+        "can_clear_wall": bool(can_clear),
+        "best_q_rad": None if best is None else vec_list(best["q"], 4),
+        "best_q_deg": None if best is None else q_deg_values(best["q"], wrap_swing_for_display=True),
+        "best_xy_err": None if best is None else float(best.get("xy_err", 999.0)),
+        "best_point": None if best is None else vec_list(best.get("best_point"), 3),
+        "best_carry_report": {} if best is None else best.get("carry_report", {}),
+    }
+    info_print(
+        "[UNLOAD REACHABILITY]",
+        f"label={label}",
+        f"samples={sample_count}",
+        f"accepted={len(accepted)}",
+        f"bin_radius={fmt_optional(report.get('bin_radius'))}",
+        f"required_z={fmt_optional(required_z)}",
+        f"max_tip_z={fmt_optional(report.get('max_reachable_tip_z'))}",
+        f"max_bucket_min_z={fmt_optional(report.get('max_reachable_bucket_min_z'))}",
+        f"margin={fmt_optional(report.get('reach_margin'))}",
+        f"can_clear_wall={report.get('can_clear_wall')}",
+        f"best_q={report.get('best_q_deg')}",
+        force_log=True,
+    )
+    return report
+
+
+def unload_pose_bucket_clearance_report(q_pose, reference_q=None):
+    q_pose = np.array(q_pose, dtype=np.float32).reshape(-1)[:4].copy()
+    if reference_q is None:
+        reference_q = q_pose
+    points = []
+    point_names = []
+    for effector in ("tip", "mid", "load", "pour"):
+        try:
+            p = predicted_end_world_point(q_pose, end_effector=effector, reference_q=reference_q)
+        except Exception:
+            p = None
+        if p is None:
+            continue
+        points.append(np.array(p, dtype=np.float32).reshape(-1)[:3])
+        point_names.append(effector)
+    if not points:
+        return {"ok": False, "reason": "no_predicted_bucket_points"}
+    z_values = [float(p[2]) for p in points]
+    min_i = int(np.argmin(np.array(z_values, dtype=np.float32)))
+    max_i = int(np.argmax(np.array(z_values, dtype=np.float32)))
+    wall_top, required_z = unload_bin_wall_clearance_required_z()
+    return {
+        "ok": True,
+        "reason": "ok",
+        "wall_top_z": float(wall_top),
+        "required_clearance_z": float(required_z),
+        "exec_required_clearance_z": float(required_z) + float(UNLOAD_BIN_WALL_EXEC_EXTRA_CLEARANCE_Z),
+        "min_bucket_z": float(z_values[min_i]),
+        "max_bucket_z": float(z_values[max_i]),
+        "min_point": point_names[min_i],
+        "max_point": point_names[max_i],
+        "margin": float(z_values[min_i]) - float(required_z),
+        "exec_margin": float(z_values[min_i]) - (float(required_z) + float(UNLOAD_BIN_WALL_EXEC_EXTRA_CLEARANCE_Z)),
+        "points": {name: vec_list(point, 3) for name, point in zip(point_names, points)},
+    }
+
+
+def validate_unload_goal(q_start, q_pre_dump, q_dump=None, dump_info=None, label="unload_goal", deadline=None):
+    ctx = task_scene_context()
+    landing = unload_bin_landing_point(ctx=ctx)
+    release = None
+    if isinstance(dump_info, dict):
+        release = dump_info.get("release_target") or dump_info.get("pour_target")
+    if release is None:
+        release = unload_bin_dump_point(ctx=ctx)
+    drop = unload_drop_report(q=q_dump, reference_q=q_start) if q_dump is not None else {}
+    collision = unload_goal_pose_collision_report(q_pre_dump, reference_q=q_start, mode="unload_to_bin")
+    ok = collision is None
+    if ok:
+        wall_top, required_z = unload_bin_wall_clearance_required_z(ctx)
+        reach = {
+            "ok": True,
+            "reason": "skipped_goal_collision_free",
+            "label": str(label),
+            "wall_top_z": float(wall_top),
+            "required_clearance_z": float(required_z),
+            "can_clear_wall": True,
+        }
+    else:
+        reach_deadline = child_planning_deadline(deadline, 0.90, min_seconds=0.20) if deadline is not None else None
+        reach = unload_goal_reachability_report(q_start, landing_target=landing, label=label, deadline=reach_deadline)
+    if ok:
+        reason = "ok"
+    elif bool((collision or {}).get("is_unload_bin_wall", False)) and not bool(reach.get("can_clear_wall", False)):
+        reason = "unload_goal_unreachable_by_reach"
+    else:
+        reason = "unload_goal_invalid"
+    rejected_segment = None
+    if isinstance(collision, dict):
+        rejected_segment = collision.get("segment")
+    draw_unload_dump_debug(
+        label,
+        landing_target=landing,
+        release_target=release,
+        q_seed=q_start,
+        q_seed_dump=q_dump,
+        best_drop=drop,
+        reason=reason,
+        best_reachable_point=reach.get("best_point"),
+        rejected_segment=rejected_segment,
+    )
+    info_print(
+        "[UNLOAD GOAL VALIDATE]",
+        f"label={label}",
+        f"ok={ok}",
+        f"reason={reason}",
+        f"q_pre_dump={q_deg_values(q_pre_dump, wrap_swing_for_display=True)}",
+        f"drop_inside={drop.get('inside_xy') if isinstance(drop, dict) else None}",
+        f"drop_close={drop.get('close_xy') if isinstance(drop, dict) else None}",
+        f"collision_obstacle={(collision or {}).get('obstacle') if isinstance(collision, dict) else None}",
+        f"collision_link={(collision or {}).get('link_name') if isinstance(collision, dict) else None}",
+        f"min_segment_z={fmt_optional((collision or {}).get('min_segment_z') if isinstance(collision, dict) else None)}",
+        f"wall_top={fmt_optional((collision or {}).get('wall_top_z') if isinstance(collision, dict) else None)}",
+        f"required_z={fmt_optional((collision or {}).get('required_clearance_z') if isinstance(collision, dict) else reach.get('required_clearance_z'))}",
+        f"reach_margin={fmt_optional(reach.get('reach_margin'))}",
+        force_log=True,
+    )
+    if not ok:
+        info_print(
+            "[UNLOAD GOAL FAIL FAST]",
+            f"label={label}",
+            f"reason={reason}",
+            f"can_clear_wall={reach.get('can_clear_wall')}",
+            f"best_q={reach.get('best_q_deg')}",
+            force_log=True,
+        )
+    return {
+        "ok": bool(ok),
+        "reason": reason,
+        "drop": drop,
+        "collision": collision,
+        "reachability": reach,
+        "can_retry_high": bool((not ok) and reach.get("can_clear_wall", False)),
+    }
 
 
 def path_block_report_text(mode, kind, report, reason):
@@ -13419,6 +14458,50 @@ def clip_command_near(q, reference=None):
     return q
 
 
+def is_unload_dump_motion(mode="", label=""):
+    text = f"{mode} {label}".lower()
+    return "unload_dump" in text or ("dump_pose" in text and "unload" in text)
+
+
+def bucket_dump_branch_target(target_rad, current_rad=None):
+    """Pick a bucket joint branch that actually opens the bucket for dump."""
+    idx = CTRL.name_to_idx.get("bucket", 3)
+    name = CTRL.dof_names[idx] if idx < len(CTRL.dof_names) else "bucket"
+    lo, hi = FINAL_LIMITS_RAD.get(name, (deg_to_rad(-360.0), deg_to_rad(360.0)))
+    target = float(target_rad)
+    current = float(CTRL.q_cmd[idx] if current_rad is None else current_rad)
+    candidates = [target + (2.0 * math.pi * k) for k in range(-3, 4)]
+    valid = [c for c in candidates if float(lo) - 1e-6 <= c <= float(hi) + 1e-6]
+    if valid:
+        opening = [c for c in valid if c >= current - deg_to_rad(1.0)]
+        if opening:
+            return float(min(opening, key=lambda c: abs(c - current)))
+        return float(min(valid, key=lambda c: abs(c - current)))
+    clipped = min(max(target, float(lo)), float(hi))
+    info_print(
+        "[UNLOAD DUMP TARGET LIMIT]",
+        f"target={rad_to_deg(target):.2f}deg",
+        f"current={rad_to_deg(current):.2f}deg",
+        f"limits=({rad_to_deg(float(lo)):.2f},{rad_to_deg(float(hi)):.2f})deg",
+        f"using={rad_to_deg(float(clipped)):.2f}deg",
+    )
+    return float(clipped)
+
+
+def clip_unload_dump_command(q, reference=None):
+    q_raw = np.array(q, dtype=np.float32).copy()
+    if reference is None:
+        reference = CTRL.q_cmd
+    reference = np.array(reference, dtype=np.float32).copy()
+    q = CTRL.clip_limits(q_raw.copy())
+    swing_idx = CTRL.name_to_idx["swing"]
+    bucket_idx = CTRL.name_to_idx.get("bucket", 3)
+    q[swing_idx] = swing_target_near(q_raw[swing_idx], reference[swing_idx])
+    q[swing_idx] = normalize_swing_cmd(q[swing_idx])
+    q[bucket_idx] = bucket_dump_branch_target(q_raw[bucket_idx], current_rad=reference[bucket_idx])
+    return CTRL.clip_limits(q)
+
+
 def planner_effective_joint_bounds_rad(name):
     try:
         lo, hi = FINAL_LIMITS_RAD[name]
@@ -13449,6 +14532,18 @@ def clip_route_command_near(q, reference=None):
 def interpolate_q_shortest(q0, q1, s):
     q0 = np.array(q0, dtype=np.float32)
     q1 = clip_command_near(q1, reference=q0)
+    q = (1.0 - float(s)) * q0 + float(s) * q1
+    swing_idx = CTRL.name_to_idx["swing"]
+    q[swing_idx] = float(q0[swing_idx]) + float(s) * swing_delta(q1[swing_idx], q0[swing_idx])
+    q[swing_idx] = normalize_swing_cmd(q[swing_idx])
+    return CTRL.clip_limits(q)
+
+
+def interpolate_q_motion(q0, q1, s, mode="", label=""):
+    if not is_unload_dump_motion(mode=mode, label=label):
+        return interpolate_q_shortest(q0, q1, s)
+    q0 = np.array(q0, dtype=np.float32)
+    q1 = clip_unload_dump_command(q1, reference=q0)
     q = (1.0 - float(s)) * q0 + float(s) * q1
     swing_idx = CTRL.name_to_idx["swing"]
     q[swing_idx] = float(q0[swing_idx]) + float(s) * swing_delta(q1[swing_idx], q0[swing_idx])
@@ -14933,6 +16028,16 @@ def swing_corridor_summary(q_start, q_goal, mode, samples=25, deadline=None):
 
 def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=None):
     end_effector = path_end_effector_for_mode(mode)
+    route_verbose = "staged_unload" in str(label).lower() or "unload_to_bin" in str(mode).lower()
+    if planning_deadline_exceeded(deadline):
+        if route_verbose:
+            info_print(
+                "[CLEARANCE ROUTE SKIP]",
+                f"label={label}",
+                "reason=planning budget exceeded before route start",
+                force_log=True,
+            )
+        return None, "planning budget exceeded before route start"
     carry_locked_route = mode_requires_loaded_carry_bucket(mode, label)
     if carry_locked_route:
         q_start = force_loaded_carry_bucket_q(q_start, reference=q_start, label=f"{label}_route_start")
@@ -14961,6 +16066,20 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
         deadline=corridor_deadline,
     )
     corridor_intervals = list((corridor or {}).get("free_intervals_deg", []) or [])
+    if route_verbose:
+        info_print(
+            "[CLEARANCE ROUTE START]",
+            f"label={label}",
+            f"mode={mode}",
+            f"end={end_effector}",
+            f"carry_locked={carry_locked_route}",
+            f"deadline={'none' if deadline is None else fmt_optional(max(0.0, float(deadline) - time.time())) + 's'}",
+            f"p_start={vec_list(p_start, 3)}",
+            f"p_goal={vec_list(p_goal, 3)}",
+            f"blockers={len(blockers)}",
+            f"corridor={corridor_intervals}",
+            force_log=True,
+        )
 
     def budget_expired():
         return planning_deadline_exceeded(deadline)
@@ -15032,11 +16151,22 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
 
     def try_joint_rrt_route():
         nonlocal last_reason
+        if route_verbose:
+            info_print(
+                "[CLEARANCE ROUTE RRT START]",
+                f"label={label}",
+                f"remaining={'none' if deadline is None else fmt_optional(max(0.0, float(deadline) - time.time())) + 's'}",
+                force_log=True,
+            )
         if joint_space_planner is None:
             last_reason = "joint_space_planner unavailable; deterministic routes only"
+            if route_verbose:
+                info_print("[CLEARANCE ROUTE RRT SKIP]", f"label={label}", last_reason, force_log=True)
             return
         if budget_expired():
             last_reason = "planning budget exceeded"
+            if route_verbose:
+                info_print("[CLEARANCE ROUTE RRT SKIP]", f"label={label}", last_reason, force_log=True)
             return
         rrt_deadline = None
         if deadline is not None:
@@ -15079,6 +16209,8 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
                 f"trapped={rrt_stats.get('trapped', 0)} advanced={rrt_stats.get('advanced', 0)} "
                 f"last={rrt_stats.get('last_reason', '')}"
             )
+            if route_verbose:
+                info_print("[CLEARANCE ROUTE RRT FAILED]", f"label={label}", last_reason, force_log=True)
 
     def add_deterministic_joint_routes():
         nonlocal last_reason
@@ -15097,6 +16229,16 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
             candidate_limit = 8
 
         tried = 0
+        detours = PATH_DETERMINISTIC_SWING_DETOURS_DEG if deadline is None else PATH_DETERMINISTIC_SWING_DETOURS_DEG[:7]
+        if route_verbose:
+            info_print(
+                "[CLEARANCE ROUTE DETERMINISTIC START]",
+                f"label={label}",
+                f"candidate_limit={candidate_limit}",
+                f"poses={len(PATH_DETERMINISTIC_ROUTE_POSES_DEG)}",
+                f"detours={len(detours)}",
+                force_log=True,
+            )
         approach_pairs = [
             (PATH_DETERMINISTIC_APPROACH_LIFTS_DEG[0], PATH_DETERMINISTIC_APPROACH_ARM_DELTAS_DEG[0]),
             (PATH_DETERMINISTIC_APPROACH_LIFTS_DEG[1], PATH_DETERMINISTIC_APPROACH_ARM_DELTAS_DEG[1]),
@@ -15104,8 +16246,6 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
             (PATH_DETERMINISTIC_APPROACH_LIFTS_DEG[3], PATH_DETERMINISTIC_APPROACH_ARM_DELTAS_DEG[2]),
             (PATH_DETERMINISTIC_APPROACH_LIFTS_DEG[1], PATH_DETERMINISTIC_APPROACH_ARM_DELTAS_DEG[3]),
         ]
-        detours = PATH_DETERMINISTIC_SWING_DETOURS_DEG if deadline is None else PATH_DETERMINISTIC_SWING_DETOURS_DEG[:7]
-
         for pose_idx, pose in enumerate(PATH_DETERMINISTIC_ROUTE_POSES_DEG):
             if budget_expired():
                 break
@@ -15178,6 +16318,15 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
 
         if not candidates and tried > 0:
             last_reason = f"deterministic joint clearance tried={tried} last={last_reason}"
+        if route_verbose:
+            info_print(
+                "[CLEARANCE ROUTE DETERMINISTIC DONE]",
+                f"label={label}",
+                f"tried={tried}",
+                f"candidates={len(candidates)}",
+                f"last={last_reason}",
+                force_log=True,
+            )
 
     add_deterministic_joint_routes()
     best = choose_best_candidate()
@@ -15270,6 +16419,15 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
     fast_heights = PATH_FAST_SIDE_HEIGHTS if deadline is None else PATH_FAST_SIDE_HEIGHTS[:2]
     fast_blocker_limit = int(PATH_FAST_SIDE_MAX_BLOCKERS) if deadline is None else 1
     fast_corner_limit = 10 if deadline is None else 4
+    if route_verbose:
+        info_print(
+            "[CLEARANCE ROUTE CORNER START]",
+            f"label={label}",
+            f"heights={fast_heights}",
+            f"blocker_limit={fast_blocker_limit}",
+            f"corner_limit={fast_corner_limit}",
+            force_log=True,
+        )
     for height in fast_heights:
         if budget_expired():
             break
@@ -15309,6 +16467,16 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
     fallback_heights = PATH_CLEARANCE_HEIGHTS if deadline is None else PATH_CLEARANCE_HEIGHTS[:3]
     fallback_fractions = PATH_CLEARANCE_FRACTIONS if deadline is None else [0.50]
     fallback_side_offsets = PATH_ROUTE_SIDE_OFFSETS if deadline is None else PATH_ROUTE_SIDE_OFFSETS[:1]
+    if route_verbose:
+        info_print(
+            "[CLEARANCE ROUTE FALLBACK START]",
+            f"label={label}",
+            f"heights={fallback_heights}",
+            f"fractions={fallback_fractions}",
+            f"side_offsets={fallback_side_offsets}",
+            f"remaining={'none' if deadline is None else fmt_optional(max(0.0, float(deadline) - time.time())) + 's'}",
+            force_log=True,
+        )
     for height in fallback_heights:
         if budget_expired():
             break
@@ -15390,6 +16558,8 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
         )
         return best["route"], str(best["type"])
 
+    if route_verbose:
+        info_print("[CLEARANCE ROUTE FAILED]", f"label={label}", f"reason={last_reason}", force_log=True)
     return None, last_reason
 
 
@@ -15946,7 +17116,7 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
             q_seed = np.array(beam["q"], dtype=np.float32).copy()
             if label == "unload_to_bin":
                 dump_deg = float(candidate.get("unload_dump_deg", BUCKET_UNLOAD_DUMP_DEG))
-                q_dump, dump_info = plan_dump_pose_to_bin(
+                q_release_align, dump_info = plan_dump_pose_to_bin(
                     q_seed=q_seed,
                     dump_deg=dump_deg,
                     label=f"plan_{candidate.get('id', 'candidate')}_{label}",
@@ -15955,7 +17125,8 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                     allow_unaligned=True,
                     deadline=deadline,
                 )
-                if q_dump is None:
+                q_dump_final = None
+                if q_release_align is None:
                     reference_angles = chain_angles_from_q(q_seed, end_effector="load")
                     carry_world = None
                     if reference_angles is not None:
@@ -15987,8 +17158,9 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                         fail_reasons.append(f"{label} dump-ready pose failed: {dump_info}; carry fallback failed: {fallback_info}")
                         continue
                     q_pre_dump = clip_command_near(q_pre_dump, reference=q_seed)
-                    q_dump = bucket_only_dump_pose(q_pre_dump, dump_deg)
-                    drop = unload_drop_report(q=q_dump, reference_q=q_pre_dump)
+                    q_release_align = bucket_only_dump_pose(q_pre_dump, unload_release_alignment_bucket_deg(dump_deg))
+                    q_dump_final = bucket_only_dump_pose(q_pre_dump, dump_deg)
+                    drop = unload_drop_report(q=q_release_align, reference_q=q_pre_dump)
                     info_print(
                         "[DIG PLAN UNLOAD FALLBACK]",
                         f"candidate={candidate.get('id', 'candidate')}",
@@ -15998,7 +17170,7 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                         f"close_xy={drop.get('close_xy')}",
                     )
                 else:
-                    q_pre_dump = np.array(q_dump, dtype=np.float32).copy()
+                    q_pre_dump = np.array(q_release_align, dtype=np.float32).copy()
                     bucket_idx = CTRL.name_to_idx["bucket"]
                     reference_angles = chain_angles_from_q(q_seed, end_effector="load")
                     carry_calc = None
@@ -16010,10 +17182,11 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                     else:
                         q_pre_dump[bucket_idx] = float(q_seed[bucket_idx])
                     q_pre_dump = clip_command_near(q_pre_dump, reference=q_seed)
-                    drop = unload_drop_report(q=q_dump, reference_q=q_pre_dump)
+                    q_dump_final = bucket_only_dump_pose(q_pre_dump, dump_deg)
+                    drop = unload_drop_report(q=q_release_align, reference_q=q_pre_dump)
 
                 landing = unload_bin_landing_point()
-                drop_ready = bool(drop.get("ok", False) and drop.get("close_xy", False))
+                drop_ready = unload_drop_execution_ready(drop)
                 if not drop_ready:
                     info_print(
                         "[DIG PLAN UNLOAD DIAG]",
@@ -16023,6 +17196,8 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                         f"xy_err={fmt_optional(drop.get('xy_err'))} "
                         f"inside_xy={drop.get('inside_xy')} above_wall={drop.get('above_wall')} "
                         f"close_xy={drop.get('close_xy')} "
+                        f"scatter_xy_ok={drop.get('scatter_xy_ok')} "
+                        f"acceptance={drop.get('landing_acceptance')} "
                         f"source_clearance={fmt_optional(drop.get('source_clearance'))}",
                     )
 
@@ -16153,10 +17328,21 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                     path_detail["direct_obstacle_ok"] = bool(direct_obstacle_ok)
                     path_detail["direct_obstacle_reason"] = str(direct_obstacle_reason)
                 xy_err = float(drop.get("xy_err", 1.0) or 1.0)
+                overflow_xy = float(drop.get("bin_overflow_xy", xy_err) or 0.0)
+                effective_xy_err = overflow_xy if unload_drop_execution_ready(drop) else xy_err
                 clearance_short = max(0.0, UNLOAD_DROP_SOURCE_MIN_CLEARANCE_Z - float(drop.get("source_clearance", 0.0) or 0.0))
                 outside_penalty = 0.0 if bool(drop.get("inside_xy", False)) else 8.0
-                close_penalty = 0.0 if bool(drop.get("close_xy", False)) else 6.0
-                unload_penalty = float(DIG_PLAN_UNLOAD_XY_COST) * xy_err + 18.0 * clearance_short + outside_penalty + close_penalty
+                scatter_penalty = 0.0 if unload_drop_execution_ready(drop) else 10.0
+                close_penalty = 0.0 if bool(drop.get("close_xy", False) or drop.get("scatter_xy_ok", False)) else 4.0
+                height_bonus = min(2.5, max(0.0, float(drop.get("source_clearance", 0.0) or 0.0) - float(UNLOAD_DROP_SOURCE_MIN_CLEARANCE_Z))) * 3.0
+                unload_penalty = (
+                    float(DIG_PLAN_UNLOAD_XY_COST) * effective_xy_err
+                    + 18.0 * clearance_short
+                    + outside_penalty
+                    + close_penalty
+                    + scatter_penalty
+                    - height_bonus
+                )
                 total_cost = float(beam["cost"]) + route_cost + motion["cost"] + path_penalty + unload_penalty
                 stage_row = {
                     "phase": label,
@@ -16164,14 +17350,16 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                     "required": bool(required),
                     "target_point": vec_list(landing, 3),
                     "q_goal_rad": vec_list(q_pre_dump, 4),
-                    "q_dump_rad": vec_list(q_dump, 4),
+                    "q_dump_rad": vec_list(q_dump_final, 4),
+                    "q_release_align_rad": vec_list(q_release_align, 4),
                     "q_goal_deg": q_deg_values(q_pre_dump, wrap_swing_for_display=True),
-                    "q_dump_deg": q_deg_values(q_dump, wrap_swing_for_display=True),
+                    "q_dump_deg": q_deg_values(q_dump_final, wrap_swing_for_display=True),
+                    "q_release_align_deg": q_deg_values(q_release_align, wrap_swing_for_display=True),
                     "duration": float(duration),
                     "effector": "landing",
                     "drop": compact_unload_drop(drop),
                     "drop_alignment_ready": bool(drop_ready),
-                    "drop_alignment_policy": "diagnostic_only_execute_then_score",
+                    "drop_alignment_policy": str(drop.get("landing_acceptance", "scatter_tolerant_execute_then_score")),
                     "clearance_route": {
                         "inserted": bool(route_waypoints),
                         "required": bool(route_required),
@@ -16961,12 +18149,18 @@ def evaluate_dig_plan_candidate(seq, points, candidate, stages=None):
             dump_reason = "missing predicted drop landing"
         else:
             xy_err = float(drop.get("xy_err", 999.0))
+            drop_ready = unload_drop_execution_ready(drop)
+            overflow_xy = float(drop.get("bin_overflow_xy", xy_err) or 0.0)
+            effective_xy_err = overflow_xy if drop_ready else xy_err
             clearance_short = max(0.0, UNLOAD_DROP_SOURCE_MIN_CLEARANCE_Z - float(drop.get("source_clearance", 0.0)))
             outside_penalty = 0.0 if bool(drop.get("inside_xy", False)) else 8.0
-            alignment_cost = 28.0 * xy_err + 18.0 * clearance_short + outside_penalty
+            scatter_penalty = 0.0 if drop_ready else 10.0
+            height_bonus = min(2.5, max(0.0, float(drop.get("source_clearance", 0.0)) - float(UNLOAD_DROP_SOURCE_MIN_CLEARANCE_Z))) * 3.0
+            alignment_cost = 28.0 * effective_xy_err + 18.0 * clearance_short + outside_penalty + scatter_penalty - height_bonus
             dump_reason = (
                 f"drop_xy_err={xy_err:.3f}; release_clearance={float(drop.get('source_clearance', 0.0)):.3f}; "
-                f"inside_xy={drop.get('inside_xy')}"
+                f"inside_xy={drop.get('inside_xy')}; scatter_xy_ok={drop.get('scatter_xy_ok')}; "
+                f"acceptance={drop.get('landing_acceptance')}"
             )
     penalties += alignment_cost
 
@@ -17109,12 +18303,14 @@ def planned_unload_stage_detail(stage_index=None, stage_name=None):
 
     q_goal = _planned_stage_q(selected, "q_goal_rad")
     q_dump = _planned_stage_q(selected, "q_dump_rad")
-    if q_goal is None and q_dump is None:
+    q_release_align = _planned_stage_q(selected, "q_release_align_rad")
+    if q_goal is None and q_dump is None and q_release_align is None:
         return None
     return {
         "phase": str(selected.get("phase", "")),
         "q_goal": None if q_goal is None else q_goal.copy(),
         "q_dump": None if q_dump is None else q_dump.copy(),
+        "q_release_align": None if q_release_align is None else q_release_align.copy(),
         "drop": selected.get("drop", {}),
         "target_point": selected.get("target_point"),
         "duration": selected.get("duration"),
@@ -17325,14 +18521,28 @@ def set_bucket_loaded_carry_joint(q_pose, reference=None):
 
 
 def force_loaded_carry_bucket_q(q_pose, reference=None, label=""):
-    """Force a loaded bucket pose for carry/unload route planning.
+    """Project a pose to a material-carrying bucket orientation.
 
-    The world-angle carry solver can choose a geometrically level branch near
-    -90 deg. That branch may look stable kinematically, but with real sand it
-    behaves like an open bucket. For loaded carry stages, keep the joint on the
-    closed carry branch and let boom/arm routing solve clearance.
+    Carry is a bucket-world orientation problem, not a fixed joint-angle
+    contract: boom/arm motion changes the bucket frame, so route planning should
+    keep the bucket mouth in a retaining orientation relative to gravity and
+    only fall back to the old closed-joint clamp when no relative carry solution
+    is available.
     """
-    q = set_bucket_loaded_carry_joint(q_pose, reference=(q_pose if reference is None else reference))
+    q = np.array(q_pose, dtype=np.float32).reshape(-1)[:4].copy()
+    q_ref = q.copy() if reference is None else np.array(reference, dtype=np.float32).reshape(-1)[:4].copy()
+    try:
+        q_adjusted, carry_report = carry_hold_adjusted_q(
+            q,
+            q_reference=q_ref,
+            end_effector="load",
+            max_bucket_adjust_deg=105.0,
+        )
+        if bool((carry_report or {}).get("ok", False)):
+            return q_adjusted.copy()
+    except Exception:
+        pass
+    q = clip_command_near(q, reference=q_ref)
     q, _limited, _old_bucket_deg = apply_loaded_bucket_closed_limit(q, label=label)
     return q
 
@@ -18335,10 +19545,25 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
         return False
 
     q_start = sync_motion_start_q("staged_post_secure_load")
+    loaded_route_test = (
+        str(task_label) == "loaded_unload_route_test"
+        or str(candidate.get("debug_task", "")) == "loaded_unload_route_test"
+        or str(candidate.get("id", "")) == "loaded_unload_route_test"
+    )
     post_lift_reentry = bool(candidate.get("staged_lift_before_bucket_safe_appended", False)) and not bool(
         candidate.get("staged_post_secure_load_appended", False)
     )
-    if post_lift_reentry:
+    if loaded_route_test:
+        secure_gate = {
+            "ok": True,
+            "reason": "loaded_route_test_current_pose_assumed_carry_safe",
+            "q_secure_deg": q_deg_values(q_start, wrap_swing_for_display=True),
+            "spill_gate_ok": True,
+            "carry_gate_ok": True,
+            "loaded_route_test": True,
+            "material_gate_bypassed": True,
+        }
+    elif post_lift_reentry:
         lift_metrics = record_phase_metrics("after_lift")
         lift_gate = post_lift_material_gate_report(current_metrics=lift_metrics, q_pose=q_start)
         candidate["post_lift_gate"] = lift_gate
@@ -18375,7 +19600,7 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
         q_cmd=q_start,
         q_real=q_start,
         data=secure_gate,
-        include_sand=True,
+        include_sand=not loaded_route_test,
     )
     carry_safe_seq = []
     carry_safe_points = []
@@ -18561,7 +19786,8 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
     lift_row = None
     lift_duration = 0.0
     q_lift = q_lift_start.copy()
-    if not post_lift_reentry:
+    skip_lift_stage = bool(post_lift_reentry or loaded_route_test)
+    if not skip_lift_stage:
         lift_rows = staged_lift_candidates(q_lift_start)
         valid_lift = [row for row in lift_rows if bool(row.get("ok", False))]
         if not valid_lift:
@@ -18592,59 +19818,342 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
             },
         )
 
-    deadline = time.time() + 10.0
-    q_dump, dump_info = plan_dump_pose_to_bin(
+    deadline = (
+        time.time() + float(LOADED_ROUTE_TEST_PLAN_BUDGET_SECONDS)
+        if loaded_route_test
+        else time.time() + 10.0
+    )
+    if loaded_route_test:
+        info_print(
+            "[LOADED ROUTE TEST OBSERVE]",
+            f"budget={float(LOADED_ROUTE_TEST_PLAN_BUDGET_SECONDS):.1f}s",
+            "mode=finite_search_with_debug",
+            "reason=avoid_main_thread_candidate_explosion",
+            force_log=True,
+        )
+    info_print(
+        "[POST SECURE PLAN START]",
+        f"loaded_route_test={loaded_route_test}",
+        f"q_start={q_deg_values(q_lift, wrap_swing_for_display=True)}",
+        f"landing={vec_list(unload_bin_landing_point(), 3)}",
+        f"dump_deg={fmt_optional(unload_dump_target_deg())}",
+        force_log=loaded_route_test,
+    )
+    dump_deadline = child_planning_deadline(deadline, 6.0, min_seconds=2.0) if loaded_route_test else deadline
+    if loaded_route_test:
+        info_print(
+            "[POST SECURE PLAN DUMP BUDGET]",
+            f"dump_budget={fmt_optional(max(0.0, float(dump_deadline) - time.time()))}s",
+            f"route_reserved={fmt_optional(max(0.0, float(deadline) - float(dump_deadline)))}s",
+            force_log=True,
+        )
+    q_release_align, dump_info = plan_dump_pose_to_bin(
         q_seed=q_lift,
         dump_deg=unload_dump_target_deg(),
         label="staged_unload_to_bin",
         log=True,
         allow_unaligned=True,
-        deadline=deadline,
+        max_correction_iters=3 if loaded_route_test else None,
+        deadline=dump_deadline,
+        goal_obstacle_check=not loaded_route_test,
+        bucket_candidate_count_override=5 if loaded_route_test else None,
     )
-    if q_dump is None:
+    if q_release_align is None:
         set_execution_failure_reason("planning_failed/staged_unload_dump_pose:" + str(dump_info))
         info_print("[DIG PLAN STAGED FAILED]", "stage=unload_to_bin", dump_info)
         return False
 
-    q_pre_dump = np.array(q_dump, dtype=np.float32).copy()
     bucket_idx = CTRL.name_to_idx["bucket"]
-    reference_angles = chain_angles_from_q(q_lift, end_effector="load")
-    carry_calc = None
-    if reference_angles is not None:
-        carry_world = nearest_bucket_carry_world_angle(reference_angles[2], q_reference=q_lift, end_effector="load")
-        carry_calc = bucket_joint_for_world_angle(q_pre_dump, carry_world, end_effector="load")
-    if carry_calc is not None:
-        q_pre_dump[bucket_idx] = carry_calc["bucket"]
-    else:
-        q_pre_dump[bucket_idx] = float(q_lift[bucket_idx])
-    q_pre_dump = clip_command_near(q_pre_dump, reference=q_lift)
-    pre_dump_old_bucket_deg = rad_to_deg(float(q_pre_dump[bucket_idx]))
-    q_pre_dump = force_loaded_carry_bucket_q(q_pre_dump, reference=q_lift, label="staged_unload_to_bin")
-    pre_dump_new_bucket_deg = rad_to_deg(float(q_pre_dump[bucket_idx]))
-    if abs(pre_dump_new_bucket_deg - pre_dump_old_bucket_deg) > 0.25:
-        info_print(
-            "[LOADED BUCKET LIMIT]",
-            "stage=staged_unload_to_bin",
-            f"requested={pre_dump_old_bucket_deg:.2f}deg",
-            f"forced_to={pre_dump_new_bucket_deg:.2f}deg",
-            "reason=pre_dump_loaded_carry_contract",
-        )
 
+    def compute_pre_dump_carry_pose(q_dump_pose, q_reference, compute_label):
+        q_pre = np.array(q_dump_pose, dtype=np.float32).copy()
+        reference_angles = chain_angles_from_q(q_reference, end_effector="load")
+        carry_calc = None
+        if reference_angles is not None:
+            carry_world = nearest_bucket_carry_world_angle(reference_angles[2], q_reference=q_reference, end_effector="load")
+            carry_calc = bucket_joint_for_world_angle(q_pre, carry_world, end_effector="load")
+        if carry_calc is not None:
+            q_pre[bucket_idx] = carry_calc["bucket"]
+        else:
+            q_pre[bucket_idx] = float(q_reference[bucket_idx])
+        q_pre = clip_command_near(q_pre, reference=q_reference)
+        old_bucket_deg = rad_to_deg(float(q_pre[bucket_idx]))
+        q_pre = force_loaded_carry_bucket_q(q_pre, reference=q_reference, label=compute_label)
+        new_bucket_deg = rad_to_deg(float(q_pre[bucket_idx]))
+        carry_report = carry_material_report_for_q(q_pre, end_effector="load")
+        if abs(new_bucket_deg - old_bucket_deg) > 0.25:
+            info_print(
+                "[LOADED BUCKET CARRY]",
+                f"stage={compute_label}",
+                f"requested={old_bucket_deg:.2f}deg",
+                f"adjusted_to={new_bucket_deg:.2f}deg",
+                f"pour_above_load_z={fmt_optional((carry_report or {}).get('pour_above_load_z'))}",
+                "reason=relative_loaded_carry_pose",
+            )
+        return q_pre, carry_report
+
+    q_pre_dump, pre_dump_carry_report = compute_pre_dump_carry_pose(q_release_align, q_lift, "staged_unload_to_bin")
+
+    def exec_clearance_for(q_pose):
+        return unload_pose_bucket_clearance_report(q_pose, reference_q=q_lift)
+
+    def needs_higher_exec_pose(clearance):
+        if not loaded_route_test:
+            return False
+        if not isinstance(clearance, dict) or not bool(clearance.get("ok", False)):
+            return False
+        return float(clearance.get("exec_margin", 0.0) or 0.0) < 0.0
+
+    unload_goal_validation = validate_unload_goal(
+        q_lift,
+        q_pre_dump,
+        q_dump=q_release_align,
+        dump_info=dump_info,
+        label="staged_unload_to_bin",
+        deadline=deadline,
+    )
+    candidate["unload_goal_validation"] = unload_goal_validation
+    STATE["dig_plan_candidate"] = candidate
+    unload_exec_clearance = exec_clearance_for(q_pre_dump)
+    needs_exec_high_retry = needs_higher_exec_pose(unload_exec_clearance)
+    if needs_exec_high_retry:
+        info_print(
+            "[UNLOAD GOAL RETRY HIGH]",
+            "label=staged_unload_to_bin",
+            "reason=insufficient_execute_clearance",
+            f"min_bucket_z={fmt_optional(unload_exec_clearance.get('min_bucket_z'))}",
+            f"required_exec_z={fmt_optional(unload_exec_clearance.get('exec_required_clearance_z'))}",
+            f"exec_margin={fmt_optional(unload_exec_clearance.get('exec_margin'))}",
+            force_log=True,
+        )
+    if (
+        (not bool(unload_goal_validation.get("ok", False)) and bool(unload_goal_validation.get("can_retry_high", False)))
+        or needs_exec_high_retry
+    ):
+        _, required_z = unload_bin_wall_clearance_required_z()
+        reach = unload_goal_validation.get("reachability", {}) if isinstance(unload_goal_validation.get("reachability"), dict) else {}
+        max_bucket_min_z = reach.get("max_reachable_bucket_min_z")
+        current_release_z = None
+        try:
+            if isinstance(dump_info, dict):
+                current_release = dump_info.get("release_target") or dump_info.get("pour_target")
+                if current_release is not None:
+                    current_release_z = float(np.array(current_release, dtype=np.float32).reshape(-1)[2])
+        except Exception:
+            current_release_z = None
+        if current_release_z is None:
+            try:
+                current_release_z = float(np.array(unload_bin_dump_point(), dtype=np.float32).reshape(-1)[2])
+            except Exception:
+                current_release_z = float(required_z) + 0.75
+        high_base_z = max(float(current_release_z), float(required_z) + 0.55)
+        retry_zs = [
+            float(high_base_z) + 0.25,
+            float(high_base_z) + 0.55,
+            float(high_base_z) + 0.90,
+            float(high_base_z) + 1.25,
+        ]
+        try:
+            if max_bucket_min_z is not None:
+                retry_zs.append(max(float(high_base_z) + 0.20, float(max_bucket_min_z) - 0.08))
+        except Exception:
+            pass
+        retry_zs = sorted({round(float(z), 3) for z in retry_zs})
+        retry_ok = False
+        best_retry_ok = None
+        for retry_idx, retry_z in enumerate(retry_zs):
+            if planning_deadline_exceeded(deadline):
+                break
+            info_print(
+                "[UNLOAD GOAL RETRY HIGH]",
+                f"label=staged_unload_to_bin",
+                f"attempt={retry_idx + 1}/{len(retry_zs)}",
+                f"release_z={retry_z:.3f}",
+                f"required_z={required_z:.3f}",
+                force_log=loaded_route_test,
+            )
+            q_retry_align, retry_info = plan_dump_pose_to_bin(
+                q_seed=q_lift,
+                dump_deg=unload_dump_target_deg(),
+                label=f"staged_unload_to_bin_high_{retry_idx + 1}",
+                log=True,
+                allow_unaligned=True,
+                max_correction_iters=3 if loaded_route_test else 1,
+                deadline=child_planning_deadline(deadline, 1.8, min_seconds=0.35),
+                goal_obstacle_check=False,
+                bucket_candidate_count_override=5 if loaded_route_test else None,
+                release_z_override=retry_z,
+            )
+            if q_retry_align is None:
+                continue
+            q_pre_retry, retry_carry_report = compute_pre_dump_carry_pose(
+                q_retry_align,
+                q_lift,
+                f"staged_unload_to_bin_high_{retry_idx + 1}",
+            )
+            retry_validation = validate_unload_goal(
+                q_lift,
+                q_pre_retry,
+                q_dump=q_retry_align,
+                dump_info=retry_info,
+                label=f"staged_unload_to_bin_high_{retry_idx + 1}",
+                deadline=deadline,
+            )
+            if bool(retry_validation.get("ok", False)):
+                retry_exec_clearance = exec_clearance_for(q_pre_retry)
+                if best_retry_ok is None or float(retry_exec_clearance.get("exec_margin", -999.0) or -999.0) > float(
+                    best_retry_ok.get("exec_clearance", {}).get("exec_margin", -999.0) or -999.0
+                ):
+                    best_retry_ok = {
+                        "q_release_align": q_retry_align,
+                        "dump_info": retry_info,
+                        "q_pre_dump": q_pre_retry,
+                        "carry_report": retry_carry_report,
+                        "validation": retry_validation,
+                        "exec_clearance": retry_exec_clearance,
+                        "release_z": retry_z,
+                    }
+                if needs_higher_exec_pose(retry_exec_clearance):
+                    info_print(
+                        "[UNLOAD GOAL RETRY HIGH LOW_MARGIN]",
+                        f"release_z={retry_z:.3f}",
+                        f"min_bucket_z={fmt_optional(retry_exec_clearance.get('min_bucket_z'))}",
+                        f"required_exec_z={fmt_optional(retry_exec_clearance.get('exec_required_clearance_z'))}",
+                        f"exec_margin={fmt_optional(retry_exec_clearance.get('exec_margin'))}",
+                        f"q_pre_dump={q_deg_values(q_pre_retry, wrap_swing_for_display=True)}",
+                        force_log=loaded_route_test,
+                    )
+                    continue
+                q_release_align = q_retry_align
+                dump_info = retry_info
+                q_pre_dump = q_pre_retry
+                pre_dump_carry_report = retry_carry_report
+                unload_goal_validation = retry_validation
+                unload_exec_clearance = retry_exec_clearance
+                candidate["unload_goal_validation"] = retry_validation
+                STATE["dig_plan_candidate"] = candidate
+                retry_ok = True
+                info_print(
+                    "[UNLOAD GOAL RETRY HIGH OK]",
+                    f"release_z={retry_z:.3f}",
+                    f"q_pre_dump={q_deg_values(q_pre_dump, wrap_swing_for_display=True)}",
+                    force_log=True,
+            )
+            break
+        if not retry_ok and best_retry_ok is not None:
+            q_release_align = np.array(best_retry_ok["q_release_align"], dtype=np.float32).copy()
+            dump_info = best_retry_ok["dump_info"]
+            q_pre_dump = np.array(best_retry_ok["q_pre_dump"], dtype=np.float32).copy()
+            pre_dump_carry_report = best_retry_ok["carry_report"]
+            unload_goal_validation = best_retry_ok["validation"]
+            unload_exec_clearance = best_retry_ok["exec_clearance"]
+            candidate["unload_goal_validation"] = unload_goal_validation
+            STATE["dig_plan_candidate"] = candidate
+            info_print(
+                "[UNLOAD GOAL RETRY HIGH BEST_AVAILABLE]",
+                f"release_z={fmt_optional(best_retry_ok.get('release_z'))}",
+                f"exec_margin={fmt_optional(unload_exec_clearance.get('exec_margin'))}",
+                f"q_pre_dump={q_deg_values(q_pre_dump, wrap_swing_for_display=True)}",
+                force_log=True,
+            )
+        if not retry_ok:
+            candidate["unload_goal_validation"] = unload_goal_validation
+            STATE["dig_plan_candidate"] = candidate
+
+    if not bool(unload_goal_validation.get("ok", False)):
+        fail_reason = str(unload_goal_validation.get("reason", "unload_goal_invalid"))
+        reach = unload_goal_validation.get("reachability", {}) if isinstance(unload_goal_validation.get("reachability"), dict) else {}
+        set_execution_failure_reason(
+            "planning_failed/staged_unload_goal:"
+            + fail_reason
+            + f"; reach_margin={fmt_optional(reach.get('reach_margin'))}"
+        )
+        info_print(
+            "[DIG PLAN STAGED FAILED]",
+            "stage=unload_to_bin",
+            f"reason={fail_reason}",
+            f"reach_margin={fmt_optional(reach.get('reach_margin'))}",
+            f"best_q={reach.get('best_q_deg')}",
+            force_log=True,
+        )
+        return False
+
+    q_dump = bucket_only_dump_pose(q_pre_dump, unload_dump_target_deg())
+    final_drop = dump_info.get("drop") if isinstance(dump_info, dict) else None
+    if not isinstance(final_drop, dict):
+        final_drop = unload_drop_report(q=q_release_align, reference_q=q_lift)
+    if isinstance(final_drop, dict) and not unload_drop_execution_ready(final_drop):
+        reason = (
+            "planning_failed/staged_unload_drop_unaligned:"
+            f"inside_xy={final_drop.get('inside_xy')} "
+            f"above_wall={final_drop.get('above_wall')} "
+            f"scatter_xy_ok={final_drop.get('scatter_xy_ok')} "
+            f"acceptance={final_drop.get('landing_acceptance')} "
+            f"xy_err={fmt_optional(final_drop.get('xy_err'))}"
+        )
+        set_execution_failure_reason(reason)
+        info_print(
+            "[DIG PLAN STAGED FAILED]",
+            "stage=unload_to_bin",
+            "reason=drop_not_inside_bin",
+            f"inside_xy={final_drop.get('inside_xy')}",
+            f"above_wall={final_drop.get('above_wall')}",
+            f"scatter_xy_ok={final_drop.get('scatter_xy_ok')}",
+            f"acceptance={final_drop.get('landing_acceptance')}",
+            f"xy_err={fmt_optional(final_drop.get('xy_err'))}",
+            force_log=True,
+        )
+        return False
+    unload_exec_clearance = exec_clearance_for(q_pre_dump)
+    info_print(
+        "[UNLOAD EXEC GOAL]",
+        f"q_carry={q_deg_values(q_pre_dump, wrap_swing_for_display=True)}",
+        f"q_release_align={q_deg_values(q_release_align, wrap_swing_for_display=True)}",
+        f"q_dump={q_deg_values(q_dump, wrap_swing_for_display=True)}",
+        f"release_align_deg={unload_release_alignment_bucket_deg(unload_dump_target_deg()):.2f}",
+        f"min_bucket_z={fmt_optional(unload_exec_clearance.get('min_bucket_z'))}",
+        f"exec_required_z={fmt_optional(unload_exec_clearance.get('exec_required_clearance_z'))}",
+        f"exec_margin={fmt_optional(unload_exec_clearance.get('exec_margin'))}",
+        "dump_policy=bucket_only_after_arrival",
+        force_log=True,
+    )
+
+    direct_samples = 8 if loaded_route_test else DIG_PLAN_PATH_CHECK_SAMPLES
+    route_samples = 3 if loaded_route_test else PATH_ROUTE_PLANNING_SAMPLE_COUNT
     direct_ok, kind, reason, sample, report = path_segment_check(
-        q_lift, q_pre_dump, "unload_to_bin", samples=DIG_PLAN_PATH_CHECK_SAMPLES, deadline=deadline
+        q_lift, q_pre_dump, "unload_to_bin", samples=direct_samples, deadline=deadline
+    )
+    info_print(
+        "[POST SECURE PLAN DIRECT CHECK]",
+        f"loaded_route_test={loaded_route_test}",
+        f"direct_ok={direct_ok}",
+        f"samples={direct_samples}",
+        f"kind={kind}",
+        f"reason={reason}",
+        f"q_pre_dump={q_deg_values(q_pre_dump, wrap_swing_for_display=True)}",
+        force_log=loaded_route_test,
     )
     route_seq = []
     route_points = []
     route_stages = []
     q_route_seed = q_lift.copy()
     if not direct_ok:
+        info_print(
+            "[POST SECURE PLAN ROUTE START]",
+            f"loaded_route_test={loaded_route_test}",
+            f"kind={kind}",
+            f"reason={reason}",
+            f"samples={route_samples}",
+            f"remaining={fmt_optional(max(0.0, float(deadline) - time.time()))}s",
+            force_log=loaded_route_test,
+        )
         route, route_reason = find_clearance_route(
             q_lift,
             q_pre_dump,
             "unload_to_bin",
             "staged_unload_to_bin",
             deadline=deadline,
-            samples=PATH_ROUTE_PLANNING_SAMPLE_COUNT,
+            samples=route_samples,
         )
         if route is None:
             fallback, fallback_reason = staged_high_carry_unload_fallback(q_lift, q_pre_dump, deadline=deadline)
@@ -18655,7 +20164,7 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
                     f"original_route={route_reason}; original={kind}:{reason}; sample={sample}"
                 )
                 q_pre_dump = np.array(fallback.get("q_pre_dump", q_pre_dump), dtype=np.float32).copy()
-                deadline = time.time() + 5.0
+                deadline = max(deadline, time.time() + 5.0) if loaded_route_test else time.time() + 5.0
                 info_print(
                     "[DIG PLAN STAGED FALLBACK]",
                     "stage=unload_to_bin",
@@ -18680,7 +20189,13 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
         for route_idx, q_route_raw in enumerate(route):
             q_route = np.array(q_route_raw, dtype=np.float32).copy()
             route_label = f"clearance_route_post_{route_idx + 1}"
-            route_duration = estimate_stage_motion_seconds(q_route_seed, q_route, requested_seconds=0.55)
+            route_duration = estimate_stage_motion_seconds(
+                q_route_seed,
+                q_route,
+                requested_seconds=LOADED_ROUTE_MIN_STAGE_SECONDS if loaded_route_test else 0.55,
+            )
+            if loaded_route_test:
+                route_duration = max(float(route_duration), float(LOADED_ROUTE_MIN_STAGE_SECONDS))
             route_target = predicted_end_world_point(q_route, end_effector=path_end_effector_for_mode("unload_to_bin"), reference_q=q_route_seed)
             route_row = make_stage_row_from_q(
                 route_label,
@@ -18707,8 +20222,16 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
             route_stages.append(route_row)
             q_route_seed = q_route.copy()
 
-    unload_duration = estimate_stage_motion_seconds(q_route_seed, q_pre_dump, requested_seconds=1.2)
-    drop = unload_drop_report(q=q_dump, reference_q=q_pre_dump)
+    q_release_align = bucket_only_dump_pose(q_pre_dump, unload_release_alignment_bucket_deg(unload_dump_target_deg()))
+    q_dump = bucket_only_dump_pose(q_pre_dump, unload_dump_target_deg())
+    unload_duration = estimate_stage_motion_seconds(
+        q_route_seed,
+        q_pre_dump,
+        requested_seconds=LOADED_ROUTE_FINAL_STAGE_SECONDS if loaded_route_test else 1.2,
+    )
+    if loaded_route_test:
+        unload_duration = max(float(unload_duration), float(LOADED_ROUTE_FINAL_STAGE_SECONDS))
+    drop = final_drop if isinstance(final_drop, dict) else unload_drop_report(q=q_release_align, reference_q=q_lift)
     unload_row = make_stage_row_from_q(
         "unload_to_bin",
         q_pre_dump,
@@ -18717,11 +20240,14 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
         target_point=unload_bin_landing_point(),
         extra={
             "q_dump_rad": vec_list(q_dump, 4),
+            "q_release_align_rad": vec_list(q_release_align, 4),
             "q_dump_deg": q_deg_values(q_dump, wrap_swing_for_display=True),
+            "q_release_align_deg": q_deg_values(q_release_align, wrap_swing_for_display=True),
+            "release_alignment_bucket_deg": unload_release_alignment_bucket_deg(unload_dump_target_deg()),
             "effector": "landing",
             "drop": compact_unload_drop(drop),
-            "drop_alignment_ready": bool(drop.get("ok", False) and drop.get("close_xy", False)),
-            "drop_alignment_policy": "staged_runtime_execute_then_score",
+            "drop_alignment_ready": unload_drop_execution_ready(drop),
+            "drop_alignment_policy": str(drop.get("landing_acceptance", "staged_runtime_execute_then_score")),
             "clearance_route": {
                 "inserted": bool(route_seq),
                 "required": bool(route_seq or not direct_ok),
@@ -18735,7 +20261,7 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
 
     seq.extend(carry_safe_seq)
     points.extend(carry_safe_points)
-    if not post_lift_reentry:
+    if not skip_lift_stage:
         seq.extend([("lift_carry", q_lift.copy(), lift_duration)])
         lift_target = lift.get("target_point") if isinstance(lift, dict) else None
         points.append(
@@ -18782,10 +20308,11 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
         draw_trace(force=True)
     info_print(
         "[DIG PLAN STAGED APPEND]",
-        "added=unload_to_bin" if post_lift_reentry else "added=lift_carry,unload_to_bin",
+        "added=unload_to_bin" if skip_lift_stage else "added=lift_carry,unload_to_bin",
         f"route_waypoints={len(route_seq)}",
         f"drop_xy_err={fmt_optional(drop.get('xy_err'))}",
         f"inside_xy={drop.get('inside_xy')}",
+        f"loaded_route_test={loaded_route_test}",
     )
     return True
 
@@ -19087,6 +20614,157 @@ def get_or_build_dig_plan():
     return seq
 
 
+def install_loaded_unload_route_test_plan_from_current():
+    if bool(STATE.get("dig_plan_planning_active", False)):
+        update_status("[LOADED ROUTE TEST] planner already running", force=True)
+        return False
+    q_start = sync_motion_start_q("loaded_unload_route_test_start")
+    target = get_target_pos() if TARGET_PATH else bucket_load_pos()
+    if target is None:
+        target = unload_bin_landing_point()
+    target = np.array(target, dtype=np.float32).reshape(-1)[:3].copy()
+    landing = unload_bin_landing_point()
+    release = unload_bin_dump_point()
+    ensure_unload_marker(landing, label="loaded_unload_route_test")
+
+    STATE["dig_plan_start_q"] = q_start.copy()
+    STATE["dig_plan_target"] = target.copy()
+    STATE["dig_plan_points"] = []
+    STATE["dig_plan_sequence"] = []
+    STATE["dig_plan_step_index"] = 0
+    STATE["dig_plan_trace_points"] = []
+    STATE["dig_plan_trace_stage_breaks"] = []
+    STATE["trace_planned_bucket_points"] = []
+    candidate = {
+        "id": "loaded_unload_route_test",
+        "planned": True,
+        "selected": True,
+        "stages": [],
+        "steps": 0,
+        "staged_execution": True,
+        "staged_prefix_ready": True,
+        "staged_prefix_terminal_phase": "secure_load",
+        "staged_post_secure_load_pending": True,
+        "staged_post_secure_load_appended": False,
+        "unload_landing_xyz": vec_list(landing, 3),
+        "unload_release_xyz": vec_list(release, 3),
+        "unload_point_xyz": vec_list(release, 3),
+        "unload_dump_deg": float(BUCKET_UNLOAD_DUMP_DEG),
+        "planner_cost": 0.0,
+        "rank_cost": 0.0,
+        "score": 0.0,
+        "estimated_time": 0.0,
+        "debug_task": "loaded_unload_route_test",
+    }
+    STATE["dig_plan_candidate"] = candidate
+    build_shared_dig_plan_object(target, STATE["dig_plan_sequence"], STATE["dig_plan_points"], candidate)
+    previous_active = bool(STATE.get("dig_plan_planning_active", False))
+    previous_source = STATE.get("dig_plan_planning_source", "")
+    previous_perf_deadline = STATE.get("dig_plan_active_perf_deadline")
+    previous_cache = STATE.get("planning_path_penalty_cache")
+    previous_swing_cache = STATE.get("planning_swing_corridor_cache")
+    STATE["planning_path_penalty_cache"] = {}
+    STATE["planning_path_penalty_cache_hits"] = 0
+    STATE["planning_path_penalty_cache_misses"] = 0
+    STATE["planning_swing_corridor_cache"] = {}
+    STATE["planning_swing_corridor_cache_hits"] = 0
+    STATE["planning_swing_corridor_cache_misses"] = 0
+    STATE["dig_plan_planning_active"] = True
+    STATE["dig_plan_planning_source"] = "loaded_route_test"
+    STATE["dig_plan_active_perf_deadline"] = None
+    try:
+        t_obstacles = time.perf_counter()
+        obstacles = rigid_obstacle_bboxes(force=True)
+        info_print(
+            "[LOADED ROUTE TEST SNAPSHOT]",
+            f"rigid_obstacles={len(obstacles)}",
+            f"obstacle_snapshot_ms={(time.perf_counter() - t_obstacles) * 1000.0:.1f}",
+            force_log=True,
+        )
+        ok = append_staged_post_secure_load_plan(task_label="loaded_unload_route_test")
+    finally:
+        info_print(
+            "[LOADED ROUTE TEST CACHE]",
+            f"path_hits={int(STATE.get('planning_path_penalty_cache_hits', 0))}",
+            f"path_misses={int(STATE.get('planning_path_penalty_cache_misses', 0))}",
+            f"swing_hits={int(STATE.get('planning_swing_corridor_cache_hits', 0))}",
+            f"swing_misses={int(STATE.get('planning_swing_corridor_cache_misses', 0))}",
+            force_log=True,
+        )
+        STATE["dig_plan_planning_active"] = previous_active
+        STATE["dig_plan_planning_source"] = previous_source
+        STATE["dig_plan_active_perf_deadline"] = previous_perf_deadline
+        STATE["planning_path_penalty_cache"] = previous_cache if isinstance(previous_cache, dict) else {}
+        STATE["planning_swing_corridor_cache"] = previous_swing_cache if isinstance(previous_swing_cache, dict) else {}
+    seq = STATE.get("dig_plan_sequence")
+    if not ok or not isinstance(seq, list) or not seq:
+        reason = str(STATE.get("last_execution_failure_reason", "") or "loaded route test plan failed")
+        update_status(f"[LOADED ROUTE TEST] plan failed: {reason}", force=True)
+        return False
+    if current_trace_mode() == 2:
+        draw_trace(force=True)
+    update_status(f"[LOADED ROUTE TEST] plan ready: {len(seq)} stages", force=True)
+    planned_landing = candidate.get("unload_landing_xyz", vec_list(landing, 3))
+    planned_release = candidate.get("unload_release_xyz", vec_list(release, 3))
+    planned_drop = None
+    for row in reversed(candidate.get("stages", []) or []):
+        if isinstance(row, dict) and str(row.get("phase", "")) == "unload_to_bin":
+            planned_drop = row.get("drop") if isinstance(row.get("drop"), dict) else None
+            break
+    if isinstance(planned_drop, dict):
+        planned_landing = planned_drop.get("landing") or planned_landing
+        planned_release = planned_drop.get("release") or planned_release
+    info_print(
+        "[LOADED ROUTE TEST PLAN]",
+        f"start_q={q_deg_values(q_start, wrap_swing_for_display=True)}",
+        f"stages={[str(item[0]) for item in seq]}",
+        f"landing_target={vec_list(landing, 3)}",
+        f"planned_landing={planned_landing}",
+        f"planned_release={planned_release}",
+        f"release_target={candidate.get('unload_release_xyz')}",
+        f"acceptance={planned_drop.get('landing_acceptance') if isinstance(planned_drop, dict) else None}",
+        f"release_xy_err={fmt_optional(planned_drop.get('release_xy_err') if isinstance(planned_drop, dict) else None)}",
+        f"drop_xy_err={fmt_optional(planned_drop.get('xy_err') if isinstance(planned_drop, dict) else None)}",
+    )
+    return True
+
+
+async def execute_loaded_unload_route_test_from_current():
+    if STATE.get("auto_collect_active", False):
+        stop_auto_collect()
+    invalidate_active_task("loaded_route_test_start")
+    STATE["follow"] = False
+    STATE["manual_joint_active"] = False
+    STATE["manual_joint_target"] = None
+    try:
+        bucket_min = float(bbox_min_z(BUCKET_LINK))
+    except Exception:
+        bucket_min = 0.0
+    if bucket_min < float(GROUND_TOP_Z) - 0.05:
+        reason = f"bucket_below_hard_ground={bucket_min:.3f}; lift boom/arm before loaded route test"
+        update_status(f"[LOADED ROUTE TEST] blocked: {reason}", force=True)
+        info_print("[LOADED ROUTE TEST BLOCKED]", reason)
+        return False
+    metrics = record_phase_metrics("loaded_route_test_start")
+    bucket_particle_diagnostic("loaded_route_test_start")
+    info_print(
+        "[LOADED ROUTE TEST]",
+        "sand_unchanged=True",
+        f"metrics_bucket={metrics.get('bucket_from_pile_count') if isinstance(metrics, dict) else None}",
+    )
+
+    update_status("[LOADED ROUTE TEST] planning loaded unload route...", force=True)
+    await step_updates(1)
+    if not install_loaded_unload_route_test_plan_from_current():
+        return False
+    await step_updates(1)
+    return await execute_dig_target_ball(
+        rebuild_plan=False,
+        task_name="loaded_unload_route_test",
+        return_home=False,
+    )
+
+
 def plan_unload_from_current():
     point = unload_bin_dump_point()
     log_unload_context("manual_unload", target_xyz=get_target_pos() if TARGET_PATH else None, unload_point=point)
@@ -19134,44 +20812,192 @@ def unload_dump_target_deg():
     return float(dump_deg)
 
 
-def plan_dump_pose_to_bin(q_seed=None, dump_deg=None, label="unload_dump", log=True, max_correction_iters=None, allow_unaligned=False, deadline=None):
+def unload_release_alignment_bucket_deg(dump_deg=None):
+    final_deg = unload_dump_target_deg() if dump_deg is None else float(dump_deg)
+    align_deg = float(UNLOAD_DUMP_FLOW_CENTER_BUCKET_DEG)
+    # If a future dump target is less open than the release-alignment angle, use the reachable final target.
+    if final_deg < align_deg:
+        align_deg = final_deg
+    return float(align_deg)
+
+
+def plan_dump_pose_to_bin(
+    q_seed=None,
+    dump_deg=None,
+    label="unload_dump",
+    log=True,
+    max_correction_iters=None,
+    allow_unaligned=False,
+    deadline=None,
+    goal_obstacle_check=True,
+    bucket_candidate_count_override=None,
+    release_z_override=None,
+):
     if q_seed is None:
         q_seed = CTRL.q_cmd.copy()
     else:
         q_seed = np.array(q_seed, dtype=np.float32).copy()
     if dump_deg is None:
         dump_deg = unload_dump_target_deg()
+    final_dump_deg = float(dump_deg)
+    release_alignment_bucket_deg = unload_release_alignment_bucket_deg(final_dump_deg)
 
     bucket_idx = CTRL.name_to_idx["bucket"]
     q_seed_dump = q_seed.copy()
-    q_seed_dump[bucket_idx] = deg_to_rad(float(dump_deg))
+    q_seed_dump[bucket_idx] = deg_to_rad(float(release_alignment_bucket_deg))
     q_seed_dump = clip_command_near(q_seed_dump, reference=q_seed)
     ctx = task_scene_context()
     drop_target = unload_bin_landing_point(ctx=ctx)
     nominal_release_target = unload_bin_dump_point(ctx=ctx)
     bin_z_range = np.array(ctx["unload_bin_z_range"], dtype=np.float32).reshape(-1)
     wall_z = float(bin_z_range[1]) if len(bin_z_range) >= 2 else GROUND_TOP_Z
-    min_release_z = max(float(nominal_release_target[2]), wall_z + UNLOAD_DROP_SOURCE_MIN_CLEARANCE_Z, GROUND_TOP_Z + UNLOAD_TARGET_MIN_Z)
-    pour_target, initial_drift = unload_release_target_for_landing(
-        drop_target,
-        q_estimate=q_seed_dump,
-        q_start=q_seed,
-        release_z=min_release_z,
-        wall_z=wall_z,
+    preferred_release_z = preferred_unload_release_z(ctx=ctx, wall_z=wall_z)
+    min_release_z = max(
+        float(nominal_release_target[2]),
+        float(wall_z) + float(UNLOAD_DROP_SOURCE_MIN_CLEARANCE_Z),
+        float(GROUND_TOP_Z) + float(UNLOAD_TARGET_MIN_Z),
+        float(preferred_release_z),
+    )
+    if release_z_override is not None:
+        try:
+            min_release_z = max(float(min_release_z), float(release_z_override))
+        except Exception:
+            pass
+    center_release_mode = bool(UNLOAD_FORCE_CENTER_HIGH_RELEASE)
+    if center_release_mode:
+        release_target = np.array(drop_target, dtype=np.float32).reshape(-1)[:3].copy()
+        release_target[2] = float(min_release_z)
+        # In center-release mode the controlled quantity is the bucket opening center.
+        # A precomputed pour->opening offset is brittle across IK poses, so use the
+        # desired opening center directly and close the residual with release_xy feedback.
+        pour_target = release_target.copy()
+        load = bucket_point_world("load", q=q_seed_dump, reference_q=q_seed)
+        initial_drift = unload_drop_drift_model(
+            q=q_seed_dump,
+            reference_q=q_seed,
+            release=release_target,
+            load=load,
+            wall_z=wall_z,
+        )
+    else:
+        release_target, initial_drift = unload_release_target_for_landing(
+            drop_target,
+            q_estimate=q_seed_dump,
+            q_start=q_seed,
+            release_z=min_release_z,
+            wall_z=wall_z,
+        )
+        pour_target = pour_target_for_unload_release_source(release_target, q_estimate=q_seed_dump, q_start=q_seed)
+    initial_release_target = np.array(release_target, dtype=np.float32).copy()
+    initial_pour_target = np.array(pour_target, dtype=np.float32).copy()
+    seed_drop = unload_drop_report(q=q_seed_dump, reference_q=q_seed)
+    seed_center_ready = (
+        (not center_release_mode)
+        or (
+            bool(seed_drop.get("release_centered_ok", False))
+            and float(seed_drop.get("release_xy_err", 999.0) or 999.0) <= float(UNLOAD_CENTER_RELEASE_XY_TOL)
+        )
+    )
+    if allow_unaligned and unload_drop_execution_ready(seed_drop) and seed_center_ready:
+        info = {
+            "reason": "current_pose_dump_already_inside_bin",
+            "drop": seed_drop,
+            "drop_target": vec_list(drop_target, 3),
+            "pour_target": vec_list(seed_drop.get("release"), 3),
+            "release_target": vec_list(seed_drop.get("release"), 3),
+            "release_source": seed_drop.get("release_source", "bucket_opening_center"),
+            "dump_bucket_target_deg": float(final_dump_deg),
+            "release_alignment_bucket_deg": float(release_alignment_bucket_deg),
+            "q_release_align_rad": vec_list(q_seed_dump, 4),
+            "q_release_align_deg": q_deg_values(q_seed_dump, wrap_swing_for_display=True),
+            "dump_bucket_err_deg": 0.0,
+            "ik_bucket_err_deg": 0.0,
+            "drop_alignment_ready": True,
+            "drop_alignment_policy": str(seed_drop.get("landing_acceptance", "current_pose_fast_path")),
+        }
+        if log:
+            info_print(
+                f"[UNLOAD DUMP PLAN] {label}: current_pose_fast_path "
+                f"landing_target={vec_list(drop_target, 3)} release={seed_drop.get('release')} "
+                f"landing={seed_drop.get('landing')} xy_err={fmt_optional(seed_drop.get('xy_err'))} "
+                f"inside_xy={seed_drop.get('inside_xy')} close_xy={seed_drop.get('close_xy')} "
+                f"scatter_xy_ok={seed_drop.get('scatter_xy_ok')} acceptance={seed_drop.get('landing_acceptance')} "
+                f"source_clearance={fmt_optional(seed_drop.get('source_clearance'))} "
+                f"q={q_deg_values(q_seed_dump, wrap_swing_for_display=True)}"
+            )
+        draw_unload_dump_debug(
+            label,
+            landing_target=drop_target,
+            release_target=seed_drop.get("release"),
+            q_seed=q_seed,
+            q_seed_dump=q_seed_dump,
+            best_drop=seed_drop,
+            reason="current_pose_fast_path",
+        )
+        return q_seed_dump, info
+    if log:
+        info_print(
+            f"[UNLOAD DUMP PLAN START] {label}: "
+            f"deadline={'none' if deadline is None else fmt_optional(max(0.0, float(deadline) - time.time())) + 's'} "
+            f"landing_target={vec_list(drop_target, 3)} "
+            f"required_release={vec_list(initial_release_target, 3)} "
+            f"ik_pour_target={vec_list(initial_pour_target, 3)} "
+            f"release_policy={'opening_center_high_no_drift_compensation' if center_release_mode else 'drift_compensated'} "
+            f"ik_target_policy={'direct_opening_center_iterative' if center_release_mode else 'pour_offset_from_release'} "
+            f"release_source=bucket_opening_center "
+            f"release_align_deg={release_alignment_bucket_deg:.2f} "
+            f"final_dump_deg={final_dump_deg:.2f} "
+            f"preferred_release_z={fmt_optional(preferred_release_z)} "
+            f"wall_z={fmt_optional(wall_z)} "
+            f"current_release={seed_drop.get('release')} "
+            f"current_landing={seed_drop.get('landing')} "
+            f"current_xy_err={fmt_optional(seed_drop.get('xy_err'))} "
+            f"inside_xy={seed_drop.get('inside_xy')} "
+            f"above_wall={seed_drop.get('above_wall')} "
+            f"drift={fmt_optional(seed_drop.get('drift_distance'))} "
+            f"q_seed={q_deg_values(q_seed, wrap_swing_for_display=True)} "
+            f"q_seed_dump={q_deg_values(q_seed_dump, wrap_swing_for_display=True)}",
+            force_log=True,
+        )
+    draw_unload_dump_debug(
+        label,
+        landing_target=drop_target,
+        release_target=initial_release_target,
+        q_seed=q_seed,
+        q_seed_dump=q_seed_dump,
+        best_drop=seed_drop,
+        reason="dump_plan_start",
     )
     best = None
     last_reason = "no dump candidate evaluated"
 
     correction_iters = max(1, int(UNLOAD_DROP_IK_CORRECTION_ITERS if max_correction_iters is None else max_correction_iters))
     if deadline is not None:
-        correction_iters = min(correction_iters, 1)
+        correction_iters = min(correction_iters, 3 if center_release_mode else 1)
     for attempt in range(correction_iters):
         if planning_deadline_exceeded(deadline):
+            draw_unload_dump_debug(
+                label,
+                landing_target=drop_target,
+                release_target=initial_release_target,
+                q_seed=q_seed,
+                q_seed_dump=q_seed_dump,
+                reason="planning budget exceeded before dump IK",
+            )
             return None, "planning budget exceeded"
+        if log:
+            info_print(
+                f"[UNLOAD DUMP PLAN TRY] {label}: "
+                f"attempt={attempt + 1}/{correction_iters} "
+                f"release_target={vec_list(release_target, 3)} "
+                f"ik_pour_target={vec_list(pour_target, 3)} "
+                f"remaining={'none' if deadline is None else fmt_optional(max(0.0, float(deadline) - time.time())) + 's'}",
+                force_log=True,
+            )
         q_dump, info = solve_priority_ik_to_target(
             pour_target,
             q_seed=q_seed_dump,
-            preferred_bucket_rad=deg_to_rad(float(dump_deg)),
+            preferred_bucket_rad=deg_to_rad(float(release_alignment_bucket_deg)),
             preferred_end_angle_rad=None,
             bucket_motion_weight=0.35,
             bucket_preference_weight=8.0,
@@ -19183,28 +21009,60 @@ def plan_dump_pose_to_bin(q_seed=None, dump_deg=None, label="unload_dump", log=T
             phase_mode="unload_dump",
             use_refinement=True,
             bucket_candidate_span_deg=95.0,
-            bucket_candidate_count=9 if deadline is not None else 25,
+            bucket_candidate_count=(
+                int(bucket_candidate_count_override)
+                if bucket_candidate_count_override is not None
+                else (9 if deadline is not None else 25)
+            ),
             deadline=deadline,
+            score_goal_obstacle=bool(goal_obstacle_check),
         )
 
         if q_dump is None:
             last_reason = str(info)
+            if log:
+                info_print(
+                    f"[UNLOAD DUMP PLAN TRY FAILED] {label}: "
+                    f"attempt={attempt + 1}/{correction_iters} reason={last_reason}",
+                    force_log=True,
+                )
             break
 
         q_ik = clip_command_near(q_dump, reference=q_seed)
-        ik_bucket_err = abs(rad_to_deg(wrap_angle(float(q_ik[bucket_idx]) - deg_to_rad(float(dump_deg)))))
+        ik_bucket_err = abs(rad_to_deg(wrap_angle(float(q_ik[bucket_idx]) - deg_to_rad(float(release_alignment_bucket_deg)))))
         q_dump = q_ik.copy()
-        q_dump[bucket_idx] = deg_to_rad(float(dump_deg))
+        q_dump[bucket_idx] = deg_to_rad(float(release_alignment_bucket_deg))
         q_dump = clip_command_near(q_dump, reference=q_seed)
-        bucket_err = abs(rad_to_deg(wrap_angle(float(q_dump[bucket_idx]) - deg_to_rad(float(dump_deg)))))
+        bucket_err = abs(rad_to_deg(wrap_angle(float(q_dump[bucket_idx]) - deg_to_rad(float(release_alignment_bucket_deg)))))
         drop = unload_drop_report(q=q_dump, reference_q=q_seed)
         xy_err = float(drop.get("xy_err", 999.0))
         source_clearance = float(drop.get("source_clearance", -999.0))
+        drop_ready = unload_drop_execution_ready(drop)
+        center_ready = (
+            (not center_release_mode)
+            or (
+                bool(drop.get("release_centered_ok", False))
+                and float(drop.get("release_xy_err", 999.0) or 999.0) <= float(UNLOAD_CENTER_RELEASE_XY_TOL)
+            )
+        )
+        overflow_xy = float(drop.get("bin_overflow_xy", xy_err) or 0.0)
+        release_xy_err = float(drop.get("release_xy_err", xy_err) or 0.0)
+        effective_xy_err = release_xy_err if center_release_mode else (overflow_xy if drop_ready else xy_err)
         source_penalty = max(0.0, UNLOAD_DROP_SOURCE_MIN_CLEARANCE_Z - source_clearance)
         bucket_penalty = max(0.0, bucket_err - UNLOAD_DUMP_BUCKET_TOL_DEG)
         ik_bucket_penalty = max(0.0, ik_bucket_err - UNLOAD_DUMP_BUCKET_TOL_DEG)
         planar_err = float(info.get("planar_err", 0.0)) if isinstance(info, dict) else 0.0
-        cost = 100.0 * xy_err + 35.0 * source_penalty + 0.6 * bucket_penalty + 0.15 * ik_bucket_penalty + 5.0 * planar_err
+        height_bonus = min(2.5, max(0.0, source_clearance - float(UNLOAD_DROP_SOURCE_MIN_CLEARANCE_Z))) * 7.5
+        acceptance_penalty = 0.0 if (drop_ready and center_ready) else 35.0
+        cost = (
+            65.0 * effective_xy_err
+            + 35.0 * source_penalty
+            + 0.6 * bucket_penalty
+            + 0.15 * ik_bucket_penalty
+            + 5.0 * planar_err
+            + acceptance_penalty
+            - height_bonus
+        )
         row = {
             "q": q_dump,
             "info": dict(info) if isinstance(info, dict) else {"reason": str(info)},
@@ -19213,28 +21071,61 @@ def plan_dump_pose_to_bin(q_seed=None, dump_deg=None, label="unload_dump", log=T
             "ik_bucket_err": float(ik_bucket_err),
             "cost": float(cost),
             "attempt": int(attempt),
+            "release_target": release_target.copy(),
             "pour_target": pour_target.copy(),
+            "center_ready": bool(center_ready),
         }
         if best is None or row["cost"] < best["cost"]:
             best = row
+        if log:
+            info_print(
+                f"[UNLOAD DUMP PLAN TRY RESULT] {label}: "
+                f"attempt={attempt + 1}/{correction_iters} "
+                f"xy_err={fmt_optional(drop.get('xy_err'))} "
+                f"inside_xy={drop.get('inside_xy')} "
+                f"above_wall={drop.get('above_wall')} "
+                f"close_xy={drop.get('close_xy')} "
+                f"scatter_xy_ok={drop.get('scatter_xy_ok')} "
+                f"release_centered_ok={drop.get('release_centered_ok')} "
+                f"release_xy_err={fmt_optional(drop.get('release_xy_err'))} "
+                f"center_required={center_release_mode} "
+                f"center_ready={center_ready} "
+                f"release_align_deg={release_alignment_bucket_deg:.2f} "
+                f"final_dump_deg={final_dump_deg:.2f} "
+                f"acceptance={drop.get('landing_acceptance')} "
+                f"source_clearance={fmt_optional(drop.get('source_clearance'))} "
+                f"bucket_err={bucket_err:.2f}deg "
+                f"cost={cost:.2f} "
+                f"q={q_deg_values(q_dump, wrap_swing_for_display=True)}",
+                force_log=True,
+            )
 
-        if bool(drop.get("ok", False)) and bool(drop.get("close_xy", False)):
+        if drop_ready and center_ready:
             row["info"]["drop"] = drop
             row["info"]["drop_target"] = vec_list(drop_target, 3)
             row["info"]["pour_target"] = vec_list(pour_target, 3)
-            row["info"]["release_target"] = vec_list(pour_target, 3)
-            row["info"]["dump_bucket_target_deg"] = float(dump_deg)
+            row["info"]["release_target"] = vec_list(release_target, 3)
+            row["info"]["release_source"] = drop.get("release_source", "bucket_opening_center")
+            row["info"]["dump_bucket_target_deg"] = float(final_dump_deg)
+            row["info"]["release_alignment_bucket_deg"] = float(release_alignment_bucket_deg)
+            row["info"]["q_release_align_rad"] = vec_list(q_dump, 4)
+            row["info"]["q_release_align_deg"] = q_deg_values(q_dump, wrap_swing_for_display=True)
             row["info"]["dump_bucket_err_deg"] = float(bucket_err)
             row["info"]["ik_bucket_err_deg"] = float(ik_bucket_err)
+            row["info"]["drop_alignment_ready"] = True
+            row["info"]["drop_alignment_policy"] = str(drop.get("landing_acceptance", "scatter_tolerant_high_release"))
             if log:
                 raw_swing = row["info"].get("raw_swing_goal")
                 swing_goal = row["info"].get("swing_goal")
                 info_print(
                     f"[UNLOAD DUMP PLAN] {label}: "
-                    f"landing_target={vec_list(drop_target, 3)} release_target={vec_list(pour_target, 3)} "
+                    f"landing_target={vec_list(drop_target, 3)} release_target={vec_list(release_target, 3)} "
+                    f"ik_pour_target={vec_list(pour_target, 3)} "
                     f"landing={drop.get('landing')} release={drop.get('release')} "
                     f"xy_err={fmt_optional(drop.get('xy_err'))} source_clearance={fmt_optional(drop.get('source_clearance'))} "
-                    f"dump_deg={float(dump_deg):.2f} bucket_err={bucket_err:.2f}deg "
+                    f"acceptance={drop.get('landing_acceptance')} scatter_xy_ok={drop.get('scatter_xy_ok')} "
+                    f"release_align_deg={release_alignment_bucket_deg:.2f} final_dump_deg={final_dump_deg:.2f} "
+                    f"bucket_err={bucket_err:.2f}deg "
                     f"ik_bucket_err={ik_bucket_err:.2f}deg "
                     f"attempt={attempt} drift={fmt_optional(drop.get('drift_distance'))} "
                     f"drift_xy={drop.get('drift_xy')} "
@@ -19244,6 +21135,47 @@ def plan_dump_pose_to_bin(q_seed=None, dump_deg=None, label="unload_dump", log=T
                     f"q={q_deg_values(q_dump, wrap_swing_for_display=True)}"
                 )
             return q_dump, row["info"]
+
+        if center_release_mode:
+            correction_drop = drop
+            correction_q = q_dump
+            correction_target = release_target.copy()
+            try:
+                best_drop = best.get("drop", {}) if isinstance(best, dict) else {}
+                best_err = float(best_drop.get("release_xy_err", 999.0) or 999.0)
+                row_err = float(drop.get("release_xy_err", 999.0) or 999.0)
+                if best_err + 1e-4 < row_err:
+                    correction_drop = best_drop
+                    correction_q = np.array(best.get("q", q_dump), dtype=np.float32).copy()
+                    correction_target = np.array(best.get("release_target", release_target), dtype=np.float32).copy()
+            except Exception:
+                correction_drop = drop
+                correction_q = q_dump
+                correction_target = release_target.copy()
+
+            err_xy = np.array(
+                [float(correction_drop.get("release_dx", 0.0)), float(correction_drop.get("release_dy", 0.0))],
+                dtype=np.float32,
+            )
+            err_norm = float(np.linalg.norm(err_xy))
+            last_reason = (
+                f"center opening release failed: release_xy_err={fmt_optional(correction_drop.get('release_xy_err'))} "
+                f"release_centered_ok={correction_drop.get('release_centered_ok')} "
+                f"xy_err={fmt_optional(correction_drop.get('xy_err'))} "
+                f"acceptance={correction_drop.get('landing_acceptance')}"
+            )
+            if err_norm < 0.01:
+                break
+            if err_norm > UNLOAD_DROP_MAX_XY_CORRECTION:
+                err_xy *= float(UNLOAD_DROP_MAX_XY_CORRECTION / err_norm)
+            gain = clamp(float(UNLOAD_CENTER_RELEASE_CORRECTION_GAIN), 0.05, 1.0)
+            release_target = correction_target.copy()
+            release_target[0] -= float(gain * err_xy[0])
+            release_target[1] -= float(gain * err_xy[1])
+            release_target[2] = min_release_z
+            pour_target = release_target.copy()
+            q_seed_dump = correction_q.copy()
+            continue
 
         if drop.get("dx") is None or drop.get("dy") is None:
             last_reason = "drop report missing xy error"
@@ -19259,6 +21191,10 @@ def plan_dump_pose_to_bin(q_seed=None, dump_deg=None, label="unload_dump", log=T
         pour_target[0] -= float(err_xy[0])
         pour_target[1] -= float(err_xy[1])
         pour_target[2] = min_release_z
+        release_target[0] -= float(err_xy[0])
+        release_target[1] -= float(err_xy[1])
+        release_target[2] = min_release_z
+        q_seed_dump = q_dump.copy()
         last_reason = (
             f"drop correction attempt={attempt} xy_err={xy_err:.3f} "
             f"bucket_err={bucket_err:.2f}deg source_clearance={source_clearance:.3f}"
@@ -19266,23 +21202,31 @@ def plan_dump_pose_to_bin(q_seed=None, dump_deg=None, label="unload_dump", log=T
 
     if (
         best is not None
-        and bool(best.get("drop", {}).get("ok", False))
-        and bool(best.get("drop", {}).get("close_xy", False))
+        and unload_drop_execution_ready(best.get("drop", {}))
+        and (not center_release_mode or bool(best.get("center_ready", False)))
     ):
         drop = best["drop"]
         best["info"]["drop"] = drop
         best["info"]["drop_target"] = vec_list(drop_target, 3)
         best["info"]["pour_target"] = vec_list(best.get("pour_target"), 3)
-        best["info"]["release_target"] = vec_list(best.get("pour_target"), 3)
-        best["info"]["dump_bucket_target_deg"] = float(dump_deg)
+        best["info"]["release_target"] = vec_list(best.get("release_target"), 3)
+        best["info"]["release_source"] = drop.get("release_source", "bucket_opening_center")
+        best["info"]["dump_bucket_target_deg"] = float(final_dump_deg)
+        best["info"]["release_alignment_bucket_deg"] = float(release_alignment_bucket_deg)
+        best["info"]["q_release_align_rad"] = vec_list(best["q"], 4)
+        best["info"]["q_release_align_deg"] = q_deg_values(best["q"], wrap_swing_for_display=True)
         best["info"]["dump_bucket_err_deg"] = float(best.get("bucket_err", 0.0))
         best["info"]["ik_bucket_err_deg"] = float(best.get("ik_bucket_err", 0.0))
+        best["info"]["drop_alignment_ready"] = True
+        best["info"]["drop_alignment_policy"] = str(drop.get("landing_acceptance", "scatter_tolerant_high_release"))
         if log:
             info_print(
                 f"[UNLOAD DUMP PLAN] {label}: accepted_inside_bin_fallback "
-                f"landing_target={vec_list(drop_target, 3)} release_target={vec_list(best.get('pour_target'), 3)} "
+                f"landing_target={vec_list(drop_target, 3)} release_target={vec_list(best.get('release_target'), 3)} "
+                f"ik_pour_target={vec_list(best.get('pour_target'), 3)} "
                 f"landing={drop.get('landing')} "
                 f"xy_err={fmt_optional(drop.get('xy_err'))} close_xy={drop.get('close_xy')} "
+                f"scatter_xy_ok={drop.get('scatter_xy_ok')} acceptance={drop.get('landing_acceptance')} "
                 f"source_clearance={fmt_optional(drop.get('source_clearance'))} "
                 f"drift={fmt_optional(drop.get('drift_distance'))} drift_xy={drop.get('drift_xy')} "
                 f"q={q_deg_values(best['q'], wrap_swing_for_display=True)}"
@@ -19296,36 +21240,62 @@ def plan_dump_pose_to_bin(q_seed=None, dump_deg=None, label="unload_dump", log=T
             f"inside_xy={drop.get('inside_xy')} above_wall={drop.get('above_wall')} "
             f"close_xy={drop.get('close_xy')} bucket_err={best['bucket_err']:.2f}deg "
             f"ik_bucket_err={best.get('ik_bucket_err', 0.0):.2f}deg "
+            f"scatter_xy_ok={drop.get('scatter_xy_ok')} acceptance={drop.get('landing_acceptance')} "
             f"source_clearance={fmt_optional(drop.get('source_clearance'))}"
         )
-        if allow_unaligned:
+        if allow_unaligned and unload_drop_execution_ready(drop) and (not center_release_mode or bool(best.get("center_ready", False))):
             best["info"]["drop"] = drop
             best["info"]["drop_target"] = vec_list(drop_target, 3)
             best["info"]["pour_target"] = vec_list(best.get("pour_target"), 3)
-            best["info"]["release_target"] = vec_list(best.get("pour_target"), 3)
-            best["info"]["dump_bucket_target_deg"] = float(dump_deg)
+            best["info"]["release_target"] = vec_list(best.get("release_target"), 3)
+            best["info"]["release_source"] = drop.get("release_source", "bucket_opening_center")
+            best["info"]["dump_bucket_target_deg"] = float(final_dump_deg)
+            best["info"]["release_alignment_bucket_deg"] = float(release_alignment_bucket_deg)
+            best["info"]["q_release_align_rad"] = vec_list(best["q"], 4)
+            best["info"]["q_release_align_deg"] = q_deg_values(best["q"], wrap_swing_for_display=True)
             best["info"]["dump_bucket_err_deg"] = float(best.get("bucket_err", 0.0))
             best["info"]["ik_bucket_err_deg"] = float(best.get("ik_bucket_err", 0.0))
-            best["info"]["drop_alignment_ready"] = False
-            best["info"]["drop_alignment_policy"] = "diagnostic_only_execute_then_score"
+            best["info"]["drop_alignment_ready"] = True
+            best["info"]["drop_alignment_policy"] = str(drop.get("landing_acceptance", "scatter_tolerant_execute_then_score"))
             best["info"]["drop_alignment_reason"] = reason
             if log:
                 info_print(
-                    f"[UNLOAD DUMP PLAN DIAG] {label}: using_best_effort_unaligned_pose "
-                    f"landing_target={vec_list(drop_target, 3)} release_target={vec_list(best.get('pour_target'), 3)} "
+                    f"[UNLOAD DUMP PLAN] {label}: using_scatter_tolerant_high_release_pose "
+                    f"landing_target={vec_list(drop_target, 3)} release_target={vec_list(best.get('release_target'), 3)} "
+                    f"ik_pour_target={vec_list(best.get('pour_target'), 3)} "
                     f"landing={drop.get('landing')} release={drop.get('release')} "
                     f"reason={reason} "
                     f"drift={fmt_optional(drop.get('drift_distance'))} drift_xy={drop.get('drift_xy')} "
                     f"q={q_deg_values(best['q'], wrap_swing_for_display=True)}"
                 )
+            draw_unload_dump_debug(
+                label,
+                landing_target=drop_target,
+                release_target=best.get("release_target"),
+                q_seed=q_seed,
+                q_seed_dump=q_seed_dump,
+                best_drop=drop,
+                reason=reason,
+            )
             return best["q"], best["info"]
     else:
         reason = last_reason
+    draw_unload_dump_debug(
+        label,
+        landing_target=drop_target,
+        release_target=initial_release_target,
+        q_seed=q_seed,
+        q_seed_dump=q_seed_dump,
+        best_drop=best.get("drop") if isinstance(best, dict) else None,
+        reason=reason,
+    )
     if log:
         info_print(
             f"[UNLOAD DUMP PLAN FAIL] {label}: "
             f"landing_target={vec_list(drop_target, 3)} "
-            f"initial_release_target={vec_list(pour_target, 3)} "
+            f"initial_release_target={vec_list(initial_release_target, 3)} "
+            f"final_release_target={vec_list(release_target, 3)} "
+            f"final_ik_pour_target={vec_list(pour_target, 3)} "
             f"initial_drift={fmt_optional(initial_drift.get('drift_distance'))} "
             f"reason={reason}"
         )
@@ -19344,6 +21314,46 @@ async def execute_unload_sequence(stage_name, q_goal, duration, task_id=None):
         return False
     q_start = sync_motion_start_q(stage_name)
     q_goal = clip_command_near(q_goal, reference=q_start)
+    q_goal_raw = q_goal.copy()
+    q_edge = swing_edge_pose_before_rebase(q_goal_raw, label=stage_name)
+    if q_edge is not None:
+        swing_idx = CTRL.name_to_idx["swing"]
+        edge_delta = abs(float(swing_delta(q_edge[swing_idx], q_start[swing_idx])))
+        edge_speed = max(0.20, float(DQ_MAX["swing"]) * max(0.05, get_speed_multiplier()))
+        edge_seconds = max(0.55, min(max(3.20, float(duration)), edge_delta / edge_speed + 0.25))
+        info_print(
+            "[UNLOAD SWING EDGE]",
+            f"stage={stage_name}",
+            f"q_start={q_deg_values(q_start, wrap_swing_for_display=True)}",
+            f"q_edge={q_deg_values(q_edge, wrap_swing_for_display=True)}",
+            f"q_goal_raw={q_deg_values(q_goal_raw, wrap_swing_for_display=True)}",
+            f"seconds={edge_seconds:.2f}",
+            force_log=True,
+        )
+        edge_ok = await move_to_profile(
+            q_edge,
+            seconds=edge_seconds,
+            label=f"{stage_name}_swing_edge",
+            task_id=task_id,
+            mode=stage_name,
+            q_start_override=q_start,
+        )
+        if not edge_ok or (task_id is not None and not task_alive(task_id)):
+            update_status(f"[UNLOAD BLOCKED] {stage_name}: swing edge move failed", force=True)
+            set_execution_failure_reason(f"execution_failed/unload_swing_edge_failed:{stage_name}")
+            return False
+        await step_updates(2)
+        q_goal, rebased = maybe_prepare_swing_rebase_for_segment(q_goal_raw, label=stage_name)
+        if rebased:
+            await step_updates(2)
+        q_start = sync_motion_start_q(f"{stage_name}_after_swing_edge")
+        q_goal = clip_command_near(q_goal_raw, reference=q_start)
+    else:
+        q_goal, rebased = maybe_prepare_swing_rebase_for_segment(q_goal_raw, label=stage_name)
+        if rebased:
+            await step_updates(2)
+            q_start = sync_motion_start_q(f"{stage_name}_after_swing_rebase")
+            q_goal = clip_command_near(q_goal_raw, reference=q_start)
     swing_idx = CTRL.name_to_idx["swing"]
     swing_delta_deg = abs(rad_to_deg(swing_delta(q_goal[swing_idx], q_start[swing_idx])))
     joint_delta = q_delta_abs_deg(q_goal, q_start)
@@ -19459,7 +21469,7 @@ async def execute_unload_sequence(stage_name, q_goal, duration, task_id=None):
 def bucket_only_dump_pose(q_reference, dump_deg):
     q = np.array(q_reference, dtype=np.float32).copy()
     q[CTRL.name_to_idx["bucket"]] = deg_to_rad(float(dump_deg))
-    return clip_command_near(q, reference=q_reference)
+    return clip_unload_dump_command(q, reference=q_reference)
 
 
 def non_bucket_delta_deg(q_a, q_b):
@@ -19497,7 +21507,7 @@ def bucket_only_dump_ready(stage_name, dump_deg, label="before_dump"):
         f"real_q={q_deg_values(q_real, wrap_swing_for_display=True)} "
         f"dump_q={q_deg_values(q_dump, wrap_swing_for_display=True)}"
     )
-    return bool(drop.get("ok", False) and drop.get("close_xy", False)), q_real, q_dump, drop
+    return unload_drop_execution_ready(drop), q_real, q_dump, drop
 
 
 async def wait_for_dump_settle(stage_name, task_id=None):
@@ -19527,12 +21537,127 @@ async def wait_for_dump_settle(stage_name, task_id=None):
     return True
 
 
-async def dump_bucket_at_target(stage_name, task_id=None, planned_q_dump=None):
+async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
+    ready, reason, _detail = await wait_for_articulation_action_ready(
+        f"{stage_name}_bucket_dump_start",
+        min_stable_frames=ACTION_READY_MIN_STABLE_FRAMES,
+        max_frames=ACTION_READY_STAGE_MAX_WAIT_FRAMES,
+        record_failure=True,
+    )
+    if not ready:
+        update_status(f"[UNLOAD BLOCKED] {stage_name}: action_channel_not_ready; {reason}", force=True)
+        set_execution_failure_reason(f"execution_failed/unload_dump_action_not_ready:{stage_name}:{reason}")
+        return False
+
+    q0 = sync_motion_start_q(f"{stage_name}_bucket_dump")
+    q1 = clip_unload_dump_command(q_dump, reference=q0)
+    bucket_idx = CTRL.name_to_idx.get("bucket", 3)
+    target_bucket = float(q1[bucket_idx])
+    step_rad = deg_to_rad(max(2.0, float(UNLOAD_DUMP_STEP_DEG)))
+    max_steps = max(8, int(math.ceil(abs(target_bucket - float(q0[bucket_idx])) / max(1e-4, step_rad))) + 4)
+    wait_frames = max(3, int(float(UNLOAD_DUMP_STEP_SECONDS) * 60))
+    start_metrics = record_phase_metrics("before_dump_direct")
+    start_bucket_count = int(start_metrics.get("bucket_from_pile_count", 0)) if isinstance(start_metrics, dict) else 0
+    start_bin_count = int(start_metrics.get("bin_from_pile_count", 0)) if isinstance(start_metrics, dict) else 0
+    if str(STATE.get("active_task_name", "")) == "loaded_unload_route_test":
+        bucket_particle_diagnostic("before_dump_direct")
+    info_print(
+        "[UNLOAD DUMP DIRECT START]",
+        f"stage={stage_name}",
+        "policy=progressive_open_until_release",
+        f"steps={max_steps}",
+        f"step_deg={rad_to_deg(step_rad):.2f}",
+        f"bucket_start={rad_to_deg(float(q0[bucket_idx])):.2f}deg",
+        f"bucket_target={rad_to_deg(target_bucket):.2f}deg",
+        f"bucket_start_particles={start_bucket_count}",
+        f"bin_start_particles={start_bin_count}",
+        force_log=True,
+    )
+
+    q_final = q0.copy()
+    last_metrics = start_metrics
+    for i in range(max_steps):
+        if motion_cancel_requested(task_id):
+            update_status(f"[MOVE STOPPED] {stage_name}_dump_pose", force=True)
+            return False
+        try:
+            q_real = q_real_near_command(get_real_joint_positions(), CTRL.q_cmd)
+        except Exception:
+            q_real = CTRL.q_cmd.copy()
+        real_bucket = float(q_real[bucket_idx])
+        if real_bucket >= target_bucket - deg_to_rad(1.5):
+            q_final = q_real.copy()
+            break
+        q = q_real.copy()
+        q[bucket_idx] = min(target_bucket, real_bucket + step_rad)
+        q = clip_unload_dump_command(q, reference=CTRL.q_cmd)
+        q_final = q.copy()
+        ok, send_reason = CTRL.send_action(q, mode="unload_dump")
+        if not ok:
+            update_status(f"[UNLOAD BLOCKED] {stage_name}: bucket dump action failed; {send_reason}", force=True)
+            set_execution_failure_reason(f"execution_failed/unload_dump_action_failed:{stage_name}:{send_reason}")
+            return False
+        await step_updates(wait_frames)
+        last_metrics = record_phase_metrics("during_dump_direct")
+        bucket_now = int(last_metrics.get("bucket_from_pile_count", 0)) if isinstance(last_metrics, dict) else 0
+        bin_now = int(last_metrics.get("bin_from_pile_count", 0)) if isinstance(last_metrics, dict) else 0
+        info_print(
+            "[UNLOAD DUMP DIRECT SAMPLE]",
+            f"stage={stage_name}",
+            f"i={i + 1}/{max_steps}",
+            f"bucket_cmd={rad_to_deg(float(q[bucket_idx])):.2f}deg",
+            f"bucket_real={rad_to_deg(real_bucket):.2f}deg",
+            f"bucket_delta={bucket_now - start_bucket_count}",
+            f"bin_delta={bin_now - start_bin_count}",
+            force_log=True,
+        )
+        stop_bucket_count = max(0, int(start_bucket_count * float(UNLOAD_DUMP_STOP_BUCKET_FRACTION)))
+        if (
+            bin_now - start_bin_count >= max(QUALITY_MIN_DUMP_PARTICLES, 8)
+            and bucket_now <= stop_bucket_count
+            and float(q[bucket_idx]) >= target_bucket - deg_to_rad(8.0)
+        ):
+            q_final = q_real.copy()
+            break
+
+    STATE["dataset_current_q_goal"] = q_final.copy()
+    try:
+        q_hold = q_real_near_command(get_real_joint_positions(), q_final)
+        CTRL.send_action(q_hold, mode="unload_dump_hold_real")
+        q_final = q_hold.copy()
+    except Exception:
+        pass
+    await step_updates(4)
+    try:
+        q_real = q_real_near_command(get_real_joint_positions(), q_final)
+        err_deg = abs(rad_to_deg(float(q_final[bucket_idx] - q_real[bucket_idx])))
+        end_metrics = record_phase_metrics("after_dump_direct")
+        bucket_end = int(end_metrics.get("bucket_from_pile_count", 0)) if isinstance(end_metrics, dict) else 0
+        bin_end = int(end_metrics.get("bin_from_pile_count", 0)) if isinstance(end_metrics, dict) else 0
+        if str(STATE.get("active_task_name", "")) == "loaded_unload_route_test":
+            bucket_particle_diagnostic("after_dump_direct")
+        info_print(
+            "[UNLOAD DUMP DIRECT DONE]",
+            f"stage={stage_name}",
+            f"bucket_cmd={rad_to_deg(float(q_final[bucket_idx])):.2f}deg",
+            f"bucket_real={rad_to_deg(float(q_real[bucket_idx])):.2f}deg",
+            f"bucket_err={err_deg:.2f}deg",
+            f"bucket_delta={bucket_end - start_bucket_count}",
+            f"bin_delta={bin_end - start_bin_count}",
+            force_log=True,
+        )
+    except Exception as e:
+        info_print("[WARN] [UNLOAD DUMP DIRECT DONE] cannot read real bucket:", type(e).__name__, e)
+    return True
+
+
+async def dump_bucket_at_target(stage_name, task_id=None, planned_q_dump=None, planned_q_release_align=None):
     dump_deg = unload_dump_target_deg()
     record_phase_metrics("before_dump")
 
     q_dump = None
     q_real = None
+    q_release_align = None
     ready = False
     dump_source = "dynamic_bucket_only"
 
@@ -19540,31 +21665,44 @@ async def dump_bucket_at_target(stage_name, task_id=None, planned_q_dump=None):
         try:
             q_seed = CTRL.q_cmd.copy()
             q_dump = clip_command_near(np.array(planned_q_dump, dtype=np.float32).reshape(-1)[:4].copy(), reference=q_seed)
+            if planned_q_release_align is not None:
+                q_release_align = clip_command_near(
+                    np.array(planned_q_release_align, dtype=np.float32).reshape(-1)[:4].copy(),
+                    reference=q_seed,
+                )
             try:
                 q_real = current_real_q_near(q_seed)
             except Exception:
                 q_real = q_seed.copy()
             actual_gate = log_actual_unload_position("before_planned_dump")
             drop = log_unload_drop("planned_cached_dump_landing", q=q_dump, reference_q=q_seed)
+            release_drop = None
+            if q_release_align is not None:
+                release_drop = log_unload_drop("planned_release_align_landing", q=q_release_align, reference_q=q_seed)
             log_unload_alignment("planned_cached_dump_pour", q=q_dump, effector="pour", reference_q=q_seed)
-            ready = bool(actual_gate.get("ok", False) and drop.get("ok", False) and drop.get("close_xy", False))
+            readiness_drop = release_drop if isinstance(release_drop, dict) else drop
+            ready = bool(actual_gate.get("ok", False) and unload_drop_execution_ready(readiness_drop))
             dump_source = "cached_planned_q_dump"
             info_print(
                 f"[UNLOAD DUMP PLAN MATCH] {stage_name}: "
                 f"ready={ready} source={dump_source} "
                 f"q_dump={q_deg_values(q_dump, wrap_swing_for_display=True)} "
+                f"q_release_align={q_deg_values(q_release_align, wrap_swing_for_display=True) if q_release_align is not None else None} "
                 f"drop_xy_err={fmt_optional(drop.get('xy_err'))} "
+                f"release_xy_err={fmt_optional((release_drop or {}).get('release_xy_err'))} "
                 f"inside_xy={drop.get('inside_xy')} close_xy={drop.get('close_xy')} "
+                f"scatter_xy_ok={drop.get('scatter_xy_ok')} acceptance={drop.get('landing_acceptance')} "
+                f"readiness_acceptance={(readiness_drop or {}).get('landing_acceptance')} "
                 f"actual_gate={actual_gate.get('ok')}"
             )
             if not ready:
                 update_status(
                     f"[UNLOAD DIAG] {stage_name}: cached planned dump predicted off target; executing and scoring actual particles; "
                     f"drop_xy_err={fmt_optional(drop.get('xy_err'))} inside_xy={drop.get('inside_xy')} "
-                    f"close_xy={drop.get('close_xy')} actual_gate={actual_gate.get('ok')}",
+                    f"close_xy={drop.get('close_xy')} scatter_xy_ok={drop.get('scatter_xy_ok')} "
+                    f"acceptance={drop.get('landing_acceptance')} actual_gate={actual_gate.get('ok')}",
                     force=True,
                 )
-                ready = True
         except Exception as e:
             info_print(f"[WARN] [UNLOAD DUMP PLAN MATCH] {stage_name}: cached q_dump failed {type(e).__name__}: {e}")
             ready = False
@@ -19595,6 +21733,7 @@ async def dump_bucket_at_target(stage_name, task_id=None, planned_q_dump=None):
             return False
 
         bucket_idx = CTRL.name_to_idx["bucket"]
+        q_release_align = np.array(q_plan, dtype=np.float32).reshape(-1)[:4].copy()
         q_pre_dump = q_plan.copy()
         if q_real is not None:
             q_pre_dump[bucket_idx] = float(q_real[bucket_idx])
@@ -19655,6 +21794,7 @@ async def dump_bucket_at_target(stage_name, task_id=None, planned_q_dump=None):
         else:
             info_print(f"[UNLOAD PRE-DUMP ALIGN] {stage_name}: already within non-bucket tolerance")
 
+        q_release_align = bucket_only_dump_pose(q_pre_dump, unload_release_alignment_bucket_deg(dump_deg))
         actual_gate = log_actual_unload_position("after_pre_dump_align")
         if not bool(actual_gate.get("ok", False)):
             update_status(
@@ -19678,12 +21818,21 @@ async def dump_bucket_at_target(stage_name, task_id=None, planned_q_dump=None):
             force=True,
         )
 
+    if q_release_align is not None:
+        log_unload_drop("planned_release_flow_landing", q=q_release_align, reference_q=q_real)
     log_unload_alignment("planned_dump_pour", q=q_dump, effector="pour", reference_q=q_real)
     drop = log_unload_drop("planned_dump_landing", q=q_dump, reference_q=q_real)
-    if not bool(drop.get("ok", False) and drop.get("close_xy", False)):
+    readiness_drop = (
+        unload_drop_report(q=q_release_align, reference_q=q_real)
+        if q_release_align is not None
+        else drop
+    )
+    if not unload_drop_execution_ready(readiness_drop):
         update_status(
-            f"[UNLOAD DIAG] {stage_name}: predicted bucket sand landing not aligned with unload target; executing and scoring actual particles; "
-            f"xy_err={fmt_optional(drop.get('xy_err'))} close_xy={drop.get('close_xy')}",
+            f"[UNLOAD DIAG] {stage_name}: release-flow opening center is not aligned; executing and scoring actual particles; "
+            f"release_xy_err={fmt_optional(readiness_drop.get('release_xy_err'))} "
+            f"xy_err={fmt_optional(readiness_drop.get('xy_err'))} close_xy={readiness_drop.get('close_xy')} "
+            f"scatter_xy_ok={readiness_drop.get('scatter_xy_ok')} acceptance={readiness_drop.get('landing_acceptance')}",
             force=True,
         )
 
@@ -19710,13 +21859,7 @@ async def dump_bucket_at_target(stage_name, task_id=None, planned_q_dump=None):
     except Exception as e:
         info_print("[WARN] [PLAN EXEC TRACE] dump cache failed:", stage_name, type(e).__name__, e)
 
-    success = await move_to_profile(
-        q_dump,
-        seconds=UNLOAD_DUMP_SECONDS,
-        label=f"{stage_name}_dump_pose",
-        task_id=task_id,
-        mode="unload_dump",
-    )
+    success = await execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=task_id)
     if not success or (task_id is not None and not task_alive(task_id)):
         update_status(f"[UNLOAD BLOCKED] {stage_name}: bucket dump failed", force=True)
         set_execution_failure_reason(f"execution_failed/unload_bucket_dump_failed:{stage_name}")
@@ -19953,7 +22096,7 @@ async def execute_dig_plan_step(step_index=None):
     update_status(f"[DIG STEP DONE] {stage_name}", force=True)
 
 
-async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"):
+async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball", return_home=True):
     STATE["follow"] = False
     if rebuild_plan:
         seq = await build_dig_plan_from_current_target_task(force_status=True)
@@ -19968,6 +22111,7 @@ async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"
         return False
 
     task_id = start_task(task_name)
+    loaded_route_diag = str(task_name) == "loaded_unload_route_test"
 
     stage_index = 0
     while stage_index < len(seq):
@@ -20013,9 +22157,12 @@ async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"
             )
 
         update_status(f"[DIG] {stage_name}", force=True)
+        if loaded_route_diag and mode_requires_loaded_carry_bucket(stage_name, stage_name):
+            bucket_particle_diagnostic(f"before_{stage_name}")
         if "unload" in stage_name:
             unload_detail = planned_unload_stage_detail(stage_index=stage_index, stage_name=stage_name)
             planned_q_dump = None if not unload_detail else unload_detail.get("q_dump")
+            planned_q_release_align = None if not unload_detail else unload_detail.get("q_release_align")
             success = await ik_movement.move_unload_stage(runtime_module(), stage_name, q_goal, duration, task_id=task_id)
             if not success or not task_alive(task_id):
                 update_status(execution_failure_status_text(stage_name), force=True)
@@ -20030,7 +22177,14 @@ async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"
                 )
                 return False
             STATE["dig_plan_step_index"] = int(STATE.get("dig_plan_step_index", 0)) + 1
-            if not await dump_bucket_at_target(stage_name, task_id=task_id, planned_q_dump=planned_q_dump):
+            if loaded_route_diag:
+                bucket_particle_diagnostic(f"after_{stage_name}_arrival")
+            if not await dump_bucket_at_target(
+                stage_name,
+                task_id=task_id,
+                planned_q_dump=planned_q_dump,
+                planned_q_release_align=planned_q_release_align,
+            ):
                 record_stage_audit(
                     stage_name,
                     stage_index,
@@ -20066,9 +22220,19 @@ async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"
                 include_sand=is_sand_contact_phase(stage_name),
             )
             return False
+        if loaded_route_diag and mode_requires_loaded_carry_bucket(stage_name, stage_name):
+            bucket_particle_diagnostic(f"after_{stage_name}")
         STATE["dig_plan_step_index"] = int(STATE.get("dig_plan_step_index", 0)) + 1
         if "unload" in stage_name:
-            if not await dump_bucket_at_target(stage_name, task_id=task_id):
+            unload_detail = planned_unload_stage_detail(stage_index=stage_index, stage_name=stage_name)
+            planned_q_dump = None if not unload_detail else unload_detail.get("q_dump")
+            planned_q_release_align = None if not unload_detail else unload_detail.get("q_release_align")
+            if not await dump_bucket_at_target(
+                stage_name,
+                task_id=task_id,
+                planned_q_dump=planned_q_dump,
+                planned_q_release_align=planned_q_release_align,
+            ):
                 record_stage_audit(
                     stage_name,
                     stage_index,
@@ -20147,7 +22311,7 @@ async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"
                 return False
         stage_index += 1
 
-    if task_alive(task_id):
+    if return_home and task_alive(task_id):
         update_status("[DIG FINISHED] direct home pose set", force=True)
         was_recording = bool(STATE.get("dataset_recording", False))
         STATE["dataset_recording"] = False
@@ -20161,7 +22325,10 @@ async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"
             )
         finally:
             STATE["dataset_recording"] = was_recording
-    update_status("[DIG FINISHED] bucket curled, lifted, unloaded, and homed.", force=True)
+    if return_home:
+        update_status("[DIG FINISHED] bucket curled, lifted, unloaded, and homed.", force=True)
+    else:
+        update_status("[LOADED ROUTE TEST FINISHED] unloaded; holding current pose.", force=True)
     return True
 
 
@@ -20576,6 +22743,9 @@ def build_ui():
     def run_dig_step_button(step_index):
         register_async_task("motion", execute_dig_plan_step(step_index), replace=True)
 
+    def run_loaded_unload_route_test_button():
+        register_async_task("motion", execute_loaded_unload_route_test_from_current(), replace=True)
+
     def use_selected_unload_mesh_from_ui():
         set_manual_unload_from_selected_mesh()
 
@@ -20588,13 +22758,14 @@ def build_ui():
     WINDOW = ui.Window("Excavator Slider Control v3", width=620, height=760)
 
     with WINDOW.frame:
-        with ui.VStack(spacing=8):
-            ui.Label("Excavator Slider Control v3")
-            STATUS_LABEL = ui.Label("Ready", width=590)
+        with ui.VStack(spacing=6):
+            with ui.VStack(height=44, spacing=2):
+                ui.Label("Excavator Slider Control v3", height=20)
+                STATUS_LABEL = ui.Label(ui_short_text("Ready", 72), width=590, height=20)
 
-            with ui.ScrollingFrame(height=690):
+            with ui.ScrollingFrame(height=ui.Fraction(1)):
                 with ui.VStack(spacing=8):
-                    with ui.HStack(spacing=6):
+                    with ui.HStack(spacing=6, height=26):
                         ui.Label("Log", width=80)
                         ui.Button("Normal", width=82, clicked_fn=set_log_normal_from_ui)
                         ui.Button("Debug ON/OFF", width=118, clicked_fn=toggle_debug_from_ui)
@@ -20625,14 +22796,14 @@ def build_ui():
                         model = ui.SimpleFloatModel(0.0)
                         SLIDER_MODELS[name] = model
 
-                        with ui.HStack(spacing=6):
+                        with ui.HStack(spacing=6, height=24):
                             ui.Label(name, width=80)
                             ui.FloatSlider(model=model, min=lo, max=hi, width=360)
                             ui.FloatField(model=model, width=90)
 
                         model.add_value_changed_fn(on_manual_joint_slider_changed)
 
-                    with ui.HStack(spacing=6):
+                    with ui.HStack(spacing=6, height=26):
                         ui.Label("Manual joints", width=170)
                         ui.Button("Home", width=82, clicked_fn=home)
                         ui.Button("Print State", width=104, clicked_fn=print_state)
@@ -20640,7 +22811,7 @@ def build_ui():
 
                     ui.Separator()
                     ui.Label("Auto Dataset (primary pipeline)")
-                    with ui.HStack(spacing=6):
+                    with ui.HStack(spacing=6, height=26):
                         ui.Label("Target trainable", width=135)
                         ui.Label("Count", width=50)
                         ui.IntField(model=auto_count_model, width=70)
@@ -20649,9 +22820,9 @@ def build_ui():
                         ui.Button("Dir", width=52, clicked_fn=open_auto_collect_dir_from_ui)
                         ui.Button("Replay", width=74, clicked_fn=request_replay_latest_record)
 
-                    with ui.HStack(spacing=6):
+                    with ui.HStack(spacing=6, height=24):
                         speed_model = ui.SimpleFloatModel(float(STATE.get("speed_multiplier", 1.0)))
-                        ui.Label("Speed x", width=80)
+                        ui.Label("Safe speed x", width=96)
                         ui.FloatSlider(model=speed_model, min=SPEED_MULTIPLIER_MIN, max=SPEED_MULTIPLIER_MAX, width=360)
                         ui.FloatField(model=speed_model, width=90)
 
@@ -20660,7 +22831,7 @@ def build_ui():
                             sm = max(SPEED_MULTIPLIER_MIN, min(SPEED_MULTIPLIER_MAX, sm))
                             STATE["speed_multiplier"] = sm
                             apply_speed_to_physx_joint_limits()
-                            update_status(f"Speed multiplier = {sm:.2f}", force=True)
+                            update_status(f"Safe speed multiplier = {sm:.2f}", force=True)
 
                         speed_model.add_value_changed_fn(update_speed_multiplier)
 
@@ -20672,7 +22843,7 @@ def build_ui():
                             for axis, val in [("x", p[0]), ("y", p[1]), ("z", p[2])]:
                                 model = ui.SimpleFloatModel(float(val))
                                 TARGET_MODELS[axis] = model
-                                with ui.HStack(spacing=4):
+                                with ui.HStack(spacing=4, height=24):
                                     ui.Label(axis.upper(), width=20)
                                     ui.FloatSlider(model=model, min=-15.0, max=15.0, width=170)
                                     ui.FloatField(model=model, width=70)
@@ -20693,26 +22864,26 @@ def build_ui():
                             for axis, val in [("x", unload_p[0]), ("y", unload_p[1])]:
                                 model = ui.SimpleFloatModel(float(val))
                                 UNLOAD_MODELS[axis] = model
-                                with ui.HStack(spacing=4):
+                                with ui.HStack(spacing=4, height=24):
                                     ui.Label(axis.upper(), width=20)
                                     ui.FloatSlider(model=model, min=-15.0, max=15.0, width=170)
                                     ui.FloatField(model=model, width=70)
                             for key, label, val in [("z_min", "Z Min", unload_z_min), ("z_max", "Z Max", unload_z_max)]:
                                 model = ui.SimpleFloatModel(float(val))
                                 UNLOAD_MODELS[key] = model
-                                with ui.HStack(spacing=4):
+                                with ui.HStack(spacing=4, height=24):
                                     ui.Label(label, width=48)
                                     ui.FloatSlider(model=model, min=-2.0, max=8.0, width=142)
                                     ui.FloatField(model=model, width=70)
                             radius_model = ui.SimpleFloatModel(float(manual_unload_radius()))
                             UNLOAD_MODELS["r"] = radius_model
-                            with ui.HStack(spacing=4):
+                            with ui.HStack(spacing=4, height=24):
                                 ui.Label("R", width=20)
                                 ui.FloatSlider(model=radius_model, min=0.05, max=4.0, width=170)
                                 ui.FloatField(model=radius_model, width=70)
                             shrink_model = ui.SimpleFloatModel(float(manual_unload_mesh_shrink_d()))
                             UNLOAD_MODELS["d"] = shrink_model
-                            with ui.HStack(spacing=4):
+                            with ui.HStack(spacing=4, height=24):
                                 ui.Label("D", width=20)
                                 ui.FloatSlider(model=shrink_model, min=0.0, max=2.0, width=170)
                                 ui.FloatField(model=shrink_model, width=70)
@@ -20725,7 +22896,7 @@ def build_ui():
                     ui.Label("Z Min/Max sets the blue unload range height; Z Max is the marker/release height.", width=590)
                     ui.Label("R applies to point/XYZ mode; D shrinks selected mesh XY footprint. Auto Dataset uses this unload target.", width=590)
                     ui.Label("Unload point setup")
-                    with ui.HStack(spacing=6):
+                    with ui.HStack(spacing=6, height=26):
                         ui.Button("Unload Selected Mesh", width=166, clicked_fn=use_selected_unload_mesh_from_ui)
                         ui.Button("Unload Selected Point", width=166, clicked_fn=use_selected_unload_point_from_ui)
                         ui.Button("Clear Unload Override", width=160, clicked_fn=clear_unload_override_from_ui)
@@ -20733,15 +22904,16 @@ def build_ui():
                     ui.Separator()
                     ui.Label("Debug Planner / Trace")
 
-                    with ui.HStack(spacing=6):
+                    with ui.HStack(spacing=6, height=26):
                         ui.Button("Calibrate IK", width=112, clicked_fn=request_calib)
                         ui.Button("IK One Step", width=104, clicked_fn=ik_one_step)
                         ui.Button("Follow ON/OFF", width=118, clicked_fn=toggle_follow)
-                    with ui.HStack(spacing=6):
+                    with ui.HStack(spacing=6, height=26):
                         ui.Button("Trace target", width=116, clicked_fn=trace_mode_1)
                         ui.Button("Trace path", width=108, clicked_fn=trace_mode_2)
+                        ui.Button("Loaded Route Test", width=156, clicked_fn=run_loaded_unload_route_test_button)
 
-                    with ui.HStack(spacing=6):
+                    with ui.HStack(spacing=6, height=26):
                         ui.Button(
                             "Build Dig Plan",
                             width=132,
@@ -20759,19 +22931,19 @@ def build_ui():
                         )
                         ui.Button("Reset Plan", width=100, clicked_fn=reset_dig_plan_button)
 
-                    with ui.HStack(spacing=6):
+                    with ui.HStack(spacing=6, height=26):
                         ui.Button("1 Pre", width=82, clicked_fn=lambda: run_dig_step_button(0))
                         ui.Button("2 Contact", width=102, clicked_fn=lambda: run_dig_step_button(1))
                         ui.Button("3 Insert", width=92, clicked_fn=lambda: run_dig_step_button(2))
                         ui.Button("4 Mid Cut", width=102, clicked_fn=lambda: run_dig_step_button(3))
 
-                    with ui.HStack(spacing=6):
+                    with ui.HStack(spacing=6, height=26):
                         ui.Button("5 Exit Cut", width=108, clicked_fn=lambda: run_dig_step_button(4))
                         ui.Button("6 Curl", width=82, clicked_fn=lambda: run_dig_step_button(5))
                         ui.Button("7 Lift", width=82, clicked_fn=lambda: run_dig_step_button(6))
                         ui.Button("8 Unload", width=98, clicked_fn=lambda: run_dig_step_button(7))
 
-                    with ui.HStack(spacing=6):
+                    with ui.HStack(spacing=6, height=26):
                         ui.Button("Stop Motion", width=116, clicked_fn=stop_all)
                         ui.Button("Stop UI Loop", width=116, clicked_fn=stop_loop)
 

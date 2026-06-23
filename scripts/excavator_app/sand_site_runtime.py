@@ -220,7 +220,7 @@ WINDOW = None
 STATUS_LABEL = None
 DIRTY_LABEL = None
 PARAM_MODELS = {}
-UI_STATUS_MAX_CHARS = 118
+UI_STATUS_MAX_CHARS = 72
 HEIGHTS = None
 BASE_HEIGHTS = None
 X_VALUES = None
@@ -3126,12 +3126,12 @@ def build_ui():
         if key not in PARAM_MODELS:
             PARAM_MODELS[key] = ui.SimpleFloatModel(float(value))
             add_listener(PARAM_MODELS[key], key)
-        with ui.VStack(width=178, spacing=1):
+        with ui.VStack(width=178, height=42, spacing=1):
             ui.Label(label)
             ui.FloatField(model=PARAM_MODELS[key], width=width)
 
     def add_param_row(items):
-        with ui.HStack(spacing=8):
+        with ui.HStack(spacing=8, height=44):
             for key, label, value in items:
                 add_float_cell(key, label, value)
 
@@ -3144,8 +3144,8 @@ def build_ui():
         if key not in PARAM_MODELS:
             PARAM_MODELS[key] = ui.SimpleFloatModel(float(SAND_AMOUNT_MULTIPLIER))
             add_listener(PARAM_MODELS[key], key)
-        with ui.VStack(spacing=3):
-            with ui.HStack(spacing=8):
+        with ui.VStack(height=48, spacing=3):
+            with ui.HStack(spacing=8, height=24):
                 ui.Label("Sand amount x", width=96)
                 ui.FloatSlider(
                     model=PARAM_MODELS[key],
@@ -3174,7 +3174,7 @@ def build_ui():
                 if key not in PARAM_MODELS:
                     PARAM_MODELS[key] = ui.SimpleFloatModel(float(value))
                     add_listener(PARAM_MODELS[key], key, live_fn=sync_sand_xyz_from_models_live)
-                with ui.HStack(spacing=8):
+                with ui.HStack(spacing=8, height=24):
                     ui.Label(label, width=72)
                     ui.FloatSlider(model=PARAM_MODELS[key], min=float(lo), max=float(hi), width=400)
                     ui.FloatField(model=PARAM_MODELS[key], width=76)
@@ -3186,13 +3186,39 @@ def build_ui():
                 width=610,
             )
 
+    def add_unload_bin_sliders():
+        specs = [
+            ("unload_x", "Bin X", float(UNLOAD_BIN_CENTER[0]), -20.0, 20.0),
+            ("unload_y", "Bin Y", float(UNLOAD_BIN_CENTER[1]), -20.0, 20.0),
+            ("unload_size_x", "Bin size X", UNLOAD_BIN_INNER_SIZE_X, 0.40, 8.0),
+            ("unload_size_y", "Bin size Y", UNLOAD_BIN_INNER_SIZE_Y, 0.40, 8.0),
+            ("unload_wall_height", "Wall H", UNLOAD_BIN_WALL_HEIGHT, 0.10, 2.50),
+            ("unload_dump_height", "Dump H", UNLOAD_BIN_DUMP_HEIGHT, 0.20, 4.0),
+        ]
+        with ui.VStack(spacing=3):
+            for key, label, value, lo, hi in specs:
+                if key not in PARAM_MODELS:
+                    PARAM_MODELS[key] = ui.SimpleFloatModel(float(value))
+                    add_listener(PARAM_MODELS[key], key)
+                with ui.HStack(spacing=8, height=24):
+                    ui.Label(label, width=82)
+                    ui.FloatSlider(model=PARAM_MODELS[key], min=float(lo), max=float(hi), width=390)
+                    ui.FloatField(model=PARAM_MODELS[key], width=76)
+            ui.Label(
+                ui_short_text(
+                    "Apply + Rebuild moves the physical UnloadBin walls/floor. Excavator unload planning uses this bin context.",
+                    112,
+                ),
+                width=610,
+            )
+
     def add_fidelity_row():
         key = "sand_fidelity"
         if key not in PARAM_MODELS:
             PARAM_MODELS[key] = ui.SimpleFloatModel(float(SAND_FIDELITY))
             add_listener(PARAM_MODELS[key], key)
-        with ui.VStack(spacing=4):
-            with ui.HStack(spacing=8):
+        with ui.VStack(height=50, spacing=4):
+            with ui.HStack(spacing=8, height=24):
                 ui.Label("Efficiency", width=86)
                 ui.FloatSlider(model=PARAM_MODELS[key], min=0.0, max=1.0, width=330)
                 ui.Label("Realistic", width=78)
@@ -3210,20 +3236,20 @@ def build_ui():
     WINDOW = ui.Window("Sand Site Control", width=650, height=650)
     with WINDOW.frame:
         with ui.VStack(spacing=5):
-            with ui.HStack(spacing=8):
-                ui.Label("Sand Site Control", width=145)
-                DIRTY_LABEL = ui.Label("Applied", width=128)
-                STATUS_LABEL = ui.Label(ui_short_text(STATE.get("status", "Ready"), 70), width=350)
-            with ui.HStack(spacing=6):
+            with ui.HStack(spacing=8, height=22):
+                ui.Label("Sand Site Control", width=145, height=20)
+                DIRTY_LABEL = ui.Label("Applied", width=128, height=20)
+                STATUS_LABEL = ui.Label(ui_short_text(STATE.get("status", "Ready"), 70), width=350, height=20)
+            with ui.HStack(spacing=6, height=26):
                 ui.Button("Apply", width=82, clicked_fn=apply_clicked)
                 ui.Button("Apply + Rebuild", width=132, clicked_fn=apply_rebuild_clicked)
                 ui.Button("Reset Sand", width=112, clicked_fn=reset_clicked)
                 ui.Button("Clean Sand", width=104, clicked_fn=clean_sand_clicked)
                 ui.Button("Status", width=82, clicked_fn=status_clicked)
-            with ui.ScrollingFrame(height=540):
+            with ui.ScrollingFrame(height=ui.Fraction(1)):
                 with ui.VStack(spacing=5):
                     section("Sand Amount")
-                    with ui.HStack(spacing=6):
+                    with ui.HStack(spacing=6, height=26):
                         ui.Button("Use Selected Sand Mesh", width=178, clicked_fn=use_selected_sand_mesh_clicked)
                         ui.Button("Use Point XYZ Sand", width=150, clicked_fn=use_point_xyz_sand_clicked)
                         ui.Label("Mesh affects sand footprint only, not walls", width=240)
@@ -3241,7 +3267,7 @@ def build_ui():
                     ])
 
                     section("Walls")
-                    with ui.HStack(spacing=6):
+                    with ui.HStack(spacing=6, height=26):
                         ui.Button("Generate Walls", width=128, clicked_fn=generate_walls_clicked)
                         ui.Button("Clean Walls", width=104, clicked_fn=clean_walls_clicked)
                         ui.Label("Walls use wall point XYZ and do not follow selected sand mesh", width=360)
@@ -3262,6 +3288,9 @@ def build_ui():
 
                     section("Sand Fidelity")
                     add_fidelity_row()
+
+                    section("Unload Bin")
+                    add_unload_bin_sliders()
 
     builtins._SAND_SITE_UI_WINDOW = WINDOW
     WINDOW.visible = True

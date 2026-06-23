@@ -21106,7 +21106,6 @@ def plan_dump_pose_to_bin(
             or (
                 center_release_mode
                 and drop_ready
-                and bool(drop.get("close_xy", False))
                 and release_xy_err <= float(UNLOAD_CENTER_RELEASE_SOFT_XY_TOL)
             )
         )

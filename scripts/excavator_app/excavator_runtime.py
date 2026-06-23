@@ -4270,6 +4270,21 @@ def unload_drop_execution_ready(report):
     )
 
 
+def unload_drop_loaded_center_ready(report):
+    if not isinstance(report, dict):
+        return False
+    if not bool(report.get("above_wall", False)):
+        return False
+    if bool(report.get("close_xy", False)) or bool(report.get("release_centered_ok", False)):
+        return True
+    if bool(report.get("inside_xy", False)):
+        try:
+            return float(report.get("xy_err", 999.0) or 999.0) <= float(UNLOAD_CENTER_RELEASE_SOFT_XY_TOL)
+        except Exception:
+            return False
+    return False
+
+
 def stage_constraint_summary(row):
     if not isinstance(row, dict):
         return {}
@@ -21839,13 +21854,16 @@ async def dump_bucket_at_target(stage_name, task_id=None, planned_q_dump=None, p
             except Exception:
                 q_real = q_seed.copy()
             actual_gate = log_actual_unload_position("before_planned_dump")
-            drop = log_unload_drop("planned_cached_dump_landing", q=q_dump, reference_q=q_seed)
+            drop = log_unload_drop("planned_cached_dump_landing", q=q_dump, reference_q=q_real)
             release_drop = None
             if q_release_align is not None:
-                release_drop = log_unload_drop("planned_release_align_landing", q=q_release_align, reference_q=q_seed)
-            log_unload_alignment("planned_cached_dump_pour", q=q_dump, effector="pour", reference_q=q_seed)
+                release_drop = log_unload_drop("planned_release_align_landing", q=q_release_align, reference_q=q_real)
+            log_unload_alignment("planned_cached_dump_pour", q=q_dump, effector="pour", reference_q=q_real)
             readiness_drop = release_drop if isinstance(release_drop, dict) else drop
-            ready = bool(actual_gate.get("ok", False) and unload_drop_execution_ready(readiness_drop))
+            if str(STATE.get("active_task_name", "")) == "loaded_unload_route_test":
+                ready = bool(actual_gate.get("ok", False) and unload_drop_loaded_center_ready(readiness_drop))
+            else:
+                ready = bool(actual_gate.get("ok", False) and unload_drop_execution_ready(readiness_drop))
             dump_source = "cached_planned_q_dump"
             info_print(
                 f"[UNLOAD DUMP PLAN MATCH] {stage_name}: "
@@ -21857,6 +21875,7 @@ async def dump_bucket_at_target(stage_name, task_id=None, planned_q_dump=None, p
                 f"inside_xy={drop.get('inside_xy')} close_xy={drop.get('close_xy')} "
                 f"scatter_xy_ok={drop.get('scatter_xy_ok')} acceptance={drop.get('landing_acceptance')} "
                 f"readiness_acceptance={(readiness_drop or {}).get('landing_acceptance')} "
+                f"loaded_center_ready={unload_drop_loaded_center_ready(readiness_drop)} "
                 f"actual_gate={actual_gate.get('ok')}"
             )
             if not ready:
@@ -22051,27 +22070,29 @@ def loaded_route_continuous_group(seq, start_index):
         return [], start_index
 
     first_name = str(seq[start_index][0])
-    if not first_name.startswith("clearance_route_post"):
-        return [], start_index
-
     group = []
     i = start_index
-    while i < len(seq):
-        name, q_goal, duration = seq[i]
-        name = str(name)
-        if not name.startswith("clearance_route_post"):
-            break
-        group.append((i, name, np.array(q_goal, dtype=np.float32).reshape(-1)[:4].copy(), float(duration)))
-        i += 1
-
-    if i < len(seq):
-        name, q_goal, duration = seq[i]
-        name = str(name)
-        if "unload_to_bin" in name or "unload" in name:
+    if first_name.startswith("clearance_route_post"):
+        while i < len(seq):
+            name, q_goal, duration = seq[i]
+            name = str(name)
+            if not name.startswith("clearance_route_post"):
+                break
             group.append((i, name, np.array(q_goal, dtype=np.float32).reshape(-1)[:4].copy(), float(duration)))
             i += 1
 
-    if len(group) < 2 or "unload" not in str(group[-1][1]).lower():
+        if i < len(seq):
+            name, q_goal, duration = seq[i]
+            name = str(name)
+            if "unload_to_bin" in name or "unload" in name:
+                group.append((i, name, np.array(q_goal, dtype=np.float32).reshape(-1)[:4].copy(), float(duration)))
+                i += 1
+    elif "unload_to_bin" in first_name or "unload" in first_name:
+        name, q_goal, duration = seq[i]
+        group.append((i, str(name), np.array(q_goal, dtype=np.float32).reshape(-1)[:4].copy(), float(duration)))
+        i += 1
+
+    if not group or "unload" not in str(group[-1][1]).lower():
         return [], start_index
     return group, i
 

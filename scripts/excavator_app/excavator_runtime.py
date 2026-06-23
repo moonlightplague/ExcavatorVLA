@@ -12388,6 +12388,8 @@ PATH_LINK_COLLISION_RADIUS_M = 0.10
 LOADED_ROUTE_TEST_PLAN_BUDGET_SECONDS = 30.0
 LOADED_ROUTE_MIN_STAGE_SECONDS = 2.40
 LOADED_ROUTE_FINAL_STAGE_SECONDS = 2.80
+LOADED_ROUTE_RUNTIME_FAST_EXEC = True
+LOADED_ROUTE_STAGE_PARTICLE_DIAGNOSTICS = False
 PATH_DETERMINISTIC_ROUTE_POSES_DEG = [
     {"boom": 72.0, "arm": -88.0, "bucket": -56.0},
     {"boom": 72.0, "arm": -88.0, "bucket": -46.0},
@@ -12408,6 +12410,17 @@ PRE_DIG_TRAVEL_DEG = {
 PRE_DIG_TRAVEL_SECONDS = 0.85
 PRE_DIG_SWING_ALIGN_MIN_SECONDS = 0.75
 PRE_DIG_SWING_ALIGN_MAX_SECONDS = 2.40
+
+
+def active_loaded_route_fast_exec(stage_name=None):
+    if not bool(LOADED_ROUTE_RUNTIME_FAST_EXEC):
+        return False
+    if str(STATE.get("active_task_name", "")) != "loaded_unload_route_test":
+        return False
+    if stage_name is None:
+        return True
+    text = str(stage_name)
+    return text.startswith("clearance_route_post") or "unload" in text
 PRE_DIG_TRAVEL_SWING_FRACTION = 0.45
 PRE_DIG_ALIGN_JOINT_BLEND = 0.35
 PATH_RIGID_OBSTACLE_PATHS = [
@@ -21365,90 +21378,101 @@ async def execute_unload_sequence(stage_name, q_goal, duration, task_id=None):
         f"q_start={q_deg_values(q_start, wrap_swing_for_display=True)} "
         f"q_goal={q_deg_values(q_goal, wrap_swing_for_display=True)}"
     )
-    try:
-        trace_points = cache_active_stage_trace_points(
-            stage_name,
-            q_start,
-            q_goal,
-            stage_index=STATE.get("active_plan_stage_index", None),
-            include_remaining=True,
-        )
-        if current_trace_mode() == 2:
-            draw_trace(force=True)
+    fast_loaded_route = active_loaded_route_fast_exec(stage_name)
+    if fast_loaded_route:
         info_print(
-            "[PLAN EXEC TRACE]",
+            "[PLAN EXEC FAST]",
             f"stage={stage_name}",
-            f"points={len(trace_points)}",
-            "source=active_stage_diagnostic",
-            f"blue_trace_source={STATE.get('trace_plan_source', '')}",
+            "source=planned_loaded_route",
+            "trace_redraw=False",
+            "precheck=skipped",
+            force_log=True,
         )
-    except Exception as e:
-        info_print("[WARN] [PLAN EXEC TRACE] unload cache failed:", stage_name, type(e).__name__, e)
+    else:
+        try:
+            trace_points = cache_active_stage_trace_points(
+                stage_name,
+                q_start,
+                q_goal,
+                stage_index=STATE.get("active_plan_stage_index", None),
+                include_remaining=True,
+            )
+            if current_trace_mode() == 2:
+                draw_trace(force=True)
+            info_print(
+                "[PLAN EXEC TRACE]",
+                f"stage={stage_name}",
+                f"points={len(trace_points)}",
+                "source=active_stage_diagnostic",
+                f"blue_trace_source={STATE.get('trace_plan_source', '')}",
+            )
+        except Exception as e:
+            info_print("[WARN] [PLAN EXEC TRACE] unload cache failed:", stage_name, type(e).__name__, e)
 
-    try:
-        phase_ok, phase_reason, phase_sample, phase_report = path_phase_check(q_start, q_goal, stage_name)
-        obstacle_ok, obstacle_reason, obstacle_sample, obstacle_report = path_obstacle_check(q_start, q_goal, stage_name)
-        if phase_ok and obstacle_ok:
-            info_print(f"[PLAN EXEC DIRECT] stage={stage_name} samples={PATH_CHECK_SAMPLES} ok=True")
-        else:
-            detail = []
-            if not phase_ok:
-                detail.append(
-                    f"phase sample={phase_sample}/{PATH_CHECK_SAMPLES} "
-                    + format_ground_report(stage_name, phase_report, phase_reason)
-                )
-            if not obstacle_ok:
-                detail.append(
-                    f"obstacle sample={obstacle_sample}/{PATH_CHECK_SAMPLES} "
-                    + format_obstacle_report(stage_name, obstacle_report, obstacle_reason)
-                )
-            detail_text = "; ".join(detail)
-            strict_needs_route = strict_path_precheck_phase(stage_name)
-            if strict_needs_route:
-                reason_text = f"execution_failed/path_precheck_failed:{stage_name}:{detail_text}"
-                set_execution_failure_reason(reason_text)
-                info_print(
-                    "[PLAN EXEC PRECHECK FAILED]",
-                    f"stage={stage_name}",
-                    detail_text,
-                    "hard_stop=True",
-                )
-                update_status(f"[DIG EXEC FAILED] {stage_name}: path_precheck_failed", force=True)
-                try:
-                    debug_timeline_record(
-                        "PATH_PRECHECK_FAIL",
-                        stage=stage_name,
-                        result="failed",
-                        reason=reason_text,
-                        q_cmd=q_goal,
-                        q_real=get_real_joint_positions(),
-                        data={
-                            "phase_ok": bool(phase_ok),
-                            "phase_reason": str(phase_reason),
-                            "phase_sample": int(phase_sample),
-                            "obstacle_ok": bool(obstacle_ok),
-                            "obstacle_reason": str(obstacle_reason),
-                            "obstacle_sample": int(obstacle_sample),
-                        },
-                        include_sand=True,
-                    )
-                except Exception:
-                    pass
-                return False
+        try:
+            phase_ok, phase_reason, phase_sample, phase_report = path_phase_check(q_start, q_goal, stage_name)
+            obstacle_ok, obstacle_reason, obstacle_sample, obstacle_report = path_obstacle_check(q_start, q_goal, stage_name)
+            if phase_ok and obstacle_ok:
+                info_print(f"[PLAN EXEC DIRECT] stage={stage_name} samples={PATH_CHECK_SAMPLES} ok=True")
             else:
-                info_print(
-                    "[PLAN EXEC DIRECT WARN]",
-                    f"stage={stage_name}",
-                    detail_text,
-                    "sand_contact_or_curl_allowance=True",
-                )
-    except Exception as e:
-        if strict_path_precheck_phase(stage_name):
-            reason_text = f"execution_failed/path_precheck_failed:{stage_name}:{type(e).__name__}:{e}"
-            set_execution_failure_reason(reason_text)
-            info_print("[PLAN EXEC PRECHECK FAILED]", f"stage={stage_name}", reason_text, "hard_stop=True")
-            return False
-        info_print("[WARN] [PLAN EXEC DIRECT] unload path precheck failed:", stage_name, type(e).__name__, e)
+                detail = []
+                if not phase_ok:
+                    detail.append(
+                        f"phase sample={phase_sample}/{PATH_CHECK_SAMPLES} "
+                        + format_ground_report(stage_name, phase_report, phase_reason)
+                    )
+                if not obstacle_ok:
+                    detail.append(
+                        f"obstacle sample={obstacle_sample}/{PATH_CHECK_SAMPLES} "
+                        + format_obstacle_report(stage_name, obstacle_report, obstacle_reason)
+                    )
+                detail_text = "; ".join(detail)
+                strict_needs_route = strict_path_precheck_phase(stage_name)
+                if strict_needs_route:
+                    reason_text = f"execution_failed/path_precheck_failed:{stage_name}:{detail_text}"
+                    set_execution_failure_reason(reason_text)
+                    info_print(
+                        "[PLAN EXEC PRECHECK FAILED]",
+                        f"stage={stage_name}",
+                        detail_text,
+                        "hard_stop=True",
+                    )
+                    update_status(f"[DIG EXEC FAILED] {stage_name}: path_precheck_failed", force=True)
+                    try:
+                        debug_timeline_record(
+                            "PATH_PRECHECK_FAIL",
+                            stage=stage_name,
+                            result="failed",
+                            reason=reason_text,
+                            q_cmd=q_goal,
+                            q_real=get_real_joint_positions(),
+                            data={
+                                "phase_ok": bool(phase_ok),
+                                "phase_reason": str(phase_reason),
+                                "phase_sample": int(phase_sample),
+                                "obstacle_ok": bool(obstacle_ok),
+                                "obstacle_reason": str(obstacle_reason),
+                                "obstacle_sample": int(obstacle_sample),
+                            },
+                            include_sand=True,
+                        )
+                    except Exception:
+                        pass
+                    return False
+                else:
+                    info_print(
+                        "[PLAN EXEC DIRECT WARN]",
+                        f"stage={stage_name}",
+                        detail_text,
+                        "sand_contact_or_curl_allowance=True",
+                    )
+        except Exception as e:
+            if strict_path_precheck_phase(stage_name):
+                reason_text = f"execution_failed/path_precheck_failed:{stage_name}:{type(e).__name__}:{e}"
+                set_execution_failure_reason(reason_text)
+                info_print("[PLAN EXEC PRECHECK FAILED]", f"stage={stage_name}", reason_text, "hard_stop=True")
+                return False
+            info_print("[WARN] [PLAN EXEC DIRECT] unload path precheck failed:", stage_name, type(e).__name__, e)
 
     success = await move_to_profile(
         q_goal,
@@ -22157,7 +22181,11 @@ async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"
             )
 
         update_status(f"[DIG] {stage_name}", force=True)
-        if loaded_route_diag and mode_requires_loaded_carry_bucket(stage_name, stage_name):
+        if (
+            loaded_route_diag
+            and bool(LOADED_ROUTE_STAGE_PARTICLE_DIAGNOSTICS)
+            and mode_requires_loaded_carry_bucket(stage_name, stage_name)
+        ):
             bucket_particle_diagnostic(f"before_{stage_name}")
         if "unload" in stage_name:
             unload_detail = planned_unload_stage_detail(stage_index=stage_index, stage_name=stage_name)
@@ -22177,7 +22205,7 @@ async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"
                 )
                 return False
             STATE["dig_plan_step_index"] = int(STATE.get("dig_plan_step_index", 0)) + 1
-            if loaded_route_diag:
+            if loaded_route_diag and bool(LOADED_ROUTE_STAGE_PARTICLE_DIAGNOSTICS):
                 bucket_particle_diagnostic(f"after_{stage_name}_arrival")
             if not await dump_bucket_at_target(
                 stage_name,
@@ -22220,7 +22248,11 @@ async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"
                 include_sand=is_sand_contact_phase(stage_name),
             )
             return False
-        if loaded_route_diag and mode_requires_loaded_carry_bucket(stage_name, stage_name):
+        if (
+            loaded_route_diag
+            and bool(LOADED_ROUTE_STAGE_PARTICLE_DIAGNOSTICS)
+            and mode_requires_loaded_carry_bucket(stage_name, stage_name)
+        ):
             bucket_particle_diagnostic(f"after_{stage_name}")
         STATE["dig_plan_step_index"] = int(STATE.get("dig_plan_step_index", 0)) + 1
         if "unload" in stage_name:

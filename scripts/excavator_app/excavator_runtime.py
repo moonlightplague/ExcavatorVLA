@@ -12406,6 +12406,19 @@ LOADED_ROUTE_MIN_STAGE_SECONDS = 2.40
 LOADED_ROUTE_FINAL_STAGE_SECONDS = 2.80
 LOADED_ROUTE_RUNTIME_FAST_EXEC = True
 LOADED_ROUTE_STAGE_PARTICLE_DIAGNOSTICS = False
+LOADED_ROUTE_ADAPTIVE_TIMING = True
+LOADED_ROUTE_ADAPTIVE_MIN_SCALE = 0.12
+LOADED_ROUTE_ADAPTIVE_SWING_SOFT_ERR_DEG = 8.0
+LOADED_ROUTE_ADAPTIVE_SWING_HARD_ERR_DEG = 28.0
+LOADED_ROUTE_ADAPTIVE_JOINT_SOFT_ERR_DEG = 5.0
+LOADED_ROUTE_ADAPTIVE_JOINT_HARD_ERR_DEG = 14.0
+LOADED_ROUTE_ADAPTIVE_BUCKET_SOFT_ERR_DEG = 9.0
+LOADED_ROUTE_ADAPTIVE_BUCKET_HARD_ERR_DEG = 24.0
+LOADED_ROUTE_ADAPTIVE_CORNER_WINDOW_SECONDS = 0.45
+LOADED_ROUTE_ADAPTIVE_CORNER_MIN_SCALE = 0.45
+LOADED_ROUTE_ADAPTIVE_LOG_INTERVAL = 1.0
+LOADED_ROUTE_ADAPTIVE_MAX_WALL_MULTIPLIER = 3.0
+LOADED_ROUTE_ADAPTIVE_MAX_EXTRA_SECONDS = 8.0
 PATH_DETERMINISTIC_ROUTE_POSES_DEG = [
     {"boom": 72.0, "arm": -88.0, "bucket": -56.0},
     {"boom": 72.0, "arm": -88.0, "bucket": -46.0},
@@ -22058,6 +22071,73 @@ def loaded_route_group_segment_seconds(q0, q1, requested_seconds, stage_name):
     return max(float(seconds), floor)
 
 
+def loaded_route_adaptive_scale(q_cmd):
+    if not bool(LOADED_ROUTE_ADAPTIVE_TIMING):
+        return 1.0, {}
+    try:
+        q_goal = np.array(q_cmd, dtype=np.float32).reshape(-1)[:4].copy()
+        q_real = q_real_near_command(get_real_joint_positions(), q_goal)
+        err = q_delta_abs_deg(q_goal, q_real)
+    except Exception as e:
+        return 1.0, {"ok": False, "reason": type(e).__name__}
+    if not err:
+        return 1.0, {"ok": False, "reason": "empty_error"}
+
+    swing_idx = CTRL.name_to_idx.get("swing", 0)
+    bucket_idx = CTRL.name_to_idx.get("bucket", 3)
+    swing_err = float(err[swing_idx])
+    bucket_err = float(err[bucket_idx]) if bucket_idx < len(err) else 0.0
+    non_bucket_err = max(
+        [
+            float(err[idx])
+            for name, idx in CTRL.name_to_idx.items()
+            if name not in ("swing", "bucket") and idx < len(err)
+        ]
+        or [0.0]
+    )
+
+    def ratio(value, soft, hard):
+        if float(value) <= float(soft):
+            return 0.0
+        span = max(1.0e-6, float(hard) - float(soft))
+        return min(1.0, max(0.0, (float(value) - float(soft)) / span))
+
+    lag_ratio = max(
+        ratio(swing_err, LOADED_ROUTE_ADAPTIVE_SWING_SOFT_ERR_DEG, LOADED_ROUTE_ADAPTIVE_SWING_HARD_ERR_DEG),
+        ratio(non_bucket_err, LOADED_ROUTE_ADAPTIVE_JOINT_SOFT_ERR_DEG, LOADED_ROUTE_ADAPTIVE_JOINT_HARD_ERR_DEG),
+        ratio(bucket_err, LOADED_ROUTE_ADAPTIVE_BUCKET_SOFT_ERR_DEG, LOADED_ROUTE_ADAPTIVE_BUCKET_HARD_ERR_DEG),
+    )
+    min_scale = max(0.02, min(1.0, float(LOADED_ROUTE_ADAPTIVE_MIN_SCALE)))
+    scale = 1.0 - lag_ratio * (1.0 - min_scale)
+    return max(min_scale, min(1.0, float(scale))), {
+        "ok": True,
+        "swing_err_deg": swing_err,
+        "non_bucket_err_deg": non_bucket_err,
+        "bucket_err_deg": bucket_err,
+        "lag_ratio": float(lag_ratio),
+        "scale": float(scale),
+    }
+
+
+def loaded_route_corner_scale(profile_t, cumulative):
+    if not bool(LOADED_ROUTE_ADAPTIVE_TIMING):
+        return 1.0
+    window = max(0.0, float(LOADED_ROUTE_ADAPTIVE_CORNER_WINDOW_SECONDS))
+    if window <= 1.0e-6 or len(cumulative or []) < 2:
+        return 1.0
+    min_scale = max(0.05, min(1.0, float(LOADED_ROUTE_ADAPTIVE_CORNER_MIN_SCALE)))
+    best = 1.0
+    for _start, boundary, _seg in cumulative[:-1]:
+        d = abs(float(profile_t) - float(boundary))
+        if d >= window:
+            continue
+        x = d / window
+        # Slow near a route corner, but do not stop there; the route remains continuous.
+        scale = min_scale + (1.0 - min_scale) * (x * x * (3.0 - 2.0 * x))
+        best = min(best, scale)
+    return float(best)
+
+
 async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
     group, next_index = loaded_route_continuous_group(seq, start_index)
     if not group:
@@ -22119,7 +22199,7 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
         f"duration={total_seconds:.2f}s",
         f"q_start={q_deg_values(q_start, wrap_swing_for_display=True)}",
         f"q_final={q_deg_values(segments[-1]['q1'], wrap_swing_for_display=True)}",
-        "profile=global_smoothstep_piecewise_linear",
+        "profile=global_smoothstep_piecewise_linear_adaptive",
         force_log=True,
     )
 
@@ -22130,7 +22210,6 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
         acc += float(seg["seconds"])
         cumulative.append((start, acc, seg))
 
-    steps = max(8, int(total_seconds * CONTROL_HZ))
     step_frames = max(1, int(60 / CONTROL_HZ))
     freeze_stride = max(4, int(CONTROL_HZ * 0.25))
     q_final_cmd = segments[-1]["q1"].copy()
@@ -22146,14 +22225,40 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
     except Exception:
         pass
 
-    for frame in range(steps):
+    profile_time = 0.0
+    path_time = 0.0
+    frame = 0
+    adaptive_scale = 1.0
+    last_adaptive_log_time = 0.0
+    wall_start = time.time()
+    max_wall_seconds = max(
+        float(total_seconds) + float(LOADED_ROUTE_ADAPTIVE_MAX_EXTRA_SECONDS),
+        float(total_seconds) * float(LOADED_ROUTE_ADAPTIVE_MAX_WALL_MULTIPLIER),
+    )
+    frame_dt = float(step_frames) / 60.0
+
+    while profile_time < total_seconds - 1.0e-6:
         if motion_cancel_requested(task_id):
             update_status("[MOVE STOPPED] loaded_route_group", force=True)
             return False, int(start_index)
+        if time.time() - wall_start > max_wall_seconds:
+            reason_text = (
+                "execution_failed/loaded_route_group_timeout:"
+                f"profile_time={profile_time:.2f}/{total_seconds:.2f}"
+            )
+            set_execution_failure_reason(reason_text)
+            update_status(f"[DIG EXEC FAILED] loaded_route_group: adaptive timeout", force=True)
+            return False, int(start_index)
 
-        u = float(frame + 1) / float(steps)
+        corner_scale = loaded_route_corner_scale(path_time, cumulative)
+        advance_scale = min(float(adaptive_scale), float(corner_scale))
+        profile_time = min(float(total_seconds), float(profile_time) + frame_dt * max(0.02, advance_scale))
+        frame += 1
+
+        u = float(profile_time) / max(1.0e-6, float(total_seconds))
         eased = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u)
         t = min(total_seconds, max(0.0, eased * total_seconds))
+        path_time = t
         seg_start, seg_end, seg = cumulative[-1]
         for row in cumulative:
             if t <= row[1] or row is cumulative[-1]:
@@ -22164,7 +22269,12 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
         stage_name = seg["name"]
         if stage_name != last_seg_name:
             last_seg_name = stage_name
-            info_print("[LOADED ROUTE GROUP SEGMENT]", f"stage={stage_name}", f"frame={frame + 1}/{steps}")
+            info_print(
+                "[LOADED ROUTE GROUP SEGMENT]",
+                f"stage={stage_name}",
+                f"profile_time={profile_time:.2f}/{total_seconds:.2f}",
+                f"frame={frame}",
+            )
         STATE["active_plan_stage_index"] = int(seg["index"])
 
         q = interpolate_q_motion(seg["q0"], seg["q1"], local, mode=stage_name, label=stage_name)
@@ -22191,6 +22301,25 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
         if motion_cancel_requested(task_id):
             update_status("[MOVE STOPPED] loaded_route_group", force=True)
             return False, int(start_index)
+        adaptive_scale, lag_report = loaded_route_adaptive_scale(q_final_cmd)
+        now = time.time()
+        if (
+            bool((lag_report or {}).get("ok", False))
+            and adaptive_scale < 0.995
+            and now - float(last_adaptive_log_time) >= float(LOADED_ROUTE_ADAPTIVE_LOG_INTERVAL)
+        ):
+            last_adaptive_log_time = now
+            info_print(
+                "[LOADED ROUTE ADAPTIVE]",
+                f"stage={stage_name}",
+                f"scale={adaptive_scale:.2f}",
+                f"corner_scale={corner_scale:.2f}",
+                f"profile_time={profile_time:.2f}/{total_seconds:.2f}",
+                f"swing_err={float(lag_report.get('swing_err_deg', 0.0)):.2f}deg",
+                f"joint_err={float(lag_report.get('non_bucket_err_deg', 0.0)):.2f}deg",
+                f"bucket_err={float(lag_report.get('bucket_err_deg', 0.0)):.2f}deg",
+                force_log=True,
+            )
         if frame % freeze_stride == 0:
             check_freeze_state(f"loaded_route_group:{stage_name}")
 

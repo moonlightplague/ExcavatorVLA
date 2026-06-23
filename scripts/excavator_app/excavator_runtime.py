@@ -12414,8 +12414,8 @@ LOADED_ROUTE_ADAPTIVE_JOINT_SOFT_ERR_DEG = 7.0
 LOADED_ROUTE_ADAPTIVE_JOINT_HARD_ERR_DEG = 22.0
 LOADED_ROUTE_ADAPTIVE_BUCKET_SOFT_ERR_DEG = 14.0
 LOADED_ROUTE_ADAPTIVE_BUCKET_HARD_ERR_DEG = 42.0
-LOADED_ROUTE_ADAPTIVE_CORNER_WINDOW_SECONDS = 0.30
-LOADED_ROUTE_ADAPTIVE_CORNER_MIN_SCALE = 0.70
+LOADED_ROUTE_ADAPTIVE_CORNER_WINDOW_SECONDS = 0.75
+LOADED_ROUTE_ADAPTIVE_CORNER_MIN_SCALE = 0.42
 LOADED_ROUTE_ADAPTIVE_LOG_INTERVAL = 1.0
 LOADED_ROUTE_ADAPTIVE_MAX_WALL_MULTIPLIER = 5.0
 LOADED_ROUTE_ADAPTIVE_MAX_EXTRA_SECONDS = 20.0
@@ -22365,7 +22365,11 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
         corner_scale = loaded_route_corner_scale(path_time, cumulative)
         base_advance_scale = min(float(adaptive_scale), float(corner_scale))
         min_step_scale = max(0.02, min(1.0, float(LOADED_ROUTE_ACCEL_MIN_STEP_SCALE)))
-        attempt_scale = max(min_step_scale, float(base_advance_scale))
+        corner_limited = float(corner_scale) < 0.995
+        step_floor = min_step_scale
+        if corner_limited:
+            step_floor = max(0.20, min(float(min_step_scale), float(corner_scale)))
+        attempt_scale = max(step_floor, float(base_advance_scale))
         accel_scale = 1.0
         accel_report = {}
         q = None
@@ -22375,7 +22379,7 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
         for _attempt in range(max(1, int(LOADED_ROUTE_ACCEL_BACKTRACK_ITERS))):
             candidate_profile_time = min(
                 float(total_seconds),
-                float(profile_time) + frame_dt * max(min_step_scale, float(attempt_scale)),
+                float(profile_time) + frame_dt * max(step_floor, float(attempt_scale)),
             )
             u = float(candidate_profile_time) / max(1.0e-6, float(total_seconds))
             eased = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u)
@@ -22391,9 +22395,9 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
                 load_vel_prev,
                 frame_dt,
             )
-            if accel_scale >= 0.995 or attempt_scale <= min_step_scale + 1.0e-6:
+            if accel_scale >= 0.995 or attempt_scale <= step_floor + 1.0e-6:
                 break
-            attempt_scale = max(min_step_scale, float(attempt_scale) * max(min_step_scale, float(accel_scale)))
+            attempt_scale = max(step_floor, float(attempt_scale) * max(step_floor, float(accel_scale)))
 
         profile_time = float(candidate_profile_time)
         path_time = float(candidate_path_time)

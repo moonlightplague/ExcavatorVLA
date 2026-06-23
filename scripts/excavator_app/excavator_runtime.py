@@ -3884,12 +3884,16 @@ def unload_arrival_report(q_goal=None):
         or abs(abs(wrap_angle(swing_goal_action)) - math.pi) <= deg_to_rad(3.0)
         or abs(abs(wrap_angle(swing_real_raw)) - math.pi) <= deg_to_rad(3.0)
     )
+    swing_action_blocked = bool(
+        swing_action_err > UNLOAD_FINAL_SWING_TOL_DEG
+        and not (swing_near_boundary and swing_err <= UNLOAD_FINAL_SWING_TOL_DEG)
+    )
     non_swing_err = 0.0
     blocked = []
     for name, idx in CTRL.name_to_idx.items():
         e = float(err_deg[idx])
         if name == "swing":
-            if e > UNLOAD_FINAL_SWING_TOL_DEG or swing_action_err > UNLOAD_FINAL_SWING_TOL_DEG:
+            if e > UNLOAD_FINAL_SWING_TOL_DEG or swing_action_blocked:
                 blocked.append(f"{name}:near={e:.2f}deg action={swing_action_err:.2f}deg")
         elif name == "bucket":
             continue
@@ -3959,6 +3963,7 @@ def unload_arrival_report(q_goal=None):
         "blocked_joints": blocked,
         "swing_err_deg": swing_err,
         "swing_action_err_deg": swing_action_err,
+        "swing_action_blocked": bool(swing_action_blocked),
         "swing_near_boundary": bool(swing_near_boundary),
         "swing_goal_raw_deg": rad_to_deg(swing_goal_raw),
         "swing_goal_wrapped_deg": rad_to_deg(wrap_angle(swing_goal_raw)),
@@ -21903,12 +21908,33 @@ async def dump_bucket_at_target(stage_name, task_id=None, planned_q_dump=None, p
 
     if not ready:
         q_seed = CTRL.q_cmd.copy()
+        release_z_override = None
+        if str(STATE.get("active_task_name", "")) == "loaded_unload_route_test" and q_real is not None:
+            try:
+                q_seed = np.array(q_real, dtype=np.float32).reshape(-1)[:4].copy()
+                q_actual_align = bucket_only_dump_pose(q_seed, unload_release_alignment_bucket_deg(dump_deg))
+                actual_drop = unload_drop_report(q=q_actual_align, reference_q=q_seed)
+                actual_release = actual_drop.get("release") if isinstance(actual_drop, dict) else None
+                if actual_release is not None:
+                    release_z_override = float(np.array(actual_release, dtype=np.float32).reshape(-1)[2])
+                info_print(
+                    f"[UNLOAD HEIGHT COMP] {stage_name}: "
+                    f"source=actual_replan "
+                    f"release_z_override={fmt_optional(release_z_override)} "
+                    f"source_clearance={fmt_optional((actual_drop or {}).get('source_clearance'))} "
+                    f"drift={fmt_optional((actual_drop or {}).get('drift_distance'))} "
+                    f"xy_err={fmt_optional((actual_drop or {}).get('xy_err'))} "
+                    f"q_seed={q_deg_values(q_seed, wrap_swing_for_display=True)}"
+                )
+            except Exception as e:
+                info_print(f"[WARN] [UNLOAD HEIGHT COMP] {stage_name}: actual-height estimate failed {type(e).__name__}: {e}")
         q_plan, dump_info = plan_dump_pose_to_bin(
             q_seed=q_seed,
             dump_deg=dump_deg,
             label=stage_name,
             log=True,
             allow_unaligned=True,
+            release_z_override=release_z_override,
         )
         if q_plan is None:
             update_status(f"[UNLOAD BLOCKED] {stage_name}: dump pose failed: {dump_info}", force=True)

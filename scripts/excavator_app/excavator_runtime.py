@@ -18771,24 +18771,41 @@ def secure_phase_delta_report(current_metrics=None):
     retained_fraction = 1.0 if start_bucket <= 0 else float(current_bucket) / float(max(1, start_bucket))
     min_retained_fraction = float(SECURE_HOLD_MIN_RETAINED_FROM_CUT_FRACTION)
     fraction_ok = bool(start_bucket <= 0 or retained_fraction >= min_retained_fraction)
-    ok = spill_delta <= spill_limit and bucket_loss <= loss_limit and fraction_ok
+    spill_ok = bool(spill_delta <= spill_limit)
+    bucket_count_ok = bool(current_bucket >= int(CURL_HOLD_MIN_BUCKET_PARTICLES))
+    material_retained_ok = bool(bucket_loss <= loss_limit and fraction_ok and bucket_count_ok)
+    ok = bool(material_retained_ok)
+    if ok and not spill_ok:
+        reason = (
+            f"secure_spill_accepted spill_delta={spill_delta}/{spill_limit} "
+            f"bucket_loss={bucket_loss}/{loss_limit} retained={retained_fraction:.2f}/{min_retained_fraction:.2f}"
+        )
+    elif ok:
+        reason = "ok"
+    else:
+        reason = (
+            f"secure_material_loss spill_delta={spill_delta}/{spill_limit} "
+            f"bucket_loss={bucket_loss}/{loss_limit} retained={retained_fraction:.2f}/{min_retained_fraction:.2f} "
+            f"bucket={current_bucket}/{int(CURL_HOLD_MIN_BUCKET_PARTICLES)}"
+        )
     return {
         "ok": bool(ok),
-        "reason": "ok" if ok else (
-            f"secure_material_loss spill_delta={spill_delta}/{spill_limit} "
-            f"bucket_loss={bucket_loss}/{loss_limit} retained={retained_fraction:.2f}/{min_retained_fraction:.2f}"
-        ),
+        "reason": reason,
         "baseline": str(baseline_name),
         "bucket_before": int(start_bucket),
         "bucket_after": int(current_bucket),
         "bucket_loss": int(bucket_loss),
         "bucket_loss_limit": int(loss_limit),
+        "bucket_count_ok": bool(bucket_count_ok),
+        "material_retained_ok": bool(material_retained_ok),
         "retained_fraction": float(retained_fraction),
         "min_retained_fraction": float(min_retained_fraction),
         "spill_before": int(start_spill),
         "spill_after": int(current_spill),
         "spill_delta": int(spill_delta),
         "spill_limit": int(spill_limit),
+        "spill_ok": bool(spill_ok),
+        "spill_accepted": bool(ok and not spill_ok),
     }
 
 
@@ -18816,7 +18833,8 @@ def secure_post_gate_report(q_start, current_metrics=None):
         "q_secure_deg": q_deg_values(q_start, wrap_swing_for_display=True),
         "carry_report": carry_report,
         "material_delta": delta_report,
-        "spill_gate_ok": bool(delta_report.get("ok", False)),
+        "spill_gate_ok": bool(delta_report.get("material_retained_ok", delta_report.get("ok", False))),
+        "spill_accepted": bool(delta_report.get("spill_accepted", False)),
         "carry_gate_ok": bool(carry_ok),
         "geometry_retains_material": bool(geometry_retains),
         "real_loaded_hold_allowed": bool(real_loaded_hold),

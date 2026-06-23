@@ -12417,8 +12417,16 @@ LOADED_ROUTE_ADAPTIVE_BUCKET_HARD_ERR_DEG = 24.0
 LOADED_ROUTE_ADAPTIVE_CORNER_WINDOW_SECONDS = 0.45
 LOADED_ROUTE_ADAPTIVE_CORNER_MIN_SCALE = 0.45
 LOADED_ROUTE_ADAPTIVE_LOG_INTERVAL = 1.0
-LOADED_ROUTE_ADAPTIVE_MAX_WALL_MULTIPLIER = 3.0
-LOADED_ROUTE_ADAPTIVE_MAX_EXTRA_SECONDS = 8.0
+LOADED_ROUTE_ADAPTIVE_MAX_WALL_MULTIPLIER = 5.0
+LOADED_ROUTE_ADAPTIVE_MAX_EXTRA_SECONDS = 20.0
+LOADED_ROUTE_ACCEL_LIMITING = True
+LOADED_ROUTE_ACCEL_MIN_STEP_SCALE = 0.65
+LOADED_ROUTE_ACCEL_BACKTRACK_ITERS = 2
+LOADED_ROUTE_MAX_LOAD_ACCEL_MPS2 = 24.0
+LOADED_ROUTE_MAX_SWING_ACCEL_DEG_S2 = 320.0
+LOADED_ROUTE_MAX_JOINT_ACCEL_DEG_S2 = 360.0
+LOADED_ROUTE_MAX_BUCKET_ACCEL_DEG_S2 = 420.0
+LOADED_ROUTE_ACCEL_LOG_INTERVAL = 1.0
 PATH_DETERMINISTIC_ROUTE_POSES_DEG = [
     {"boom": 72.0, "arm": -88.0, "bucket": -56.0},
     {"boom": 72.0, "arm": -88.0, "bucket": -46.0},
@@ -22138,6 +22146,106 @@ def loaded_route_corner_scale(profile_t, cumulative):
     return float(best)
 
 
+def loaded_route_joint_velocity(q0, q1, dt):
+    q0 = np.array(q0, dtype=np.float32).reshape(-1)[:4]
+    q1 = np.array(q1, dtype=np.float32).reshape(-1)[:4]
+    dt = max(1.0e-4, float(dt))
+    dq = q1 - q0
+    swing_idx = CTRL.name_to_idx.get("swing", 0)
+    dq[swing_idx] = float(swing_delta(q1[swing_idx], q0[swing_idx]))
+    return dq / dt
+
+
+def loaded_route_sample_q_at_path_time(path_time, total_seconds, cumulative):
+    if not cumulative:
+        return None, None
+    t = min(float(total_seconds), max(0.0, float(path_time)))
+    seg_start, seg_end, seg = cumulative[-1]
+    for row in cumulative:
+        if t <= row[1] or row is cumulative[-1]:
+            seg_start, seg_end, seg = row
+            break
+    local = 1.0 if seg_end <= seg_start else (t - seg_start) / (seg_end - seg_start)
+    local = min(1.0, max(0.0, float(local)))
+    stage_name = seg["name"]
+    q = interpolate_q_motion(seg["q0"], seg["q1"], local, mode=stage_name, label=stage_name)
+    if mode_requires_loaded_carry_bucket(stage_name, stage_name):
+        q = force_loaded_carry_bucket_q(q, reference=q, label=stage_name)
+    return seg, q
+
+
+def loaded_route_accel_limit_scale(q_prev, q_candidate, joint_vel_prev, load_vel_prev, dt):
+    if not bool(LOADED_ROUTE_ACCEL_LIMITING):
+        return 1.0, {}
+    dt = max(1.0e-4, float(dt))
+    try:
+        q_prev = np.array(q_prev, dtype=np.float32).reshape(-1)[:4].copy()
+        q_candidate = np.array(q_candidate, dtype=np.float32).reshape(-1)[:4].copy()
+        joint_vel = loaded_route_joint_velocity(q_prev, q_candidate, dt)
+        joint_acc = (joint_vel - np.array(joint_vel_prev, dtype=np.float32).reshape(-1)[:4]) / dt
+        joint_acc_deg = np.abs(np.degrees(joint_acc))
+    except Exception as e:
+        return 1.0, {"ok": False, "reason": "joint_accel_" + type(e).__name__}
+
+    swing_idx = CTRL.name_to_idx.get("swing", 0)
+    bucket_idx = CTRL.name_to_idx.get("bucket", 3)
+    swing_acc = float(joint_acc_deg[swing_idx])
+    bucket_acc = float(joint_acc_deg[bucket_idx]) if bucket_idx < len(joint_acc_deg) else 0.0
+    other_acc = max(
+        [
+            float(joint_acc_deg[idx])
+            for name, idx in CTRL.name_to_idx.items()
+            if name not in ("swing", "bucket") and idx < len(joint_acc_deg)
+        ]
+        or [0.0]
+    )
+
+    load_acc = 0.0
+    load_vel = np.array(load_vel_prev, dtype=np.float32).reshape(-1)[:3].copy()
+    try:
+        p0 = predicted_end_world_point(q_prev, end_effector="load", reference_q=q_prev)
+        p1 = predicted_end_world_point(q_candidate, end_effector="load", reference_q=q_candidate)
+        if p0 is not None and p1 is not None:
+            p0 = np.array(p0, dtype=np.float32).reshape(-1)[:3]
+            p1 = np.array(p1, dtype=np.float32).reshape(-1)[:3]
+            load_vel_new = (p1 - p0) / dt
+            load_acc = float(np.linalg.norm((load_vel_new - load_vel) / dt))
+            load_vel = load_vel_new
+    except Exception:
+        load_acc = 0.0
+
+    limits = [
+        (swing_acc, float(LOADED_ROUTE_MAX_SWING_ACCEL_DEG_S2)),
+        (other_acc, float(LOADED_ROUTE_MAX_JOINT_ACCEL_DEG_S2)),
+        (bucket_acc, float(LOADED_ROUTE_MAX_BUCKET_ACCEL_DEG_S2)),
+        (load_acc, float(LOADED_ROUTE_MAX_LOAD_ACCEL_MPS2)),
+    ]
+    scale = 1.0
+    limiting = []
+    for value, limit in limits:
+        if limit <= 1.0e-6 or value <= limit:
+            continue
+        scale = min(scale, max(0.02, limit / max(value, 1.0e-6)))
+    if swing_acc > float(LOADED_ROUTE_MAX_SWING_ACCEL_DEG_S2):
+        limiting.append("swing")
+    if other_acc > float(LOADED_ROUTE_MAX_JOINT_ACCEL_DEG_S2):
+        limiting.append("boom_arm")
+    if bucket_acc > float(LOADED_ROUTE_MAX_BUCKET_ACCEL_DEG_S2):
+        limiting.append("bucket")
+    if load_acc > float(LOADED_ROUTE_MAX_LOAD_ACCEL_MPS2):
+        limiting.append("load_xyz")
+    return max(0.02, min(1.0, float(scale))), {
+        "ok": True,
+        "swing_acc_deg_s2": swing_acc,
+        "joint_acc_deg_s2": other_acc,
+        "bucket_acc_deg_s2": bucket_acc,
+        "load_acc_mps2": load_acc,
+        "load_vel": load_vel,
+        "joint_vel": joint_vel,
+        "limiting": limiting,
+    }
+
+
 async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
     group, next_index = loaded_route_continuous_group(seq, start_index)
     if not group:
@@ -22230,12 +22338,16 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
     frame = 0
     adaptive_scale = 1.0
     last_adaptive_log_time = 0.0
+    last_accel_log_time = 0.0
     wall_start = time.time()
     max_wall_seconds = max(
         float(total_seconds) + float(LOADED_ROUTE_ADAPTIVE_MAX_EXTRA_SECONDS),
         float(total_seconds) * float(LOADED_ROUTE_ADAPTIVE_MAX_WALL_MULTIPLIER),
     )
     frame_dt = float(step_frames) / 60.0
+    q_sent_prev = q_start.copy()
+    joint_vel_prev = np.zeros(4, dtype=np.float32)
+    load_vel_prev = np.zeros(3, dtype=np.float32)
 
     while profile_time < total_seconds - 1.0e-6:
         if motion_cancel_requested(task_id):
@@ -22251,21 +22363,41 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
             return False, int(start_index)
 
         corner_scale = loaded_route_corner_scale(path_time, cumulative)
-        advance_scale = min(float(adaptive_scale), float(corner_scale))
-        profile_time = min(float(total_seconds), float(profile_time) + frame_dt * max(0.02, advance_scale))
-        frame += 1
-
-        u = float(profile_time) / max(1.0e-6, float(total_seconds))
-        eased = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u)
-        t = min(total_seconds, max(0.0, eased * total_seconds))
-        path_time = t
-        seg_start, seg_end, seg = cumulative[-1]
-        for row in cumulative:
-            if t <= row[1] or row is cumulative[-1]:
-                seg_start, seg_end, seg = row
+        base_advance_scale = min(float(adaptive_scale), float(corner_scale))
+        min_step_scale = max(0.02, min(1.0, float(LOADED_ROUTE_ACCEL_MIN_STEP_SCALE)))
+        attempt_scale = max(min_step_scale, float(base_advance_scale))
+        accel_scale = 1.0
+        accel_report = {}
+        q = None
+        seg = None
+        candidate_profile_time = profile_time
+        candidate_path_time = path_time
+        for _attempt in range(max(1, int(LOADED_ROUTE_ACCEL_BACKTRACK_ITERS))):
+            candidate_profile_time = min(
+                float(total_seconds),
+                float(profile_time) + frame_dt * max(min_step_scale, float(attempt_scale)),
+            )
+            u = float(candidate_profile_time) / max(1.0e-6, float(total_seconds))
+            eased = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u)
+            candidate_path_time = min(total_seconds, max(0.0, eased * total_seconds))
+            seg, q = loaded_route_sample_q_at_path_time(candidate_path_time, total_seconds, cumulative)
+            if q is None or seg is None:
+                set_execution_failure_reason("execution_failed/loaded_route_group_sample_failed")
+                return False, int(start_index)
+            accel_scale, accel_report = loaded_route_accel_limit_scale(
+                q_sent_prev,
+                q,
+                joint_vel_prev,
+                load_vel_prev,
+                frame_dt,
+            )
+            if accel_scale >= 0.995 or attempt_scale <= min_step_scale + 1.0e-6:
                 break
-        local = 1.0 if seg_end <= seg_start else (t - seg_start) / (seg_end - seg_start)
-        local = min(1.0, max(0.0, float(local)))
+            attempt_scale = max(min_step_scale, float(attempt_scale) * max(min_step_scale, float(accel_scale)))
+
+        profile_time = float(candidate_profile_time)
+        path_time = float(candidate_path_time)
+        frame += 1
         stage_name = seg["name"]
         if stage_name != last_seg_name:
             last_seg_name = stage_name
@@ -22277,9 +22409,6 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
             )
         STATE["active_plan_stage_index"] = int(seg["index"])
 
-        q = interpolate_q_motion(seg["q0"], seg["q1"], local, mode=stage_name, label=stage_name)
-        if mode_requires_loaded_carry_bucket(stage_name, stage_name):
-            q = force_loaded_carry_bucket_q(q, reference=q, label=stage_name)
         q_final_cmd = q.copy()
         ok, send_reason = CTRL.apply_target_direct(q, mode=stage_name)
         if not ok:
@@ -22301,6 +22430,37 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
         if motion_cancel_requested(task_id):
             update_status("[MOVE STOPPED] loaded_route_group", force=True)
             return False, int(start_index)
+        if bool((accel_report or {}).get("ok", False)):
+            try:
+                joint_vel_prev = np.array(accel_report.get("joint_vel"), dtype=np.float32).reshape(-1)[:4].copy()
+                load_vel_prev = np.array(accel_report.get("load_vel"), dtype=np.float32).reshape(-1)[:3].copy()
+                q_sent_prev = q_final_cmd.copy()
+            except Exception:
+                joint_vel_prev = loaded_route_joint_velocity(q_sent_prev, q_final_cmd, frame_dt)
+                q_sent_prev = q_final_cmd.copy()
+        else:
+            joint_vel_prev = loaded_route_joint_velocity(q_sent_prev, q_final_cmd, frame_dt)
+            q_sent_prev = q_final_cmd.copy()
+        now = time.time()
+        if (
+            bool((accel_report or {}).get("ok", False))
+            and accel_scale < 0.995
+            and now - float(last_accel_log_time) >= float(LOADED_ROUTE_ACCEL_LOG_INTERVAL)
+        ):
+            last_accel_log_time = now
+            info_print(
+                "[LOADED ROUTE ACCEL LIMIT]",
+                f"stage={stage_name}",
+                f"scale={accel_scale:.2f}",
+                f"base_scale={base_advance_scale:.2f}",
+                f"profile_time={profile_time:.2f}/{total_seconds:.2f}",
+                f"load_acc={float(accel_report.get('load_acc_mps2', 0.0)):.2f}mps2",
+                f"swing_acc={float(accel_report.get('swing_acc_deg_s2', 0.0)):.1f}deg/s2",
+                f"joint_acc={float(accel_report.get('joint_acc_deg_s2', 0.0)):.1f}deg/s2",
+                f"bucket_acc={float(accel_report.get('bucket_acc_deg_s2', 0.0)):.1f}deg/s2",
+                f"limiting={accel_report.get('limiting')}",
+                force_log=True,
+            )
         adaptive_scale, lag_report = loaded_route_adaptive_scale(q_final_cmd)
         now = time.time()
         if (

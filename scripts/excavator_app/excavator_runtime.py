@@ -12414,6 +12414,8 @@ LOADED_ROUTE_ADAPTIVE_JOINT_SOFT_ERR_DEG = 7.0
 LOADED_ROUTE_ADAPTIVE_JOINT_HARD_ERR_DEG = 22.0
 LOADED_ROUTE_ADAPTIVE_BUCKET_SOFT_ERR_DEG = 14.0
 LOADED_ROUTE_ADAPTIVE_BUCKET_HARD_ERR_DEG = 42.0
+LOADED_ROUTE_ADAPTIVE_SWING_CRITICAL_ERR_DEG = 42.0
+LOADED_ROUTE_ADAPTIVE_SWING_CRITICAL_MIN_SCALE = 0.34
 LOADED_ROUTE_ADAPTIVE_CORNER_WINDOW_SECONDS = 0.75
 LOADED_ROUTE_ADAPTIVE_CORNER_MIN_SCALE = 0.42
 LOADED_ROUTE_ADAPTIVE_LOG_INTERVAL = 1.0
@@ -12427,6 +12429,8 @@ LOADED_ROUTE_MAX_SWING_ACCEL_DEG_S2 = 700.0
 LOADED_ROUTE_MAX_JOINT_ACCEL_DEG_S2 = 700.0
 LOADED_ROUTE_MAX_BUCKET_ACCEL_DEG_S2 = 2500.0
 LOADED_ROUTE_ACCEL_LOG_INTERVAL = 1.0
+LOADED_ROUTE_CARRY_SWING_MAX_DEG_PER_S = 16.0
+LOADED_ROUTE_CARRY_SWING_TIME_PAD_SECONDS = 0.45
 PATH_DETERMINISTIC_ROUTE_POSES_DEG = [
     {"boom": 72.0, "arm": -88.0, "bucket": -56.0},
     {"boom": 72.0, "arm": -88.0, "bucket": -46.0},
@@ -22076,6 +22080,16 @@ def loaded_route_group_segment_seconds(q0, q1, requested_seconds, stage_name):
     seconds = estimate_stage_motion_seconds(q0, q1, requested_seconds=requested_seconds)
     stage_text = str(stage_name).lower()
     floor = float(LOADED_ROUTE_FINAL_STAGE_SECONDS) if "unload_to_bin" in stage_text else float(LOADED_ROUTE_MIN_STAGE_SECONDS)
+    q0_arr = np.array(q0, dtype=np.float32).reshape(-1)[:4]
+    q1_arr = np.array(q1, dtype=np.float32).reshape(-1)[:4]
+    swing_idx = CTRL.name_to_idx.get("swing", 0)
+    swing_deg = abs(rad_to_deg(swing_delta(float(q1_arr[swing_idx]), float(q0_arr[swing_idx]))))
+    if mode_requires_loaded_carry_bucket(stage_text, stage_text) and swing_deg > 1.0:
+        swing_rate = max(1.0, float(LOADED_ROUTE_CARRY_SWING_MAX_DEG_PER_S))
+        floor = max(
+            floor,
+            float(swing_deg) / swing_rate + float(LOADED_ROUTE_CARRY_SWING_TIME_PAD_SECONDS),
+        )
     return max(float(seconds), floor)
 
 
@@ -22117,13 +22131,23 @@ def loaded_route_adaptive_scale(q_cmd):
     )
     min_scale = max(0.02, min(1.0, float(LOADED_ROUTE_ADAPTIVE_MIN_SCALE)))
     scale = 1.0 - lag_ratio * (1.0 - min_scale)
-    return max(min_scale, min(1.0, float(scale))), {
+    critical_min_scale = max(0.02, min(1.0, float(LOADED_ROUTE_ADAPTIVE_SWING_CRITICAL_MIN_SCALE)))
+    critical_err = float(LOADED_ROUTE_ADAPTIVE_SWING_CRITICAL_ERR_DEG)
+    effective_min_scale = min_scale
+    if swing_err > critical_err:
+        critical_span = max(1.0, float(LOADED_ROUTE_ADAPTIVE_SWING_HARD_ERR_DEG) - critical_err)
+        critical_ratio = min(1.0, max(0.0, (float(swing_err) - critical_err) / critical_span))
+        critical_scale = 1.0 - critical_ratio * (1.0 - critical_min_scale)
+        scale = min(float(scale), float(critical_scale))
+        effective_min_scale = critical_min_scale
+    return max(effective_min_scale, min(1.0, float(scale))), {
         "ok": True,
         "swing_err_deg": swing_err,
         "non_bucket_err_deg": non_bucket_err,
         "bucket_err_deg": bucket_err,
         "lag_ratio": float(lag_ratio),
         "scale": float(scale),
+        "critical_swing": bool(swing_err > critical_err),
     }
 
 
@@ -22483,6 +22507,7 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
                 f"swing_err={float(lag_report.get('swing_err_deg', 0.0)):.2f}deg",
                 f"joint_err={float(lag_report.get('non_bucket_err_deg', 0.0)):.2f}deg",
                 f"bucket_err={float(lag_report.get('bucket_err_deg', 0.0)):.2f}deg",
+                f"critical_swing={bool(lag_report.get('critical_swing', False))}",
                 force_log=True,
             )
         if frame % freeze_stride == 0:

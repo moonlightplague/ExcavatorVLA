@@ -1,5 +1,7 @@
 import asyncio
 import hashlib
+import importlib
+import importlib.util
 import json
 import math
 import os
@@ -36,6 +38,45 @@ from . import auto_dataset_collect
 from . import ik_calculation
 from . import ik_movement
 from . import trace_showing
+
+
+def _load_optional_joint_space_planner():
+    errors = []
+    candidates = []
+    package_name = str(__package__ or "")
+    if package_name:
+        candidates.append(f"{package_name}.joint_space_planner")
+    candidates.append("excavator_app.joint_space_planner")
+
+    for module_name in dict.fromkeys(candidates):
+        try:
+            return importlib.import_module(module_name), ""
+        except Exception as exc:
+            errors.append(f"{module_name}:{type(exc).__name__}:{exc}")
+
+    module_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "joint_space_planner.py")
+    if os.path.isfile(module_path):
+        try:
+            spec = importlib.util.spec_from_file_location("excavator_app._joint_space_planner_runtime", module_path)
+            if spec is not None and spec.loader is not None:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                return module, ""
+            errors.append("file_spec_unavailable")
+        except Exception as exc:
+            errors.append(f"file:{type(exc).__name__}:{exc}")
+    else:
+        errors.append(f"missing_file:{module_path}")
+
+    return None, "; ".join(errors)
+
+
+joint_space_planner, JOINT_SPACE_PLANNER_IMPORT_ERROR = _load_optional_joint_space_planner()
+if joint_space_planner is None:
+    print(
+        "[INFO] [WARN] joint_space_planner import failed; fallback clearance routes will be used:",
+        JOINT_SPACE_PLANNER_IMPORT_ERROR,
+    )
 
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -159,6 +200,10 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dig_plan_trace_points": [],
     "dig_plan_trace_stage_breaks": [],
     "dig_plan_planning_active": False,
+    "planning_cancel_requested": False,
+    "planning_path_penalty_cache": {},
+    "planning_path_penalty_cache_hits": 0,
+    "planning_path_penalty_cache_misses": 0,
     "dig_plan_planning_version": 0,
     "dig_plan_planning_source": "",
     "dig_plan_best_failure": None,
@@ -216,6 +261,9 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_sample_interval": 0.20,
     "dataset_last_q_cmd": None,
     "dataset_last_q_real": None,
+    "dataset_last_action": None,
+    "dataset_last_dq_real": None,
+    "dataset_last_ddq_real": None,
     "dataset_current_q_goal": None,
     "last_execution_failure_reason": "",
     "dataset_samples": 0,
@@ -253,7 +301,13 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "sand_metrics_last": None,
     "sand_snapshot_last_time": 0.0,
     "sand_snapshot_last": None,
+    "auto_collect_episode_sand_snapshot": None,
+    "auto_collect_episode_sand_snapshot_time": 0.0,
+    "planning_sand_snapshot": None,
+    "planning_sand_snapshot_active": False,
     "sand_perf_last": {},
+    "perf_block_count": 0,
+    "perf_block_last": None,
     "rigid_obstacle_cache_time": 0.0,
     "rigid_obstacle_cache": None,
     "sand_site_stable_reset_done": False,
@@ -338,7 +392,8 @@ FREEZE_MIN_DURATION = 0.45
 FREEZE_SWING_ONLY_MIN_DURATION = 2.25
 FREEZE_BUCKET_CUT_MIN_DURATION = 1.35
 FREEZE_PRINT_INTERVAL = 1.0
-SAND_CONTACT_PHASES = {"insert_cut", "pull_mid_cut", "pull_exit_cut", "curl_to_hold_material"}
+SAND_CONTACT_PHASES = {"insert_cut", "pull_mid_cut", "pull_exit_cut", "curl_to_hold_material", "secure_load"}
+SAND_CUT_GEOMETRY_PHASES = {"insert_cut", "pull_mid_cut", "pull_exit_cut"}
 SAND_CONTACT_BUCKET_PROGRESS_MIN = 80
 SAND_CONTACT_PILE_PROGRESS_MIN = 60
 SAND_CONTACT_TIP_PROGRESS_MIN_M = 0.015
@@ -356,10 +411,18 @@ SAND_CONTACT_ADVANCE_FALLBACK_PILE_MIN = 300
 SAND_CONTACT_MAX_STAGE_WALL_SECONDS = 8.0
 SAND_CONTACT_SPILL_RATIO_MAX = 0.55
 SAND_CONTACT_SPILL_WITHOUT_LOAD_MIN = 140
+SAND_CONTACT_EXIT_LOADED_BUCKET_MIN = 300
+SAND_CONTACT_EXIT_SPILL_RATIO_MAX = 0.80
 CURL_HOLD_MIN_BUCKET_PARTICLES = 80
-CURL_HOLD_ACCEPT_BUCKET_DEG = -82.0
-CURL_HOLD_ACCEPT_MAX_ERR_DEG = 34.0
-CURL_HOLD_TARGET_DEG = -90.0
+CURL_HOLD_ACCEPT_BUCKET_DEG = -110.0
+CURL_HOLD_ACCEPT_MAX_ERR_DEG = 14.0
+CURL_HOLD_TARGET_DEG = -120.0
+BUCKET_LOADED_CLOSED_LIMIT_DEG = CURL_HOLD_TARGET_DEG
+SECURE_HOLD_MAX_SPILL_PARTICLES = 240
+SECURE_HOLD_MAX_SPILL_FRACTION = 0.35
+SECURE_HOLD_MAX_BUCKET_LOSS_FRACTION = 0.45
+SECURE_HOLD_MIN_RETAINED_FROM_CUT_FRACTION = 0.55
+LIFT_CARRY_MIN_RETAINED_FROM_CUT_FRACTION = 0.12
 MANUAL_FREEZE_STOP_ENABLED = True
 AUTO_FREEZE_STOP_ENABLED = True
 
@@ -372,6 +435,7 @@ AUTO_COLLECT_DATASET_ROOT = os.environ.get(
 )
 AUTO_COLLECT_DEFAULT_COUNT = 10
 AUTO_COLLECT_MAX_PLAN_RETRIES = 3
+AUTO_COLLECT_GLOBAL_PLAN_FAILURE_LIMIT = 4
 AUTO_COLLECT_BETWEEN_EPISODE_FRAMES = 90
 AUTO_COLLECT_SAND_RESET_POLICY = "once_per_run_after_home"
 AUTO_COLLECT_REUSE_READY_SAND_RESET = True
@@ -387,12 +451,12 @@ AUTO_COLLECT_TARGET_RADIUS_Y = 0.82
 AUTO_COLLECT_TARGET_DEPTHS = [0.24, 0.32, 0.40, 0.46]
 AUTO_COLLECT_TARGET_MIN_Z = GROUND_TOP_Z + 0.04
 AUTO_COLLECT_TARGET_MAX_Z = 5.00
-AUTO_COLLECT_SCHEMA = "excavator_auto_state_action_v1"
-DATASET_TRAJECTORY_FORMAT = "compact_jsonl_v2"
+AUTO_COLLECT_SCHEMA = "excavator_auto_state_action_v3"
+DATASET_TRAJECTORY_FORMAT = "compact_jsonl_v4"
 DATASET_DEBUG_PLAN_FILE = "plan_debug.json"
 DATASET_DEBUG_TIMELINE_FILE = "debug_timeline.jsonl"
 AUTO_COLLECT_MAX_ATTEMPT_MULTIPLIER = 5
-PLANNER_VERSION = "dig_plan_v3_shared_auto_flatfill"
+PLANNER_VERSION = "dig_plan_v4_joint_space_world_debug"
 QUALITY_GATE_VERSION = "quality_gate_v2_particles_no_freeze"
 AUTO_PREFLIGHT_MIN_PARTICLES = 1000
 AUTO_DIG_GRID_SIZE = 7
@@ -406,8 +470,19 @@ AUTO_DIG_RING_POINTS = [1, 6, 8, 10]
 AUTO_DIG_DEPTH_PRIORITY = [0.22, 0.18, 0.14, 0.10]
 AUTO_DIG_SWEEP_RADIUS = 0.30
 AUTO_DIG_FULL_PLAN_TOPK_PER_RING = 4
+AUTO_DIG_SCORE_WEIGHTS = {
+    "reach": 32.0,
+    "fill": 26.0,
+    "swept_density": 22.0,
+    "depth": 12.0,
+    "center": 10.0,
+    "motion": 6.0,
+    "approach": 8.0,
+}
 AUTO_UNLOAD_GRID_SIZE = 5
-AUTO_UNLOAD_WALL_MARGIN = 0.18
+# Keep the selected landing cell far enough from bin walls for the bucket body,
+# not just the falling sand point.
+AUTO_UNLOAD_WALL_MARGIN = 0.60
 AUTO_UNLOAD_EMPTY_CELL_HEIGHT = -1.0
 AUTO_UNLOAD_FILL_HEIGHT_WEIGHT = 1.0
 AUTO_UNLOAD_CENTER_WEIGHT = 0.12
@@ -473,6 +548,16 @@ DESIRED_LIMITS_DEG = {
     "bucket": (-120.0, 90.0),
 }
 
+# Planner-only limits are narrower than the authored joint limits. They keep
+# route generation away from poses that are technically inside USD limits but
+# repeatedly fail actuator tracking in simulation, such as deep arm tuck near
+# -95 deg during obstacle avoidance.
+PATH_EFFECTIVE_LIMITS_DEG = {
+    "boom": (-70.0, 74.0),
+    "arm": (-89.0, 92.0),
+    "bucket": (-118.0, 88.0),
+}
+
 DQ_MAX = {
     "swing": 1.0,
     "boom": 0.7,
@@ -511,6 +596,11 @@ BUCKET_LIFT_LEVEL_TOL_DEG = 4.0
 BUCKET_CARRY_HOLD_TILT_DEG = 18.0
 BUCKET_CARRY_HOLD_TOL_DEG = 8.0
 BUCKET_CARRY_MIN_POUR_ABOVE_LOAD_Z = 0.08
+BUCKET_CARRY_MAX_DUMP_BRANCH_DEG = 35.0
+BUCKET_CARRY_MAX_ADJUST_DEG = 65.0
+BUCKET_CARRY_SOFT_ADJUST_DEG = 42.0
+BUCKET_CARRY_TRANSITIONAL_MIN_POUR_Z = -0.28
+BUCKET_CARRY_SPILL_RISK_COST = 140.0
 BUCKET_DIG_APPROACH_WORLD_DEG = -52.0
 BUCKET_DIG_INSERT_WORLD_DEG = -78.0
 BUCKET_DIG_PULL_WORLD_DEG = -92.0
@@ -1200,7 +1290,8 @@ def ui_short_text(text, max_chars=UI_STATUS_MAX_CHARS):
 
 
 def apply_speed_to_physx_joint_limits():
-    # Keep joint physics exactly as imported. Speed is handled in software only.
+    # Speed is handled in software only. Joint angle limits are authored by
+    # ensure_joint_limits_are_valid() before the articulation is created.
     get_speed_multiplier()
 
 
@@ -1266,9 +1357,32 @@ def task_alive(task_id):
     )
 
 
+def invalidate_active_task(reason=""):
+    STATE["active_task_id"] = int(STATE.get("active_task_id", 0)) + 1
+    STATE["active_task_name"] = "idle"
+    STATE["sand_contact_stage"] = ""
+    STATE["sand_contact_stage_started"] = 0.0
+    if reason:
+        info_print("[TASK INVALIDATE]", f"reason={reason}")
+
+
+def motion_cancel_requested(task_id=None):
+    if not bool(STATE.get("running", False)):
+        return True
+    if task_id is not None and not task_alive(task_id):
+        return True
+    if bool(STATE.get("auto_collect_stop_requested", False)) and str(STATE.get("dig_plan_planning_source", "")) == "auto_collect":
+        return True
+    if bool(STATE.get("planning_cancel_requested", False)) and str(STATE.get("dig_plan_planning_source", "")) == "auto_collect":
+        return True
+    return False
+
+
 def cancel_registered_task(name, reason=""):
     tasks = STATE.setdefault("async_tasks", {})
     task = tasks.get(str(name))
+    if str(name) in ("planner", "auto_collect"):
+        STATE["planning_cancel_requested"] = True
     if task is None:
         return False
     try:
@@ -3743,19 +3857,105 @@ def compact_unload_drop(report=None):
         return {"ok": False}
     return {
         "ok": bool(report.get("ok", False)),
+        "reason": str(report.get("reason", "")),
         "inside_xy": bool(report.get("inside_xy", False)),
         "above_wall": bool(report.get("above_wall", False)),
         "close_xy": bool(report.get("close_xy", False)),
+        "dx": None if report.get("dx") is None else float(report.get("dx")),
+        "dy": None if report.get("dy") is None else float(report.get("dy")),
         "xy_err": None if report.get("xy_err") is None else float(report.get("xy_err")),
         "source_clearance": None if report.get("source_clearance") is None else float(report.get("source_clearance")),
         "target": vec_list(report.get("target"), 3),
         "landing": vec_list(report.get("landing"), 3),
         "release": vec_list(report.get("release"), 3),
+        "load": vec_list(report.get("load"), 3),
+        "forward_xy": vec_list(report.get("forward_xy"), 2),
         "drift_xy": vec_list(report.get("drift_xy"), 2),
         "drift_distance": None if report.get("drift_distance") is None else float(report.get("drift_distance")),
+        "roll_offset": None if report.get("roll_offset") is None else float(report.get("roll_offset")),
+        "tangential_offset": None if report.get("tangential_offset") is None else float(report.get("tangential_offset")),
         "fall_time": None if report.get("fall_time") is None else float(report.get("fall_time")),
+        "height_above_wall": None if report.get("height_above_wall") is None else float(report.get("height_above_wall")),
+        "lip_span_xy": None if report.get("lip_span_xy") is None else float(report.get("lip_span_xy")),
         "bucket_delta_deg": None if report.get("bucket_delta_deg") is None else float(report.get("bucket_delta_deg")),
+        "bin_center": vec_list(report.get("bin_center"), 3),
+        "safe_half": vec_list(report.get("safe_half"), 2),
+        "source": str(report.get("source", "")),
     }
+
+
+def stage_constraint_summary(row):
+    if not isinstance(row, dict):
+        return {}
+    motion = row.get("motion") if isinstance(row.get("motion"), dict) else {}
+    path = row.get("path") if isinstance(row.get("path"), dict) else {}
+    front = row.get("front_edge") if isinstance(row.get("front_edge"), dict) else {}
+    hold = row.get("material_hold") if isinstance(row.get("material_hold"), dict) else {}
+    drop = row.get("drop") if isinstance(row.get("drop"), dict) else {}
+    clearance = row.get("clearance_route") if isinstance(row.get("clearance_route"), dict) else {}
+
+    out = {
+        "stage_cost": None if row.get("stage_cost") is None else float(row.get("stage_cost")),
+        "motion_cost": None if motion.get("cost") is None else float(motion.get("cost")),
+        "weighted_angle": None if motion.get("weighted_angle") is None else float(motion.get("weighted_angle")),
+        "estimated_time": None if motion.get("estimated_time") is None else float(motion.get("estimated_time")),
+        "joint_delta_deg": motion.get("joint_delta_deg", []),
+        "path_penalty": None if path.get("path_penalty") is None else float(path.get("path_penalty")),
+        "phase_ok": bool(path.get("phase_ok", True)),
+        "obstacle_ok": bool(path.get("obstacle_ok", True)),
+        "route_inserted": bool(path.get("route_inserted", clearance.get("inserted", False))),
+        "route_waypoints": int(path.get("route_waypoints", clearance.get("waypoints", 0)) or 0),
+        "phase_reason": str(path.get("phase_reason", "")),
+        "obstacle_reason": str(path.get("obstacle_reason", "")),
+    }
+    if front:
+        out["front_edge"] = {
+            "ok": bool(front.get("ok", False)),
+            "reason": str(front.get("reason", "")),
+            "tip_depth": front.get("tip_depth"),
+            "bucket_mid_depth": front.get("bucket_mid_depth"),
+            "pour_depth": front.get("pour_depth"),
+            "load_depth": front.get("load_depth"),
+            "surface_source": front.get("surface_source"),
+        }
+    if hold:
+        carry_report = hold.get("carry_report") if isinstance(hold.get("carry_report"), dict) else {}
+        carry_retains = hold.get(
+            "carry_retains_material",
+            hold.get("retains_material", carry_report.get("retains_material", False)),
+        )
+        out["material_hold"] = {
+            "bucket_closed_ok": bool(hold.get("bucket_closed_ok", True)),
+            "carry_retains_material": bool(carry_retains),
+            "pour_above_load_z": carry_report.get("pour_above_load_z", hold.get("pour_above_load_z")),
+            "target_world_deg": carry_report.get("target_world_deg", hold.get("target_world_deg")),
+            "actual_world_deg": carry_report.get("actual_world_deg", hold.get("actual_world_deg")),
+            "world_err_deg": carry_report.get("world_err_deg", hold.get("world_err_deg")),
+        }
+    if drop:
+        out["unload_drop"] = {
+            "ok": bool(drop.get("ok", False)),
+            "inside_xy": bool(drop.get("inside_xy", False)),
+            "close_xy": bool(drop.get("close_xy", False)),
+            "above_wall": bool(drop.get("above_wall", False)),
+            "xy_err": drop.get("xy_err"),
+            "source_clearance": drop.get("source_clearance"),
+            "drift_distance": drop.get("drift_distance"),
+            "fall_time": drop.get("fall_time"),
+        }
+    flags = []
+    if not out["phase_ok"]:
+        flags.append("phase_path_risk")
+    if not out["obstacle_ok"]:
+        flags.append("rigid_obstacle_risk")
+    if out.get("front_edge") and not out["front_edge"].get("ok", False):
+        flags.append("bad_cut_front_edge")
+    if out.get("material_hold") and not out["material_hold"].get("carry_retains_material", False):
+        flags.append("carry_spill_risk")
+    if out.get("unload_drop") and not out["unload_drop"].get("ok", False):
+        flags.append("unload_drop_risk")
+    out["flags"] = flags
+    return out
 
 
 def compact_plan_stage(row):
@@ -3767,6 +3967,7 @@ def compact_plan_stage(row):
         "required": bool(row.get("required", False)),
         "target": vec_list(row.get("target_point"), 3),
     }
+    out["collision_context"] = phase_collision_context(out["phase"])
     if row.get("q_goal_deg") is not None:
         out["q_goal_deg"] = row.get("q_goal_deg")
     if row.get("q_dump_deg") is not None:
@@ -3777,12 +3978,90 @@ def compact_plan_stage(row):
         out["drop"] = row.get("drop")
     if row.get("reason"):
         out["reason"] = str(row.get("reason"))
+    if row.get("route_source"):
+        out["route_source"] = str(row.get("route_source"))
+    if row.get("route_reason"):
+        out["route_reason"] = str(row.get("route_reason"))
+    if row.get("route_index") is not None:
+        out["route_index"] = int(row.get("route_index"))
+    if row.get("route_count") is not None:
+        out["route_count"] = int(row.get("route_count"))
+    if row.get("clearance_route") is not None:
+        out["clearance_route"] = row.get("clearance_route")
+    if row.get("path") is not None:
+        path = row.get("path")
+        if isinstance(path, dict):
+            out["path"] = {
+                "phase_ok": bool(path.get("phase_ok", True)),
+                "obstacle_ok": bool(path.get("obstacle_ok", True)),
+                "phase_reason": str(path.get("phase_reason", "")),
+                "obstacle_reason": str(path.get("obstacle_reason", "")),
+                "route_inserted": bool(path.get("route_inserted", False)),
+                "route_waypoints": int(path.get("route_waypoints", 0) or 0),
+                "route_reason": str(path.get("route_reason", "")),
+            }
+    constraints = stage_constraint_summary(row)
+    if constraints:
+        out["constraint_summary"] = constraints
     return out
+
+
+def route_diagnostics_from_stages(stages):
+    rows = []
+    if not isinstance(stages, list):
+        return rows
+    for idx, stage in enumerate(stages):
+        if not isinstance(stage, dict):
+            continue
+        phase = str(stage.get("phase", ""))
+        is_route = phase.startswith("clearance_route")
+        clearance = stage.get("clearance_route") if isinstance(stage.get("clearance_route"), dict) else None
+        if not is_route and not clearance:
+            continue
+        row = {
+            "stage_index": int(idx),
+            "phase": phase,
+            "route_source": str(stage.get("route_source", "")),
+            "route_reason": str(stage.get("route_reason", "")),
+            "route_index": None if stage.get("route_index") is None else int(stage.get("route_index")),
+            "route_count": None if stage.get("route_count") is None else int(stage.get("route_count")),
+            "target_point": vec_list(stage.get("target_point"), 3),
+            "q_goal_deg": stage.get("q_goal_deg"),
+            "duration": None if stage.get("duration") is None else float(stage.get("duration")),
+            "motion": stage.get("motion", {}),
+            "path": stage.get("path", {}),
+        }
+        if clearance:
+            row["clearance_route"] = clearance
+        rows.append(row)
+    return rows
+
+
+def unload_ballistics_from_stages(stages):
+    if not isinstance(stages, list):
+        return {}
+    for idx, stage in enumerate(stages):
+        if not isinstance(stage, dict):
+            continue
+        phase = str(stage.get("phase", ""))
+        if not phase.startswith("unload"):
+            continue
+        drop = stage.get("drop")
+        if not isinstance(drop, dict):
+            continue
+        out = dict(drop)
+        out["stage_index"] = int(idx)
+        out["phase"] = phase
+        out["drop_alignment_ready"] = bool(stage.get("drop_alignment_ready", False))
+        out["drop_alignment_policy"] = str(stage.get("drop_alignment_policy", ""))
+        return out
+    return {}
 
 
 def compact_plan_candidate(row, include_stages=False):
     if not isinstance(row, dict):
         return {}
+    stages = row.get("stages", [])
     out = {
         "id": str(row.get("id", "")),
         "planned": bool(row.get("planned", False)),
@@ -3799,10 +4078,209 @@ def compact_plan_candidate(row, include_stages=False):
         "estimated_time": None if row.get("estimated_time") is None else float(row.get("estimated_time")),
         "unload_point_xyz": vec_list(row.get("unload_point_xyz"), 3),
         "unload_landing_xyz": vec_list(row.get("unload_landing_xyz"), 3),
+        "dig_primitive": row.get("dig_primitive", {}),
+        "route_diagnostics": row.get("route_diagnostics", []),
+        "unload_ballistics": row.get("unload_ballistics", {}) or unload_ballistics_from_stages(stages),
+        "fsm_contract": row.get("fsm_contract", {}),
     }
     if include_stages:
-        out["stages"] = [compact_plan_stage(x) for x in row.get("stages", [])]
+        out["stages"] = [compact_plan_stage(x) for x in stages]
     return out
+
+
+def compact_dig_primitive_params(candidate):
+    candidate = candidate if isinstance(candidate, dict) else {}
+    keys = [
+        "id",
+        "surface_z",
+        "depth_candidate",
+        "approach_offset",
+        "pre_z",
+        "contact_z",
+        "insert_depth",
+        "mid_pull",
+        "mid_depth",
+        "exit_pull",
+        "exit_depth",
+        "exit_lift_z",
+        "curl_z",
+        "lift_height",
+        "unload_height_delta",
+        "unload_dump_deg",
+        "bucket_attack_world",
+        "bucket_cut_world",
+        "bucket_mid_cut_world",
+        "bucket_exit_world",
+        "bucket_curl",
+        "curl_boom_lift_deg",
+    ]
+    out = {}
+    for key in keys:
+        if key in candidate:
+            value = candidate.get(key)
+            if isinstance(value, (int, float, np.integer, np.floating)):
+                out[key] = float(value) if key != "id" else str(value)
+            else:
+                out[key] = value
+    return out
+
+
+DIG_PLAN_REQUIRED_PHASE_ORDER = [
+    "pre_dig",
+    "approach_contact",
+    "insert_cut",
+    "pull_mid_cut",
+    "pull_exit_cut",
+    "curl_to_hold_material",
+    "secure_load",
+    "lift_carry",
+    "unload_to_bin",
+]
+
+
+def dig_plan_semantic_phase_name(phase):
+    text = str(phase).lower()
+    if text.startswith("clearance_route"):
+        return "clearance_route"
+    idx = dataset_phase_index(text)
+    if 0 <= idx < len(DATASET_PHASE_NAMES):
+        return DATASET_PHASE_NAMES[idx]
+    return text
+
+
+def validate_dig_plan_contract(seq=None, points=None, stages=None, trace_points=None):
+    seq = [] if seq is None else list(seq)
+    points = [] if points is None else list(points)
+    stages = [] if stages is None else list(stages)
+    trace_points = [] if trace_points is None else list(trace_points)
+
+    if stages:
+        raw_phases = [str(stage.get("phase", "")) for stage in stages if isinstance(stage, dict)]
+    else:
+        raw_phases = [str(item[0]) for item in seq if isinstance(item, (list, tuple)) and len(item) >= 1]
+
+    semantic = [dig_plan_semantic_phase_name(phase) for phase in raw_phases]
+    main_semantic = [phase for phase in semantic if phase != "clearance_route"]
+    unknown = [
+        phase
+        for phase, sem in zip(raw_phases, semantic)
+        if sem not in DATASET_PHASE_NAMES and sem != "clearance_route"
+    ]
+
+    reasons = []
+    warnings = []
+    if not seq:
+        reasons.append("empty_sequence")
+    if not main_semantic:
+        reasons.append("empty_semantic_sequence")
+
+    cursor = 0
+    missing = []
+    out_of_order = []
+    for required in DIG_PLAN_REQUIRED_PHASE_ORDER:
+        try:
+            found = main_semantic.index(required, cursor)
+            cursor = found + 1
+        except ValueError:
+            missing.append(required)
+    if missing:
+        reasons.append("missing_required_phases:" + ",".join(missing))
+
+    required_positions = {
+        phase: main_semantic.index(phase)
+        for phase in DIG_PLAN_REQUIRED_PHASE_ORDER
+        if phase in main_semantic
+    }
+    for a, b in zip(DIG_PLAN_REQUIRED_PHASE_ORDER[:-1], DIG_PLAN_REQUIRED_PHASE_ORDER[1:]):
+        if a in required_positions and b in required_positions and required_positions[a] > required_positions[b]:
+            out_of_order.append(f"{a}>{b}")
+    if out_of_order:
+        reasons.append("out_of_order:" + ",".join(out_of_order))
+
+    if unknown:
+        reasons.append("unknown_phases:" + ",".join(unknown[:6]))
+
+    route_count = sum(1 for phase in semantic if phase == "clearance_route")
+    unload_stage = None
+    for stage in stages:
+        if isinstance(stage, dict) and str(stage.get("phase", "")).startswith("unload"):
+            unload_stage = stage
+            break
+    unload_dump_embedded = bool(isinstance(unload_stage, dict) and unload_stage.get("q_dump_deg") is not None)
+    if not unload_dump_embedded:
+        warnings.append("unload_dump_not_embedded_in_unload_stage")
+
+    if points and seq and len(points) != len(seq):
+        warnings.append(f"points_sequence_count_mismatch:{len(points)}!={len(seq)}")
+    if not trace_points:
+        warnings.append("empty_trace_points")
+
+    blocked_direct_paths = []
+    for idx, stage in enumerate(stages):
+        if not isinstance(stage, dict):
+            continue
+        path = stage.get("path")
+        if not isinstance(path, dict):
+            continue
+        phase_ok = bool(path.get("phase_ok", True))
+        obstacle_ok = bool(path.get("obstacle_ok", True))
+        route_inserted = bool(path.get("route_inserted", False))
+        if (not phase_ok or not obstacle_ok) and not route_inserted:
+            blocked_direct_paths.append(
+                {
+                    "stage_index": int(idx),
+                    "phase": str(stage.get("phase", "")),
+                    "phase_ok": phase_ok,
+                    "obstacle_ok": obstacle_ok,
+                    "phase_reason": str(path.get("phase_reason", "")),
+                    "obstacle_reason": str(path.get("obstacle_reason", "")),
+                }
+            )
+    if blocked_direct_paths:
+        warnings.append(f"blocked_direct_paths_without_route:{len(blocked_direct_paths)}")
+
+    constraint_flags = []
+    constraint_rows = []
+    for idx, stage in enumerate(stages):
+        if not isinstance(stage, dict):
+            continue
+        summary = stage.get("constraint_summary")
+        if not isinstance(summary, dict):
+            summary = stage_constraint_summary(stage)
+        flags = summary.get("flags", []) if isinstance(summary, dict) else []
+        if flags:
+            constraint_flags.extend(str(flag) for flag in flags)
+            constraint_rows.append(
+                {
+                    "stage_index": int(idx),
+                    "phase": str(stage.get("phase", "")),
+                    "flags": [str(flag) for flag in flags],
+                    "stage_cost": summary.get("stage_cost"),
+                    "weighted_angle": summary.get("weighted_angle"),
+                    "path_penalty": summary.get("path_penalty"),
+                }
+            )
+
+    return {
+        "ok": len(reasons) == 0,
+        "reasons": reasons,
+        "warnings": warnings,
+        "required_order": list(DIG_PLAN_REQUIRED_PHASE_ORDER),
+        "raw_phases": raw_phases,
+        "semantic_phases": semantic,
+        "main_semantic_phases": main_semantic,
+        "missing": missing,
+        "unknown": unknown,
+        "route_count": int(route_count),
+        "unload_dump_embedded": bool(unload_dump_embedded),
+        "stage_count": int(len(seq)),
+        "semantic_stage_count": int(len(main_semantic)),
+        "point_count": int(len(points)),
+        "trace_point_count": int(len(trace_points)),
+        "blocked_direct_paths": blocked_direct_paths[:6],
+        "constraint_flags": sorted(set(constraint_flags)),
+        "constraint_flagged_stages": constraint_rows[:10],
+    }
 
 
 DATASET_STATE_NAMES = [
@@ -3827,6 +4305,19 @@ DATASET_ACTION_NAMES = [
     "boom_cmd_velocity",
     "arm_cmd_velocity",
     "bucket_cmd_velocity",
+]
+
+DATASET_PHASE_NAMES = [
+    "pre_dig",
+    "approach_contact",
+    "insert_cut",
+    "pull_mid_cut",
+    "pull_exit_cut",
+    "curl_to_hold_material",
+    "secure_load",
+    "lift_carry",
+    "unload_to_bin",
+    "unload_dump",
 ]
 
 
@@ -4027,6 +4518,10 @@ def planner_config_snapshot():
     return {
         "planner_version": PLANNER_VERSION,
         "dig_plan_max_build_seconds": DIG_PLAN_MAX_BUILD_SECONDS,
+        "auto_collect_candidate_plan_seconds": AUTO_COLLECT_CANDIDATE_PLAN_SECONDS,
+        "auto_collect_candidate_hard_budget_grace_seconds": AUTO_COLLECT_CANDIDATE_HARD_BUDGET_GRACE_SECONDS,
+        "auto_collect_find_plan_max_seconds": AUTO_COLLECT_FIND_PLAN_MAX_SECONDS,
+        "planning_path_penalty_cache_max": PLANNING_PATH_PENALTY_CACHE_MAX,
         "dig_plan_max_candidates": DIG_PLAN_MAX_CANDIDATES,
         "dig_plan_beam_size": DIG_PLAN_BEAM_SIZE,
         "dig_plan_topk_ik": DIG_PLAN_TOPK_IK,
@@ -4046,7 +4541,21 @@ def planner_config_snapshot():
         "auto_dig_depth_priority": list(AUTO_DIG_DEPTH_PRIORITY),
         "auto_dig_sweep_radius": AUTO_DIG_SWEEP_RADIUS,
         "auto_dig_full_plan_topk_per_ring": AUTO_DIG_FULL_PLAN_TOPK_PER_RING,
+        "auto_dig_score_weights": dict(AUTO_DIG_SCORE_WEIGHTS),
         "auto_unload_grid_size": AUTO_UNLOAD_GRID_SIZE,
+        "path_rrt_max_iters": PATH_RRT_MAX_ITERS,
+        "path_rrt_step_deg": PATH_RRT_STEP_DEG,
+        "path_rrt_goal_bias": PATH_RRT_GOAL_BIAS,
+        "path_rrt_joint_weights": list(PATH_RRT_JOINT_WEIGHTS),
+        "path_rrt_smooth_rounds": PATH_RRT_SMOOTH_ROUNDS,
+        "path_rrt_smooth_alpha": PATH_RRT_SMOOTH_ALPHA,
+        "path_rrt_smooth_bend_weight": PATH_RRT_SMOOTH_BEND_WEIGHT,
+        "path_rrt_smooth_min_improvement": PATH_RRT_SMOOTH_MIN_IMPROVEMENT,
+        "path_link_collision_segment_samples": PATH_LINK_COLLISION_SEGMENT_SAMPLES,
+        "path_link_collision_radius_m": PATH_LINK_COLLISION_RADIUS_M,
+        "collision_world_policy": "rigid_hard_avoid__sand_soft_contact",
+        "rigid_obstacle_paths": [str(x) for x in PATH_RIGID_OBSTACLE_PATHS],
+        "obstacle_exclude_tokens": [str(x) for x in PATH_OBSTACLE_EXCLUDE_TOKENS],
     }
 
 
@@ -4069,6 +4578,7 @@ def auto_dataset_config_snapshot():
         "default_count": AUTO_COLLECT_DEFAULT_COUNT,
         "max_attempt_multiplier": AUTO_COLLECT_MAX_ATTEMPT_MULTIPLIER,
         "max_plan_retries": AUTO_COLLECT_MAX_PLAN_RETRIES,
+        "global_plan_failure_limit": AUTO_COLLECT_GLOBAL_PLAN_FAILURE_LIMIT,
         "target_center": vec_list(AUTO_COLLECT_TARGET_CENTER, 3),
         "target_radius_x": AUTO_COLLECT_TARGET_RADIUS_X,
         "target_radius_y": AUTO_COLLECT_TARGET_RADIUS_Y,
@@ -4327,6 +4837,12 @@ def sand_snapshot_density_count(snapshot, x, y, radius):
 def get_sand_snapshot(force=False, label="", max_age=None):
     now = time.time()
     max_age = float(SAND_SNAPSHOT_MAX_AGE if max_age is None else max_age)
+    if not force and bool(STATE.get("planning_sand_snapshot_active", False)):
+        planning_snapshot = STATE.get("planning_sand_snapshot")
+        if isinstance(planning_snapshot, dict):
+            created_at = float(planning_snapshot.get("created_at", 0.0) or 0.0)
+            if now - created_at <= max_age:
+                return planning_snapshot
     cached = STATE.get("sand_snapshot_last")
     if (
         not force
@@ -4900,6 +5416,35 @@ def is_sand_contact_phase(mode):
     return any(phase in m for phase in SAND_CONTACT_PHASES)
 
 
+def is_sand_cut_geometry_phase(mode):
+    m = str(mode).lower()
+    return any(phase in m for phase in SAND_CUT_GEOMETRY_PHASES)
+
+
+def phase_collision_context(mode):
+    m = str(mode).lower()
+    if is_sand_contact_phase(m) or "curl_to_hold_material" in m:
+        return {
+            "phase_class": "material_interaction",
+            "rigid_policy": "hard_avoid",
+            "sand_policy": "soft_contact_progress",
+            "strict_path_precheck": False,
+        }
+    if "dump" in m:
+        return {
+            "phase_class": "unload_release",
+            "rigid_policy": "hard_avoid",
+            "sand_policy": "ballistic_release_scored",
+            "strict_path_precheck": False,
+        }
+    return {
+        "phase_class": "rigid_free_space",
+        "rigid_policy": "hard_avoid",
+        "sand_policy": "ignored_for_collision",
+        "strict_path_precheck": True,
+    }
+
+
 def sand_contact_snapshot(force=False):
     metrics = sand_metrics_current(force=force)
     try:
@@ -5107,6 +5652,59 @@ def sand_contact_should_suppress_freeze(stage_name, blocked_names, cmd_err_deg, 
     return True, report
 
 
+def secure_hold_spill_report(stage_name, report, bucket_loaded=None):
+    stage_l = str(stage_name).lower()
+    if "curl_to_hold_material" not in stage_l and "secure_load" not in stage_l:
+        return {
+            "ok": True,
+            "reason": "not_secure_hold_stage",
+        }
+    report = report if isinstance(report, dict) else {}
+    bucket_total = int(report.get("total_bucket_delta", 0) or 0)
+    spill_total = max(0, int(report.get("total_spill_delta", 0) or 0))
+    current_bucket = int(report.get("bucket", 0) or 0)
+    if bucket_loaded is None:
+        bucket_loaded = current_bucket
+    bucket_loaded = max(0, int(bucket_loaded or 0))
+    bucket_loss = max(0, -bucket_total)
+    spill_limit = max(
+        int(SECURE_HOLD_MAX_SPILL_PARTICLES),
+        int(float(bucket_loaded) * float(SECURE_HOLD_MAX_SPILL_FRACTION)),
+    )
+    loss_limit = max(
+        int(CURL_HOLD_MIN_BUCKET_PARTICLES),
+        int(float(max(bucket_loaded, current_bucket)) * float(SECURE_HOLD_MAX_BUCKET_LOSS_FRACTION)),
+    )
+    moved = max(1, max(0, bucket_total) + spill_total)
+    spill_ratio = float(spill_total) / float(moved)
+    ok = spill_total <= spill_limit and bucket_loss <= loss_limit
+    cut_report = secure_phase_delta_report(current_metrics=None)
+    cut_ok = True
+    if isinstance(cut_report, dict) and cut_report.get("baseline") == "after_cut":
+        cut_ok = bool(cut_report.get("ok", True))
+        if not cut_ok:
+            ok = False
+    reason = "ok" if ok else (
+        f"secure_spill_or_loss_too_high spill={spill_total}/{spill_limit} "
+        f"bucket_loss={bucket_loss}/{loss_limit} spill_ratio={spill_ratio:.2f}"
+    )
+    if not ok and not cut_ok:
+        reason = str(cut_report.get("reason", reason))
+    return {
+        "ok": bool(ok),
+        "reason": reason,
+        "bucket_total_delta": int(bucket_total),
+        "bucket_loss": int(bucket_loss),
+        "bucket_loss_limit": int(loss_limit),
+        "spill_total_delta": int(spill_total),
+        "spill_limit": int(spill_limit),
+        "spill_ratio": float(spill_ratio),
+        "bucket_loaded": int(bucket_loaded),
+        "current_bucket": int(current_bucket),
+        "cut_baseline": cut_report,
+    }
+
+
 def sand_contact_stage_can_advance(q_goal, label="", mode="auto", seconds_eff=0.0):
     stage_name = str(label or mode)
     if not is_sand_contact_phase(stage_name):
@@ -5132,17 +5730,29 @@ def sand_contact_stage_can_advance(q_goal, label="", mode="auto", seconds_eff=0.
         return False
 
     max_err = max(err_deg) if err_deg else 0.0
-    if "curl_to_hold_material" in stage_name:
+    if "curl_to_hold_material" in stage_name or "secure_load" in stage_name:
         bucket_idx = CTRL.name_to_idx.get("bucket", 3)
         bucket_real_deg = rad_to_deg(float(q_real[bucket_idx]))
+        retain_report = carry_material_report_for_q(q_real, end_effector="load")
+        retains_material = bool(retain_report.get("retains_material", False))
         metrics = sand_metrics_current(force=True)
         bucket_loaded = int(metrics.get("bucket_from_pile_count", 0) or 0) if isinstance(metrics, dict) else 0
         bucket_err = float(err_deg[bucket_idx]) if len(err_deg) > bucket_idx else float(max_err)
+        real_loaded_hold = real_loaded_secure_hold_allowed(retain_report, loaded_count=bucket_loaded)
         if (
             bucket_loaded >= CURL_HOLD_MIN_BUCKET_PARTICLES
-            and bucket_real_deg <= CURL_HOLD_ACCEPT_BUCKET_DEG
+            and (retains_material or real_loaded_hold)
             and bucket_err <= CURL_HOLD_ACCEPT_MAX_ERR_DEG
         ):
+            hold_spill = secure_hold_spill_report(stage_name, report, bucket_loaded=bucket_loaded)
+            if not bool(hold_spill.get("ok", False)):
+                info_print(
+                    "[SECURE HOLD WAIT]",
+                    f"stage={stage_name}",
+                    hold_spill.get("reason", "secure hold spill gate failed"),
+                    f"bucket_loaded={bucket_loaded}",
+                )
+                return False
             info_print(
                 "[CURL HOLD DONE]",
                 f"stage={stage_name}",
@@ -5150,7 +5760,8 @@ def sand_contact_stage_can_advance(q_goal, label="", mode="auto", seconds_eff=0.
                 f"bucket_real={bucket_real_deg:.2f}deg",
                 f"bucket_err={bucket_err:.2f}deg",
                 f"bucket_loaded={bucket_loaded}",
-                "reason=loaded_bucket_closed_enough",
+                f"pour_above_load_z={fmt_optional(retain_report.get('pour_above_load_z'))}",
+                "reason=loaded_bucket_retaining_geometry" if retains_material else "reason=real_loaded_bucket_hold",
             )
             return True
 
@@ -5160,24 +5771,27 @@ def sand_contact_stage_can_advance(q_goal, label="", mode="auto", seconds_eff=0.
     bucket_total = int(report.get("total_bucket_delta", 0))
     pile_total = int(report.get("total_pile_delta", 0))
     spill_total = int(report.get("total_spill_delta", 0))
+    current_bucket = int(report.get("bucket", 0) or 0)
     moved_material = max(1, bucket_total + spill_total)
     spill_ratio = float(spill_total) / float(moved_material)
+    exit_loaded = "pull_exit_cut" in str(stage_name) and current_bucket >= CURL_HOLD_MIN_BUCKET_PARTICLES
     material_progress = (
         bucket_total >= SAND_CONTACT_BUCKET_PROGRESS_MIN
         or (pile_total >= SAND_CONTACT_PILE_PROGRESS_MIN and spill_ratio <= SAND_CONTACT_SPILL_RATIO_MAX)
     )
     tip_progress = float(report.get("total_tip_delta", 0.0) or 0.0) >= SAND_CONTACT_ACCEPT_TIP_PROGRESS_MIN_M
     q_close_enough = float(max_err) <= SAND_CONTACT_Q_LAG_ACCEPT_DEG
-    if material_progress or (tip_progress and q_close_enough) or q_close_enough:
+    if material_progress or (exit_loaded and (tip_progress or q_close_enough)) or (tip_progress and q_close_enough) or q_close_enough:
         info_print(
             "[SAND CONTACT DONE]",
             f"stage={stage_name}",
             f"elapsed={elapsed:.2f}s",
             f"max_err={max_err:.2f}deg",
+            f"bucket_now={current_bucket}",
             f"bucket_total=+{int(report.get('total_bucket_delta', 0))}",
             f"pile_total=-{int(report.get('total_pile_delta', 0))}",
             f"tip_total={float(report.get('total_tip_delta', 0.0) or 0.0):.3f}m",
-            "reason=material_progress_or_compliant_arrival",
+            "reason=loaded_exit_or_material_progress",
         )
         return True
     return False
@@ -5215,26 +5829,37 @@ def sand_contact_stage_should_advance(stage_name, report, q_cmd=None, q_real=Non
     bucket_total = int(report.get("total_bucket_delta", 0) or 0)
     pile_total = int(report.get("total_pile_delta", 0) or 0)
     spill_total = int(report.get("total_spill_delta", 0) or 0)
+    current_bucket = int(report.get("bucket", 0) or 0)
     tip_total = float(report.get("total_tip_delta", 0.0) or 0.0)
-    if "curl_to_hold_material" in str(stage_name):
+    if "curl_to_hold_material" in str(stage_name) or "secure_load" in str(stage_name):
         try:
             bucket_idx = CTRL.name_to_idx.get("bucket", 3)
             bucket_real_deg = rad_to_deg(float(q_real[bucket_idx])) if q_real is not None else 999.0
             bucket_err = abs(rad_to_deg(wrap_angle(float(q_cmd[bucket_idx]) - float(q_real[bucket_idx])))) if q_cmd is not None and q_real is not None else max_err
+            retain_report = carry_material_report_for_q(q_real if q_real is not None else q_cmd, end_effector="load")
+            retains_material = bool(retain_report.get("retains_material", False))
         except Exception:
             bucket_real_deg = 999.0
             bucket_err = max_err
+            retain_report = {}
+            retains_material = False
         metrics = sand_metrics_current(force=True)
         bucket_loaded = int(metrics.get("bucket_from_pile_count", 0) or 0) if isinstance(metrics, dict) else 0
+        real_loaded_hold = real_loaded_secure_hold_allowed(retain_report, loaded_count=bucket_loaded)
         if (
             bucket_loaded >= CURL_HOLD_MIN_BUCKET_PARTICLES
-            and bucket_real_deg <= CURL_HOLD_ACCEPT_BUCKET_DEG
+            and (retains_material or real_loaded_hold)
             and bucket_err <= CURL_HOLD_ACCEPT_MAX_ERR_DEG
         ):
+            hold_spill = secure_hold_spill_report(stage_name, report, bucket_loaded=bucket_loaded)
+            if not bool(hold_spill.get("ok", False)):
+                return False, str(hold_spill.get("reason", "secure hold spill gate failed"))
             return True, (
-                f"loaded_bucket_closed_enough elapsed={elapsed:.2f}s "
+                f"loaded_bucket_retaining_geometry elapsed={elapsed:.2f}s "
                 f"bucket_real={bucket_real_deg:.2f}deg bucket_err={bucket_err:.2f}deg "
-                f"bucket_loaded={bucket_loaded}"
+                f"bucket_loaded={bucket_loaded} "
+                f"pour_above_load_z={fmt_optional(retain_report.get('pour_above_load_z'))} "
+                f"hold_source={'geometry' if retains_material else 'real_loaded'}"
             )
 
     bad_cut, _bad_reason = sand_contact_bad_cut_geometry(stage_name, report)
@@ -5242,14 +5867,16 @@ def sand_contact_stage_should_advance(stage_name, report, q_cmd=None, q_real=Non
         return False, ""
     moved_material = max(1, bucket_total + spill_total)
     spill_ratio = float(spill_total) / float(moved_material)
+    exit_loaded = "pull_exit_cut" in str(stage_name) and current_bucket >= CURL_HOLD_MIN_BUCKET_PARTICLES
 
     if (
         bucket_total >= SAND_CONTACT_ADVANCE_BUCKET_MIN
         or (pile_total >= SAND_CONTACT_ADVANCE_PILE_MIN and spill_ratio <= SAND_CONTACT_SPILL_RATIO_MAX)
         or (tip_total >= SAND_CONTACT_ADVANCE_TIP_MIN_M and bucket_total >= SAND_CONTACT_BUCKET_PROGRESS_MIN)
+        or (exit_loaded and tip_total >= SAND_CONTACT_ACCEPT_TIP_PROGRESS_MIN_M)
     ):
         return True, (
-            f"material_progress elapsed={elapsed:.2f}s bucket={bucket_total} "
+            f"loaded_exit_or_material_progress elapsed={elapsed:.2f}s bucket_now={current_bucket} bucket={bucket_total} "
             f"pile={pile_total} tip={tip_total:.3f}m spill={spill_total} spill_ratio={spill_ratio:.2f} "
             f"max_err={max_err:.2f}deg boom_err={boom_err:.2f}deg"
         )
@@ -5271,18 +5898,24 @@ def sand_contact_stage_should_advance(stage_name, report, q_cmd=None, q_real=Non
 def sand_contact_bad_cut_geometry(stage_name, report):
     if not is_sand_contact_phase(stage_name) or not isinstance(report, dict):
         return False, ""
-    if "curl_to_hold_material" in str(stage_name):
+    if not is_sand_cut_geometry_phase(stage_name):
         return False, ""
     bucket_total = int(report.get("total_bucket_delta", 0) or 0)
     pile_total = int(report.get("total_pile_delta", 0) or 0)
     spill_total = int(report.get("total_spill_delta", 0) or 0)
+    current_bucket = int(report.get("bucket", 0) or 0)
+    if current_bucket >= max(int(CURL_HOLD_MIN_BUCKET_PARTICLES), int(SAND_CONTACT_BUCKET_PROGRESS_MIN)):
+        return False, ""
     if spill_total < SAND_CONTACT_SPILL_WITHOUT_LOAD_MIN:
         return False, ""
     moved_material = max(1, bucket_total + spill_total)
     spill_ratio = float(spill_total) / float(moved_material)
+    if "pull_exit_cut" in str(stage_name):
+        if current_bucket >= CURL_HOLD_MIN_BUCKET_PARTICLES:
+            return False, ""
     if bucket_total <= max(8, int(SAND_CONTACT_BUCKET_PROGRESS_MIN * 0.25)) and spill_ratio > SAND_CONTACT_SPILL_RATIO_MAX:
         return True, (
-            f"spilling_without_loading bucket={bucket_total} pile={pile_total} "
+            f"spilling_without_loading bucket={bucket_total} bucket_now={current_bucket} pile={pile_total} "
             f"spill={spill_total} spill_ratio={spill_ratio:.2f}"
         )
     return False, ""
@@ -5329,12 +5962,7 @@ def dataset_action_from_q(q_cmd, now):
 
     q_prev = np.array(q_prev, dtype=np.float32)
     dt = max(1e-4, float(now) - t_prev)
-    dq = q_cmd - q_prev
-    try:
-        swing_idx = CTRL.name_to_idx["swing"]
-        dq[swing_idx] = swing_delta(q_cmd[swing_idx], q_prev[swing_idx])
-    except Exception:
-        pass
+    dq = dataset_q_delta(q_cmd, q_prev)
     STATE["dataset_last_q_cmd"] = q_cmd.copy()
     return [float(x) for x in (dq / dt)]
 
@@ -5349,14 +5977,67 @@ def dataset_joint_velocity_from_real(q_real, now):
 
     q_prev = np.array(q_prev, dtype=np.float32)
     dt = max(1e-4, float(now) - t_prev)
-    dq = q_real - q_prev
-    try:
-        swing_idx = CTRL.name_to_idx["swing"]
-        dq[swing_idx] = swing_delta(q_real[swing_idx], q_prev[swing_idx])
-    except Exception:
-        pass
+    dq = dataset_q_delta(q_real, q_prev)
     STATE["dataset_last_q_real"] = q_real.copy()
     return [float(x) for x in (dq / dt)]
+
+
+def dataset_motion_derivatives(q_cmd, q_real, now):
+    q_cmd = np.array(q_cmd, dtype=np.float32).reshape(-1)[:4]
+    q_real = np.array(q_real, dtype=np.float32).reshape(-1)[:4]
+    t_prev = float(STATE.get("dataset_last_sample_time", 0.0) or 0.0)
+    dt = max(1.0e-4, float(now) - t_prev) if t_prev > 0.0 else 0.0
+
+    last_q_cmd = STATE.get("dataset_last_q_cmd")
+    last_q_real = STATE.get("dataset_last_q_real")
+    last_action = STATE.get("dataset_last_action")
+    last_dq_real = STATE.get("dataset_last_dq_real")
+    last_ddq_real = STATE.get("dataset_last_ddq_real")
+
+    if last_q_cmd is None or dt <= 0.0:
+        action = np.zeros(4, dtype=np.float32)
+    else:
+        action = dataset_q_delta(q_cmd, np.array(last_q_cmd, dtype=np.float32)) / dt
+
+    if last_q_real is None or dt <= 0.0:
+        dq_real = np.zeros(4, dtype=np.float32)
+    else:
+        dq_real = dataset_q_delta(q_real, np.array(last_q_real, dtype=np.float32)) / dt
+
+    if last_dq_real is None or dt <= 0.0:
+        ddq_real = np.zeros(4, dtype=np.float32)
+    else:
+        ddq_real = (dq_real - np.array(last_dq_real, dtype=np.float32).reshape(-1)[:4]) / dt
+
+    if last_action is None or dt <= 0.0:
+        action_ddq = np.zeros(4, dtype=np.float32)
+    else:
+        action_ddq = (action - np.array(last_action, dtype=np.float32).reshape(-1)[:4]) / dt
+
+    if last_ddq_real is None or dt <= 0.0:
+        jerk_real = np.zeros(4, dtype=np.float32)
+    else:
+        jerk_real = (ddq_real - np.array(last_ddq_real, dtype=np.float32).reshape(-1)[:4]) / dt
+
+    STATE["dataset_last_q_cmd"] = q_cmd.copy()
+    STATE["dataset_last_q_real"] = q_real.copy()
+    STATE["dataset_last_action"] = action.copy()
+    STATE["dataset_last_dq_real"] = dq_real.copy()
+    STATE["dataset_last_ddq_real"] = ddq_real.copy()
+
+    return {
+        "dt": float(dt),
+        "action": [float(x) for x in action],
+        "dq_real": [float(x) for x in dq_real],
+        "ddq_real": [float(x) for x in ddq_real],
+        "action_ddq": [float(x) for x in action_ddq],
+        "jerk_real": [float(x) for x in jerk_real],
+        "speed_l2": float(np.linalg.norm(dq_real)),
+        "accel_l2": float(np.linalg.norm(ddq_real)),
+        "jerk_l2": float(np.linalg.norm(jerk_real)),
+        "command_accel_l2": float(np.linalg.norm(action_ddq)),
+        "energy_proxy": float(np.dot(np.abs(action), np.abs(action))),
+    }
 
 
 def dataset_joint_error(q_cmd, q_real):
@@ -5369,6 +6050,248 @@ def dataset_joint_error(q_cmd, q_real):
     except Exception:
         pass
     return [float(x) for x in err]
+
+
+def dataset_phase_index(phase):
+    text = str(phase).lower()
+    if "pre_dig" in text or "travel" in text or "align" in text:
+        return 0
+    if "approach_contact" in text or ("approach" in text and "contact" in text):
+        return 1
+    if "insert" in text:
+        return 2
+    if "pull_mid" in text:
+        return 3
+    if "pull_exit" in text:
+        return 4
+    if "curl" in text:
+        return 5
+    if "secure_load" in text or text == "secure" or "secure" in text:
+        return 6
+    if "lift_carry" in text or "lift" in text or "carry" in text:
+        return 7
+    if "unload_dump" in text or ("dump" in text and "unload" in text):
+        return 9
+    if "unload_to_bin" in text or "unload" in text or "dump" in text:
+        return 8
+    return -1
+
+
+def dataset_phase_features(phase):
+    idx = dataset_phase_index(phase)
+    one_hot = [0] * len(DATASET_PHASE_NAMES)
+    if 0 <= idx < len(one_hot):
+        one_hot[idx] = 1
+    return {
+        "name": DATASET_PHASE_NAMES[idx] if 0 <= idx < len(DATASET_PHASE_NAMES) else str(phase),
+        "index": int(idx),
+        "one_hot": one_hot,
+        "context": phase_collision_context(phase),
+    }
+
+
+def point_aabb_signed_distance(point, mn, mx):
+    p = np.array(point, dtype=np.float32).reshape(-1)[:3]
+    lo = np.array(mn, dtype=np.float32).reshape(-1)[:3]
+    hi = np.array(mx, dtype=np.float32).reshape(-1)[:3]
+    outside = np.maximum(np.maximum(lo - p, p - hi), 0.0)
+    outside_dist = float(np.linalg.norm(outside))
+    if outside_dist > 0.0:
+        return outside_dist
+    inside_margin = np.minimum(p - lo, hi - p)
+    return -float(np.min(inside_margin))
+
+
+def dataset_rigid_clearance_summary():
+    obstacles = rigid_obstacle_bboxes()
+    points = [
+        ("tip", bucket_tip_pos()),
+        ("load", bucket_load_pos()),
+        ("pour", bucket_pour_pos()),
+        ("mid", bucket_mid_pos()),
+    ]
+    best = {
+        "available": bool(obstacles),
+        "min_m": None,
+        "point": "",
+        "obstacle": "",
+        "inside": False,
+        "obstacle_count": int(len(obstacles)),
+    }
+    if not obstacles:
+        return best
+    best_dist = None
+    best_point = ""
+    best_obstacle = ""
+    for point_name, point in points:
+        if point is None:
+            continue
+        for obstacle in obstacles:
+            try:
+                dist = point_aabb_signed_distance(point, obstacle["min"], obstacle["max"])
+            except Exception:
+                continue
+            if best_dist is None or dist < best_dist:
+                best_dist = float(dist)
+                best_point = point_name
+                best_obstacle = str(obstacle.get("path", ""))
+    if best_dist is not None:
+        best.update({
+            "min_m": float(best_dist),
+            "point": best_point,
+            "obstacle": best_obstacle,
+            "inside": bool(best_dist < 0.0),
+        })
+    return best
+
+
+def dataset_local_height_patch(target=None, radius=0.42, grid=3):
+    if target is None:
+        return {
+            "available": False,
+            "grid": int(grid),
+            "radius": float(radius),
+            "values": [],
+            "source": "missing_target",
+        }
+    try:
+        p = np.array(target, dtype=np.float32).reshape(-1)[:3]
+    except Exception:
+        return {
+            "available": False,
+            "grid": int(grid),
+            "radius": float(radius),
+            "values": [],
+            "source": "bad_target",
+        }
+    grid = max(1, int(grid))
+    radius = max(0.05, float(radius))
+    snapshot = get_sand_snapshot(force=False, label="dataset_height_patch", max_age=0.75)
+    values = []
+    sources = []
+    offsets = np.linspace(-radius, radius, grid)
+    for dy in offsets:
+        row = []
+        for dx in offsets:
+            x = float(p[0] + dx)
+            y = float(p[1] + dy)
+            z = sand_snapshot_surface_height(snapshot, x, y)
+            source = "snapshot"
+            if z is None:
+                try:
+                    z, source = sand_surface_query_at_xy(x, y)
+                except Exception:
+                    z = None
+                    source = "missing"
+            row.append(None if z is None else round(float(z), 4))
+            sources.append(str(source))
+        values.append(row)
+    available = any(v is not None for row in values for v in row)
+    return {
+        "available": bool(available),
+        "grid": int(grid),
+        "radius": float(radius),
+        "center": vec_list(p, 3),
+        "values": values,
+        "source": "snapshot" if any(s == "snapshot" for s in sources) else (sources[0] if sources else "missing"),
+    }
+
+
+def dataset_environment_summary(target=None):
+    ctx = task_scene_context()
+    api = get_sand_site_api()
+    if target is None:
+        target = get_target_pos() if TARGET_PATH else None
+    surface_z = None
+    surface_source = ""
+    if target is not None:
+        try:
+            surface_z, surface_source = sand_surface_query_at_xy(float(target[0]), float(target[1]))
+        except Exception:
+            surface_z = None
+            surface_source = "query_failed"
+    return {
+        "dig_target": vec_list(target, 3),
+        "sand_surface_z": None if surface_z is None else float(surface_z),
+        "sand_surface_source": str(surface_source),
+        "local_height_patch": dataset_local_height_patch(target=target, radius=0.42, grid=3),
+        "soil": {
+            "sand_site_active": bool(api is not None and sand_site_active()),
+            "fidelity": None if api is None else api.get("sand_fidelity"),
+            "particle_mass": sand_particle_mass(),
+            "particle_count": int((STATE.get("sand_snapshot_last") or {}).get("particle_count", 0))
+            if isinstance(STATE.get("sand_snapshot_last"), dict)
+            else 0,
+        },
+        "unload_landing": vec_list(STATE.get("active_unload_landing_point"), 3),
+        "unload_release": vec_list(STATE.get("active_unload_release_point"), 3),
+        "bin_center": vec_list(ctx.get("unload_bin_center"), 3),
+        "bin_half_size": vec_list(ctx.get("unload_bin_half_size"), 2),
+        "bin_z_range": vec_list(ctx.get("unload_bin_z_range"), 2),
+        "bin_aabb": {
+            "center": vec_list(ctx.get("unload_bin_center"), 3),
+            "half_size_xy": vec_list(ctx.get("unload_bin_half_size"), 2),
+            "z_range": vec_list(ctx.get("unload_bin_z_range"), 2),
+        },
+        "rigid_obstacle_count": int(len(rigid_obstacle_bboxes())),
+    }
+
+
+def dataset_contact_flags(phase, sand_metrics, rigid_clearance):
+    sand_metrics = sand_metrics if isinstance(sand_metrics, dict) else {}
+    bucket_from_pile = int(sand_metrics.get("bucket_from_pile_count", 0) or 0)
+    bucket_total = int(sand_metrics.get("bucket_count", 0) or 0)
+    bin_from_pile = int(sand_metrics.get("bin_from_pile_count", 0) or 0)
+    spill_from_pile = int(sand_metrics.get("spill_from_pile_count", 0) or 0)
+    rigid_inside = bool(isinstance(rigid_clearance, dict) and rigid_clearance.get("inside", False))
+    return {
+        "bucket_soil_phase": bool(is_sand_contact_phase(phase) or is_curl_phase(phase)),
+        "bucket_has_pile_sand": bool(bucket_from_pile > 0),
+        "bucket_has_any_sand": bool(bucket_total > 0),
+        "bin_has_pile_sand": bool(bin_from_pile > 0),
+        "spill_from_pile": bool(spill_from_pile > 0),
+        "bucket_rigid_overlap": rigid_inside,
+    }
+
+
+def dataset_cost_summary(q_cmd, q_real, action, sand_metrics, rigid_clearance, dynamics=None):
+    err = dataset_joint_error(q_cmd, q_real)
+    err_deg = [abs(rad_to_deg(x)) for x in err]
+    action_arr = np.array(action, dtype=np.float32).reshape(-1) if action is not None else np.zeros(4, dtype=np.float32)
+    bucket_from_pile = int(sand_metrics.get("bucket_from_pile_count", 0) or 0) if isinstance(sand_metrics, dict) else 0
+    spill_from_pile = int(sand_metrics.get("spill_from_pile_count", 0) or 0) if isinstance(sand_metrics, dict) else 0
+    load_total = max(1.0, float(bucket_from_pile + spill_from_pile))
+    dynamics = dynamics if isinstance(dynamics, dict) else {}
+    return {
+        "joint_error_max_deg": float(max(err_deg) if err_deg else 0.0),
+        "joint_error_l2_rad": float(np.linalg.norm(np.array(err, dtype=np.float32))),
+        "action_l2": float(np.linalg.norm(action_arr)),
+        "speed_l2": float(dynamics.get("speed_l2", 0.0) or 0.0),
+        "accel_l2": float(dynamics.get("accel_l2", 0.0) or 0.0),
+        "jerk_l2": float(dynamics.get("jerk_l2", 0.0) or 0.0),
+        "command_accel_l2": float(dynamics.get("command_accel_l2", 0.0) or 0.0),
+        "energy_proxy": float(dynamics.get("energy_proxy", 0.0) or 0.0),
+        "clearance_to_rigid_m": None if not isinstance(rigid_clearance, dict) else rigid_clearance.get("min_m"),
+        "spill_ratio_instant": float(spill_from_pile / load_total),
+        "bucket_from_pile": int(bucket_from_pile),
+        "spill_from_pile": int(spill_from_pile),
+    }
+
+
+def dataset_constraint_flags(cost, contact, phase_features):
+    flags = []
+    if isinstance(contact, dict) and contact.get("bucket_rigid_overlap", False):
+        flags.append("rigid_overlap")
+    if isinstance(cost, dict) and float(cost.get("joint_error_max_deg", 0.0) or 0.0) > 12.0:
+        flags.append("joint_tracking_error")
+    context = phase_features.get("context", {}) if isinstance(phase_features, dict) else {}
+    if context.get("phase_class") == "rigid_free_space" and isinstance(cost, dict):
+        clearance = cost.get("clearance_to_rigid_m")
+        if clearance is not None and float(clearance) < 0.04:
+            flags.append("low_rigid_clearance")
+    if isinstance(cost, dict) and float(cost.get("spill_ratio_instant", 0.0) or 0.0) > QUALITY_MAX_SPILL_RATIO:
+        flags.append("high_spill_ratio")
+    return flags
 
 
 def dataset_observation_state(q_real=None):
@@ -5419,12 +6342,20 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False)
         if q_real is None:
             q_real = get_real_joint_positions()
 
-        action = dataset_action_from_q(q_cmd, now)
-        joint_velocity = dataset_joint_velocity_from_real(q_real, now)
+        dynamics = dataset_motion_derivatives(q_cmd, q_real, now)
+        action = dynamics["action"]
+        joint_velocity = dynamics["dq_real"]
+        joint_acceleration = dynamics["ddq_real"]
         sand_metrics = sand_metrics_current(force=force)
         update_episode_quality_trackers(sand_metrics, phase, q_cmd=q_cmd, q_real=q_real, action=action)
         q_goal = STATE.get("dataset_current_q_goal")
         target = get_target_pos() if TARGET_PATH else None
+        phase_features = dataset_phase_features(phase)
+        rigid_clearance = dataset_rigid_clearance_summary()
+        contact_flags = dataset_contact_flags(phase, sand_metrics, rigid_clearance)
+        env_summary = dataset_environment_summary(target)
+        cost_summary = dataset_cost_summary(q_cmd, q_real, action, sand_metrics, rigid_clearance, dynamics=dynamics)
+        constraint_flags = dataset_constraint_flags(cost_summary, contact_flags, phase_features)
         sample_index = int(STATE.get("dataset_samples", 0)) - int(STATE.get("dataset_episode_sample_start", 0))
         sample = {
             "v": DATASET_TRAJECTORY_FORMAT,
@@ -5433,19 +6364,28 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False)
             "i": int(sample_index),
             "t": float(now) - float(STATE.get("dataset_episode_start_time", now)),
             "phase": str(phase),
+            "phase.index": phase_features["index"],
+            "phase.one_hot": phase_features["one_hot"],
+            "phase.context": phase_features["context"],
             "label": str(label),
             "obs.state": dataset_observation_state(q_real=q_real),
             "obs.q": vec_list(q_real, 4),
             "obs.dq": joint_velocity,
+            "obs.ddq": joint_acceleration,
             "obs.q_cmd": vec_list(q_cmd, 4),
             "obs.q_err": dataset_joint_error(q_cmd, q_real),
             "action": action,
+            "action.ddq": dynamics["action_ddq"],
             "goal.q": vec_list(q_goal, 4),
             "target": vec_list(target, 3),
             "bucket.tip": vec_list(bucket_tip_pos(), 3),
             "bucket.load": vec_list(bucket_load_pos(), 3),
             "bucket.pour": vec_list(bucket_pour_pos(), 3),
             "sand": compact_sand_metrics(sand_metrics),
+            "contact": contact_flags,
+            "env": env_summary,
+            "cost": cost_summary,
+            "label.flags": constraint_flags,
         }
 
         path = str(STATE.get("dataset_path", "excavator_dataset.jsonl"))
@@ -5549,14 +6489,20 @@ def ensure_auto_collect_run_dir():
             "dataset_root": AUTO_COLLECT_DATASET_ROOT,
             "state_names": DATASET_STATE_NAMES,
             "action_names": DATASET_ACTION_NAMES,
+            "phase_names": DATASET_PHASE_NAMES,
             "trajectory_fields": {
                 "obs.state": DATASET_STATE_NAMES,
                 "obs.q": DOF_ORDER,
                 "obs.dq": DOF_ORDER,
+                "obs.ddq": DOF_ORDER,
                 "obs.q_cmd": DOF_ORDER,
                 "obs.q_err": DOF_ORDER,
                 "action": DATASET_ACTION_NAMES,
+                "action.ddq": DATASET_ACTION_NAMES,
                 "goal.q": DOF_ORDER,
+                "phase.index": "index into phase_names; -1 means unknown/debug",
+                "phase.one_hot": DATASET_PHASE_NAMES,
+                "phase.context": ["phase_class", "rigid_policy", "sand_policy", "strict_path_precheck"],
                 "target": ["x", "y", "z"],
                 "bucket.tip": ["x", "y", "z"],
                 "bucket.load": ["x", "y", "z"],
@@ -5573,6 +6519,57 @@ def ensure_auto_collect_run_dir():
                     "bin_from_pile_mass",
                     "spill_from_pile_mass",
                 ],
+                "contact": [
+                    "bucket_soil_phase",
+                    "bucket_has_pile_sand",
+                    "bucket_has_any_sand",
+                    "bin_has_pile_sand",
+                    "spill_from_pile",
+                    "bucket_rigid_overlap",
+                ],
+                "env": [
+                    "dig_target",
+                    "sand_surface_z",
+                    "sand_surface_source",
+                    "local_height_patch",
+                    "soil",
+                    "unload_landing",
+                    "unload_release",
+                    "bin_center",
+                    "bin_half_size",
+                    "bin_z_range",
+                    "bin_aabb",
+                    "rigid_obstacle_count",
+                ],
+                "cost": [
+                    "joint_error_max_deg",
+                    "joint_error_l2_rad",
+                    "action_l2",
+                    "clearance_to_rigid_m",
+                    "spill_ratio_instant",
+                    "bucket_from_pile",
+                    "spill_from_pile",
+                ],
+                "label.flags": [
+                    "rigid_overlap",
+                    "joint_tracking_error",
+                    "low_rigid_clearance",
+                    "high_spill_ratio",
+                ],
+                "events.stage_audit.constraint_summary": [
+                    "stage_cost",
+                    "motion_cost",
+                    "weighted_angle",
+                    "estimated_time",
+                    "path_penalty",
+                    "phase_ok",
+                    "obstacle_ok",
+                    "route_inserted",
+                    "front_edge",
+                    "material_hold",
+                    "unload_drop",
+                    "flags",
+                ],
             },
             "trainable_index": "trainable_episodes.jsonl",
             "successful_index": "successful_episodes.jsonl",
@@ -5580,6 +6577,12 @@ def ensure_auto_collect_run_dir():
             "failed_index": "failed_episodes.jsonl",
             "diagnostic_index": "diagnostic_episodes.jsonl",
             "planning_diagnostics_index": "planning_diagnostics.jsonl",
+            "segment_indices": {
+                "dig": "segment_dig.jsonl",
+                "dig_secure": "segment_dig_secure.jsonl",
+                "lift_carry": "segment_lift_carry.jsonl",
+                "unload": "segment_unload.jsonl",
+            },
             "debug_timeline_index": DATASET_DEBUG_TIMELINE_FILE,
             "trajectory_format": DATASET_TRAJECTORY_FORMAT,
             "scene_context": compact_scene_context(),
@@ -5623,6 +6626,10 @@ def ensure_auto_collect_run_dir():
         "failed_episodes.jsonl",
         "diagnostic_episodes.jsonl",
         "planning_diagnostics.jsonl",
+        "segment_dig.jsonl",
+        "segment_dig_secure.jsonl",
+        "segment_lift_carry.jsonl",
+        "segment_unload.jsonl",
         DATASET_DEBUG_TIMELINE_FILE,
     ]:
         open(os.path.join(run_dir, index_name), "a", encoding="utf-8").close()
@@ -5646,7 +6653,12 @@ def auto_collect_write_run_summary():
     failed_count = jsonl_line_count(os.path.join(run_dir, "failed_episodes.jsonl"))
     diagnostic_count = jsonl_line_count(os.path.join(run_dir, "diagnostic_episodes.jsonl"))
     planning_count = jsonl_line_count(os.path.join(run_dir, "planning_diagnostics.jsonl"))
-    attempts = max(int(STATE.get("auto_collect_attempts", 0)), episodes_count)
+    segment_dig_count = jsonl_line_count(os.path.join(run_dir, "segment_dig.jsonl"))
+    segment_dig_secure_count = jsonl_line_count(os.path.join(run_dir, "segment_dig_secure.jsonl"))
+    segment_lift_carry_count = jsonl_line_count(os.path.join(run_dir, "segment_lift_carry.jsonl"))
+    segment_unload_count = jsonl_line_count(os.path.join(run_dir, "segment_unload.jsonl"))
+    indexed_attempt_rows = int(episodes_count) + int(planning_count) + int(diagnostic_count)
+    attempts = max(int(STATE.get("auto_collect_attempts", 0)), episodes_count, indexed_attempt_rows)
     STATE["auto_collect_attempts"] = attempts
     STATE["auto_collect_successes"] = max(int(STATE.get("auto_collect_successes", 0)), success_count)
     STATE["auto_collect_rejections"] = max(int(STATE.get("auto_collect_rejections", 0)), rejected_count)
@@ -5672,6 +6684,12 @@ def auto_collect_write_run_summary():
             "failures": int(STATE.get("auto_collect_failures", 0)),
             "diagnostic": diagnostic_count,
             "planning_diagnostics": int(STATE.get("auto_collect_planning_diagnostics", 0)),
+            "segments": {
+                "dig": segment_dig_count,
+                "dig_secure": segment_dig_secure_count,
+                "lift_carry": segment_lift_carry_count,
+                "unload": segment_unload_count,
+            },
             "last_result": STATE.get("auto_collect_last_result", ""),
             "run_dir": run_dir,
             "trainable_index": os.path.join(run_dir, "trainable_episodes.jsonl"),
@@ -5680,6 +6698,12 @@ def auto_collect_write_run_summary():
             "failed_index": os.path.join(run_dir, "failed_episodes.jsonl"),
             "diagnostic_index": os.path.join(run_dir, "diagnostic_episodes.jsonl"),
             "planning_diagnostics_index": os.path.join(run_dir, "planning_diagnostics.jsonl"),
+            "segment_indices": {
+                "dig": os.path.join(run_dir, "segment_dig.jsonl"),
+                "dig_secure": os.path.join(run_dir, "segment_dig_secure.jsonl"),
+                "lift_carry": os.path.join(run_dir, "segment_lift_carry.jsonl"),
+                "unload": os.path.join(run_dir, "segment_unload.jsonl"),
+            },
             "debug_timeline_index": os.path.join(run_dir, DATASET_DEBUG_TIMELINE_FILE),
             "scene_context": compact_scene_context(),
             "sand_reset_policy": AUTO_COLLECT_SAND_RESET_POLICY,
@@ -5723,6 +6747,22 @@ def auto_collect_plan_summary(seq):
                 row["q_dump_deg"] = stage.get("q_dump_deg")
             if stage.get("drop") is not None:
                 row["drop"] = stage.get("drop")
+            for key in [
+                "motion",
+                "path",
+                "front_edge",
+                "material_hold",
+                "clearance_route",
+                "stage_cost",
+                "drop_alignment_ready",
+                "drop_alignment_policy",
+                "planar_err",
+                "world_angle_err_deg",
+                "bucket_world_deg",
+            ]:
+                if stage.get(key) is not None:
+                    row[key] = stage.get(key)
+            row["constraint_summary"] = stage_constraint_summary(stage)
         rows.append(row)
     return rows
 
@@ -5797,11 +6837,110 @@ def record_phase_metrics(label, q_cmd=None, q_real=None, action=None):
     return metrics
 
 
+def stage_contract_summary(stage_name, stage_index=None, q_goal=None, duration=None):
+    stage_name = str(stage_name)
+    plan = STATE.get("current_dig_plan")
+    plan = plan if isinstance(plan, dict) else {}
+    seq = plan.get("stage_sequence", [])
+    stage_row = {}
+    if isinstance(seq, list) and stage_index is not None:
+        try:
+            idx = int(stage_index)
+            if 0 <= idx < len(seq) and isinstance(seq[idx], dict):
+                stage_row = dict(seq[idx])
+        except Exception:
+            stage_row = {}
+    if not stage_row and isinstance(seq, list):
+        for item in seq:
+            if isinstance(item, dict) and str(item.get("phase", "")) == stage_name:
+                stage_row = dict(item)
+                break
+
+    out = {
+        "plan_id": str(plan.get("plan_id", "")),
+        "planner_version": str(plan.get("planner_version", PLANNER_VERSION)),
+        "stage_index": None if stage_index is None else int(stage_index),
+        "stage_name": stage_name,
+        "phase_context": phase_collision_context(stage_name),
+        "duration": None if duration is None else float(duration),
+    }
+    if q_goal is not None:
+        out["q_goal_deg"] = q_deg_values(q_goal, wrap_swing_for_display=True)
+    if stage_row:
+        out["planned"] = bool(stage_row.get("planned", True))
+        out["required"] = bool(stage_row.get("required", False))
+        out["target"] = vec_list(stage_row.get("target"), 3)
+        if stage_row.get("q_goal_deg") is not None:
+            out["plan_q_goal_deg"] = stage_row.get("q_goal_deg")
+        if stage_row.get("q_dump_deg") is not None:
+            out["plan_q_dump_deg"] = stage_row.get("q_dump_deg")
+        if stage_row.get("path") is not None:
+            out["path"] = stage_row.get("path")
+        if stage_row.get("clearance_route") is not None:
+            out["clearance_route"] = stage_row.get("clearance_route")
+        if stage_row.get("drop") is not None:
+            out["unload_drop"] = stage_row.get("drop")
+        constraints = stage_row.get("constraint_summary")
+        if constraints is None:
+            constraints = stage_constraint_summary(stage_row)
+        if constraints:
+            out["constraint_summary"] = constraints
+    if stage_name.startswith("unload") and isinstance(plan.get("unload_ballistics"), dict):
+        out["unload_ballistics"] = plan.get("unload_ballistics")
+    return out
+
+
+def record_stage_audit(stage_name, stage_index, result, reason="", q_goal=None, duration=None, data=None, include_sand=False):
+    try:
+        row = stage_contract_summary(stage_name, stage_index=stage_index, q_goal=q_goal, duration=duration)
+        row["result"] = str(result)
+        if reason:
+            row["reason"] = debug_short_string(reason, 360)
+        try:
+            q_real = q_real_near_command(get_real_joint_positions(), CTRL.q_cmd)
+        except Exception:
+            q_real = None
+        row["q_cmd_deg"] = q_deg_values(CTRL.q_cmd, wrap_swing_for_display=True)
+        if q_real is not None:
+            row["q_real_deg"] = q_deg_values(q_real, wrap_swing_for_display=True)
+        if q_goal is not None and q_real is not None:
+            try:
+                row["goal_error_deg"] = q_delta_abs_deg(q_goal, q_real)
+            except Exception:
+                pass
+        if include_sand:
+            row["sand"] = debug_compact_sand_counts()
+        if isinstance(data, dict):
+            row.update(data)
+        if bool(STATE.get("dataset_recording", False)):
+            dataset_record_event(
+                "stage_audit",
+                f"{stage_name}:{result}" + (f":{reason}" if reason else ""),
+                data=row,
+            )
+        else:
+            debug_timeline_record(
+                "STAGE_AUDIT",
+                stage=stage_name,
+                result=str(result),
+                reason=reason,
+                data=row,
+                q_cmd=q_goal if q_goal is not None else CTRL.q_cmd,
+                q_real=q_real,
+                include_sand=include_sand,
+            )
+    except Exception as e:
+        info_print("[WARN] stage audit failed:", stage_name, result, type(e).__name__, e)
+
+
 def auto_collect_preflight_report(target_successes=None):
     run_dir = ensure_auto_collect_run_dir()
     ctx = task_scene_context()
     t0 = time.perf_counter()
     snapshot = get_sand_snapshot(force=True, label="auto_preflight")
+    if isinstance(snapshot, dict):
+        STATE["auto_collect_episode_sand_snapshot"] = snapshot
+        STATE["auto_collect_episode_sand_snapshot_time"] = float(time.time())
     metrics = sand_metrics_current(force=True, snapshot=snapshot)
     particles = snapshot.get("points") if isinstance(snapshot, dict) else None
     particle_count = int(len(particles)) if particles is not None else int(metrics.get("particle_count", 0) or 0)
@@ -5988,6 +7127,16 @@ def compact_target_score_row(row):
         "depth_candidate",
         "swept_density_count",
         "density_count",
+        "effective_density_count",
+        "density_score",
+        "swept_density_score",
+        "depth_score",
+        "fill_potential_score",
+        "motion_score",
+        "center_score",
+        "approach_score",
+        "approach_quality",
+        "score_components",
         "score",
         "planned",
         "failed_stage",
@@ -6022,6 +7171,7 @@ def compact_auto_plan_attempts(plan_attempts, limit=4):
                 "build_ms": item.get("build_ms"),
                 "wall_ms": item.get("wall_ms"),
                 "candidate_count": item.get("candidate_count"),
+                "planning_world": item.get("planning_world", {}),
                 "target_score": compact_target_score_row(item.get("target_score", {})),
                 "best_failure": compact_plan_candidate(item.get("best_failure", {}), include_stages=False),
             }
@@ -6049,12 +7199,15 @@ def auto_collect_record_planning_diagnostic(attempt_index, target, plan_attempts
         "initial_pose_id": str(initial_info.get("id", "")),
         "q_initial_deg": q_deg_values(initial_info.get("q"), wrap_swing_for_display=True) if initial_info.get("q") is not None else None,
         "preflight": STATE.get("last_auto_preflight", {}),
+        "prepare_gate_report": STATE.get("auto_collect_prepare_gate_report", {}),
+        "planning_world": planning_world_snapshot(force=False),
         "best_failure": compact_plan_candidate(best_failure, include_stages=True),
         "chosen_plan": compact_plan_candidate(chosen_plan, include_stages=True),
         "shared_plan": {
             "plan_id": shared_plan.get("plan_id", "") if isinstance(shared_plan, dict) else "",
             "cost": shared_plan.get("total_plan_cost") if isinstance(shared_plan, dict) else None,
             "stage_count": shared_plan.get("stage_count") if isinstance(shared_plan, dict) else None,
+            "unload_ballistics": shared_plan.get("unload_ballistics", {}) if isinstance(shared_plan, dict) else {},
         },
         "plan_attempts": compact_auto_plan_attempts(plan_attempts, limit=4),
         "dig_target_candidates": [
@@ -6123,7 +7276,13 @@ def compute_episode_quality_score(execution_success, reason):
     quality_reasons = []
     if not execution_success:
         raw_reason = str(reason)
-        if raw_reason.startswith(("preflight_failed/", "planning_failed/", "execution_failed/")):
+        if raw_reason.startswith((
+            "prepare_failed/",
+            "preflight_failed/",
+            "planning_failed/",
+            "execution_failed/",
+            "quality_rejected/",
+        )):
             quality_reasons.append(raw_reason)
         elif "freeze" in raw_reason:
             quality_reasons.append(f"execution_failed/freeze_detected:{raw_reason}")
@@ -6179,6 +7338,112 @@ def compute_episode_quality_score(execution_success, reason):
     }
 
 
+def phase_metric_bucket_from_pile(phase_metrics, phase_names):
+    if not isinstance(phase_metrics, dict):
+        return 0
+    names = [str(x).lower() for x in phase_names]
+    best = 0
+    for label, row in phase_metrics.items():
+        label_l = str(label).lower()
+        if not any(name in label_l for name in names):
+            continue
+        sand = row.get("sand") if isinstance(row, dict) else {}
+        if isinstance(sand, dict):
+            best = max(best, int(sand.get("bucket_from_pile", 0) or 0))
+    return int(best)
+
+
+def auto_collect_write_segment_indices(run_dir, meta, index_row, score_report):
+    if not run_dir:
+        return
+    counts = score_report.get("counts", {}) if isinstance(score_report, dict) else {}
+    phase_metrics = score_report.get("phase_metrics", {}) if isinstance(score_report, dict) else {}
+    dig_bucket = max(
+        int(counts.get("max_bucket_from_pile_particles", 0) or 0),
+        phase_metric_bucket_from_pile(phase_metrics, ["insert_cut", "pull_mid_cut", "pull_exit_cut", "after_cut"]),
+    )
+    secure_bucket = phase_metric_bucket_from_pile(phase_metrics, ["curl_to_hold_material", "secure_load"])
+    lift_bucket = int(counts.get("lift_bucket_from_pile_particles", 0) or 0)
+    final_bin = int(counts.get("final_bin_from_pile_particles", 0) or 0)
+    final_spill = int(counts.get("final_spill_from_pile_particles", 0) or 0)
+    episode_reason = str(index_row.get("reason", "") or "")
+    secure_gate_failed = (
+        "secure_not_retaining_material" in episode_reason
+        or "carry_spill_risk" in episode_reason
+        or "secure_material_loss" in episode_reason
+    )
+    base = {
+        "episode_id": index_row.get("episode_id"),
+        "episode_index": index_row.get("episode_index"),
+        "created_at": time.time(),
+        "full_chain_success": bool(index_row.get("full_chain_success", False)),
+        "episode_status": index_row.get("status"),
+        "episode_reason": index_row.get("reason"),
+        "planner_version": index_row.get("planner_version"),
+        "config_hash": index_row.get("config_hash"),
+        "target_xyz": index_row.get("target_xyz"),
+        "unload_landing_xyz": index_row.get("unload_landing_xyz"),
+        "unload_release_xyz": index_row.get("unload_release_xyz"),
+        "initial_pose_id": index_row.get("initial_pose_id", ""),
+        "plan_debug": index_row.get("plan_debug", ""),
+        "trajectory": index_row.get("trajectory", ""),
+        "events": index_row.get("events", ""),
+        "score_path": index_row.get("score_path", ""),
+        "meta": index_row.get("meta", ""),
+        "score": index_row.get("score"),
+        "freeze_count": index_row.get("freeze_count"),
+    }
+
+    def append_segment(filename, segment, count, threshold, extra=None):
+        if int(count) < int(threshold):
+            return
+        bucket_field = int(count) if str(segment) in ("dig", "dig_secure") else int(secure_bucket)
+        row = dict(base)
+        row.update({
+            "segment": str(segment),
+            "segment_success": True,
+            "segment_count": int(count),
+            "threshold": int(threshold),
+            "bucket_from_pile": bucket_field,
+            "lift_bucket_from_pile": int(lift_bucket),
+            "final_bin_from_pile": int(final_bin),
+            "final_spill_from_pile": int(final_spill),
+        })
+        if isinstance(extra, dict):
+            row.update(extra)
+        append_jsonl(os.path.join(run_dir, filename), row)
+
+    append_segment(
+        "segment_dig.jsonl",
+        "dig",
+        dig_bucket,
+        QUALITY_MIN_BUCKET_PARTICLES,
+        {"success_gate": "bucket_from_pile_after_cut"},
+    )
+    if not secure_gate_failed:
+        append_segment(
+            "segment_dig_secure.jsonl",
+            "dig_secure",
+            secure_bucket,
+            QUALITY_MIN_BUCKET_PARTICLES,
+            {"success_gate": "bucket_from_pile_after_curl_or_secure_and_retains_material"},
+        )
+    append_segment(
+        "segment_lift_carry.jsonl",
+        "lift_carry",
+        lift_bucket,
+        QUALITY_MIN_BUCKET_PARTICLES,
+        {"success_gate": "bucket_from_pile_after_lift"},
+    )
+    append_segment(
+        "segment_unload.jsonl",
+        "unload",
+        final_bin,
+        QUALITY_MIN_DUMP_PARTICLES,
+        {"success_gate": "bin_from_pile_after_dump"},
+    )
+
+
 def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initial_info=None):
     episode_dir = auto_collect_episode_dir(attempt_index)
     os.makedirs(episode_dir, exist_ok=True)
@@ -6195,6 +7460,9 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
     STATE["dataset_last_sample_time"] = 0.0
     STATE["dataset_last_q_cmd"] = None
     STATE["dataset_last_q_real"] = None
+    STATE["dataset_last_action"] = None
+    STATE["dataset_last_dq_real"] = None
+    STATE["dataset_last_ddq_real"] = None
     STATE["dataset_current_q_goal"] = None
     STATE["last_execution_failure_reason"] = ""
     STATE["sand_metrics_last_time"] = 0.0
@@ -6244,6 +7512,7 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
         unload_landing = unload_landing_point_from_release(unload_point)
     scene_ctx = compact_scene_context()
     chosen_plan_compact = compact_plan_candidate(chosen_plan, include_stages=True)
+    chosen_dig_primitive = chosen_plan_compact.get("dig_primitive", {})
     candidates_compact = [
         compact_plan_candidate(x, include_stages=False)
         for x in STATE.get("last_dig_plan_candidates", [])
@@ -6266,6 +7535,7 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
             "target_xyz": vec_list(target, 3),
             "unload_point_xyz": vec_list(unload_point, 3),
             "unload_landing_xyz": vec_list(unload_landing, 3),
+            "dig_primitive": chosen_dig_primitive,
             "shared_dig_plan": shared_plan,
             "preflight": STATE.get("last_auto_preflight", {}),
             "dig_target_candidates": STATE.get("last_auto_dig_target_scores", []),
@@ -6297,6 +7567,7 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
         "unload_point_xyz": vec_list(unload_point, 3),
         "unload_landing_xyz": vec_list(unload_landing, 3),
         "unload_release_xyz": vec_list(unload_point, 3),
+        "dig_primitive": chosen_dig_primitive,
         "scene_context": scene_ctx,
         "preflight": STATE.get("last_auto_preflight", {}),
         "initial_pose_id": initial_pose_id,
@@ -6312,6 +7583,18 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
         "trainable_rule": "full_dig_lift_dump_only",
         "state_names": DATASET_STATE_NAMES,
         "action_names": DATASET_ACTION_NAMES,
+        "phase_names": DATASET_PHASE_NAMES,
+        "trajectory_fields_added_v3": [
+            "phase.index",
+            "phase.one_hot",
+            "phase.context",
+            "contact",
+            "env",
+                "cost",
+                "label.flags",
+                "obs.ddq",
+                "action.ddq",
+            ],
         "paths": {
             "trajectory": STATE["dataset_path"],
             "events": STATE["dataset_event_path"],
@@ -6392,6 +7675,7 @@ def auto_collect_finish_episode(meta, success, reason):
         "episode_id": meta.get("episode_id"),
         "episode_index": meta.get("episode_index"),
         "success": success,
+        "full_chain_success": bool(success),
         "status": status,
         "score": score_report.get("score"),
         "reason": meta.get("failure_reason", reason),
@@ -6428,6 +7712,7 @@ def auto_collect_finish_episode(meta, success, reason):
         "final_spill_from_pile_particles": metrics.get("final_spill_from_pile_particles"),
     }
     append_jsonl(os.path.join(run_dir, "episodes.jsonl"), index_row)
+    auto_collect_write_segment_indices(run_dir, meta, index_row, score_report)
     if success:
         bucket_name = "successful_episodes.jsonl"
         append_jsonl(os.path.join(run_dir, "trainable_episodes.jsonl"), index_row)
@@ -6534,15 +7819,7 @@ def sand_surface_height_for_auto_target(x, y, particles=None, snapshot=None):
             # shape used for generation and can describe empty air after particles settle.
             return float(max(float(floor_z) + 0.02, min(float(np.percentile(near[:, 2], 90.0)), float(z_expected_max))))
         return float(floor_z + 0.10)
-    surface_z = max(float(floor_z) + 0.10, min(float(floor_z) + float(fill_height), float(z_expected_max)))
-    api = get_sand_site_api()
-    fn = None if api is None else api.get("height_fn")
-    if callable(fn):
-        try:
-            surface_z = min(float(fn(float(x), float(y))), float(z_expected_max))
-        except Exception:
-            pass
-    return float(surface_z)
+    return float(max(float(floor_z) + 0.10, min(float(floor_z) + 0.18, float(z_expected_max))))
 
 
 def auto_dig_depth_candidates():
@@ -6591,6 +7868,77 @@ def auto_dig_swept_density_count(target, surface_z, particles=None, snapshot=Non
     return int(np.count_nonzero(mask))
 
 
+def auto_dig_approach_quality(target, surface_z, snapshot=None):
+    target = np.array(target, dtype=np.float32).reshape(-1)[:3]
+    inward = dig_direction_unit(target)
+    if float(np.linalg.norm(inward)) < 1.0e-6:
+        inward = np.array([-1.0, 0.0], dtype=np.float32)
+    outward = -inward
+    probe_dist = 0.28
+    p_outer = target[:2] + outward * probe_dist
+    p_inner = target[:2] + inward * probe_dist
+    outer_z = sand_snapshot_surface_height(snapshot, float(p_outer[0]), float(p_outer[1])) if isinstance(snapshot, dict) else None
+    inner_z = sand_snapshot_surface_height(snapshot, float(p_inner[0]), float(p_inner[1])) if isinstance(snapshot, dict) else None
+    if outer_z is None:
+        outer_z = float(surface_z)
+    if inner_z is None:
+        inner_z = float(surface_z)
+    slope_rise = float(inner_z) - float(outer_z)
+    # Prefer a modest rise into the pile. Flat is acceptable; steep local slopes
+    # and falling surfaces are less reliable for front-edge cutting.
+    slope_score = clamp01(1.0 - abs(slope_rise - 0.08) / 0.42)
+    falling_penalty = clamp01(max(0.0, -slope_rise) / 0.30)
+    approach_score = clamp01(slope_score * (1.0 - 0.45 * falling_penalty))
+    return {
+        "approach_score": float(approach_score),
+        "slope_rise_m": float(slope_rise),
+        "outer_surface_z": float(outer_z),
+        "inner_surface_z": float(inner_z),
+    }
+
+
+def auto_dig_fast_reach_check(target_world, q_seed=None, end_effector="tip"):
+    target = np.array(target_world, dtype=np.float32).reshape(-1)[:3]
+    q = CTRL.q_cmd.copy() if q_seed is None else CTRL.clip_limits(q_seed)
+    pts = get_ik_world_points()
+    swing_anchor = pts.get("swing") if isinstance(pts, dict) else None
+    boom_now = pts.get("boom") if isinstance(pts, dict) else None
+    if swing_anchor is None or boom_now is None:
+        return False, "missing swing/boom anchor", {}
+
+    part = ik_model_part(end_effector=end_effector)
+    if part is None:
+        part = ik_model_part(end_effector="mid")
+    chain_now = current_planar_chain(end_effector)
+    fallback_lengths = [] if chain_now is None else chain_now.get("lengths", [])
+    lengths = np.array((part or {}).get("lengths", fallback_lengths), dtype=np.float32).reshape(-1)
+    if len(lengths) != 3 or not np.all(np.isfinite(lengths)) or float(np.min(lengths)) < IK_MIN_SEGMENT_LENGTH:
+        return False, "invalid fast reach lengths", {}
+
+    dx = float(target[0] - swing_anchor[0])
+    dy = float(target[1] - swing_anchor[1])
+    raw_swing_goal = math.atan2(dy, dx)
+    swing_now = float(q[CTRL.name_to_idx["swing"]])
+    swing_goal = normalize_swing_cmd(swing_target_near(raw_swing_goal, swing_now))
+    boom_offset_xy = boom_now[:2] - swing_anchor[:2]
+    boom_goal_xy = swing_anchor[:2] + rotate_xy(boom_offset_xy, swing_goal - swing_now)
+    boom_root = np.array([boom_goal_xy[0], boom_goal_xy[1], float(boom_now[2])], dtype=np.float32)
+    radial = safe_norm(np.array([math.cos(swing_goal), math.sin(swing_goal)], dtype=np.float32), default=(1.0, 0.0))
+    target_2d = point_to_2d(target, boom_root, radial)
+    planar_dist = float(np.linalg.norm(target_2d))
+    total_reach = float(np.sum(lengths))
+    min_fold = max(0.0, float(np.max(lengths) - (np.sum(lengths) - np.max(lengths))))
+    reach_margin = 0.35
+    ok = bool(planar_dist <= total_reach + reach_margin and planar_dist >= max(0.0, min_fold - reach_margin))
+    reason = "fast_reach_ok" if ok else f"fast_reach_out_of_range:{planar_dist:.3f}/{total_reach:.3f}"
+    return ok, reason, {
+        "planar_dist": float(planar_dist),
+        "total_reach": float(total_reach),
+        "min_fold": float(min_fold),
+        "swing_goal_deg": float(rad_to_deg(swing_goal)),
+    }
+
+
 def auto_collect_rank_dig_targets(attempt_index):
     rank_t0 = time.perf_counter()
     ctx = task_scene_context()
@@ -6598,13 +7946,27 @@ def auto_collect_rank_dig_targets(attempt_index):
     pile_radius = np.array(ctx["pile_radius"], dtype=np.float32).reshape(-1)[:2]
     rx = min(float(AUTO_COLLECT_TARGET_RADIUS_X), max(0.12, float(pile_radius[0]) * 0.56))
     ry = min(float(AUTO_COLLECT_TARGET_RADIUS_Y), max(0.12, float(pile_radius[1]) * 0.56))
-    snapshot = get_sand_snapshot(force=True, label="auto_rank_targets")
+    snapshot = None
+    cached_snapshot = STATE.get("auto_collect_episode_sand_snapshot")
+    cached_age = time.time() - float(STATE.get("auto_collect_episode_sand_snapshot_time", 0.0) or 0.0)
+    if isinstance(cached_snapshot, dict) and cached_age <= float(AUTO_COLLECT_PLANNING_SNAPSHOT_MAX_AGE):
+        snapshot = cached_snapshot
+    if snapshot is None:
+        snapshot = get_sand_snapshot(force=False, label="auto_rank_targets", max_age=AUTO_COLLECT_PLANNING_SNAPSHOT_MAX_AGE)
     settled_status = snapshot.get("settle", {}) if isinstance(snapshot, dict) else {}
     settled_particles = snapshot.get("settled_points") if isinstance(snapshot, dict) else None
     q_ref = CTRL.q_cmd.copy()
     depths = auto_dig_depth_candidates()
     phase = 2.0 * math.pi * (((max(1, int(attempt_index)) - 1) * 0.3819660112501051) % 1.0)
     rows = []
+    candidate_budget = int(sum((1 if int(i) == 0 else int(AUTO_DIG_RING_POINTS[min(int(i), len(AUTO_DIG_RING_POINTS) - 1)])) for i, _r in enumerate(AUTO_DIG_RING_RADII)) * max(1, len(depths)))
+    info_print(
+        "[AUTO DIG TARGET RANK]",
+        f"start attempt={int(attempt_index)}",
+        f"candidate_budget={candidate_budget}",
+        f"particles={0 if settled_particles is None else len(settled_particles)}",
+        f"snapshot_ms={fmt_optional((snapshot.get('perf_ms') or {}).get('total') if isinstance(snapshot, dict) else None)}",
+    )
 
     for ring_index, radius_norm in enumerate(AUTO_DIG_RING_RADII):
         point_count = 1 if ring_index == 0 else int(AUTO_DIG_RING_POINTS[min(ring_index, len(AUTO_DIG_RING_POINTS) - 1)])
@@ -6679,45 +8041,28 @@ def auto_collect_rank_dig_targets(attempt_index):
                 density_score = clamp01(effective_density_count / 320.0)
                 swept_density_score = clamp01(swept_density_count / 320.0)
                 depth_score = clamp01((surface_z - z) / max(0.01, max(AUTO_COLLECT_TARGET_DEPTHS)))
-                boundary_score = clamp01(1.0 - float(norm) / max(0.01, max(AUTO_DIG_RING_RADII)))
+                center_score = clamp01(1.0 - float(norm) / max(0.01, max(AUTO_DIG_RING_RADII)))
+                fill_potential_score = clamp01(0.58 * swept_density_score + 0.42 * depth_score)
+                approach_quality = auto_dig_approach_quality(target, surface_z, snapshot=snapshot)
+                approach_score = float(approach_quality.get("approach_score", 0.0))
                 swing_goal = target_to_swing_angle(target)
                 swing_delta_deg_abs = abs(rad_to_deg(swing_delta(swing_goal, q_ref[CTRL.name_to_idx["swing"]])))
                 motion_score = clamp01(1.0 - swing_delta_deg_abs / 180.0)
 
-                ik_ok = True
-                ik_reason = "ok"
-                try:
-                    q_probe, ik_info = solve_priority_ik_to_target(
-                        target,
-                        q_seed=q_ref,
-                        preferred_bucket_rad=deg_to_rad(-50.0),
-                        bucket_motion_weight=0.35,
-                        bucket_preference_weight=2.0,
-                        min_world_z=GROUND_TOP_Z - 0.02,
-                        accept_err=0.75,
-                        end_effector="tip",
-                        allow_end_below=True,
-                        min_end_z=GROUND_TOP_Z - DIG_MAX_TIP_DEPTH,
-                        phase_mode="approach_contact",
-                        use_refinement=False,
-                        bucket_candidate_span_deg=90.0,
-                        bucket_candidate_count=9,
-                    )
-                    if q_probe is None:
-                        ik_ok = False
-                        ik_reason = str(ik_info)
-                except Exception as e:
-                    ik_ok = False
-                    ik_reason = f"ik_check_failed:{type(e).__name__}:{e}"
+                ik_ok, ik_reason, reach_info = auto_dig_fast_reach_check(target, q_seed=q_ref, end_effector="tip")
 
                 reach_score = 1.0 if ik_ok else 0.0
-                score = (
-                    35.0 * reach_score
-                    + 30.0 * swept_density_score
-                    + 24.0 * depth_score
-                    + 8.0 * motion_score
-                    + 8.0 * boundary_score
-                )
+                weights = AUTO_DIG_SCORE_WEIGHTS
+                score_components = {
+                    "reach": float(weights["reach"] * reach_score),
+                    "fill": float(weights["fill"] * fill_potential_score),
+                    "swept_density": float(weights["swept_density"] * swept_density_score),
+                    "depth": float(weights["depth"] * depth_score),
+                    "center": float(weights["center"] * center_score),
+                    "motion": float(weights["motion"] * motion_score),
+                    "approach": float(weights["approach"] * approach_score),
+                }
+                score = float(sum(score_components.values()))
                 row = dict(base_row)
                 row.update(
                     {
@@ -6727,9 +8072,14 @@ def auto_collect_rank_dig_targets(attempt_index):
                         "density_score": float(density_score),
                         "swept_density_score": float(swept_density_score),
                         "depth_score": float(depth_score),
+                        "fill_potential_score": float(fill_potential_score),
                         "motion_score": float(motion_score),
-                        "boundary_score": float(boundary_score),
+                        "center_score": float(center_score),
+                        "approach_score": float(approach_score),
+                        "approach_quality": approach_quality,
+                        "fast_reach": reach_info,
                         "reach_score": float(reach_score),
+                        "score_components": score_components,
                         "score": float(score),
                         "planned": bool(ik_ok),
                         "reason": ik_reason,
@@ -6862,31 +8212,132 @@ async def auto_collect_prepare_environment():
     was_recording = bool(STATE.get("dataset_recording", False))
     STATE["dataset_recording"] = False
     STATE["auto_collect_prepare_failure_reason"] = ""
-    reset_dig_plan()
-    if handle_timeline_stop_if_needed("auto_collect_prepare_start"):
+    gate_report = {"started_at": time.time(), "gates": []}
+    STATE["auto_collect_prepare_gate_report"] = gate_report
+
+    def record_gate(name, ok, reason="ok", detail=None):
+        row = {
+            "gate": str(name),
+            "ok": bool(ok),
+            "reason": str(reason or ("ok" if ok else "failed")),
+        }
+        if isinstance(detail, dict):
+            row["detail"] = detail
+        elif detail is not None:
+            row["detail"] = {"value": str(detail)}
+        gate_report["gates"].append(row)
+        STATE["auto_collect_prepare_gate_report"] = gate_report
+        return bool(ok)
+
+    def fail_prepare(reason, gate="", detail=None, q_cmd=None):
+        if gate:
+            record_gate(gate, False, reason, detail=detail)
+        gate_report["finished_at"] = time.time()
+        gate_report["ok"] = False
+        gate_report["reason"] = str(reason)
+        STATE["auto_collect_prepare_failure_reason"] = str(reason)
+        STATE["auto_collect_prepare_gate_report"] = gate_report
+        info_print("[AUTO DATASET PREP FAILED]", reason)
+        debug_timeline_record(
+            "AUTO_PREP",
+            result="failed",
+            reason=str(reason),
+            data={"gate_report": gate_report},
+            q_cmd=q_cmd,
+            include_sand=True,
+        )
         STATE["dataset_recording"] = was_recording
         return False
+
+    reset_dig_plan()
+    if not simulation_timeline_is_playing():
+        ensure_timeline_playing("auto_collect_prepare_start")
+        await step_updates(2)
+    timeline_ok = simulation_timeline_is_playing()
+    record_gate("timeline", timeline_ok, "ok" if timeline_ok else "prepare_failed/timeline_not_playing")
+    if not timeline_ok or handle_timeline_stop_if_needed("auto_collect_prepare_start"):
+        return fail_prepare("prepare_failed/timeline_not_playing", gate="timeline")
+
+    action_ready, action_reason, action_detail = await wait_for_articulation_action_ready(
+        "auto_collect_prepare_action_channel",
+        min_stable_frames=ACTION_READY_MIN_STABLE_FRAMES,
+        max_frames=ACTION_READY_MAX_WAIT_FRAMES,
+        record_failure=False,
+    )
+    record_gate(
+        "action_channel",
+        action_ready,
+        "ok" if action_ready else "prepare_failed/action_channel_not_ready",
+        detail={"reason": action_reason, "action_detail": action_detail},
+    )
+    if not action_ready:
+        return fail_prepare(
+            f"prepare_failed/action_channel_not_ready:{action_reason}",
+            gate="action_channel",
+            detail=action_detail,
+        )
+
+    physics_ok = object_physics_view_state(ROBOT) is not False
+    record_gate("physics_view", physics_ok, "ok" if physics_ok else "prepare_failed/physics_view_missing")
+    if not physics_ok:
+        return fail_prepare("prepare_failed/physics_view_missing", gate="physics_view")
 
     if not ik_model_is_valid():
         update_status("[AUTO DATASET] calibrating IK", force=True)
         ok_ik = await calibrate_ik()
         if not ok_ik or not ik_model_is_valid():
-            reason = "preflight_failed/ik_calibration_invalid"
-            STATE["auto_collect_prepare_failure_reason"] = reason
+            reason = "prepare_failed/ik_invalid"
             update_status(f"[AUTO DATASET] {reason}", force=True)
-            STATE["dataset_recording"] = was_recording
-            return False
+            return fail_prepare(
+                reason,
+                gate="ik_calibrated",
+                detail={"ik_report": dict(STATE.get("ik_calibration_report", {}) or {})},
+            )
+    record_gate(
+        "ik_calibrated",
+        True,
+        "ok",
+        detail={"ik_report": dict(STATE.get("ik_calibration_report", {}) or {})},
+    )
 
     task_id = start_task("auto_collect_prepare")
+    task_ok = bool(task_alive(task_id))
+    record_gate(
+        "task_state",
+        task_ok,
+        "ok" if task_ok else "prepare_failed/task_state_desync",
+        detail={"task_id": task_id, "active_task": STATE.get("active_task_name", "")},
+    )
+    if not task_ok:
+        return fail_prepare(
+            "prepare_failed/task_state_desync",
+            gate="task_state",
+            detail={"task_id": task_id, "active_task": STATE.get("active_task_name", "")},
+        )
     q_home = safe_home_q()
     ok = await set_joint_pose_direct_and_settle(
         q_home,
         label="auto_collect_home",
         mode="auto_collect_home_direct",
         settle_frames=DIRECT_HOME_SETTLE_FRAMES,
-        task_id=task_id,
+        task_id=None,
     )
+    if not ok:
+        action_ready = robot_articulation_action_ready()
+        reason = (
+            "prepare_failed/home_direct_failed:"
+            f"action_ready={action_ready}; "
+            f"timeline={simulation_timeline_is_playing()}; "
+            f"running={STATE.get('running', False)}; "
+            f"active_task={STATE.get('active_task_name', '')}; "
+            f"task_alive={task_alive(task_id)}; "
+            f"q_home_deg={q_deg_values(q_home, wrap_swing_for_display=True)}"
+        )
+        return fail_prepare(reason, gate="home_pose", q_cmd=q_home)
+    record_gate("home_pose", True, "ok", detail={"q_home_deg": q_deg_values(q_home, wrap_swing_for_display=True)})
     await step_updates(AUTO_COLLECT_PRE_RESET_SETTLE_FRAMES)
+    if handle_timeline_stop_if_needed("auto_collect_prepare_after_home"):
+        return fail_prepare("prepare_failed/timeline_stopped_after_home", gate="timeline")
 
     policy = str(AUTO_COLLECT_SAND_RESET_POLICY).lower()
     ready_reset_done = bool(STATE.get("sand_site_stable_reset_done", False))
@@ -6904,8 +8355,7 @@ async def auto_collect_prepare_environment():
     if should_reset_sand:
         try:
             if handle_timeline_stop_if_needed("auto_collect_prepare_reset"):
-                STATE["dataset_recording"] = was_recording
-                return False
+                return fail_prepare("prepare_failed/timeline_stopped_before_sand_reset", gate="timeline")
             update_status("[AUTO DATASET] resetting sand after home pose", force=True)
             info_print(
                 "[AUTO DATASET RESET]",
@@ -6916,8 +8366,20 @@ async def auto_collect_prepare_environment():
             )
             reset_ok = await reset_sand_site_stably("auto_collect_prepare")
             STATE["auto_collect_sand_reset_done"] = bool(reset_ok)
+            record_gate(
+                "sand_settled",
+                bool(reset_ok),
+                "ok" if reset_ok else "prepare_failed/sand_not_settled",
+                detail={"reset_attempted": True},
+            )
+            if not reset_ok:
+                return fail_prepare("prepare_failed/sand_not_settled", gate="sand_settled")
         except Exception as e:
             info_print("[WARN] [AUTO DATASET] sand reset failed:", type(e).__name__, e)
+            return fail_prepare(
+                f"prepare_failed/sand_reset_exception:{type(e).__name__}:{e}",
+                gate="sand_settled",
+            )
     else:
         if ready_reset_done and AUTO_COLLECT_REUSE_READY_SAND_RESET and policy == "once_per_run_after_home":
             STATE["auto_collect_sand_reset_done"] = True
@@ -6930,9 +8392,32 @@ async def auto_collect_prepare_environment():
             "action=skip",
         )
         await step_updates(20)
+        settle_snapshot = get_sand_snapshot(force=False, label="auto_prepare_sand_gate", max_age=1.0)
+        settle = (
+            settle_snapshot.get("settle")
+            if isinstance(settle_snapshot, dict) and isinstance(settle_snapshot.get("settle"), dict)
+            else sand_settle_status(points=settle_snapshot.get("points") if isinstance(settle_snapshot, dict) else None)
+        )
+        sand_ok = bool(settle.get("ok", False))
+        record_gate(
+            "sand_settled",
+            sand_ok,
+            "ok" if sand_ok else "prepare_failed/sand_not_settled",
+            detail={"settle": settle},
+        )
+        if not sand_ok:
+            return fail_prepare("prepare_failed/sand_not_settled", gate="sand_settled", detail=settle)
 
     STATE["dataset_recording"] = was_recording
-    return bool(ok and task_alive(task_id))
+    if handle_timeline_stop_if_needed("auto_collect_prepare_done"):
+        return fail_prepare("prepare_failed/timeline_stopped_after_prepare", gate="timeline")
+    if not bool(STATE.get("auto_collect_active", False)):
+        return fail_prepare("prepare_failed/auto_collect_inactive_after_prepare", gate="task_state")
+    gate_report["finished_at"] = time.time()
+    gate_report["ok"] = True
+    gate_report["reason"] = "ok"
+    STATE["auto_collect_prepare_gate_report"] = gate_report
+    return True
 
 
 async def auto_collect_find_plan(attempt_index):
@@ -6948,17 +8433,30 @@ async def auto_collect_one_episode():
     if not prepared:
         prepare_reason = str(
             STATE.pop("auto_collect_prepare_failure_reason", "")
-            or "preflight_failed/prepare_environment_failed"
+            or "prepare_failed/prepare_environment_failed"
         )
+        gate_report = STATE.get("auto_collect_prepare_gate_report", {}) or {}
         target = auto_collect_sample_target(attempt, 0)
-        meta = auto_collect_begin_episode(attempt, target, [{"prepared": False}], None, initial_info=None)
+        plan_attempts = [{
+            "prepared": False,
+            "failed_gate": str(gate_report.get("reason", prepare_reason)) if isinstance(gate_report, dict) else prepare_reason,
+            "prepare_reason": prepare_reason,
+            "prepare_gate_report": gate_report,
+        }]
         info_print(
             "[AUTO DATASET ATTEMPT]",
             f"attempt={attempt}",
             f"result={prepare_reason}",
             "executed=False",
         )
-        return auto_collect_finish_episode(meta, False, prepare_reason)
+        auto_collect_record_planning_diagnostic(
+            attempt,
+            target,
+            plan_attempts,
+            prepare_reason,
+            initial_info=None,
+        )
+        return False
 
     initial_ok, initial_info = await auto_collect_move_to_initial_pose(attempt)
     if not initial_ok:
@@ -7202,6 +8700,9 @@ async def auto_collect_loop(count):
             },
             include_sand=True,
         )
+        active_name = str(STATE.get("active_task_name", "") or "")
+        if active_name.startswith("auto_collect"):
+            invalidate_active_task("auto_collect_loop_end")
         STATE["auto_collect_active"] = False
         STATE["auto_collect_stop_requested"] = False
         STATE["dataset_recording"] = previous_dataset["dataset_recording"]
@@ -7209,6 +8710,9 @@ async def auto_collect_loop(count):
         STATE["dataset_event_path"] = previous_dataset["dataset_event_path"]
         STATE["dataset_meta_path"] = previous_dataset["dataset_meta_path"]
         STATE["dataset_sand_metrics_path"] = previous_dataset["dataset_sand_metrics_path"]
+        STATE["auto_collect_episode_sand_snapshot"] = None
+        STATE["auto_collect_episode_sand_snapshot_time"] = 0.0
+        clear_planning_runtime_caches("auto_collect_loop_end")
         auto_collect_write_run_summary()
         update_status(auto_collect_status_text(), force=True)
 
@@ -7217,6 +8721,7 @@ def request_auto_collect(count):
     if bool(STATE.get("auto_collect_active", False)):
         update_status("[AUTO DATASET] already running", force=True)
         return
+    STATE["planning_cancel_requested"] = False
     task = register_async_task("auto_collect", auto_collect_loop(max(1, int(count))), replace=True)
     STATE["auto_collect_task"] = task
 
@@ -7227,6 +8732,7 @@ def stop_auto_collect():
     STATE["trace_no_plan_notice_shown"] = True
     STATE["trace_no_plan_notice_time"] = time.time()
     cancel_active_task("auto dataset stop requested")
+    invalidate_active_task("auto_collect_stop_requested")
     cancel_registered_task("auto_collect", reason="stop_auto_collect")
     auto_collect_write_run_summary()
     update_status("[AUTO DATASET] stop requested", force=True)
@@ -7400,12 +8906,191 @@ def q_delta_abs_deg(q_a, q_b):
     return out
 
 
+def dataset_q_delta(q_a, q_b):
+    q_a = np.array(q_a, dtype=np.float32).reshape(-1)[:4]
+    q_b = np.array(q_b, dtype=np.float32).reshape(-1)[:4]
+    dq = q_a - q_b
+    try:
+        swing_idx = CTRL.name_to_idx["swing"]
+        dq[swing_idx] = swing_delta(q_a[swing_idx], q_b[swing_idx])
+    except Exception:
+        pass
+    return dq.astype(np.float32, copy=False)
+
+
 def plan_joint_motion_metrics(q_to, q_from, duration=0.0):
     return ik_calculation.joint_motion_metrics(runtime_module(), q_to, q_from, duration=duration)
 
 
-def plan_path_penalty(q_start, q_goal, mode):
-    return ik_calculation.path_penalty(runtime_module(), q_start, q_goal, mode)
+def reload_ik_calculation_module(reason=""):
+    global ik_calculation
+    module_name = getattr(ik_calculation, "__name__", "excavator_app.ik_calculation")
+    try:
+        if module_name in sys.modules:
+            ik_calculation = importlib.reload(sys.modules[module_name])
+        else:
+            ik_calculation = importlib.import_module(module_name)
+        info_print(
+            "[MODULE RELOAD] ik_calculation",
+            f"reason={reason}",
+            f"module={module_name}",
+            f"file={getattr(ik_calculation, '__file__', '')}",
+        )
+        return True
+    except Exception as e:
+        info_print("[WARN] [MODULE RELOAD] ik_calculation failed:", f"reason={reason}", type(e).__name__, e)
+        return False
+
+
+def plan_path_penalty_cache_key(q_start, q_goal, mode):
+    try:
+        qa = np.round(np.array(q_start, dtype=np.float32).reshape(-1)[:4], 4)
+        qb = np.round(np.array(q_goal, dtype=np.float32).reshape(-1)[:4], 4)
+        return (str(mode), tuple(float(x) for x in qa), tuple(float(x) for x in qb))
+    except Exception:
+        return None
+
+
+def path_penalty_cacheable(detail):
+    if not isinstance(detail, dict):
+        return False
+    reason_text = " ".join(
+        [
+            str(detail.get("phase_reason", "")),
+            str(detail.get("obstacle_reason", "")),
+        ]
+    ).lower()
+    return "planning budget exceeded" not in reason_text and "planning_deadline" not in reason_text
+
+
+def compute_path_penalty_uncached(q_start, q_goal, mode, deadline=None):
+    try:
+        return ik_calculation.path_penalty(runtime_module(), q_start, q_goal, mode, deadline=deadline)
+    except TypeError as e:
+        if "deadline" not in str(e):
+            raise
+        info_print(
+            "[WARN] [MODULE STALE] ik_calculation.path_penalty missing deadline; attempting reload",
+            f"error={e}",
+        )
+        if reload_ik_calculation_module(reason="path_penalty_deadline_signature"):
+            try:
+                return ik_calculation.path_penalty(runtime_module(), q_start, q_goal, mode, deadline=deadline)
+            except TypeError as e2:
+                if "deadline" not in str(e2):
+                    raise
+                info_print(
+                    "[WARN] [MODULE STALE] ik_calculation.path_penalty still missing deadline after reload; using fallback",
+                    f"error={e2}",
+                )
+        return ik_calculation.path_penalty(runtime_module(), q_start, q_goal, mode)
+
+
+def plan_path_penalty(q_start, q_goal, mode, deadline=None):
+    cache_key = plan_path_penalty_cache_key(q_start, q_goal, mode)
+    cache = STATE.setdefault("planning_path_penalty_cache", {})
+    if bool(STATE.get("dig_plan_planning_active", False)) and cache_key is not None:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            STATE["planning_path_penalty_cache_hits"] = int(STATE.get("planning_path_penalty_cache_hits", 0)) + 1
+            return float(cached[0]), dict(cached[1])
+
+    penalty, detail = compute_path_penalty_uncached(q_start, q_goal, mode, deadline=deadline)
+    STATE["planning_path_penalty_cache_misses"] = int(STATE.get("planning_path_penalty_cache_misses", 0)) + 1
+    if (
+        bool(STATE.get("dig_plan_planning_active", False))
+        and cache_key is not None
+        and not planning_deadline_exceeded(deadline)
+        and path_penalty_cacheable(detail)
+    ):
+        if len(cache) >= int(PLANNING_PATH_PENALTY_CACHE_MAX):
+            try:
+                cache.pop(next(iter(cache)))
+            except Exception:
+                cache.clear()
+        cache[cache_key] = (float(penalty), dict(detail))
+    return float(penalty), detail
+
+
+def planning_deadline_exceeded(deadline):
+    if bool(STATE.get("planning_cancel_requested", False)):
+        return True
+    if bool(STATE.get("auto_collect_stop_requested", False)) and str(STATE.get("dig_plan_planning_source", "")) == "auto_collect":
+        return True
+    try:
+        perf_deadline = STATE.get("dig_plan_active_perf_deadline", None)
+        if perf_deadline is not None and time.perf_counter() > float(perf_deadline):
+            return True
+    except Exception:
+        pass
+    return deadline is not None and time.time() > float(deadline)
+
+
+def child_planning_deadline(parent_deadline, max_seconds, min_seconds=0.05):
+    if parent_deadline is None:
+        return None
+    try:
+        now = time.time()
+        parent_deadline = float(parent_deadline)
+        remaining = max(0.0, parent_deadline - now)
+        if remaining <= 0.0:
+            return now
+        window = max(float(min_seconds), min(float(max_seconds), remaining))
+        return min(parent_deadline, now + window)
+    except Exception:
+        return parent_deadline
+
+
+def perf_block_record(label, elapsed_ms, data=None, threshold_ms=None):
+    try:
+        elapsed_ms = float(elapsed_ms)
+    except Exception:
+        return
+    threshold = float(PLANNER_SYNC_BLOCK_WARN_MS if threshold_ms is None else threshold_ms)
+    if elapsed_ms < threshold:
+        return
+    payload = dict(data or {})
+    payload["elapsed_ms"] = float(elapsed_ms)
+    payload["threshold_ms"] = float(threshold)
+    payload["planning_active"] = bool(STATE.get("dig_plan_planning_active", False))
+    payload["auto_collect_active"] = bool(STATE.get("auto_collect_active", False))
+    payload["stop_requested"] = bool(STATE.get("auto_collect_stop_requested", False))
+    payload["path_penalty_cache_hits"] = int(STATE.get("planning_path_penalty_cache_hits", 0))
+    payload["path_penalty_cache_misses"] = int(STATE.get("planning_path_penalty_cache_misses", 0))
+    STATE["perf_block_count"] = int(STATE.get("perf_block_count", 0) or 0) + 1
+    STATE["perf_block_last"] = {"label": str(label), **payload}
+    info_print(
+        "[PERF BLOCK]",
+        f"label={label}",
+        f"elapsed_ms={elapsed_ms:.1f}",
+        f"threshold_ms={threshold:.1f}",
+        f"planning={payload['planning_active']}",
+        f"auto={payload['auto_collect_active']}",
+        f"cache={payload['path_penalty_cache_hits']}/{payload['path_penalty_cache_misses']}",
+    )
+    try:
+        debug_timeline_record(
+            "PERF_BLOCK",
+            stage=str(label),
+            result="slow_sync",
+            data=payload,
+            include_sand=False,
+        )
+    except Exception:
+        pass
+
+
+def clear_planning_runtime_caches(reason=""):
+    STATE["planning_path_penalty_cache"] = {}
+    STATE["planning_path_penalty_cache_hits"] = 0
+    STATE["planning_path_penalty_cache_misses"] = 0
+    STATE["planning_swing_corridor_cache"] = {}
+    STATE["planning_swing_corridor_cache_hits"] = 0
+    STATE["planning_swing_corridor_cache_misses"] = 0
+    STATE["planning_sand_snapshot"] = None
+    STATE["planning_sand_snapshot_active"] = False
+    if reason:
+        STATE["planning_cache_clear_reason"] = str(reason)
 
 
 def stop_manual_motion_after_freeze(q_real, detail=""):
@@ -7680,6 +9365,21 @@ def check_freeze_state(label="loop"):
     if "direct" in action_mode_l or "home_direct" in action_mode_l or "initial_direct" in action_mode_l:
         STATE["freeze_candidate_since"] = 0.0
         return
+    if is_sand_contact_phase(action_mode):
+        STATE["freeze_candidate_since"] = 0.0
+        try:
+            q_cmd_contact = np.array(q_cmd, dtype=np.float32)
+            q_real_contact = q_real_near_command(get_real_joint_positions(), q_cmd_contact)
+            update_sand_contact_progress(
+                action_mode,
+                q_cmd=q_cmd_contact,
+                q_real=q_real_contact,
+                force=False,
+                log=True,
+            )
+        except Exception:
+            pass
+        return
 
     try:
         q_cmd = np.array(q_cmd, dtype=np.float32)
@@ -7866,16 +9566,33 @@ def ensure_joint_limits_are_valid():
         except Exception:
             valid = False
 
+        desired_lo, desired_hi = DESIRED_LIMITS_DEG[name]
+        if LIMIT_POLICY == "override":
+            needs_override = (
+                not valid
+                or abs(float(lo) - float(desired_lo)) > 1.0e-3
+                or abs(float(hi) - float(desired_hi)) > 1.0e-3
+            )
+            if needs_override:
+                lo_attr.Set(float(desired_lo))
+                hi_attr.Set(float(desired_hi))
+                info_print(
+                    f"[JOINT LIMIT OVERRIDE] {name}: imported=({raw_lo},{raw_hi}) "
+                    f"set=({desired_lo:.3f},{desired_hi:.3f})"
+                )
+            else:
+                info_print(f"[JOINT LIMIT OK] {name}: lower={lo:.3f} upper={hi:.3f}")
+            continue
+
         if valid:
             info_print(f"[JOINT LIMIT OK] {name}: lower={lo:.3f} upper={hi:.3f}")
             continue
 
-        lo, hi = DESIRED_LIMITS_DEG[name]
-        lo_attr.Set(float(lo))
-        hi_attr.Set(float(hi))
+        lo_attr.Set(float(desired_lo))
+        hi_attr.Set(float(desired_hi))
         info_print(
             f"[JOINT LIMIT FIX] {name}: invalid imported lower/upper=({raw_lo},{raw_hi}) "
-            f"set=({lo:.3f},{hi:.3f})"
+            f"set=({desired_lo:.3f},{desired_hi:.3f})"
         )
 
 
@@ -9263,7 +10980,9 @@ def trace_auto_carry_bucket_world(q0, q1, mode):
     level_mode = str(mode).lower()
     auto_carry_bucket = (
         ("unload_to_bin" in level_mode)
-        or ("carry" in level_mode and "lift_carry" not in level_mode and "unload" not in level_mode)
+        or ("clearance_route_post" in level_mode)
+        or ("lift_carry" in level_mode)
+        or ("carry" in level_mode and "unload" not in level_mode)
     )
     if not auto_carry_bucket:
         return None
@@ -9514,6 +11233,48 @@ def execution_failure_status_text(stage_name):
     return f"[DIG EXEC FAILED] {stage_name} could not complete: {reason}"
 
 
+def current_dig_plan_contract_status():
+    plan = STATE.get("current_dig_plan")
+    if not isinstance(plan, dict):
+        return True, {}
+    contract = plan.get("fsm_contract")
+    if not isinstance(contract, dict):
+        return True, {}
+    return bool(contract.get("ok", True)), contract
+
+
+def block_invalid_dig_plan_contract(task_label="dig_plan"):
+    ok, contract = current_dig_plan_contract_status()
+    if ok:
+        return False
+    plan = STATE.get("current_dig_plan")
+    if (
+        isinstance(plan, dict)
+        and bool(plan.get("staged_execution", False))
+        and bool(plan.get("staged_prefix_ready", False))
+    ):
+        missing = contract.get("missing", []) if isinstance(contract, dict) else []
+        info_print(
+            "[DIG PLAN CONTRACT STAGED]",
+            f"{task_label}: allowing executable dig prefix",
+            f"missing_later_phases={missing}",
+        )
+        return False
+    reasons = contract.get("reasons", []) if isinstance(contract, dict) else []
+    reason_text = "planning_failed/fsm_contract_invalid:" + ";".join(str(x) for x in reasons[:4])
+    set_execution_failure_reason(reason_text)
+    update_status(f"[DIG PLAN CONTRACT FAILED] {task_label}: {reason_text}", force=True)
+    debug_timeline_record(
+        "PLAN_CONTRACT",
+        stage=str(task_label),
+        result="failed",
+        reason=reason_text,
+        data=contract,
+        include_sand=False,
+    )
+    return True
+
+
 def sync_motion_start_q(label=""):
     try:
         q_real = q_real_near_command(get_real_joint_positions(), CTRL.q_cmd)
@@ -9613,6 +11374,28 @@ async def wait_for_motion_reached(q_goal, label="", mode="auto", seconds_eff=0.0
             )
         await step_updates(1)
     info_print("[MOVE VERIFY WAIT TIMEOUT]", f"label={label}", f"mode={mode}", f"detail={last_detail}")
+    if is_sand_contact_phase(str(label or mode)):
+        report = STATE.get("sand_contact_last_report")
+        report = report if isinstance(report, dict) else {}
+        reason = (
+            f"execution_failed/no_material_progress:{label}:"
+            f"bucket_total={int(report.get('total_bucket_delta', 0) or 0)};"
+            f"pile_total={int(report.get('total_pile_delta', 0) or 0)};"
+            f"spill_total={int(report.get('total_spill_delta', 0) or 0)};"
+            f"tip_total={float(report.get('total_tip_delta', 0.0) or 0.0):.3f};"
+            f"progress_age={float(report.get('progress_age', 0.0) or 0.0):.2f};"
+            f"last_reach_detail={last_detail}"
+        )
+        set_execution_failure_reason(reason)
+        debug_timeline_record(
+            "SAND_CONTACT_NO_PROGRESS",
+            stage=str(label or mode),
+            result="failed",
+            reason=reason,
+            data=report,
+            include_sand=True,
+        )
+        return False
     return verify_motion_reached(q_goal, label=label, mode=mode, record_failure=True)
 
 
@@ -9668,7 +11451,9 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
     level_mode = str(mode).lower()
     auto_carry_bucket = (
         ("unload_to_bin" in level_mode)
-        or ("carry" in level_mode and "lift_carry" not in level_mode and "unload" not in level_mode)
+        or ("clearance_route_post" in level_mode)
+        or ("lift_carry" in level_mode)
+        or ("carry" in level_mode and "unload" not in level_mode)
     )
     if auto_carry_bucket:
         start_angles = chain_angles_from_q(q0, end_effector="load")
@@ -9685,9 +11470,10 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
 
     contact_advanced = False
     contact_advance_reason = ""
+    carry_loaded_limit_logged = False
 
     for i in range(steps):
-        if task_id is not None and not task_alive(task_id):
+        if motion_cancel_requested(task_id):
             update_status(f"[MOVE STOPPED] {label}", force=True)
             return False
 
@@ -9698,20 +11484,49 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
             carry_calc = bucket_joint_for_world_angle(q, carry_bucket_world_rad, end_effector="load")
             if carry_calc is not None:
                 raw_bucket = float(carry_calc["bucket"])
-                q[CTRL.name_to_idx["bucket"]] = carry_calc["bucket"]
-                q = CTRL.clip_limits(q)
-                if abs(wrap_angle(float(q[CTRL.name_to_idx["bucket"]]) - raw_bucket)) > deg_to_rad(0.25):
+                raw_bucket_deg = rad_to_deg(raw_bucket)
+                skip_auto_carry_adjust = False
+                if bucket_is_dump_branch_for_carry(raw_bucket_deg):
                     carry_limited = True
-                actual_angles = chain_angles_from_q(q, end_effector="load")
-                if actual_angles is not None:
-                    carry_err_rad = abs(wrap_angle(float(actual_angles[2]) - carry_bucket_world_rad))
-                    carry_max_err_rad = max(carry_max_err_rad, carry_err_rad)
-                    if carry_err_rad > deg_to_rad(BUCKET_CARRY_HOLD_TOL_DEG):
-                        update_status(
-                            f"[MOVE CARRY DIAG] {label}: load_world_err={rad_to_deg(carry_err_rad):.2f}deg "
-                            f"bucket_limit={carry_limited}; executing and scoring actual carried sand",
-                            force=True,
+                    skip_auto_carry_adjust = True
+                    if not carry_loaded_limit_logged:
+                        carry_loaded_limit_logged = True
+                        info_print(
+                            "[LOADED BUCKET LIMIT]",
+                            f"stage={label}",
+                            f"requested={raw_bucket_deg:.2f}deg",
+                            f"max_carry_dump_branch={float(BUCKET_CARRY_MAX_DUMP_BRANCH_DEG):.2f}deg",
+                            "reason=avoid_dump_branch_during_carry",
                         )
+                    # Keep the planned/interpolated bucket command. Dumping is
+                    # allowed only in dump_bucket_at_target(), not while carrying.
+                if not skip_auto_carry_adjust:
+                    q[CTRL.name_to_idx["bucket"]] = carry_calc["bucket"]
+                    q = CTRL.clip_limits(q)
+                    q, loaded_limited, old_bucket_deg = apply_loaded_bucket_closed_limit(q, label=label)
+                    if loaded_limited:
+                        carry_limited = True
+                        if not carry_loaded_limit_logged:
+                            carry_loaded_limit_logged = True
+                            info_print(
+                                "[LOADED BUCKET LIMIT]",
+                                f"stage={label}",
+                                f"requested={old_bucket_deg:.2f}deg",
+                                f"limited_to={float(BUCKET_LOADED_CLOSED_LIMIT_DEG):.2f}deg",
+                                "reason=loaded_carry_executable_limit",
+                            )
+                    if abs(wrap_angle(float(q[CTRL.name_to_idx["bucket"]]) - raw_bucket)) > deg_to_rad(0.25):
+                        carry_limited = True
+                    actual_angles = chain_angles_from_q(q, end_effector="load")
+                    if actual_angles is not None:
+                        carry_err_rad = abs(wrap_angle(float(actual_angles[2]) - carry_bucket_world_rad))
+                        carry_max_err_rad = max(carry_max_err_rad, carry_err_rad)
+                        if carry_err_rad > deg_to_rad(BUCKET_CARRY_HOLD_TOL_DEG):
+                            update_status(
+                                f"[MOVE CARRY DIAG] {label}: load_world_err={rad_to_deg(carry_err_rad):.2f}deg "
+                                f"bucket_limit={carry_limited}; executing and scoring actual carried sand",
+                                force=True,
+                            )
 
         q_final_cmd = q.copy()
         ok, reason = CTRL.apply_target_direct(q, mode=mode)
@@ -9736,6 +11551,9 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                 return False
 
         await step_updates(max(1, int(60 / CONTROL_HZ)))
+        if motion_cancel_requested(task_id):
+            update_status(f"[MOVE STOPPED] {label}", force=True)
+            return False
         dataset_record_sample(mode, q_cmd=CTRL.q_cmd.copy(), label=label)
         notify_sand_site_tool_sample(mode)
         if is_sand_contact_phase(contact_stage_name):
@@ -9810,7 +11628,8 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                     include_sand=True,
                 )
                 break
-        check_freeze_state(f"move_profile:{mode}")
+        if not is_sand_contact_phase(contact_stage_name):
+            check_freeze_state(f"move_profile:{mode}")
 
     if carry_bucket_world_rad is not None:
         final_angles = chain_angles_from_q(CTRL.q_cmd, end_effector="load")
@@ -9822,6 +11641,10 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
         )
 
     if contact_advanced:
+        dataset_record_event(
+            "sand_contact_advance",
+            f"stage={label}; mode={mode}; reason={contact_advance_reason}",
+        )
         update_status(
             f"[MOVE CONTACT ADVANCE] {label}: {contact_advance_reason}",
             force=False,
@@ -9870,8 +11693,16 @@ IK_COST_WEIGHTS = np.array([0.35, 0.45, 0.55, 4.50], dtype=np.float32)
 DIG_PLAN_BEAM_SIZE = 3
 DIG_PLAN_TOPK_IK = 2
 DIG_PLAN_MAX_CANDIDATES = 10
-DIG_PLAN_PATH_CHECK_SAMPLES = 8
-DIG_PLAN_MAX_BUILD_SECONDS = 3.5
+DIG_PLAN_PATH_CHECK_SAMPLES = 6
+DIG_PLAN_MAX_BUILD_SECONDS = 10.0
+PLANNER_SYNC_BLOCK_WARN_MS = 250.0
+AUTO_COLLECT_FIND_PLAN_MAX_SECONDS = 30.0
+AUTO_COLLECT_CANDIDATE_PLAN_SECONDS = 10.0
+AUTO_COLLECT_CANDIDATE_HARD_BUDGET_GRACE_SECONDS = 0.50
+AUTO_COLLECT_MAX_FULL_PLAN_ATTEMPTS = 2
+AUTO_COLLECT_PLANNING_SNAPSHOT_MAX_AGE = 6.0
+PLANNING_PATH_PENALTY_CACHE_MAX = 256
+PLANNING_SWING_CORRIDOR_CACHE_MAX = 128
 DIG_PLAN_MOTION_WEIGHTS = np.array([1.15, 1.0, 0.9, 0.7], dtype=np.float32)
 DIG_PLAN_ANGLE_COST_WEIGHT = 0.65
 DIG_PLAN_TIME_COST_WEIGHT = 0.35
@@ -9888,6 +11719,7 @@ IK_ACCEPT_ERR = 0.35
 IK_REFINE_ITERS = 10
 IK_REFINE_LAMBDA = 0.035
 IK_REFINE_MAX_STEP = 0.12
+IK_GOAL_OBSTACLE_COST = 260.0
 DIG_MAX_TIP_DEPTH = 0.28
 DIG_MAX_CURL_DEPTH = 0.14
 DIG_MAX_BUCKET_BODY_DEPTH = 0.10
@@ -9906,8 +11738,32 @@ PATH_OBSTACLE_MARGIN_XY = 0.18
 PATH_OBSTACLE_MARGIN_Z = 0.10
 PATH_OBSTACLE_OVER_CLEARANCE_Z = 0.45
 PATH_OBSTACLE_CACHE_SECONDS = 2.50
+PATH_OBSTACLE_MESH_PROXY_MIN_AREA = 1.0e-4
+PATH_OBSTACLE_MESH_PROXY_MAX_FACES = 32
 PATH_ROUTE_SIDE_OFFSETS = [0.65, 1.10, 1.65, 2.25]
-PATH_ROUTE_PLANNING_SAMPLE_COUNT = 8
+PATH_ROUTE_PLANNING_SAMPLE_COUNT = 6
+PATH_RRT_MAX_ITERS = 260
+PATH_RRT_MAX_ITERS_WITH_DEADLINE = 70
+PATH_RRT_STEP_DEG = 13.0
+PATH_RRT_GOAL_BIAS = 0.18
+PATH_RRT_JOINT_WEIGHTS = [1.15, 1.0, 0.9, 0.7]
+PATH_RRT_SMOOTH_ROUNDS = 24
+PATH_RRT_SMOOTH_ROUNDS_WITH_DEADLINE = 4
+PATH_RRT_CONNECT_STEPS_WITH_DEADLINE = 12
+PATH_RRT_SMOOTH_ALPHA = 0.55
+PATH_RRT_SMOOTH_BEND_WEIGHT = 0.35
+PATH_RRT_SMOOTH_MIN_IMPROVEMENT = 1.0e-4
+PATH_LINK_COLLISION_SEGMENT_SAMPLES = 4
+PATH_LINK_COLLISION_RADIUS_M = 0.10
+PATH_DETERMINISTIC_ROUTE_POSES_DEG = [
+    {"boom": 72.0, "arm": -88.0, "bucket": -56.0},
+    {"boom": 72.0, "arm": -88.0, "bucket": -46.0},
+    {"boom": 64.0, "arm": -76.0, "bucket": -34.0},
+    {"boom": 56.0, "arm": -62.0, "bucket": -20.0},
+]
+PATH_DETERMINISTIC_APPROACH_LIFTS_DEG = [8.0, 14.0, 22.0, 32.0]
+PATH_DETERMINISTIC_APPROACH_ARM_DELTAS_DEG = [-4.0, -10.0, -18.0, 4.0]
+PATH_DETERMINISTIC_SWING_DETOURS_DEG = [0.0, 85.0, -85.0, 120.0, -120.0, 55.0, -55.0, 28.0, -28.0]
 PRE_DIG_SWING_ALIGN_THRESHOLD_DEG = 8.0
 MOVE_FINAL_SWING_TOL_DEG = 3.0
 MOVE_FINAL_JOINT_TOL_DEG = 8.0
@@ -10099,6 +11955,12 @@ def sand_surface_query_at_xy(x, y):
         if abs(float(x) - float(center[0])) > float(radius[0]) or abs(float(y) - float(center[1])) > float(radius[1]):
             return None, "outside"
 
+    snapshot = STATE.get("planning_sand_snapshot") if bool(STATE.get("planning_sand_snapshot_active", False)) else None
+    if isinstance(snapshot, dict):
+        z_snapshot = sand_snapshot_surface_height(snapshot, x, y)
+        if z_snapshot is not None:
+            return float(z_snapshot), "planning_particle_snapshot"
+
     snapshot = get_sand_snapshot(force=False, label="surface_query", max_age=0.75)
     z_snapshot = sand_snapshot_surface_height(snapshot, x, y)
     if z_snapshot is not None:
@@ -10128,18 +11990,13 @@ def sand_surface_query_at_xy(x, y):
             z = max(float(floor_z) + 0.02, min(z, float(z_expected_max)))
             return z, "particle_p90"
 
-    for fn_key in ["height_fn", "initial_height_fn"]:
-        fn = api.get(fn_key) if isinstance(api, dict) else None
-        if callable(fn):
-            try:
-                z = float(fn(float(x), float(y)))
-                if math.isfinite(z):
-                    return z, fn_key
-            except Exception:
-                pass
-    if len(center) >= 3:
-        return float(center[2]), "fallback_center"
-    return None, "missing"
+    try:
+        _sx, _sy, floor_z, _fill_height, _expected_min, z_expected_max = sand_pile_geometry_from_context(ctx)
+        return float(max(float(floor_z) + 0.10, min(float(floor_z) + 0.18, float(z_expected_max)))), "fallback_floor_no_particle_surface"
+    except Exception:
+        if len(center) >= 3:
+            return float(center[2]), "fallback_center_no_particle_surface"
+    return None, "missing_particle_surface"
 
 
 def sand_surface_z_at_xy(x, y):
@@ -10460,13 +12317,15 @@ def cut_front_edge_quality(mode, report):
     return True, f"front_edge_ok tip={tip_depth:.3f} body={deepest_body:.3f} body_over_tip={body_over_tip:.3f}", float(attack_penalty)
 
 
-def path_phase_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES):
+def path_phase_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadline=None):
     t0 = time.perf_counter()
     samples = max(2, int(samples))
     last_report = None
 
     try:
         for i in range(1, samples + 1):
+            if planning_deadline_exceeded(deadline):
+                return False, "planning budget exceeded", i, last_report
             s = float(i) / float(samples)
             q = interpolate_q_shortest(q_start, q_goal, s)
             report = predicted_phase_ground_report(q, mode, reference_q=q_start)
@@ -10520,14 +12379,38 @@ def append_obstacle_bbox(bboxes, seen_paths, path, source="collision_api", colli
     size = np.array(mx, dtype=np.float32) - np.array(mn, dtype=np.float32)
     if float(np.max(size)) <= 1.0e-4:
         return
+    footprint = None
+    footprint_source_vertices = 0
+    proxy = "aabb"
+    try:
+        xy_points = mesh_world_xy_points_under(prim)
+        hull = convex_hull_xy(xy_points) if xy_points is not None and len(xy_points) >= 3 else None
+        if hull is not None and abs(polygon_signed_area(hull)) >= float(PATH_OBSTACLE_MESH_PROXY_MIN_AREA):
+            footprint_source_vertices = int(len(hull))
+            limited = visual_polygon_xy(hull, PATH_OBSTACLE_MESH_PROXY_MAX_FACES)
+            if limited is not None and len(limited) >= 3 and abs(polygon_signed_area(limited)) >= float(PATH_OBSTACLE_MESH_PROXY_MIN_AREA):
+                footprint = np.array(limited, dtype=np.float32).reshape(-1, 2)
+                proxy = "mesh_footprint_prism"
+    except Exception:
+        footprint = None
+        footprint_source_vertices = 0
+        proxy = "aabb"
     seen_paths.add(path)
-    bboxes.append({
+    row = {
         "path": path,
         "min": np.array(mn, dtype=np.float32),
         "max": np.array(mx, dtype=np.float32),
         "collision_required": bool(collision_required),
         "source": str(source),
-    })
+        "proxy": proxy,
+    }
+    if footprint is not None:
+        row["footprint_xy"] = footprint
+        row["footprint_vertices"] = int(len(footprint))
+        row["footprint_faces"] = int(len(footprint))
+        row["footprint_source_vertices"] = int(footprint_source_vertices)
+        row["footprint_max_faces"] = int(PATH_OBSTACLE_MESH_PROXY_MAX_FACES)
+    bboxes.append(row)
 
 
 def collect_collision_api_obstacles(bboxes, seen_paths):
@@ -10562,6 +12445,11 @@ def rigid_obstacle_bboxes(force=False):
     if not force:
         cached = STATE.get("rigid_obstacle_cache")
         cached_time = float(STATE.get("rigid_obstacle_cache_time", 0.0) or 0.0)
+        if cached is not None and (
+            bool(STATE.get("dig_plan_planning_active", False))
+            or bool(STATE.get("auto_collect_active", False))
+        ):
+            return cached
         if cached is not None and now - cached_time <= PATH_OBSTACLE_CACHE_SECONDS:
             return cached
 
@@ -10580,6 +12468,8 @@ def rigid_obstacle_bboxes(force=False):
             collision_required = str(base_path) not in PATH_VISUAL_OBSTACLE_PATHS
             source = "visual_bbox_fallback" if not collision_required else "configured_collision_path"
         for path in candidate_paths:
+            if source == "visual_bbox_fallback" and any(str(p).startswith(str(path).rstrip("/") + "/") for p in seen_paths):
+                continue
             append_obstacle_bbox(
                 bboxes,
                 seen_paths,
@@ -10590,6 +12480,53 @@ def rigid_obstacle_bboxes(force=False):
     STATE["rigid_obstacle_cache"] = bboxes
     STATE["rigid_obstacle_cache_time"] = now
     return bboxes
+
+
+def compact_obstacle_bbox(row):
+    if not isinstance(row, dict):
+        return {}
+    mn = np.array(row.get("min", []), dtype=np.float32).reshape(-1)
+    mx = np.array(row.get("max", []), dtype=np.float32).reshape(-1)
+    if len(mn) < 3 or len(mx) < 3:
+        return {"path": str(row.get("path", "")), "valid": False}
+    center = 0.5 * (mn[:3] + mx[:3])
+    size = mx[:3] - mn[:3]
+    return {
+        "path": str(row.get("path", "")),
+        "source": str(row.get("source", "")),
+        "proxy": str(row.get("proxy", "aabb")),
+        "footprint_vertices": int(row.get("footprint_vertices", 0) or 0),
+        "footprint_faces": int(row.get("footprint_faces", 0) or 0),
+        "footprint_source_vertices": int(row.get("footprint_source_vertices", 0) or 0),
+        "footprint_max_faces": int(row.get("footprint_max_faces", 0) or 0),
+        "collision_required": bool(row.get("collision_required", False)),
+        "min": debug_round_vec(mn[:3], 3),
+        "max": debug_round_vec(mx[:3], 3),
+        "center": debug_round_vec(center, 3),
+        "size": debug_round_vec(size, 3),
+    }
+
+
+def planning_world_snapshot(force=False, max_obstacles=64):
+    obstacles = rigid_obstacle_bboxes(force=force)
+    rows = [compact_obstacle_bbox(x) for x in obstacles[:max(0, int(max_obstacles))]]
+    particle_like = []
+    for row in rows:
+        path = str(row.get("path", "")).lower()
+        if any(token in path for token in ("/realsandparticles", "/particlesystem", "sandparticles")):
+            particle_like.append(row.get("path", ""))
+    return {
+        "collision_world_policy": "rigid_hard_avoid__sand_soft_contact",
+        "rigid_obstacle_count": int(len(obstacles)),
+        "reported_obstacle_count": int(len(rows)),
+        "obstacles_truncated": bool(len(obstacles) > len(rows)),
+        "rigid_obstacles": rows,
+        "configured_rigid_paths": [str(x) for x in PATH_RIGID_OBSTACLE_PATHS],
+        "visual_bbox_fallback_paths": [str(x) for x in sorted(PATH_VISUAL_OBSTACLE_PATHS)],
+        "excluded_path_tokens": [str(x) for x in PATH_OBSTACLE_EXCLUDE_TOKENS],
+        "sand_particles_in_rigid_world": particle_like,
+        "sand_particles_treated_as_soft_contact": bool(not particle_like),
+    }
 
 
 def point_inside_expanded_bbox(point, mn, mx, margin_xy=0.0, margin_z=0.0):
@@ -10605,6 +12542,230 @@ def point_inside_expanded_bbox(point, mn, mx, margin_xy=0.0, margin_z=0.0):
     return bool(np.all(p >= lo) and np.all(p <= hi))
 
 
+def expanded_bbox_arrays(mn, mx, margin_xy=0.0, margin_z=0.0, radius=0.0):
+    lo = np.array(mn, dtype=np.float32).copy()
+    hi = np.array(mx, dtype=np.float32).copy()
+    r = max(0.0, float(radius))
+    lo[0] -= float(margin_xy) + r
+    lo[1] -= float(margin_xy) + r
+    hi[0] += float(margin_xy) + r
+    hi[1] += float(margin_xy) + r
+    lo[2] -= float(margin_z) + r
+    hi[2] += float(margin_z) + r
+    return lo, hi
+
+
+def segment_intersects_expanded_bbox(a, b, mn, mx, margin_xy=0.0, margin_z=0.0, radius=0.0):
+    p0 = np.array(a, dtype=np.float32).reshape(-1)[:3]
+    p1 = np.array(b, dtype=np.float32).reshape(-1)[:3]
+    lo, hi = expanded_bbox_arrays(mn, mx, margin_xy=margin_xy, margin_z=margin_z, radius=radius)
+    d = p1 - p0
+    tmin = 0.0
+    tmax = 1.0
+    for axis in range(3):
+        if abs(float(d[axis])) < 1.0e-8:
+            if float(p0[axis]) < float(lo[axis]) or float(p0[axis]) > float(hi[axis]):
+                return False, None
+            continue
+        inv = 1.0 / float(d[axis])
+        t1 = (float(lo[axis]) - float(p0[axis])) * inv
+        t2 = (float(hi[axis]) - float(p0[axis])) * inv
+        if t1 > t2:
+            t1, t2 = t2, t1
+        tmin = max(tmin, t1)
+        tmax = min(tmax, t2)
+        if tmin > tmax:
+            return False, None
+    hit_t = max(0.0, min(1.0, tmin))
+    hit_point = p0 + hit_t * d
+    return True, hit_point
+
+
+def point_in_convex_polygon_xy(point_xy, poly, eps=1.0e-7):
+    p = np.array(point_xy, dtype=np.float64).reshape(-1)[:2]
+    poly = np.array(poly, dtype=np.float64).reshape(-1, 2)
+    if poly.shape[0] < 3:
+        return False
+    if polygon_signed_area(poly) < 0.0:
+        poly = poly[::-1].copy()
+    for i in range(poly.shape[0]):
+        a = poly[i]
+        b = poly[(i + 1) % poly.shape[0]]
+        e = b - a
+        if float(e[0] * (p[1] - a[1]) - e[1] * (p[0] - a[0])) < -float(eps):
+            return False
+    return True
+
+
+def orient2d(a, b, c):
+    a = np.array(a, dtype=np.float64).reshape(-1)[:2]
+    b = np.array(b, dtype=np.float64).reshape(-1)[:2]
+    c = np.array(c, dtype=np.float64).reshape(-1)[:2]
+    return float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+
+
+def segments_intersect_xy(a0, a1, b0, b1, eps=1.0e-8):
+    a0 = np.array(a0, dtype=np.float64).reshape(-1)[:2]
+    a1 = np.array(a1, dtype=np.float64).reshape(-1)[:2]
+    b0 = np.array(b0, dtype=np.float64).reshape(-1)[:2]
+    b1 = np.array(b1, dtype=np.float64).reshape(-1)[:2]
+    o1 = orient2d(a0, a1, b0)
+    o2 = orient2d(a0, a1, b1)
+    o3 = orient2d(b0, b1, a0)
+    o4 = orient2d(b0, b1, a1)
+
+    def on_segment(p, q, r):
+        return (
+            min(float(p[0]), float(r[0])) - eps <= float(q[0]) <= max(float(p[0]), float(r[0])) + eps
+            and min(float(p[1]), float(r[1])) - eps <= float(q[1]) <= max(float(p[1]), float(r[1])) + eps
+        )
+
+    if o1 * o2 < -eps and o3 * o4 < -eps:
+        return True
+    if abs(o1) <= eps and on_segment(a0, b0, a1):
+        return True
+    if abs(o2) <= eps and on_segment(a0, b1, a1):
+        return True
+    if abs(o3) <= eps and on_segment(b0, a0, b1):
+        return True
+    if abs(o4) <= eps and on_segment(b0, a1, b1):
+        return True
+    return False
+
+
+def point_segment_distance_xy(point, a, b):
+    p = np.array(point, dtype=np.float64).reshape(-1)[:2]
+    a = np.array(a, dtype=np.float64).reshape(-1)[:2]
+    b = np.array(b, dtype=np.float64).reshape(-1)[:2]
+    ab = b - a
+    denom = float(np.dot(ab, ab))
+    if denom <= 1.0e-12:
+        return float(np.linalg.norm(p - a))
+    t = max(0.0, min(1.0, float(np.dot(p - a, ab) / denom)))
+    return float(np.linalg.norm(p - (a + t * ab)))
+
+
+def segment_segment_distance_xy(a0, a1, b0, b1):
+    if segments_intersect_xy(a0, a1, b0, b1):
+        return 0.0
+    return min(
+        point_segment_distance_xy(a0, b0, b1),
+        point_segment_distance_xy(a1, b0, b1),
+        point_segment_distance_xy(b0, a0, a1),
+        point_segment_distance_xy(b1, a0, a1),
+    )
+
+
+def point_in_polygon_with_margin_xy(point_xy, poly, margin_xy=0.0):
+    poly = np.array(poly, dtype=np.float32).reshape(-1, 2)
+    if poly.shape[0] < 3:
+        return False
+    if point_in_convex_polygon_xy(point_xy, poly):
+        return True
+    margin = max(0.0, float(margin_xy))
+    if margin <= 1.0e-6:
+        return False
+    for i in range(poly.shape[0]):
+        if point_segment_distance_xy(point_xy, poly[i], poly[(i + 1) % poly.shape[0]]) <= margin:
+            return True
+    return False
+
+
+def segment_intersects_polygon_with_margin_xy(a_xy, b_xy, poly, margin_xy=0.0):
+    poly = np.array(poly, dtype=np.float32).reshape(-1, 2)
+    if poly.shape[0] < 3:
+        return False
+    if point_in_convex_polygon_xy(a_xy, poly) or point_in_convex_polygon_xy(b_xy, poly):
+        return True
+    for i in range(poly.shape[0]):
+        edge_a = poly[i]
+        edge_b = poly[(i + 1) % poly.shape[0]]
+        if segments_intersect_xy(a_xy, b_xy, edge_a, edge_b):
+            return True
+    margin = max(0.0, float(margin_xy))
+    if margin <= 1.0e-6:
+        return False
+    for i in range(poly.shape[0]):
+        if segment_segment_distance_xy(a_xy, b_xy, poly[i], poly[(i + 1) % poly.shape[0]]) <= margin:
+            return True
+    return False
+
+
+def segment_z_overlap_subsegment(a, b, z_min, z_max, margin_z=0.0, radius=0.0):
+    p0 = np.array(a, dtype=np.float32).reshape(-1)[:3]
+    p1 = np.array(b, dtype=np.float32).reshape(-1)[:3]
+    lo = float(z_min) - float(margin_z) - max(0.0, float(radius))
+    hi = float(z_max) + float(margin_z) + max(0.0, float(radius))
+    dz = float(p1[2] - p0[2])
+    if abs(dz) < 1.0e-8:
+        if float(p0[2]) < lo or float(p0[2]) > hi:
+            return None
+        return p0.copy(), p1.copy()
+    t0 = (lo - float(p0[2])) / dz
+    t1 = (hi - float(p0[2])) / dz
+    if t0 > t1:
+        t0, t1 = t1, t0
+    t0 = max(0.0, float(t0))
+    t1 = min(1.0, float(t1))
+    if t0 > t1:
+        return None
+    return p0 + t0 * (p1 - p0), p0 + t1 * (p1 - p0)
+
+
+def point_inside_obstacle_proxy(point, obstacle, margin_xy=0.0, margin_z=0.0, radius=0.0):
+    poly = obstacle.get("footprint_xy") if isinstance(obstacle, dict) else None
+    if poly is None:
+        return point_inside_expanded_bbox(
+            point,
+            obstacle["min"],
+            obstacle["max"],
+            margin_xy=margin_xy,
+            margin_z=margin_z,
+        )
+    p = np.array(point, dtype=np.float32).reshape(-1)[:3]
+    mn = obstacle["min"]
+    mx = obstacle["max"]
+    z_lo = float(mn[2]) - float(margin_z) - max(0.0, float(radius))
+    z_hi = float(mx[2]) + float(margin_z) + max(0.0, float(radius))
+    if float(p[2]) < z_lo or float(p[2]) > z_hi:
+        return False
+    return point_in_polygon_with_margin_xy(p[:2], poly, margin_xy=max(0.0, float(margin_xy) + float(radius)))
+
+
+def segment_intersects_obstacle_proxy(a, b, obstacle, margin_xy=0.0, margin_z=0.0, radius=0.0):
+    poly = obstacle.get("footprint_xy") if isinstance(obstacle, dict) else None
+    if poly is None:
+        return segment_intersects_expanded_bbox(
+            a,
+            b,
+            obstacle["min"],
+            obstacle["max"],
+            margin_xy=margin_xy,
+            margin_z=margin_z,
+            radius=radius,
+        )
+    sub = segment_z_overlap_subsegment(
+        a,
+        b,
+        float(obstacle["min"][2]),
+        float(obstacle["max"][2]),
+        margin_z=margin_z,
+        radius=radius,
+    )
+    if sub is None:
+        return False, None
+    a_sub, b_sub = sub
+    hit = segment_intersects_polygon_with_margin_xy(
+        a_sub[:2],
+        b_sub[:2],
+        poly,
+        margin_xy=max(0.0, float(margin_xy) + float(radius)),
+    )
+    if not hit:
+        return False, None
+    return True, 0.5 * (a_sub + b_sub)
+
+
 def predicted_obstacle_check_points(q, reference_q=None):
     points = []
     for end_effector in ["tip", "mid", "load", "pour"]:
@@ -10615,6 +12776,15 @@ def predicted_obstacle_check_points(q, reference_q=None):
             if p is None:
                 continue
             points.append(np.array(p, dtype=np.float32))
+        segment_samples = max(1, int(PATH_LINK_COLLISION_SEGMENT_SAMPLES))
+        for a, b in zip(chain_points[:-1], chain_points[1:]):
+            if a is None or b is None:
+                continue
+            pa = np.array(a, dtype=np.float32)
+            pb = np.array(b, dtype=np.float32)
+            for j in range(1, segment_samples):
+                s = float(j) / float(segment_samples)
+                points.append((1.0 - s) * pa + s * pb)
 
     unique = []
     seen = set()
@@ -10627,19 +12797,101 @@ def predicted_obstacle_check_points(q, reference_q=None):
     return unique
 
 
+def predicted_obstacle_check_segments(q, reference_q=None):
+    segments = []
+    for end_effector in ["tip", "mid", "load", "pour"]:
+        chain_points = predicted_chain_world_points(q, end_effector=end_effector, reference_q=reference_q)
+        if chain_points is None or len(chain_points) < 2:
+            continue
+        for idx, (a, b) in enumerate(zip(chain_points[:-1], chain_points[1:])):
+            if a is None or b is None:
+                continue
+            pa = np.array(a, dtype=np.float32).reshape(-1)[:3]
+            pb = np.array(b, dtype=np.float32).reshape(-1)[:3]
+            if float(np.linalg.norm(pb - pa)) < 1.0e-5:
+                continue
+            if idx == 0:
+                link_name = "boom"
+            elif idx == 1:
+                link_name = "arm"
+            else:
+                link_name = f"bucket_{end_effector}"
+            segments.append((link_name, pa, pb))
+
+    unique = []
+    seen = set()
+    for link_name, pa, pb in segments:
+        key = (
+            link_name,
+            tuple(round(float(v), 3) for v in pa),
+            tuple(round(float(v), 3) for v in pb),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((link_name, pa, pb))
+    return unique
+
+
 def format_obstacle_report(mode, report, reason):
     point = report.get("point") if isinstance(report, dict) else None
+    segment = report.get("segment") if isinstance(report, dict) else None
+    link_name = report.get("link_name") if isinstance(report, dict) else None
     bbox_min = report.get("bbox_min") if isinstance(report, dict) else None
     bbox_max = report.get("bbox_max") if isinstance(report, dict) else None
     point_text = "None" if point is None else f"({float(point[0]):.3f},{float(point[1]):.3f},{float(point[2]):.3f})"
+    segment_text = ""
+    if segment is not None:
+        try:
+            a, b = segment
+            segment_text = (
+                f" segment=({float(a[0]):.3f},{float(a[1]):.3f},{float(a[2]):.3f})"
+                f"->({float(b[0]):.3f},{float(b[1]):.3f},{float(b[2]):.3f})"
+            )
+        except Exception:
+            segment_text = " segment=unavailable"
+    link_text = "" if not link_name else f" link={link_name}"
     min_text = "None" if bbox_min is None else f"({float(bbox_min[0]):.3f},{float(bbox_min[1]):.3f},{float(bbox_min[2]):.3f})"
     max_text = "None" if bbox_max is None else f"({float(bbox_max[0]):.3f},{float(bbox_max[1]):.3f},{float(bbox_max[2]):.3f})"
     obstacle = report.get("obstacle", "unknown") if isinstance(report, dict) else "unknown"
     source = report.get("obstacle_source", "") if isinstance(report, dict) else ""
     source_text = "" if not source else f" source={source}"
+    proxy = report.get("obstacle_proxy", "") if isinstance(report, dict) else ""
+    proxy_text = "" if not proxy else f" proxy={proxy}"
+    faces = report.get("obstacle_footprint_faces", None) if isinstance(report, dict) else None
+    source_vertices = report.get("obstacle_footprint_source_vertices", None) if isinstance(report, dict) else None
+    footprint_text = ""
+    try:
+        if faces is not None and int(faces) > 0:
+            footprint_text = f" footprint_faces={int(faces)} source_vertices={int(source_vertices or 0)}"
+    except Exception:
+        footprint_text = ""
     return (
         f"phase={mode} kind=rigid_obstacle {reason}; "
-        f"obstacle={obstacle}{source_text} point={point_text} bbox_min={min_text} bbox_max={max_text}"
+        f"obstacle={obstacle}{source_text}{proxy_text}{footprint_text}{link_text} point={point_text}{segment_text} "
+        f"bbox_min={min_text} bbox_max={max_text}"
+    )
+
+
+def obstacle_aabb_overlaps_segment(pa, pb, obstacle, margin_xy=0.0, margin_z=0.0, radius=0.0):
+    try:
+        mn = np.array(obstacle["min"], dtype=np.float32).reshape(-1)[:3]
+        mx = np.array(obstacle["max"], dtype=np.float32).reshape(-1)[:3]
+        a = np.array(pa, dtype=np.float32).reshape(-1)[:3]
+        b = np.array(pb, dtype=np.float32).reshape(-1)[:3]
+    except Exception:
+        return True
+    pad_xy = max(0.0, float(margin_xy) + float(radius))
+    pad_z = max(0.0, float(margin_z) + float(radius))
+    seg_min = np.minimum(a, b) - np.array([pad_xy, pad_xy, pad_z], dtype=np.float32)
+    seg_max = np.maximum(a, b) + np.array([pad_xy, pad_xy, pad_z], dtype=np.float32)
+    return bool(
+        float(seg_max[0]) >= float(mn[0])
+        and float(seg_min[0]) <= float(mx[0])
+        and float(seg_max[1]) >= float(mn[1])
+        and float(seg_min[1]) <= float(mx[1])
+        and float(seg_max[2]) >= float(mn[2])
+        and float(seg_min[2]) <= float(mx[2])
     )
 
 
@@ -10658,10 +12910,9 @@ def actual_rigid_obstacle_contact_detail():
         if point is None:
             continue
         for obstacle in obstacles:
-            if point_inside_expanded_bbox(
+            if point_inside_obstacle_proxy(
                 point,
-                obstacle["min"],
-                obstacle["max"],
+                obstacle,
                 margin_xy=PATH_OBSTACLE_MARGIN_XY,
                 margin_z=PATH_OBSTACLE_MARGIN_Z,
             ):
@@ -10674,44 +12925,110 @@ def actual_rigid_obstacle_contact_detail():
     return ""
 
 
-def path_obstacle_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES):
+def path_obstacle_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadline=None):
+    t0 = time.perf_counter()
     obstacles = rigid_obstacle_bboxes()
-    if not obstacles:
+    try:
+        if not obstacles:
+            return True, "ok", samples, None
+
+        samples = max(2, int(samples))
+        for i in range(1, samples + 1):
+            if planning_deadline_exceeded(deadline):
+                return False, "planning budget exceeded", i, None
+            s = float(i) / float(samples)
+            q = interpolate_q_shortest(q_start, q_goal, s)
+            segments = predicted_obstacle_check_segments(q, reference_q=q_start)
+            for link_name, pa, pb in segments:
+                for obstacle in obstacles:
+                    if planning_deadline_exceeded(deadline):
+                        return False, "planning budget exceeded", i, None
+                    if not obstacle_aabb_overlaps_segment(
+                        pa,
+                        pb,
+                        obstacle,
+                        margin_xy=PATH_OBSTACLE_MARGIN_XY,
+                        margin_z=PATH_OBSTACLE_MARGIN_Z,
+                        radius=PATH_LINK_COLLISION_RADIUS_M,
+                    ):
+                        continue
+                    hit, hit_point = segment_intersects_obstacle_proxy(
+                        pa,
+                        pb,
+                        obstacle,
+                        margin_xy=PATH_OBSTACLE_MARGIN_XY,
+                        margin_z=PATH_OBSTACLE_MARGIN_Z,
+                        radius=PATH_LINK_COLLISION_RADIUS_M,
+                    )
+                    if hit:
+                        report = {
+                            "mode": str(mode),
+                            "obstacle": obstacle["path"],
+                            "obstacle_source": obstacle.get("source", ""),
+                            "obstacle_proxy": obstacle.get("proxy", "aabb"),
+                            "obstacle_footprint_faces": obstacle.get("footprint_faces", 0),
+                            "obstacle_footprint_source_vertices": obstacle.get("footprint_source_vertices", 0),
+                            "link_name": link_name,
+                            "point": hit_point,
+                            "segment": (pa, pb),
+                            "bbox_min": obstacle["min"],
+                            "bbox_max": obstacle["max"],
+                        }
+                        return False, "predicted rigid link sweep contact", i, report
+
+            # Segment sweeps already include all chain endpoints. Keep point-only
+            # checks as a fallback for unusual missing-segment predictions instead
+            # of repeating a full second obstacle pass for every path sample.
+            if not segments:
+                points = predicted_obstacle_check_points(q, reference_q=q_start)
+                for p in points:
+                    for obstacle in obstacles:
+                        if planning_deadline_exceeded(deadline):
+                            return False, "planning budget exceeded", i, None
+                        if not obstacle_aabb_overlaps_segment(
+                            p,
+                            p,
+                            obstacle,
+                            margin_xy=PATH_OBSTACLE_MARGIN_XY,
+                            margin_z=PATH_OBSTACLE_MARGIN_Z,
+                            radius=0.0,
+                        ):
+                            continue
+                        if point_inside_obstacle_proxy(
+                            p,
+                            obstacle,
+                            margin_xy=PATH_OBSTACLE_MARGIN_XY,
+                            margin_z=PATH_OBSTACLE_MARGIN_Z,
+                        ):
+                            report = {
+                                "mode": str(mode),
+                                "obstacle": obstacle["path"],
+                                "obstacle_source": obstacle.get("source", ""),
+                                "obstacle_proxy": obstacle.get("proxy", "aabb"),
+                                "obstacle_footprint_faces": obstacle.get("footprint_faces", 0),
+                                "obstacle_footprint_source_vertices": obstacle.get("footprint_source_vertices", 0),
+                                "point": p,
+                                "bbox_min": obstacle["min"],
+                                "bbox_max": obstacle["max"],
+                            }
+                            return False, "predicted rigid obstacle contact", i, report
+
         return True, "ok", samples, None
-
-    samples = max(2, int(samples))
-    for i in range(1, samples + 1):
-        s = float(i) / float(samples)
-        q = interpolate_q_shortest(q_start, q_goal, s)
-        points = predicted_obstacle_check_points(q, reference_q=q_start)
-        for p in points:
-            for obstacle in obstacles:
-                if point_inside_expanded_bbox(
-                    p,
-                    obstacle["min"],
-                    obstacle["max"],
-                    margin_xy=PATH_OBSTACLE_MARGIN_XY,
-                    margin_z=PATH_OBSTACLE_MARGIN_Z,
-                ):
-                    report = {
-                        "mode": str(mode),
-                        "obstacle": obstacle["path"],
-                        "obstacle_source": obstacle.get("source", ""),
-                        "point": p,
-                        "bbox_min": obstacle["min"],
-                        "bbox_max": obstacle["max"],
-                    }
-                    return False, "predicted rigid obstacle contact", i, report
-
-    return True, "ok", samples, None
+    finally:
+        perf = dict(STATE.get("sand_perf_last", {}) or {})
+        perf["obstacle_check_ms"] = float(perf.get("obstacle_check_ms", 0.0) or 0.0) + (
+            time.perf_counter() - t0
+        ) * 1000.0
+        perf["obstacle_check_count"] = int(perf.get("obstacle_check_count", 0) or 0) + 1
+        STATE["sand_perf_last"] = perf
 
 
-def path_segment_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES):
-    ok, reason, sample, report = path_phase_check(q_start, q_goal, mode, samples=samples)
+def path_segment_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadline=None):
+    ok, reason, sample, report = path_phase_check(q_start, q_goal, mode, samples=samples, deadline=deadline)
     if not ok:
         return False, "phase", reason, sample, report
 
-    ok, reason, sample, report = path_obstacle_check(q_start, q_goal, mode, samples=samples)
+    ok, reason, sample, report = path_obstacle_check(q_start, q_goal, mode, samples=samples, deadline=deadline)
     if not ok:
         return False, "obstacle", reason, sample, report
 
@@ -10743,6 +13060,13 @@ def obstacle_top_z_for_segment(p_start, p_goal):
             and float(seg_max[1]) >= float(mn[1] - PATH_OBSTACLE_MARGIN_XY)
             and float(seg_min[1]) <= float(mx[1] + PATH_OBSTACLE_MARGIN_XY)
         )
+        if overlap and obstacle.get("footprint_xy") is not None:
+            overlap = segment_intersects_polygon_with_margin_xy(
+                a[:2],
+                b[:2],
+                obstacle["footprint_xy"],
+                margin_xy=PATH_OBSTACLE_MARGIN_XY + PATH_LINK_COLLISION_RADIUS_M,
+            )
         if overlap:
             top = float(mx[2]) if top is None else max(top, float(mx[2]))
     return top
@@ -10767,12 +13091,42 @@ def obstacle_bboxes_for_segment_xy(p_start, p_goal):
             and float(seg_max[1]) >= float(mn[1] - PATH_OBSTACLE_MARGIN_XY)
             and float(seg_min[1]) <= float(mx[1] + PATH_OBSTACLE_MARGIN_XY)
         )
+        if overlap and obstacle.get("footprint_xy") is not None:
+            overlap = segment_intersects_polygon_with_margin_xy(
+                a[:2],
+                b[:2],
+                obstacle["footprint_xy"],
+                margin_xy=PATH_OBSTACLE_MARGIN_XY + PATH_LINK_COLLISION_RADIUS_M,
+            )
         if not overlap:
             continue
         size_xy = float(max(abs(float(mx[0] - mn[0])), abs(float(mx[1] - mn[1]))))
         rows.append((size_xy, obstacle))
     rows.sort(key=lambda item: float(item[0]), reverse=True)
     return [item[1] for item in rows]
+
+
+def obstacle_corridor_report(p_start, p_goal, obstacle=None, link_name="planned_end"):
+    if obstacle is None:
+        blockers = obstacle_bboxes_for_segment_xy(p_start, p_goal)
+        obstacle = blockers[0] if blockers else None
+    if obstacle is None:
+        return None
+    a = np.array(p_start, dtype=np.float32).reshape(-1)[:3]
+    b = np.array(p_goal, dtype=np.float32).reshape(-1)[:3]
+    return {
+        "mode": "corridor",
+        "obstacle": obstacle.get("path", ""),
+        "obstacle_source": obstacle.get("source", ""),
+        "obstacle_proxy": obstacle.get("proxy", "aabb"),
+        "obstacle_footprint_faces": obstacle.get("footprint_faces", 0),
+        "obstacle_footprint_source_vertices": obstacle.get("footprint_source_vertices", 0),
+        "link_name": str(link_name),
+        "point": 0.5 * (a + b),
+        "segment": (a, b),
+        "bbox_min": obstacle.get("min"),
+        "bbox_max": obstacle.get("max"),
+    }
 
 
 def wrap_angle(x):
@@ -11040,6 +13394,33 @@ def clip_command_near(q, reference=None):
     return q
 
 
+def planner_effective_joint_bounds_rad(name):
+    try:
+        lo, hi = FINAL_LIMITS_RAD[name]
+        lo = float(lo)
+        hi = float(hi)
+    except Exception:
+        lo, hi = deg_to_rad(DESIRED_LIMITS_DEG.get(name, (-180.0, 180.0))[0]), deg_to_rad(DESIRED_LIMITS_DEG.get(name, (-180.0, 180.0))[1])
+    if name in PATH_EFFECTIVE_LIMITS_DEG:
+        eff_lo, eff_hi = PATH_EFFECTIVE_LIMITS_DEG[name]
+        lo = max(lo, deg_to_rad(float(eff_lo)))
+        hi = min(hi, deg_to_rad(float(eff_hi)))
+        if lo >= hi:
+            lo, hi = FINAL_LIMITS_RAD.get(name, (lo, hi))
+    return float(lo), float(hi)
+
+
+def clip_route_command_near(q, reference=None):
+    q = clip_command_near(q, reference=reference)
+    for name in ["boom", "arm", "bucket"]:
+        idx = CTRL.name_to_idx.get(name)
+        if idx is None:
+            continue
+        lo, hi = planner_effective_joint_bounds_rad(name)
+        q[idx] = min(max(float(q[idx]), float(lo)), float(hi))
+    return clip_command_near(q, reference=reference)
+
+
 def interpolate_q_shortest(q0, q1, s):
     q0 = np.array(q0, dtype=np.float32)
     q1 = clip_command_near(q1, reference=q0)
@@ -11205,6 +13586,33 @@ def nearest_bucket_level_world_angle(reference_rad):
     return min(candidates, key=lambda a: abs(wrap_angle(float(a) - float(reference_rad))))
 
 
+def bucket_carry_world_angle_candidates(reference_rad, tilt_deg=None):
+    """Candidate bucket world angles for carrying material.
+
+    Bucket orientation has multiple 180/360-degree equivalents in the planar
+    model, but only one branch keeps the pour edge above the load point for the
+    actual bucket geometry. Enumerate those branches and let FK pick the
+    physically retaining one.
+    """
+    tilt = deg_to_rad(BUCKET_CARRY_HOLD_TILT_DEG if tilt_deg is None else float(tilt_deg))
+    base = deg_to_rad(BUCKET_LIFT_LEVEL_WORLD_DEG)
+    offsets = [tilt, -tilt, 0.0, 0.5 * tilt, -0.5 * tilt, 1.5 * tilt, -1.5 * tilt]
+    candidates = []
+    seen = set()
+    for k in range(-3, 4):
+        for branch in (0.0, math.pi):
+            level = base + branch + 2.0 * math.pi * float(k)
+            for offset in offsets:
+                angle = float(level + offset)
+                key = round(wrap_angle(angle), 6)
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(angle)
+    candidates.sort(key=lambda a: abs(wrap_angle(float(a) - float(reference_rad))))
+    return candidates
+
+
 def bucket_mouth_raise_for_world_angle(q_reference, world_angle_rad, end_effector="load"):
     if q_reference is None:
         return None
@@ -11236,32 +13644,293 @@ def bucket_mouth_raise_for_world_angle(q_reference, world_angle_rad, end_effecto
 def nearest_bucket_carry_world_angle(reference_rad, q_reference=None, end_effector="load", tilt_deg=None):
     level = nearest_bucket_level_world_angle(reference_rad)
     tilt = deg_to_rad(BUCKET_CARRY_HOLD_TILT_DEG if tilt_deg is None else float(tilt_deg))
-    candidates = [level + tilt, level - tilt, level]
+    candidates = bucket_carry_world_angle_candidates(reference_rad, tilt_deg=tilt_deg)
     if q_reference is None:
-        return candidates[0]
+        return min(candidates, key=lambda a: abs(wrap_angle(float(a) - float(reference_rad))))
 
     best = None
+    fallback = None
     for angle in candidates:
         report = bucket_mouth_raise_for_world_angle(q_reference, angle, end_effector=end_effector)
         if report is None:
             continue
         raise_z = float(report["raise_z"])
         tilt_err = abs(abs(wrap_angle(float(angle) - float(level))) - tilt)
-        retain_penalty = max(0.0, BUCKET_CARRY_MIN_POUR_ABOVE_LOAD_Z - raise_z) * 12.0
-        limit_penalty = 2.0 if report.get("limited") else 0.0
-        cost = retain_penalty + tilt_err + 0.05 * abs(wrap_angle(float(angle) - float(reference_rad))) + limit_penalty
+        retain_short = max(0.0, BUCKET_CARRY_MIN_POUR_ABOVE_LOAD_Z - raise_z)
+        retain_penalty = retain_short * 80.0
+        limit_penalty = 25.0 if report.get("limited") else 0.0
+        bucket_motion = abs(wrap_angle(float(report.get("bucket", 0.0)) - float(q_reference[CTRL.name_to_idx.get("bucket", 3)])))
+        bucket_delta_deg = abs(rad_to_deg(bucket_motion))
+        flip_penalty = 5000.0 if bucket_delta_deg > float(BUCKET_CARRY_MAX_ADJUST_DEG) else 0.0
+        soft_penalty = max(0.0, bucket_delta_deg - float(BUCKET_CARRY_SOFT_ADJUST_DEG)) * 0.12
+        cost = (
+            retain_penalty
+            + 0.35 * tilt_err
+            + 0.04 * abs(wrap_angle(float(angle) - float(reference_rad)))
+            + 0.08 * bucket_motion
+            + soft_penalty
+            + flip_penalty
+            + limit_penalty
+        )
         row = {
             "angle": float(angle),
             "cost": float(cost),
             "raise_z": raise_z,
             "limited": bool(report.get("limited")),
+            "bucket_delta_deg": float(bucket_delta_deg),
+            "bucket_flip_rejected": bool(bucket_delta_deg > float(BUCKET_CARRY_MAX_ADJUST_DEG)),
+            "retains_material": bool(raise_z >= BUCKET_CARRY_MIN_POUR_ABOVE_LOAD_Z),
         }
-        if best is None or row["cost"] < best["cost"]:
+        if row["bucket_flip_rejected"]:
+            if fallback is None or row["cost"] < fallback["cost"]:
+                fallback = row
+            continue
+        if best is None or (
+            (bool(row["retains_material"]) and not bool(best.get("retains_material", False)))
+            or (bool(row["retains_material"]) == bool(best.get("retains_material", False)) and row["cost"] < best["cost"])
+        ):
             best = row
 
     if best is None:
-        return candidates[0]
+        if fallback is not None:
+            return float(fallback["angle"])
+        return min(candidates, key=lambda a: abs(wrap_angle(float(a) - float(reference_rad))))
     return float(best["angle"])
+
+
+def carry_hold_adjusted_q(q_pose, q_reference=None, end_effector="load", max_bucket_adjust_deg=None):
+    q_pose = np.array(q_pose, dtype=np.float32).reshape(-1)[:4].copy()
+    q_reference = q_pose if q_reference is None else np.array(q_reference, dtype=np.float32).reshape(-1)[:4].copy()
+    max_adjust_deg = float(BUCKET_CARRY_MAX_ADJUST_DEG if max_bucket_adjust_deg is None else max_bucket_adjust_deg)
+    pose_angles = chain_angles_from_q(q_pose, end_effector=end_effector)
+    if pose_angles is None:
+        return q_pose, {
+            "ok": False,
+            "reason": "missing_pose_angles",
+            "end_effector": str(end_effector),
+        }
+    bucket_idx = CTRL.name_to_idx.get("bucket", 3)
+    best = None
+    rows = []
+    for carry_world in bucket_carry_world_angle_candidates(float(pose_angles[2])):
+        calc = bucket_joint_for_world_angle(q_pose, carry_world, end_effector=end_effector)
+        if calc is None:
+            continue
+        raw_bucket = float(calc["bucket"])
+        q_out = q_pose.copy()
+        q_out[bucket_idx] = raw_bucket
+        q_out = clip_command_near(q_out, reference=q_pose)
+        q_out, loaded_bucket_limited, _old_bucket_deg = apply_loaded_bucket_closed_limit(
+            q_out,
+            label="carry_hold_adjusted_q",
+        )
+        limited = (
+            abs(wrap_angle(float(q_out[bucket_idx]) - raw_bucket)) > deg_to_rad(0.25)
+            or loaded_bucket_limited
+        )
+        report = bucket_mouth_raise_for_world_angle(q_out, carry_world, end_effector=end_effector)
+        raise_z = None if report is None else float(report.get("raise_z", 0.0))
+        goal_angles = chain_angles_from_q(q_out, end_effector=end_effector)
+        goal_world = None if goal_angles is None else float(goal_angles[2])
+        bucket_deg = rad_to_deg(float(q_out[bucket_idx]))
+        dump_branch = bucket_is_dump_branch_for_carry(bucket_deg)
+        retains = bool(raise_z is not None and raise_z >= BUCKET_CARRY_MIN_POUR_ABOVE_LOAD_Z and not dump_branch)
+        q_delta = q_delta_abs_deg(q_out, q_reference)
+        motion_cost = float(np.sum(np.array(DIG_PLAN_MOTION_WEIGHTS, dtype=np.float32) * np.array(q_delta, dtype=np.float32)))
+        bucket_delta_deg = abs(rad_to_deg(wrap_angle(float(q_out[bucket_idx]) - float(q_reference[bucket_idx]))))
+        bucket_flip_rejected = bool(bucket_delta_deg > float(max_adjust_deg))
+        bucket_soft_penalty = max(0.0, bucket_delta_deg - float(BUCKET_CARRY_SOFT_ADJUST_DEG)) * 6.0
+        retain_short = max(0.0, BUCKET_CARRY_MIN_POUR_ABOVE_LOAD_Z - float(raise_z if raise_z is not None else -1.0))
+        level = nearest_bucket_level_world_angle(float(pose_angles[2]))
+        tilt = deg_to_rad(BUCKET_CARRY_HOLD_TILT_DEG)
+        tilt_err = abs(abs(wrap_angle(float(carry_world) - float(level))) - tilt)
+        score = (
+            (0.0 if retains else 1000.0)
+            + (5000.0 if bucket_flip_rejected else 0.0)
+            + (8000.0 if dump_branch else 0.0)
+            + 120.0 * retain_short
+            + 0.45 * motion_cost
+            + bucket_soft_penalty
+            + 0.8 * rad_to_deg(tilt_err)
+            + (80.0 if limited else 0.0)
+        )
+        row = {
+            "q": q_out.copy(),
+            "raw_bucket": raw_bucket,
+            "carry_world": float(carry_world),
+            "goal_world": goal_world,
+            "raise_z": raise_z,
+            "retains_material": retains,
+            "loaded_carry_joint_ok": bool(bucket_joint_in_loaded_carry_state(bucket_deg)),
+            "dump_branch_for_carry": bool(dump_branch),
+            "limited": bool(limited),
+            "loaded_bucket_limited": loaded_bucket_limited,
+            "motion_cost": motion_cost,
+            "bucket_delta_deg": float(bucket_delta_deg),
+            "bucket_flip_rejected": bucket_flip_rejected,
+            "score": float(score),
+        }
+        rows.append(row)
+        if bucket_flip_rejected or dump_branch:
+            continue
+        if best is None or row["score"] < best["score"]:
+            best = row
+
+    if best is None:
+        return q_pose, {
+            "ok": False,
+            "reason": "bucket_carry_requires_large_bucket_flip",
+            "end_effector": str(end_effector),
+            "max_bucket_adjust_deg": float(max_adjust_deg),
+            "candidate_count": len(rows),
+            "candidate_preview": [
+                {
+                    "world_deg": rad_to_deg(row["carry_world"]),
+                    "bucket_deg": rad_to_deg(row["q"][bucket_idx]),
+                    "bucket_delta_deg": row.get("bucket_delta_deg"),
+                    "raise_z": row["raise_z"],
+                    "retains": row["retains_material"],
+                    "dump_branch_for_carry": row.get("dump_branch_for_carry", False),
+                    "limited": row["limited"],
+                    "loaded_bucket_limited": row.get("loaded_bucket_limited", False),
+                    "flip_rejected": row.get("bucket_flip_rejected", False),
+                    "score": row["score"],
+                }
+                for row in sorted(rows, key=lambda r: float(r.get("score", 1.0e9)))[:6]
+            ],
+        }
+    q_out = best["q"].copy()
+    carry_world = float(best["carry_world"])
+    goal_world = best.get("goal_world")
+    raise_z = best.get("raise_z")
+    return q_out, {
+        "ok": True,
+        "reason": "ok",
+        "end_effector": str(end_effector),
+        "target_world_deg": rad_to_deg(carry_world),
+        "actual_world_deg": None if goal_world is None else rad_to_deg(goal_world),
+        "world_err_deg": None if goal_world is None else rad_to_deg(abs(wrap_angle(goal_world - carry_world))),
+        "bucket_deg": rad_to_deg(q_out[bucket_idx]),
+        "loaded_carry_joint_ok": bool(bucket_joint_in_loaded_carry_state(rad_to_deg(q_out[bucket_idx]))),
+        "loaded_carry_target_deg": float(CURL_HOLD_TARGET_DEG),
+        "loaded_carry_accept_deg": float(CURL_HOLD_ACCEPT_BUCKET_DEG),
+        "raw_bucket_deg": rad_to_deg(float(best.get("raw_bucket", q_out[bucket_idx]))),
+        "limited": bool(best.get("limited", False)),
+        "loaded_bucket_limited": bool(best.get("loaded_bucket_limited", False)),
+        "dump_branch_for_carry": bool(best.get("dump_branch_for_carry", False)),
+        "max_carry_dump_branch_deg": float(BUCKET_CARRY_MAX_DUMP_BRANCH_DEG),
+        "loaded_bucket_limit_deg": float(BUCKET_LOADED_CLOSED_LIMIT_DEG),
+        "max_bucket_adjust_deg": float(max_adjust_deg),
+        "pour_above_load_z": raise_z,
+        "min_pour_above_load_z": float(BUCKET_CARRY_MIN_POUR_ABOVE_LOAD_Z),
+        "retains_material": bool(best.get("retains_material", False)),
+        "candidate_count": len(rows),
+        "candidate_preview": [
+            {
+                "world_deg": rad_to_deg(row["carry_world"]),
+                "bucket_deg": rad_to_deg(row["q"][bucket_idx]),
+                "bucket_delta_deg": row.get("bucket_delta_deg"),
+                "raise_z": row["raise_z"],
+                "retains": row["retains_material"],
+                "dump_branch_for_carry": row.get("dump_branch_for_carry", False),
+                "limited": row["limited"],
+                "loaded_bucket_limited": row.get("loaded_bucket_limited", False),
+                "flip_rejected": row.get("bucket_flip_rejected", False),
+                "score": row["score"],
+            }
+            for row in sorted(rows, key=lambda r: float(r.get("score", 1.0e9)))[:6]
+        ],
+    }
+
+
+def carry_report_pour_above_load(carry_report):
+    if not isinstance(carry_report, dict):
+        return None
+    value = carry_report.get("pour_above_load_z")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def carry_report_allows_transitional_load(carry_report):
+    if bool((carry_report or {}).get("retains_material", False)):
+        return True
+    if bool((carry_report or {}).get("transitional_load", False)):
+        return True
+    pour_above = carry_report_pour_above_load(carry_report)
+    if pour_above is None:
+        return False
+    return pour_above >= float(BUCKET_CARRY_TRANSITIONAL_MIN_POUR_Z)
+
+
+def loaded_transitional_hold_allowed(carry_report, loaded_count=0):
+    try:
+        loaded = int(loaded_count or 0)
+    except Exception:
+        loaded = 0
+    if loaded < int(CURL_HOLD_MIN_BUCKET_PARTICLES):
+        return False
+    if not isinstance(carry_report, dict) or not bool(carry_report.get("ok", False)):
+        return False
+    # Once the real particle monitor proves the bucket already contains a
+    # meaningful load, pour_above_load_z is no longer a reliable hard veto:
+    # the mesh proxy can say "spill risk" while particles are visibly held.
+    # Keep the true hard safety guard: do not proceed if the bucket is on a
+    # dump branch. The later secure/lift material gates still reject real loss.
+    if bool(carry_report.get("dump_branch_for_carry", False)):
+        return False
+    return True
+
+
+def real_loaded_secure_hold_allowed(carry_report, loaded_count=0):
+    if not loaded_transitional_hold_allowed(carry_report, loaded_count=loaded_count):
+        return False
+    if not bool((carry_report or {}).get("loaded_carry_joint_ok", False)):
+        return False
+    return True
+
+
+def carry_spill_risk_penalty(carry_report):
+    if bool((carry_report or {}).get("retains_material", False)):
+        return 0.0
+    if carry_report_pour_above_load(carry_report) is None and bool((carry_report or {}).get("transitional_load", False)):
+        return float(BUCKET_CARRY_SPILL_RISK_COST)
+    pour_above = carry_report_pour_above_load(carry_report)
+    if pour_above is None:
+        return float(BUCKET_CARRY_SPILL_RISK_COST)
+    shortfall = max(0.0, float(BUCKET_CARRY_MIN_POUR_ABOVE_LOAD_Z) - float(pour_above))
+    return float(BUCKET_CARRY_SPILL_RISK_COST) * shortfall
+
+
+def apply_loaded_bucket_closed_limit(q, label=""):
+    q = np.array(q, dtype=np.float32).reshape(-1)[:4].copy()
+    bucket_idx = CTRL.name_to_idx.get("bucket", 3)
+    limit_rad = deg_to_rad(float(BUCKET_LOADED_CLOSED_LIMIT_DEG))
+    if float(q[bucket_idx]) < limit_rad:
+        old_deg = rad_to_deg(float(q[bucket_idx]))
+        raw_q = CTRL.clip_limits(q)
+        limited_q = np.array(raw_q, dtype=np.float32).copy()
+        limited_q[bucket_idx] = limit_rad
+        limited_q = CTRL.clip_limits(limited_q)
+        # The loaded limit is a safety clamp, not a license to destroy a valid
+        # carry pose. If the requested angle is still inside hard joint limits
+        # and is the only geometry that keeps the pour edge above the load
+        # region, preserve it and let the quality gate score the real result.
+        try:
+            raw_report = carry_material_report_for_q(raw_q, end_effector="load")
+            limited_report = carry_material_report_for_q(limited_q, end_effector="load")
+            if (
+                bool(raw_report.get("retains_material", False))
+                and not bool(limited_report.get("retains_material", False))
+            ):
+                return raw_q, False, old_deg
+        except Exception:
+            pass
+        return limited_q, True, old_deg
+    return q, False, None
 
 
 def planar_points_from_angles(angles, lengths):
@@ -11497,6 +14166,8 @@ def solve_priority_ik_to_target(
     return_candidates=False,
     max_solutions=1,
     soft_accept_err=None,
+    deadline=None,
+    score_goal_obstacle=True,
 ):
     global IK_MODEL
 
@@ -11504,6 +14175,8 @@ def solve_priority_ik_to_target(
         IK_MODEL = default_ik_model()
     if IK_MODEL is None:
         return None, "IK model unavailable"
+    if planning_deadline_exceeded(deadline):
+        return ([], "planning budget exceeded") if return_candidates else (None, "planning budget exceeded")
 
     if q_seed is None:
         update_q_cmd_from_real()
@@ -11604,9 +14277,17 @@ def solve_priority_ik_to_target(
         reject_counts[key] = int(reject_counts.get(key, 0)) + 1
 
     for a3 in candidate_angles:
+        if planning_deadline_exceeded(deadline):
+            if return_candidates:
+                break
+            return None, "planning budget exceeded"
         wrist_target = target_2d - np.array([math.cos(a3), math.sin(a3)], dtype=np.float32) * float(lengths[2])
 
         for _, a1, a2 in two_link_ik_2d(wrist_target, lengths[0], lengths[1], seed_angles):
+            if planning_deadline_exceeded(deadline):
+                if return_candidates:
+                    break
+                return None, "planning budget exceeded"
             angles = [a1, a2, a3]
             q_candidate = q_from_chain_angles(swing_goal, angles, end_effector=end_effector)
             if use_refinement:
@@ -11646,6 +14327,23 @@ def solve_priority_ik_to_target(
                     reject(phase_reason)
                     continue
 
+            goal_obstacle_ok = True
+            goal_obstacle_reason = "ok"
+            goal_obstacle_report = None
+            if phase_mode is not None and bool(score_goal_obstacle):
+                try:
+                    goal_obstacle_ok, goal_obstacle_reason, _goal_sample, goal_obstacle_report = path_obstacle_check(
+                        q_candidate,
+                        q_candidate,
+                        phase_mode,
+                        samples=2,
+                        deadline=deadline,
+                    )
+                except Exception as exc:
+                    goal_obstacle_ok = True
+                    goal_obstacle_reason = f"obstacle_check_error:{type(exc).__name__}:{exc}"
+                    goal_obstacle_report = None
+
             dq = np.array([wrap_angle(float(q_candidate[i] - q_now[i])) for i in range(4)], dtype=np.float32)
             motion_cost = float(np.sum(IK_COST_WEIGHTS * np.abs(dq)))
             bucket_change = abs(wrap_angle(float(q_candidate[CTRL.name_to_idx["bucket"]] - q_now[CTRL.name_to_idx["bucket"]])))
@@ -11655,7 +14353,14 @@ def solve_priority_ik_to_target(
             if preferred_end_angle_rad is not None:
                 bucket_pref_cost += abs(wrap_angle(float(actual_a3 - preferred_end_angle_rad))) * 1.8
 
-            cost = 140.0 * err_after_clip + motion_cost + float(bucket_motion_weight) * bucket_change + float(bucket_preference_weight) * bucket_pref_cost
+            goal_obstacle_cost = 0.0 if goal_obstacle_ok else float(IK_GOAL_OBSTACLE_COST)
+            cost = (
+                140.0 * err_after_clip
+                + motion_cost
+                + float(bucket_motion_weight) * bucket_change
+                + float(bucket_preference_weight) * bucket_pref_cost
+                + goal_obstacle_cost
+            )
             row = {
                 "cost": float(cost),
                 "q": q_candidate.copy(),
@@ -11665,13 +14370,20 @@ def solve_priority_ik_to_target(
                 "angles": angles,
                 "end_angle": float(actual_a3),
                 "phase_report": phase_report,
+                "goal_obstacle_ok": bool(goal_obstacle_ok),
+                "goal_obstacle_reason": str(goal_obstacle_reason),
+                "goal_obstacle_report": goal_obstacle_report,
             }
             solution_rows.append(row)
 
             if best is None or cost < best["cost"]:
                 best = row
+        if planning_deadline_exceeded(deadline):
+            break
 
     if best is None:
+        if planning_deadline_exceeded(deadline):
+            return ([], "planning budget exceeded") if return_candidates else (None, "planning budget exceeded")
         details = ", ".join(
             f"{k}:{v}" for k, v in sorted(reject_counts.items(), key=lambda item: -item[1])[:4]
         )
@@ -11692,6 +14404,8 @@ def solve_priority_ik_to_target(
             "end_angle": row["end_angle"],
             "end_effector": end_effector,
             "phase_report": row.get("phase_report"),
+            "goal_obstacle_ok": bool(row.get("goal_obstacle_ok", True)),
+            "goal_obstacle_reason": str(row.get("goal_obstacle_reason", "")),
             "target_dist": target_dist,
             "total_reach": total_reach,
             "raw_swing_goal": raw_swing_goal,
@@ -11791,7 +14505,10 @@ def solve_dig_pose(
     accept_err=0.38,
     bucket_motion_weight=0.45,
     bucket_preference_weight=None,
+    deadline=None,
 ):
+    if planning_deadline_exceeded(deadline):
+        return None
     if is_cutting_phase(label):
         min_end_z = GROUND_TOP_Z - DIG_MAX_TIP_DEPTH
         min_body_z = GROUND_TOP_Z - 0.02
@@ -11820,7 +14537,9 @@ def solve_dig_pose(
         end_angle_tolerance_rad=None,
         use_refinement=True,
         bucket_candidate_span_deg=DIG_IK_BUCKET_CANDIDATE_SPAN_DEG,
-        bucket_candidate_count=DIG_IK_BUCKET_CANDIDATE_COUNT,
+        bucket_candidate_count=(min(DIG_IK_BUCKET_CANDIDATE_COUNT, 9) if deadline is not None else DIG_IK_BUCKET_CANDIDATE_COUNT),
+        deadline=deadline,
+        score_goal_obstacle=(deadline is None),
     )
 
     if q_goal is None:
@@ -11891,7 +14610,10 @@ def solve_dig_pose_candidates(
     bucket_motion_weight=0.45,
     bucket_preference_weight=None,
     max_solutions=DIG_PLAN_TOPK_IK,
+    deadline=None,
 ):
+    if planning_deadline_exceeded(deadline):
+        return [], "planning budget exceeded"
     if is_cutting_phase(label):
         min_end_z = GROUND_TOP_Z - DIG_MAX_TIP_DEPTH
         min_body_z = GROUND_TOP_Z - 0.02
@@ -11904,6 +14626,10 @@ def solve_dig_pose_candidates(
 
     carry_angle_phase = ("lift" in label) or ("carry" in label) or ("unload" in label and bucket_world_deg is not None)
     end_angle_tol_deg = BUCKET_CARRY_HOLD_TOL_DEG if carry_angle_phase else BUCKET_LIFT_LEVEL_TOL_DEG
+    fast_pre_dig = (str(label).lower() == "pre_dig") and (deadline is not None)
+    ik_bucket_candidate_count = 3 if fast_pre_dig else (
+        min(DIG_IK_BUCKET_CANDIDATE_COUNT, 9) if deadline is not None else DIG_IK_BUCKET_CANDIDATE_COUNT
+    )
     candidate_rows, reason = solve_priority_ik_to_target(
         point,
         q_seed=q_seed,
@@ -11918,12 +14644,14 @@ def solve_dig_pose_candidates(
         min_end_z=min_end_z,
         phase_mode=label,
         end_angle_tolerance_rad=None,
-        use_refinement=True,
+        use_refinement=not fast_pre_dig,
         bucket_candidate_span_deg=DIG_IK_BUCKET_CANDIDATE_SPAN_DEG,
-        bucket_candidate_count=DIG_IK_BUCKET_CANDIDATE_COUNT,
+        bucket_candidate_count=ik_bucket_candidate_count,
         return_candidates=True,
-        max_solutions=max_solutions,
+        max_solutions=min(int(max_solutions), 2) if fast_pre_dig else max_solutions,
         soft_accept_err=soft_accept_err,
+        deadline=deadline,
+        score_goal_obstacle=False,
     )
 
     if not candidate_rows:
@@ -11977,7 +14705,7 @@ def path_end_effector_for_mode(mode):
     return "tip"
 
 
-def solve_clearance_pose(point, q_seed, end_effector, clearance_z):
+def solve_clearance_pose(point, q_seed, end_effector, clearance_z, deadline=None):
     p = np.array(point, dtype=np.float32).copy()
     p[2] = float(clearance_z)
     return solve_priority_ik_to_target(
@@ -11995,21 +14723,29 @@ def solve_clearance_pose(point, q_seed, end_effector, clearance_z):
         phase_mode="clearance",
         use_refinement=True,
         bucket_candidate_span_deg=DIG_IK_BUCKET_CANDIDATE_SPAN_DEG,
-        bucket_candidate_count=DIG_IK_BUCKET_CANDIDATE_COUNT,
+        bucket_candidate_count=(min(DIG_IK_BUCKET_CANDIDATE_COUNT, 9) if deadline is not None else DIG_IK_BUCKET_CANDIDATE_COUNT),
+        deadline=deadline,
+        score_goal_obstacle=(deadline is None),
     )
 
 
-def route_segments_ok(q_start, route, q_goal, mode, samples=None):
+def route_segments_ok(q_start, route, q_goal, mode, samples=None, deadline=None):
     sample_count = PATH_CHECK_SAMPLES if samples is None else max(2, int(samples))
     q_prev = q_start
     for idx, q_next in enumerate(route):
-        ok, kind, reason, sample, report = path_segment_check(q_prev, q_next, "clearance", samples=sample_count)
+        if planning_deadline_exceeded(deadline):
+            return False, "planning budget exceeded"
+        ok, kind, reason, sample, report = path_segment_check(
+            q_prev, q_next, "clearance", samples=sample_count, deadline=deadline
+        )
         if not ok:
             text = path_block_report_text("clearance", kind, report, reason)
             return False, f"segment {idx + 1} blocked at {sample}/{sample_count}: {text}"
         q_prev = q_next
 
-    ok, kind, reason, sample, report = path_segment_check(q_prev, q_goal, mode, samples=sample_count)
+    if planning_deadline_exceeded(deadline):
+        return False, "planning budget exceeded"
+    ok, kind, reason, sample, report = path_segment_check(q_prev, q_goal, mode, samples=sample_count, deadline=deadline)
     if not ok:
         text = path_block_report_text(mode, kind, report, reason)
         return False, f"final segment blocked at {sample}/{sample_count}: {text}"
@@ -12032,6 +14768,136 @@ def clearance_route_cost(q_start, route, q_goal, duration=0.0, clearance_z=0.0, 
     return float(total), float(total_angle)
 
 
+def q_with_joint_degrees(reference_q, joint_degrees, swing_value=None):
+    q = np.array(reference_q, dtype=np.float32).reshape(-1)[:4].copy()
+    for name, value_deg in dict(joint_degrees or {}).items():
+        if name not in CTRL.name_to_idx:
+            continue
+        q[CTRL.name_to_idx[name]] = deg_to_rad(float(value_deg))
+    if swing_value is not None and "swing" in CTRL.name_to_idx:
+        q[CTRL.name_to_idx["swing"]] = float(swing_value)
+    return clip_command_near(q, reference=reference_q)
+
+
+def q_with_swing_near(reference_q, target_swing):
+    q = np.array(reference_q, dtype=np.float32).reshape(-1)[:4].copy()
+    swing_idx = CTRL.name_to_idx["swing"]
+    q[swing_idx] = float(q[swing_idx]) + float(swing_delta(target_swing, q[swing_idx]))
+    return clip_command_near(q, reference=reference_q)
+
+
+def q_goal_raised_approach(q_goal, q_reference, lift_deg, arm_delta_deg, bucket_blend=0.55):
+    q = np.array(q_goal, dtype=np.float32).reshape(-1)[:4].copy()
+    boom_idx = CTRL.name_to_idx["boom"]
+    arm_idx = CTRL.name_to_idx["arm"]
+    bucket_idx = CTRL.name_to_idx["bucket"]
+
+    goal_boom = rad_to_deg(q_goal[boom_idx])
+    goal_arm = rad_to_deg(q_goal[arm_idx])
+    q[boom_idx] = deg_to_rad(goal_boom + float(lift_deg))
+    q[arm_idx] = deg_to_rad(goal_arm + float(arm_delta_deg))
+    q[bucket_idx] = float(q_goal[bucket_idx]) + float(bucket_blend) * float(q_reference[bucket_idx] - q_goal[bucket_idx])
+    return clip_command_near(q, reference=q_reference)
+
+
+def swing_corridor_cache_key(q_start, q_goal, mode, samples):
+    try:
+        qa = np.round(np.array(q_start, dtype=np.float32).reshape(-1)[:4], 3)
+        qb = np.round(np.array(q_goal, dtype=np.float32).reshape(-1)[:4], 3)
+        world_version = int(STATE.get("planning_world_snapshot_version", 0) or 0)
+        return (
+            str(mode),
+            int(samples),
+            int(world_version),
+            tuple(float(x) for x in qa),
+            tuple(float(x) for x in qb),
+        )
+    except Exception:
+        return None
+
+
+def swing_corridor_summary(q_start, q_goal, mode, samples=25, deadline=None):
+    q_start = np.array(q_start, dtype=np.float32).reshape(-1)[:4].copy()
+    q_goal = clip_route_command_near(q_goal, reference=q_start)
+    sample_count = max(9, int(samples))
+    cache_key = swing_corridor_cache_key(q_start, q_goal, mode, sample_count)
+    cache = STATE.setdefault("planning_swing_corridor_cache", {})
+    if bool(STATE.get("dig_plan_planning_active", False)) and cache_key is not None:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            STATE["planning_swing_corridor_cache_hits"] = int(STATE.get("planning_swing_corridor_cache_hits", 0)) + 1
+            STATE["last_swing_corridor"] = dict(cached)
+            return dict(cached)
+    STATE["planning_swing_corridor_cache_misses"] = int(STATE.get("planning_swing_corridor_cache_misses", 0)) + 1
+    swing_idx = CTRL.name_to_idx.get("swing", 0)
+    base_pose = PATH_DETERMINISTIC_ROUTE_POSES_DEG[0] if PATH_DETERMINISTIC_ROUTE_POSES_DEG else {}
+    q_probe_base = clip_route_command_near(q_with_joint_degrees(q_start, base_pose), reference=q_start)
+    center = float(q_start[swing_idx]) + 0.5 * float(swing_delta(float(q_goal[swing_idx]), float(q_start[swing_idx])))
+    span = math.radians(220.0)
+    rows = []
+    free_runs = []
+    current_run = None
+    for i in range(sample_count):
+        if planning_deadline_exceeded(deadline):
+            break
+        frac = 0.0 if sample_count <= 1 else float(i) / float(sample_count - 1)
+        swing = center - 0.5 * span + span * frac
+        q_probe = q_probe_base.copy()
+        q_probe[swing_idx] = normalize_swing_cmd(swing)
+        ok, kind, reason, _sample, _report = path_segment_check(q_probe, q_probe, mode, samples=1, deadline=deadline)
+        deg = rad_to_deg(float(q_probe[swing_idx]))
+        rows.append({
+            "swing_deg": round(float(deg), 2),
+            "ok": bool(ok),
+            "kind": str(kind),
+            "reason": debug_short_string(reason, 120),
+        })
+        if ok:
+            if current_run is None:
+                current_run = [deg, deg]
+            else:
+                current_run[1] = deg
+        elif current_run is not None:
+            free_runs.append([round(float(current_run[0]), 2), round(float(current_run[1]), 2)])
+            current_run = None
+    if current_run is not None:
+        free_runs.append([round(float(current_run[0]), 2), round(float(current_run[1]), 2)])
+    summary = {
+        "mode": str(mode),
+        "samples": len(rows),
+        "free_count": sum(1 for row in rows if row.get("ok")),
+        "blocked_count": sum(1 for row in rows if not row.get("ok")),
+        "free_intervals_deg": free_runs,
+        "preview": rows[:8],
+    }
+    STATE["last_swing_corridor"] = summary
+    info_print(
+        "[SWING CORRIDOR]",
+        f"mode={mode}",
+        f"free={summary['free_count']}/{summary['samples']}",
+        f"intervals={summary['free_intervals_deg'][:4]}",
+    )
+    debug_timeline_record(
+        "SWING_CORRIDOR",
+        result="ok" if summary["free_count"] > 0 else "blocked",
+        reason=f"free={summary['free_count']}/{summary['samples']}",
+        data=summary,
+        include_sand=False,
+    )
+    if (
+        bool(STATE.get("dig_plan_planning_active", False))
+        and cache_key is not None
+        and not planning_deadline_exceeded(deadline)
+    ):
+        if len(cache) >= int(PLANNING_SWING_CORRIDOR_CACHE_MAX):
+            try:
+                cache.pop(next(iter(cache)))
+            except Exception:
+                cache.clear()
+        cache[cache_key] = dict(summary)
+    return summary
+
+
 def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=None):
     end_effector = path_end_effector_for_mode(mode)
     p_start = predicted_end_world_point(q_start, end_effector=end_effector, reference_q=q_start)
@@ -12047,16 +14913,33 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
     blockers = obstacle_bboxes_for_segment_xy(p_start, p_goal)
     candidates = []
     sample_count = PATH_CHECK_SAMPLES if samples is None else max(2, int(samples))
+    mode_text = f"{mode} {label}".lower()
+    pre_dig_route = "pre_dig" in mode_text
+    corridor_deadline = child_planning_deadline(deadline, 0.25, min_seconds=0.05) if deadline is not None else None
+    corridor = swing_corridor_summary(
+        q_start,
+        q_goal,
+        mode,
+        samples=17 if deadline is not None else 25,
+        deadline=corridor_deadline,
+    )
 
     def budget_expired():
-        return deadline is not None and time.time() > float(deadline)
+        return planning_deadline_exceeded(deadline)
 
     def add_route(route, route_type, clearance_z, detail="", side_offset=0.0):
         nonlocal last_reason
         if budget_expired():
             last_reason = "planning budget exceeded"
             return
-        ok_route, route_reason = route_segments_ok(q_start, route, q_goal, mode, samples=sample_count)
+        route_clipped = []
+        q_ref = np.array(q_start, dtype=np.float32).reshape(-1)[:4].copy()
+        for q_raw in route or []:
+            q_next = clip_route_command_near(q_raw, reference=q_ref)
+            route_clipped.append(q_next.copy())
+            q_ref = q_next.copy()
+        route = route_clipped
+        ok_route, route_reason = route_segments_ok(q_start, route, q_goal, mode, samples=sample_count, deadline=deadline)
         if not ok_route:
             last_reason = route_reason
             return
@@ -12083,6 +14966,165 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
             return None
         return sorted(candidates, key=lambda row: (float(row["cost"]), float(row["weighted_angle"]), len(row["route"])))[0]
 
+    def try_joint_rrt_route():
+        nonlocal last_reason
+        if joint_space_planner is None:
+            last_reason = "joint_space_planner unavailable; deterministic routes only"
+            return
+        if budget_expired():
+            last_reason = "planning budget exceeded"
+            return
+        rrt_deadline = None
+        if deadline is not None:
+            now = time.time()
+            remaining = max(0.0, float(deadline) - now)
+            if pre_dig_route:
+                rrt_deadline = child_planning_deadline(deadline, max(0.20, min(0.85, 0.28 * remaining)), min_seconds=0.10)
+            else:
+                rrt_deadline = child_planning_deadline(deadline, max(0.25, min(1.20, 0.45 * remaining)), min_seconds=0.12)
+        rrt_result = joint_space_planner.plan_joint_space_route(
+            runtime_module(),
+            q_start,
+            q_goal,
+            mode=mode,
+            label=label,
+            deadline=rrt_deadline,
+            samples=sample_count,
+        )
+        if bool(rrt_result.get("ok", False)):
+            route = [np.array(q, dtype=np.float32).copy() for q in rrt_result.get("waypoints", [])]
+            rrt_stats = rrt_result.get("stats", {}) if isinstance(rrt_result.get("stats", {}), dict) else {}
+            add_route(
+                route,
+                "joint_rrt_connect",
+                max(float(p_start[2]), float(p_goal[2])),
+                detail=(
+                    f"reason={rrt_result.get('reason')} "
+                    f"iters={rrt_result.get('iterations')} nodes={rrt_result.get('nodes')} "
+                    f"trapped={rrt_stats.get('trapped', 0)} advanced={rrt_stats.get('advanced', 0)} "
+                    f"smooth={rrt_stats.get('smooth_accepts', 0)}/{rrt_stats.get('smooth_rejects', 0)} "
+                    f"smooth_cost={float(rrt_stats.get('cost_before_smooth', 0.0)):.2f}->{float(rrt_stats.get('cost_after_smooth', 0.0)):.2f} "
+                    f"carry_world={fmt_optional(rrt_result.get('carry_world_deg'))}deg "
+                    f"elapsed_ms={float(rrt_result.get('elapsed_ms', 0.0)):.1f}"
+                ),
+            )
+        else:
+            rrt_stats = rrt_result.get("stats", {}) if isinstance(rrt_result.get("stats", {}), dict) else {}
+            last_reason = (
+                f"joint_rrt_connect failed: {rrt_result.get('reason', 'unknown')} "
+                f"trapped={rrt_stats.get('trapped', 0)} advanced={rrt_stats.get('advanced', 0)} "
+                f"last={rrt_stats.get('last_reason', '')}"
+            )
+
+    def add_deterministic_joint_routes():
+        nonlocal last_reason
+        q_start_arr = np.array(q_start, dtype=np.float32).reshape(-1)[:4].copy()
+        q_goal_arr = np.array(q_goal, dtype=np.float32).reshape(-1)[:4].copy()
+        swing_idx = CTRL.name_to_idx["swing"]
+        goal_swing = float(q_goal_arr[swing_idx])
+        base_clearance_z = max(float(p_start[2]), float(p_goal[2]), GROUND_TOP_Z + 1.25)
+        if obstacle_top is not None:
+            base_clearance_z = max(base_clearance_z, float(obstacle_top) + PATH_OBSTACLE_OVER_CLEARANCE_Z)
+        if deadline is None:
+            candidate_limit = 999999
+        elif pre_dig_route:
+            candidate_limit = 4
+        else:
+            candidate_limit = 8
+
+        tried = 0
+        approach_pairs = [
+            (PATH_DETERMINISTIC_APPROACH_LIFTS_DEG[0], PATH_DETERMINISTIC_APPROACH_ARM_DELTAS_DEG[0]),
+            (PATH_DETERMINISTIC_APPROACH_LIFTS_DEG[1], PATH_DETERMINISTIC_APPROACH_ARM_DELTAS_DEG[1]),
+            (PATH_DETERMINISTIC_APPROACH_LIFTS_DEG[2], PATH_DETERMINISTIC_APPROACH_ARM_DELTAS_DEG[2]),
+            (PATH_DETERMINISTIC_APPROACH_LIFTS_DEG[3], PATH_DETERMINISTIC_APPROACH_ARM_DELTAS_DEG[2]),
+            (PATH_DETERMINISTIC_APPROACH_LIFTS_DEG[1], PATH_DETERMINISTIC_APPROACH_ARM_DELTAS_DEG[3]),
+        ]
+        detours = PATH_DETERMINISTIC_SWING_DETOURS_DEG if deadline is None else PATH_DETERMINISTIC_SWING_DETOURS_DEG[:7]
+
+        for pose_idx, pose in enumerate(PATH_DETERMINISTIC_ROUTE_POSES_DEG):
+            if budget_expired():
+                break
+            q_clear_start = q_with_joint_degrees(q_start_arr, pose)
+            q_clear_goal = q_with_swing_near(q_clear_start, goal_swing)
+            q_clear_start = clip_command_near(q_clear_start, reference=q_start_arr)
+            q_clear_goal = clip_command_near(q_clear_goal, reference=q_clear_start)
+
+            add_route(
+                [q_clear_start, q_clear_goal],
+                "joint_tuck_swing",
+                base_clearance_z,
+                detail=f"pose={pose_idx} direct_swing_clearance",
+            )
+            tried += 1
+            if pre_dig_route and candidates:
+                return
+            if len(candidates) >= candidate_limit:
+                return
+
+            for detour_deg in detours:
+                if budget_expired():
+                    break
+                if abs(float(detour_deg)) < 1.0e-4:
+                    continue
+                q_detour = q_clear_start.copy()
+                q_detour[swing_idx] = (
+                    float(q_clear_start[swing_idx])
+                    + float(swing_delta(goal_swing, q_clear_start[swing_idx]))
+                    + deg_to_rad(float(detour_deg))
+                )
+                q_detour = clip_command_near(q_detour, reference=q_clear_start)
+                add_route(
+                    [q_clear_start, q_detour, q_clear_goal],
+                    "joint_tuck_swing_detour",
+                    base_clearance_z,
+                    detail=f"pose={pose_idx} detour={float(detour_deg):.1f}deg",
+                    side_offset=float(detour_deg) / 45.0,
+                )
+                tried += 1
+                if pre_dig_route and candidates:
+                    return
+                if len(candidates) >= candidate_limit:
+                    return
+
+            for lift_deg, arm_delta_deg in approach_pairs:
+                if budget_expired():
+                    break
+                q_approach = q_goal_raised_approach(
+                    q_goal_arr,
+                    q_clear_goal,
+                    lift_deg=float(lift_deg),
+                    arm_delta_deg=float(arm_delta_deg),
+                    bucket_blend=0.45,
+                )
+                add_route(
+                    [q_clear_start, q_clear_goal, q_approach],
+                    "joint_tuck_swing_high_approach",
+                    base_clearance_z,
+                    detail=(
+                        f"pose={pose_idx} lift={float(lift_deg):.1f}deg "
+                        f"arm_delta={float(arm_delta_deg):.1f}deg"
+                    ),
+                )
+                tried += 1
+                if pre_dig_route and candidates:
+                    return
+                if len(candidates) >= candidate_limit:
+                    return
+
+        if not candidates and tried > 0:
+            last_reason = f"deterministic joint clearance tried={tried} last={last_reason}"
+
+    add_deterministic_joint_routes()
+    best = choose_best_candidate()
+    if best is not None:
+        info_print(
+            f"[PATH ROUTE SELECTED] {label}: end={end_effector} type={best['type']} "
+            f"z={best['z']:.2f} cost={best['cost']:.2f} weighted_angle={best['weighted_angle']:.2f} "
+            f"waypoints={len(best['route'])} {best['detail']}"
+        )
+        return best["route"], str(best["type"])
+
     midpoint = 0.5 * (np.array(p_start, dtype=np.float32) + np.array(p_goal, dtype=np.float32))
 
     def info_planar_err(info):
@@ -12098,7 +15140,9 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
         infos = []
         q_cursor = np.array(q_seed, dtype=np.float32).copy()
         for point in points:
-            q_next, info_next = solve_clearance_pose(point, q_cursor, end_effector, clearance_z)
+            if budget_expired():
+                return None, "planning budget exceeded", infos
+            q_next, info_next = solve_clearance_pose(point, q_cursor, end_effector, clearance_z, deadline=deadline)
             if q_next is None:
                 return None, info_next, infos
             route.append(np.array(q_next, dtype=np.float32).copy())
@@ -12159,12 +15203,15 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
                     )
         return sorted(out, key=lambda row: (float(row["route_len"]), abs(float(row["side_offset"])), float(row["pad"])))
 
-    for height in PATH_FAST_SIDE_HEIGHTS:
+    fast_heights = PATH_FAST_SIDE_HEIGHTS if deadline is None else PATH_FAST_SIDE_HEIGHTS[:2]
+    fast_blocker_limit = int(PATH_FAST_SIDE_MAX_BLOCKERS) if deadline is None else 1
+    fast_corner_limit = 10 if deadline is None else 4
+    for height in fast_heights:
         if budget_expired():
             break
         clearance_z = max(float(p_start[2]), float(p_goal[2]), GROUND_TOP_Z + float(height))
-        for obstacle in blockers[: max(1, int(PATH_FAST_SIDE_MAX_BLOCKERS))]:
-            for route_candidate in obstacle_corner_route_points(obstacle, clearance_z)[:10]:
+        for obstacle in blockers[: max(1, fast_blocker_limit)]:
+            for route_candidate in obstacle_corner_route_points(obstacle, clearance_z)[:fast_corner_limit]:
                 if budget_expired():
                     break
                 route, fail_info, infos = solve_clearance_waypoints(
@@ -12193,11 +15240,11 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
                 f"z={best['z']:.2f} cost={best['cost']:.2f} weighted_angle={best['weighted_angle']:.2f} "
                 f"waypoints={len(best['route'])} {best['detail']}"
             )
-            return best["route"], "ok"
+            return best["route"], str(best["type"])
 
-    fallback_heights = PATH_CLEARANCE_HEIGHTS if deadline is None else PATH_CLEARANCE_HEIGHTS[:4]
-    fallback_fractions = PATH_CLEARANCE_FRACTIONS if deadline is None else [0.40, 0.60]
-    fallback_side_offsets = PATH_ROUTE_SIDE_OFFSETS if deadline is None else PATH_ROUTE_SIDE_OFFSETS[:2]
+    fallback_heights = PATH_CLEARANCE_HEIGHTS if deadline is None else PATH_CLEARANCE_HEIGHTS[:3]
+    fallback_fractions = PATH_CLEARANCE_FRACTIONS if deadline is None else [0.50]
+    fallback_side_offsets = PATH_ROUTE_SIDE_OFFSETS if deadline is None else PATH_ROUTE_SIDE_OFFSETS[:1]
     for height in fallback_heights:
         if budget_expired():
             break
@@ -12212,7 +15259,7 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
             p_via = (1.0 - float(frac)) * np.array(p_start, dtype=np.float32) + float(frac) * np.array(p_goal, dtype=np.float32)
             p_via[2] = clearance_z
 
-            q_via, info = solve_clearance_pose(p_via, q_start, end_effector, clearance_z)
+            q_via, info = solve_clearance_pose(p_via, q_start, end_effector, clearance_z, deadline=deadline)
 
             if q_via is None:
                 last_reason = f"clearance IK failed: {info}"
@@ -12225,12 +15272,12 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
                 detail=f"frac={float(frac):.2f} planar_err={info['planar_err']:.3f}",
             )
 
-        q_up_start, info_start = solve_clearance_pose(p_start, q_start, end_effector, clearance_z)
+        q_up_start, info_start = solve_clearance_pose(p_start, q_start, end_effector, clearance_z, deadline=deadline)
         if q_up_start is None:
             last_reason = f"start lift IK failed: {info_start}"
             continue
 
-        q_up_goal, info_goal = solve_clearance_pose(p_goal, q_up_start, end_effector, clearance_z)
+        q_up_goal, info_goal = solve_clearance_pose(p_goal, q_up_start, end_effector, clearance_z, deadline=deadline)
         if q_up_goal is None:
             last_reason = f"goal lift IK failed: {info_goal}"
             continue
@@ -12247,7 +15294,7 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
                 p_side = midpoint.copy()
                 p_side[:2] += float(sign) * float(side_offset) * perp
                 p_side[2] = base_clearance_z
-                q_side, info_side = solve_clearance_pose(p_side, q_up_start, end_effector, base_clearance_z)
+                q_side, info_side = solve_clearance_pose(p_side, q_up_start, end_effector, base_clearance_z, deadline=deadline)
                 if q_side is None:
                     last_reason = f"side route IK failed: {info_side}"
                     continue
@@ -12267,7 +15314,17 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
             f"z={best['z']:.2f} cost={best['cost']:.2f} weighted_angle={best['weighted_angle']:.2f} "
             f"waypoints={len(best['route'])} {best['detail']}"
         )
-        return best["route"], "ok"
+        return best["route"], str(best["type"])
+
+    try_joint_rrt_route()
+    best = choose_best_candidate()
+    if best is not None:
+        info_print(
+            f"[PATH ROUTE SELECTED] {label}: end={end_effector} type={best['type']} "
+            f"z={best['z']:.2f} cost={best['cost']:.2f} weighted_angle={best['weighted_angle']:.2f} "
+            f"waypoints={len(best['route'])} {best['detail']}"
+        )
+        return best["route"], str(best["type"])
 
     return None, last_reason
 
@@ -12508,6 +15565,7 @@ def dig_plan_specs_from_candidate(target_xyz, candidate):
     exit_cut_z = max(cut_z(exit_depth), float(surface_z) + exit_lift_z)
     exit_cut = offset_xy(target, inward, float(candidate.get("exit_pull", 0.55)), exit_cut_z)
     curl = offset_xy(exit_cut, inward, 0.02, max(float(surface_z) + 0.22, float(exit_cut[2]) + float(candidate.get("curl_z", 0.18))))
+    secure = offset_xy(curl, inward, 0.02, max(float(curl[2]) + 0.18, float(surface_z) + 0.52))
     lift_z = float(exit_cut[2]) + float(candidate.get("lift_height", 0.70))
     lift_z = max(lift_z, float(target[2]) + float(candidate.get("lift_above_target", 0.50)))
     lift_z = max(lift_z, float(candidate.get("min_lift_z", GROUND_TOP_Z + 1.05)))
@@ -12530,6 +15588,7 @@ def dig_plan_specs_from_candidate(target_xyz, candidate):
         ("pull_mid_cut", mid_cut, bucket_mid_cut_deg, bucket_mid_world, "tip", 2.0, True),
         ("pull_exit_cut", exit_cut, float(candidate.get("bucket_exit", -70.0)), bucket_exit_world, "tip", 1.5, True),
         ("curl_to_hold_material", curl, float(candidate.get("bucket_curl", CURL_HOLD_TARGET_DEG)), None, "tip", 0.9, True),
+        ("secure_load", secure, None, "hold", "load", 0.85, True),
         ("lift_carry", lift, None, "hold", "load", 1.2, True),
         ("unload_to_bin", unload, None, "carry", "load", 1.35, True),
     ]
@@ -12551,6 +15610,32 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
     last_reason = "no candidate tried"
     best_partial = beams[0]
 
+    def budget_failure(label, partial=None, reasons=None):
+        partial = partial if isinstance(partial, dict) else best_partial
+        reason_text = "; ".join([str(x) for x in (reasons or []) if str(x)]) or "planning budget exceeded"
+        if "planning budget exceeded" not in reason_text:
+            reason_text = "planning budget exceeded; " + reason_text
+        partial_stages = list(partial.get("stages", []))
+        return None, list(partial.get("points", [])), {
+            "id": str(candidate.get("id", "candidate")),
+            "dig_primitive": compact_dig_primitive_params(candidate),
+            "planned": False,
+            "failed_stage": label,
+            "failure_reason": reason_text,
+            "planned_prefix": len(partial.get("seq", [])),
+            "best_partial_cost": float(partial.get("cost", 0.0)),
+            "best_partial_q_deg": q_deg_values(partial.get("q", CTRL.q_cmd), wrap_swing_for_display=True),
+            "stages": partial_stages,
+            "route_diagnostics": route_diagnostics_from_stages(partial_stages),
+            "unload_ballistics": unload_ballistics_from_stages(partial_stages),
+            "fsm_contract": validate_dig_plan_contract(
+                seq=partial.get("seq", []),
+                points=partial.get("points", []),
+                stages=partial_stages,
+                trace_points=[],
+            ),
+        }
+
     def resolve_bucket_world(label, bucket_deg, bucket_world_deg, q_seed, ik_effector):
         if bucket_world_deg == "hold":
             return rad_to_deg(q_seed[CTRL.name_to_idx["bucket"]]), None, "ok"
@@ -12565,23 +15650,233 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
             bucket_world_rad = nearest_bucket_level_world_angle(reference_angles[2])
         return bucket_deg, rad_to_deg(bucket_world_rad), "ok"
 
-    for label, point, bucket_deg, bucket_world_deg, ik_effector, duration, required in specs:
-        if deadline is not None and time.time() > float(deadline):
-            return None, list(best_partial.get("points", [])), {
-                "id": str(candidate.get("id", "candidate")),
-                "planned": False,
-                "failed_stage": label,
-                "failure_reason": "planning budget exceeded",
-                "planned_prefix": len(best_partial.get("seq", [])),
-                "best_partial_cost": float(best_partial.get("cost", 0.0)),
-                "best_partial_q_deg": q_deg_values(best_partial.get("q", CTRL.q_cmd), wrap_swing_for_display=True),
-                "stages": list(best_partial.get("stages", [])),
+    def routed_stage_components(q_seed, q_goal, label, duration, target_point, effector):
+        if planning_deadline_exceeded(deadline):
+            return None, "planning budget exceeded"
+        pre_dig_primary_route = str(label).lower() == "pre_dig"
+        pre_dig_obstacle_context = False
+        pre_dig_corridor_report = None
+        pre_dig_route_deadline = deadline
+        if pre_dig_primary_route:
+            try:
+                route_effector = path_end_effector_for_mode(label)
+                p0 = predicted_end_world_point(q_seed, end_effector=route_effector, reference_q=q_seed)
+                p1 = predicted_end_world_point(q_goal, end_effector=route_effector, reference_q=q_seed)
+                if p0 is not None and p1 is not None:
+                    blockers = obstacle_bboxes_for_segment_xy(p0, p1)
+                    pre_dig_obstacle_context = bool(blockers)
+                    if blockers:
+                        pre_dig_corridor_report = obstacle_corridor_report(
+                            p0,
+                            p1,
+                            obstacle=blockers[0],
+                            link_name=route_effector,
+                        )
+            except Exception:
+                pre_dig_obstacle_context = False
+        direct_phase_ok, direct_phase_reason, direct_phase_sample, direct_phase_report = path_phase_check(
+            q_seed, q_goal, label, samples=DIG_PLAN_PATH_CHECK_SAMPLES, deadline=deadline
+        )
+        if planning_deadline_exceeded(deadline):
+            return None, "planning budget exceeded"
+        if pre_dig_primary_route and pre_dig_obstacle_context:
+            direct_obstacle_ok = False
+            direct_obstacle_reason = "pre_dig corridor intersects rigid obstacle; route required before direct sweep"
+            direct_obstacle_sample = 0
+            direct_obstacle_report = pre_dig_corridor_report
+            if deadline is not None:
+                now = time.time()
+                remaining = max(0.0, float(deadline) - now)
+                pre_dig_route_deadline = child_planning_deadline(
+                    deadline,
+                    max(0.35, min(1.10, 0.45 * remaining)),
+                    min_seconds=0.12,
+                )
+        else:
+            direct_obstacle_ok, direct_obstacle_reason, direct_obstacle_sample, direct_obstacle_report = path_obstacle_check(
+                q_seed, q_goal, label, samples=DIG_PLAN_PATH_CHECK_SAMPLES, deadline=deadline
+            )
+        route_required = not (direct_phase_ok and direct_obstacle_ok)
+        route_preferred = bool(pre_dig_primary_route and pre_dig_obstacle_context)
+        route_waypoints = []
+        route_reason = "direct_ok"
+        if route_required or route_preferred:
+            route_waypoints, route_reason = find_clearance_route(
+                q_seed,
+                q_goal,
+                label,
+                f"plan_{candidate.get('id', 'candidate')}_{label}",
+                deadline=pre_dig_route_deadline,
+                samples=PATH_ROUTE_PLANNING_SAMPLE_COUNT,
+            )
+            if route_waypoints is None:
+                if route_preferred and not route_required and direct_phase_ok and direct_obstacle_ok:
+                    route_waypoints = []
+                    route_reason = f"direct_ok; preferred pre_dig route unavailable: {route_reason}"
+                else:
+                    detail = []
+                    if not direct_phase_ok:
+                        detail.append(
+                            f"phase sample={direct_phase_sample}/{PATH_CHECK_SAMPLES} "
+                            + format_ground_report(label, direct_phase_report, direct_phase_reason)
+                        )
+                    if not direct_obstacle_ok:
+                        detail.append(
+                            f"obstacle sample={direct_obstacle_sample}/{PATH_CHECK_SAMPLES} "
+                            + format_obstacle_report(label, direct_obstacle_report, direct_obstacle_reason)
+                        )
+                    return None, f"{label}: no collision-free route: {route_reason}; " + "; ".join(detail)
+            else:
+                route_required = True
+                route_reason = str(route_reason)
+        route_seq = []
+        route_points = []
+        route_stages = []
+        route_cost = 0.0
+        route_weighted_angle = 0.0
+        route_estimated_time = 0.0
+        q_motion_seed = np.array(q_seed, dtype=np.float32).copy()
+        route_end_effector = path_end_effector_for_mode(label)
+        path_eval_deadline = pre_dig_route_deadline if route_preferred else deadline
+        route_prevalidated = bool(route_waypoints)
+        for route_idx, q_route_raw in enumerate(route_waypoints or []):
+            if planning_deadline_exceeded(path_eval_deadline):
+                return None, "planning budget exceeded"
+            q_route = np.array(q_route_raw, dtype=np.float32).copy()
+            route_label = f"clearance_route_{route_idx + 1}"
+            route_duration = max(0.45, min(PATH_CLEARANCE_DURATION, float(duration) * 0.65))
+            route_motion = plan_joint_motion_metrics(q_route, q_motion_seed, route_duration)
+            route_duration = max(route_duration, float(route_motion.get("estimated_time", route_duration) or route_duration))
+            route_motion = plan_joint_motion_metrics(q_route, q_motion_seed, route_duration)
+            if route_prevalidated:
+                route_path_penalty = 0.0
+                route_path_detail = {
+                    "phase_ok": True,
+                    "obstacle_ok": True,
+                    "phase_reason": "prevalidated_by_clearance_route",
+                    "obstacle_reason": "prevalidated_by_clearance_route",
+                    "phase_sample": int(PATH_ROUTE_PLANNING_SAMPLE_COUNT),
+                    "obstacle_sample": int(PATH_ROUTE_PLANNING_SAMPLE_COUNT),
+                    "path_penalty": 0.0,
+                    "path_check_reused": True,
+                    "route_prevalidated": True,
+                }
+            else:
+                route_path_penalty, route_path_detail = plan_path_penalty(
+                    q_motion_seed, q_route, "clearance", deadline=path_eval_deadline
+                )
+                if planning_deadline_exceeded(path_eval_deadline):
+                    return None, "planning budget exceeded"
+                if not bool(route_path_detail.get("phase_ok", True)) or not bool(route_path_detail.get("obstacle_ok", True)):
+                    return None, (
+                        f"{label}: clearance route segment still invalid; "
+                        f"phase={route_path_detail.get('phase_reason')} obstacle={route_path_detail.get('obstacle_reason')}"
+                    )
+            route_target = predicted_end_world_point(q_route, end_effector=route_end_effector, reference_q=q_motion_seed)
+            if route_target is None:
+                route_target = np.array(target_point, dtype=np.float32).copy()
+            route_stage_cost = float(route_motion["cost"] + route_path_penalty)
+            route_seq.append((route_label, q_route.copy(), float(route_duration)))
+            route_points.append(np.array(route_target, dtype=np.float32).copy())
+            route_stages.append(
+                {
+                    "phase": route_label,
+                    "planned": True,
+                    "required": True,
+                    "target_point": vec_list(route_target, 3),
+                    "q_goal_rad": vec_list(q_route, 4),
+                    "q_goal_deg": q_deg_values(q_route, wrap_swing_for_display=True),
+                    "duration": float(route_duration),
+                    "effector": route_end_effector,
+                    "route_source": "obstacle_clearance",
+                    "route_reason": str(route_reason),
+                    "route_index": int(route_idx + 1),
+                    "route_count": int(len(route_waypoints or [])),
+                    "motion": route_motion,
+                    "path": route_path_detail,
+                    "stage_cost": route_stage_cost,
+                }
+            )
+            route_cost += route_stage_cost
+            route_weighted_angle += float(route_motion["weighted_angle"])
+            route_estimated_time += float(route_motion["estimated_time"])
+            q_motion_seed = q_route.copy()
+
+        if planning_deadline_exceeded(path_eval_deadline):
+            return None, "planning budget exceeded"
+        if route_prevalidated:
+            path_penalty = 0.0
+            path_detail = {
+                "phase_ok": True,
+                "obstacle_ok": True,
+                "phase_reason": "prevalidated_by_clearance_route",
+                "obstacle_reason": "prevalidated_by_clearance_route",
+                "phase_sample": int(PATH_ROUTE_PLANNING_SAMPLE_COUNT),
+                "obstacle_sample": int(PATH_ROUTE_PLANNING_SAMPLE_COUNT),
+                "path_penalty": 0.0,
+                "path_check_reused": True,
+                "route_prevalidated": True,
+                "route_inserted": True,
+                "route_waypoints": len(route_waypoints or []),
+                "route_reason": str(route_reason),
+                "direct_phase_ok": bool(direct_phase_ok),
+                "direct_phase_reason": str(direct_phase_reason),
+                "direct_obstacle_ok": bool(direct_obstacle_ok),
+                "direct_obstacle_reason": str(direct_obstacle_reason),
             }
+        elif (
+            not route_required
+            and bool(direct_phase_ok)
+            and bool(direct_obstacle_ok)
+            and not planning_deadline_exceeded(path_eval_deadline)
+        ):
+            path_penalty = 0.0
+            path_detail = {
+                "phase_ok": True,
+                "obstacle_ok": True,
+                "phase_reason": str(direct_phase_reason),
+                "obstacle_reason": str(direct_obstacle_reason),
+                "phase_sample": int(direct_phase_sample),
+                "obstacle_sample": int(direct_obstacle_sample),
+                "path_penalty": 0.0,
+                "path_check_reused": True,
+            }
+        else:
+            path_penalty, path_detail = plan_path_penalty(q_motion_seed, q_goal, label, deadline=path_eval_deadline)
+        if planning_deadline_exceeded(path_eval_deadline):
+            return None, "planning budget exceeded"
+        if route_required:
+            path_detail["route_inserted"] = bool(route_waypoints)
+            path_detail["route_waypoints"] = len(route_waypoints or [])
+            path_detail["route_reason"] = str(route_reason)
+            path_detail["direct_phase_ok"] = bool(direct_phase_ok)
+            path_detail["direct_phase_reason"] = str(direct_phase_reason)
+            path_detail["direct_obstacle_ok"] = bool(direct_obstacle_ok)
+            path_detail["direct_obstacle_reason"] = str(direct_obstacle_reason)
+        if not bool(path_detail.get("obstacle_ok", True)):
+            return None, f"{label}: final segment still hits rigid obstacle: {path_detail.get('obstacle_reason')}"
+        if strict_path_precheck_phase(label) and not bool(path_detail.get("phase_ok", True)):
+            return None, f"{label}: final segment violates ground/path guard: {path_detail.get('phase_reason')}"
+        return {
+            "route_seq": route_seq,
+            "route_points": route_points,
+            "route_stages": route_stages,
+            "route_cost": float(route_cost),
+            "route_weighted_angle": float(route_weighted_angle),
+            "route_estimated_time": float(route_estimated_time),
+            "q_motion_seed": q_motion_seed.copy(),
+            "path_penalty": float(path_penalty),
+            "path_detail": path_detail,
+        }, "ok"
+
+    for label, point, bucket_deg, bucket_world_deg, ik_effector, duration, required in specs:
+        if planning_deadline_exceeded(deadline):
+            return budget_failure(label)
         new_beams = []
         fail_reasons = []
 
         for beam in beams:
-            if deadline is not None and time.time() > float(deadline):
+            if planning_deadline_exceeded(deadline):
                 fail_reasons.append("planning budget exceeded")
                 break
             q_seed = np.array(beam["q"], dtype=np.float32).copy()
@@ -12594,6 +15889,7 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                     log=False,
                     max_correction_iters=2,
                     allow_unaligned=True,
+                    deadline=deadline,
                 )
                 if q_dump is None:
                     reference_angles = chain_angles_from_q(q_seed, end_effector="load")
@@ -12611,6 +15907,7 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                         accept_err=0.85,
                         bucket_motion_weight=0.65,
                         bucket_preference_weight=0.0,
+                        deadline=deadline,
                     )
                     fallback_info = "ok"
                     q_pre_dump = None
@@ -12665,8 +15962,18 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                         f"source_clearance={fmt_optional(drop.get('source_clearance'))}",
                     )
 
-                direct_phase_ok, direct_phase_reason, direct_phase_sample, direct_phase_report = path_phase_check(q_seed, q_pre_dump, label)
-                direct_obstacle_ok, direct_obstacle_reason, direct_obstacle_sample, direct_obstacle_report = path_obstacle_check(q_seed, q_pre_dump, label)
+                if planning_deadline_exceeded(deadline):
+                    fail_reasons.append("planning budget exceeded")
+                    break
+                direct_phase_ok, direct_phase_reason, direct_phase_sample, direct_phase_report = path_phase_check(
+                    q_seed, q_pre_dump, label, samples=DIG_PLAN_PATH_CHECK_SAMPLES, deadline=deadline
+                )
+                if planning_deadline_exceeded(deadline):
+                    fail_reasons.append("planning budget exceeded")
+                    break
+                direct_obstacle_ok, direct_obstacle_reason, direct_obstacle_sample, direct_obstacle_report = path_obstacle_check(
+                    q_seed, q_pre_dump, label, samples=DIG_PLAN_PATH_CHECK_SAMPLES, deadline=deadline
+                )
                 route_waypoints = []
                 route_reason = "direct_ok"
                 route_required = not (direct_phase_ok and direct_obstacle_ok)
@@ -12705,13 +16012,21 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                 q_motion_seed = q_seed.copy()
                 route_end_effector = path_end_effector_for_mode(label)
                 for route_idx, q_route_raw in enumerate(route_waypoints or []):
+                    if planning_deadline_exceeded(deadline):
+                        fail_reasons.append("planning budget exceeded")
+                        break
                     q_route = np.array(q_route_raw, dtype=np.float32).copy()
                     route_label = f"clearance_route_{route_idx + 1}"
                     route_duration = max(0.45, min(PATH_CLEARANCE_DURATION, float(duration) * 0.65))
                     route_motion = plan_joint_motion_metrics(q_route, q_motion_seed, route_duration)
                     route_duration = max(route_duration, float(route_motion.get("estimated_time", route_duration) or route_duration))
                     route_motion = plan_joint_motion_metrics(q_route, q_motion_seed, route_duration)
-                    route_path_penalty, route_path_detail = plan_path_penalty(q_motion_seed, q_route, "clearance")
+                    route_path_penalty, route_path_detail = plan_path_penalty(
+                        q_motion_seed, q_route, "clearance", deadline=deadline
+                    )
+                    if planning_deadline_exceeded(deadline):
+                        fail_reasons.append("planning budget exceeded")
+                        break
                     route_target = predicted_end_world_point(q_route, end_effector=route_end_effector, reference_q=q_motion_seed)
                     if route_target is None:
                         route_target = np.array(landing, dtype=np.float32).copy()
@@ -12730,6 +16045,8 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                             "effector": route_end_effector,
                             "route_source": "obstacle_clearance",
                             "route_reason": str(route_reason),
+                            "route_index": int(route_idx + 1),
+                            "route_count": int(len(route_waypoints or [])),
                             "motion": route_motion,
                             "path": route_path_detail,
                             "stage_cost": route_stage_cost,
@@ -12739,9 +16056,30 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                     route_weighted_angle += float(route_motion["weighted_angle"])
                     route_estimated_time += float(route_motion["estimated_time"])
                     q_motion_seed = q_route.copy()
+                if planning_deadline_exceeded(deadline):
+                    break
 
                 motion = plan_joint_motion_metrics(q_pre_dump, q_motion_seed, duration)
-                path_penalty, path_detail = plan_path_penalty(q_motion_seed, q_pre_dump, label)
+                if planning_deadline_exceeded(deadline):
+                    fail_reasons.append("planning budget exceeded")
+                    break
+                if not route_required and bool(direct_phase_ok) and bool(direct_obstacle_ok):
+                    path_penalty = 0.0
+                    path_detail = {
+                        "phase_ok": True,
+                        "obstacle_ok": True,
+                        "phase_reason": str(direct_phase_reason),
+                        "obstacle_reason": str(direct_obstacle_reason),
+                        "phase_sample": int(direct_phase_sample),
+                        "obstacle_sample": int(direct_obstacle_sample),
+                        "path_penalty": 0.0,
+                        "path_check_reused": True,
+                    }
+                else:
+                    path_penalty, path_detail = plan_path_penalty(q_motion_seed, q_pre_dump, label, deadline=deadline)
+                if planning_deadline_exceeded(deadline):
+                    fail_reasons.append("planning budget exceeded")
+                    break
                 if route_required:
                     path_detail["route_inserted"] = bool(route_waypoints)
                     path_detail["route_waypoints"] = len(route_waypoints or [])
@@ -12795,13 +16133,143 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
 
             if label == "curl_to_hold_material":
                 bucket_idx = CTRL.name_to_idx["bucket"]
-                q_goal = None
-                pose_info = {}
+                boom_idx = CTRL.name_to_idx.get("boom", 1)
+                target_bucket_deg = float(bucket_deg if bucket_deg is not None else candidate.get("bucket_curl", CURL_HOLD_TARGET_DEG))
+                target_bucket_rad = deg_to_rad(target_bucket_deg)
+                curl_candidates = []
+
+                def add_curl_candidate(q_raw, source, reason="", extra_lift_deg=0.0, pose_info=None):
+                    if planning_deadline_exceeded(deadline):
+                        return
+                    if q_raw is None:
+                        return
+                    q_candidate = np.array(q_raw, dtype=np.float32).reshape(-1)[:4].copy()
+                    if extra_lift_deg:
+                        q_candidate[boom_idx] = float(q_candidate[boom_idx]) + deg_to_rad(float(extra_lift_deg))
+                    q_candidate[bucket_idx] = target_bucket_rad
+                    q_candidate = clip_command_near(q_candidate, reference=q_seed)
+                    bucket_after = float(rad_to_deg(q_candidate[bucket_idx]))
+                    closed_deficit = max(0.0, bucket_after - float(CURL_HOLD_ACCEPT_BUCKET_DEG))
+                    if deadline is not None:
+                        phase_ok, phase_reason, phase_sample, _phase_report = path_phase_check(
+                            q_seed, q_candidate, label, samples=2, deadline=deadline
+                        )
+                        obstacle_ok, obstacle_reason, obstacle_sample, _obstacle_report = path_obstacle_check(
+                            q_seed, q_candidate, label, samples=2, deadline=deadline
+                        )
+                        motion = plan_joint_motion_metrics(q_candidate, q_seed, duration)
+                        path_penalty = 0.0
+                        if not phase_ok:
+                            path_penalty += float(DIG_PLAN_PATH_SOFT_PENALTY)
+                        if not obstacle_ok:
+                            path_penalty += float(DIG_PLAN_OBSTACLE_SOFT_PENALTY)
+                        path_detail = {
+                            "phase_ok": bool(phase_ok),
+                            "obstacle_ok": bool(obstacle_ok),
+                            "phase_reason": str(phase_reason),
+                            "obstacle_reason": str(obstacle_reason),
+                            "phase_sample": int(phase_sample),
+                            "obstacle_sample": int(obstacle_sample),
+                            "route_inserted": False,
+                            "route_reason": "auto_budget_direct_material_hold",
+                            "path_penalty": path_penalty,
+                            "budget_fast_path": True,
+                        }
+                        route_cost = 0.0
+                        route_weighted_angle = 0.0
+                        route_estimated_time = 0.0
+                        route_seq = []
+                        route_points = []
+                        route_stages = []
+                        routed_ok = bool(phase_ok and obstacle_ok)
+                    else:
+                        routed, route_reason = routed_stage_components(q_seed, q_candidate, label, duration, point, "tip")
+                        if routed is None:
+                            motion = plan_joint_motion_metrics(q_candidate, q_seed, duration)
+                            path_penalty = float(DIG_PLAN_OBSTACLE_SOFT_PENALTY + DIG_PLAN_PATH_SOFT_PENALTY)
+                            path_detail = {
+                                "phase_ok": False,
+                                "obstacle_ok": False,
+                                "phase_reason": str(route_reason),
+                                "obstacle_reason": str(route_reason),
+                                "route_inserted": False,
+                                "route_reason": str(route_reason),
+                                "path_penalty": path_penalty,
+                            }
+                            route_cost = 0.0
+                            route_weighted_angle = 0.0
+                            route_estimated_time = 0.0
+                            route_seq = []
+                            route_points = []
+                            route_stages = []
+                            routed_ok = False
+                        else:
+                            motion = plan_joint_motion_metrics(q_candidate, routed["q_motion_seed"], duration)
+                            path_penalty = float(routed["path_penalty"])
+                            path_detail = routed["path_detail"]
+                            route_cost = float(routed["route_cost"])
+                            route_weighted_angle = float(routed["route_weighted_angle"])
+                            route_estimated_time = float(routed["route_estimated_time"])
+                            route_seq = routed["route_seq"]
+                            route_points = routed["route_points"]
+                            route_stages = routed["route_stages"]
+                            routed_ok = True
+                    curl_report = predicted_phase_ground_report(q_candidate, label, reference_q=q_seed)
+                    curl_ok, curl_reason = phase_ground_ok(label, curl_report)
+                    curl_hold_q, curl_hold_report = carry_hold_adjusted_q(q_candidate, q_candidate, end_effector="load")
+                    curl_retains = bool((curl_hold_report or {}).get("retains_material", False))
+                    retain_penalty = 0.0 if curl_retains else 10.0
+                    closed_penalty = 0.0 if curl_retains else 80.0 * closed_deficit
+                    ground_penalty = 0.0 if curl_ok else 120.0
+                    tip_point = predicted_end_world_point(q_candidate, end_effector="tip", reference_q=q_seed)
+                    if tip_point is None:
+                        tip_point = np.array(point, dtype=np.float32).copy()
+                    curl_candidates.append(
+                        {
+                            "q": q_candidate.copy(),
+                            "source": str(source),
+                            "reason": str(reason),
+                            "extra_lift_deg": float(extra_lift_deg),
+                            "pose_info": dict(pose_info or {}),
+                            "bucket_deg": bucket_after,
+                            "joint_closed_ok_deprecated": bool(closed_deficit <= 0.05),
+                            "closed_ok": bool(curl_retains),
+                            "retains": bool(curl_retains),
+                            "motion": motion,
+                            "path_detail": path_detail,
+                            "path_penalty": float(path_penalty),
+                            "route_cost": float(route_cost),
+                            "route_weighted_angle": float(route_weighted_angle),
+                            "route_estimated_time": float(route_estimated_time),
+                            "route_seq": route_seq,
+                            "route_points": route_points,
+                            "route_stages": route_stages,
+                            "ground_report": curl_report,
+                            "ground_ok": bool(curl_ok and routed_ok),
+                            "ground_reason": str(curl_reason if routed_ok else path_detail.get("route_reason", "route_failed")),
+                            "hold_report": curl_hold_report,
+                            "retain_penalty": float(retain_penalty),
+                            "closed_penalty": float(closed_penalty),
+                            "ground_penalty": float(ground_penalty),
+                            "target_point": np.array(tip_point, dtype=np.float32).copy(),
+                            "score": float(route_cost + motion["cost"] + path_penalty + retain_penalty + closed_penalty + ground_penalty),
+                        }
+                    )
+
+                # Curl is a material-retention action: bucket closure is the hard
+                # constraint, while exact tip position is only a soft/diagnostic target.
+                add_curl_candidate(q_seed, "bucket_close_only", "preserve_pull_exit_pose", extra_lift_deg=0.0)
+                add_curl_candidate(
+                    q_seed,
+                    "bucket_close_with_boom_lift",
+                    "seal_bucket_then_small_lift",
+                    extra_lift_deg=float(candidate.get("curl_boom_lift_deg", 4.5)),
+                )
                 try:
                     curl_rows, curl_reason = solve_dig_pose_candidates(
                         label,
                         point,
-                        float(bucket_deg if bucket_deg is not None else candidate.get("bucket_curl", CURL_HOLD_TARGET_DEG)),
+                        target_bucket_deg,
                         duration,
                         q_seed,
                         bucket_world_deg=None,
@@ -12809,41 +16277,79 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                         accept_err=0.62,
                         soft_accept_err=0.90,
                         bucket_motion_weight=0.50,
-                        bucket_preference_weight=1.2,
+                        bucket_preference_weight=8.0,
                         max_solutions=2,
+                        deadline=deadline,
                     )
                 except Exception as e:
                     curl_rows = []
                     curl_reason = f"{type(e).__name__}:{e}"
-                if curl_rows:
-                    best_curl = sorted(
-                        curl_rows,
-                        key=lambda row: (
-                            float((row.get("info") or {}).get("planar_err", 999.0) or 999.0),
-                            sum(q_delta_abs_deg(np.array(row.get("q_goal"), dtype=np.float32), q_seed)),
-                        ),
-                    )[0]
-                    q_goal = np.array(best_curl["q_goal"], dtype=np.float32).copy()
-                    pose_info = dict(best_curl.get("info", {}) or {})
-                    pose_info["source"] = "curl_lift_tip_ik"
-                if q_goal is None:
-                    q_goal = q_seed.copy()
-                    boom_idx = CTRL.name_to_idx.get("boom", 1)
-                    q_goal[boom_idx] = float(q_goal[boom_idx]) + deg_to_rad(float(candidate.get("curl_boom_lift_deg", 4.5)))
-                    q_goal[bucket_idx] = deg_to_rad(float(bucket_deg if bucket_deg is not None else candidate.get("bucket_curl", CURL_HOLD_TARGET_DEG)))
-                    pose_info = {"source": "bucket_plus_boom_lift_fallback", "reason": str(curl_reason)}
-                q_goal = clip_command_near(q_goal, reference=q_seed)
-                motion = plan_joint_motion_metrics(q_goal, q_seed, duration)
-                path_penalty, path_detail = plan_path_penalty(q_seed, q_goal, label)
-                curl_report = predicted_phase_ground_report(q_goal, label, reference_q=q_seed)
-                curl_ok, curl_reason = phase_ground_ok(label, curl_report)
+                for row in curl_rows or []:
+                    if planning_deadline_exceeded(deadline):
+                        break
+                    q_row = np.array(row.get("q_goal"), dtype=np.float32).copy()
+                    row_info = dict(row.get("info", {}) or {})
+                    row_info["source"] = "curl_tip_ik_bucket_forced_closed"
+                    row_info["raw_ik_bucket_deg"] = float(rad_to_deg(q_row[bucket_idx]))
+                    add_curl_candidate(q_row, "curl_tip_ik_bucket_forced_closed", str(curl_reason), pose_info=row_info)
+
+                valid_curl_candidates = [
+                    row for row in curl_candidates
+                    if row["ground_ok"] and row["retains"]
+                ]
+                if not valid_curl_candidates:
+                    if planning_deadline_exceeded(deadline):
+                        fail_reasons.append("planning budget exceeded")
+                        break
+                    if curl_candidates:
+                        best_diag = sorted(curl_candidates, key=lambda row: row["score"])[0]
+                        fail_reasons.append(
+                            f"{label}: no geometrically retaining safe curl pose; "
+                            f"best_source={best_diag['source']} bucket={best_diag['bucket_deg']:.2f}deg "
+                            f"joint_closed={best_diag.get('joint_closed_ok_deprecated')} retains={best_diag['retains']} ground={best_diag['ground_ok']} "
+                            f"ground_reason={best_diag['ground_reason']}"
+                        )
+                    else:
+                        fail_reasons.append(f"{label}: no curl candidates; {curl_reason}")
+                    continue
+
+                best_curl = sorted(
+                    valid_curl_candidates,
+                    key=lambda row: (
+                        0 if row["retains"] else 1,
+                        float(row["score"]),
+                        sum(q_delta_abs_deg(row["q"], q_seed)),
+                    ),
+                )[0]
+                q_goal = best_curl["q"].copy()
+                curl_bucket_deg = float(best_curl["bucket_deg"])
+                curl_closed_ok = bool(best_curl["retains"])
+                curl_hold_report = best_curl["hold_report"]
+                curl_retains = bool(best_curl["retains"])
+                if not curl_closed_ok:
+                    fail_reasons.append(
+                        f"{label}: bucket geometry does not retain material; bucket={curl_bucket_deg:.2f}deg "
+                        f"pour_above_load_z={fmt_optional((curl_hold_report or {}).get('pour_above_load_z'))}"
+                    )
+                    continue
+                motion = best_curl["motion"]
+                path_penalty = float(best_curl["path_penalty"])
+                path_detail = best_curl["path_detail"]
+                route_seq = list(best_curl.get("route_seq", []))
+                route_points = list(best_curl.get("route_points", []))
+                route_stages = list(best_curl.get("route_stages", []))
+                route_cost = float(best_curl.get("route_cost", 0.0) or 0.0)
+                route_weighted_angle = float(best_curl.get("route_weighted_angle", 0.0) or 0.0)
+                route_estimated_time = float(best_curl.get("route_estimated_time", 0.0) or 0.0)
+                curl_report = best_curl["ground_report"]
+                curl_ok = bool(best_curl["ground_ok"])
+                curl_reason = str(best_curl["ground_reason"])
                 if not curl_ok:
                     fail_reasons.append(f"{label}: {curl_reason}")
                     continue
-                target_point = predicted_end_world_point(q_goal, end_effector="tip", reference_q=q_seed)
-                if target_point is None:
-                    target_point = point
-                total_cost = float(beam["cost"]) + motion["cost"] + path_penalty
+                retain_penalty = float(best_curl["retain_penalty"])
+                target_point = best_curl["target_point"]
+                total_cost = float(beam["cost"]) + route_cost + motion["cost"] + path_penalty + retain_penalty
                 stage_row = {
                     "phase": label,
                     "planned": True,
@@ -12852,10 +16358,23 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                     "q_goal_rad": vec_list(q_goal, 4),
                     "q_goal_deg": q_deg_values(q_goal, wrap_swing_for_display=True),
                     "duration": float(duration),
-                    "effector": "tip_curl_lift" if pose_info.get("source") == "curl_lift_tip_ik" else "bucket_plus_boom_lift",
+                    "effector": "bucket_closure_primary",
                     "seal_bucket_first": True,
-                    "bucket_target_deg": float(rad_to_deg(q_goal[bucket_idx])),
-                    "curl_pose": pose_info,
+                    "bucket_target_deg": curl_bucket_deg,
+                    "material_hold": {
+                        "bucket_closed_ok": bool(curl_closed_ok),
+                        "carry_retains_material": bool(curl_retains),
+                        "carry_report": curl_hold_report,
+                        "penalty": float(retain_penalty),
+                    },
+                    "curl_pose": {
+                        "source": best_curl["source"],
+                        "reason": best_curl["reason"],
+                        "extra_lift_deg": best_curl["extra_lift_deg"],
+                        "target_bucket_deg": target_bucket_deg,
+                        "candidate_count": len(curl_candidates),
+                        "pose_info": best_curl["pose_info"],
+                    },
                     "ground": {
                         "ok": bool(curl_ok),
                         "reason": str(curl_reason),
@@ -12867,17 +16386,210 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                     },
                     "motion": motion,
                     "path": path_detail,
-                    "stage_cost": float(motion["cost"] + path_penalty),
+                    "clearance_route": {
+                        "inserted": bool(route_seq),
+                        "required": bool(route_seq),
+                        "waypoints": len(route_seq),
+                    },
+                    "stage_cost": float(route_cost + motion["cost"] + path_penalty + retain_penalty),
                 }
                 new_beams.append(
                     {
                         "q": q_goal.copy(),
-                        "seq": beam["seq"] + [(label, q_goal.copy(), float(duration))],
-                        "points": beam["points"] + [np.array(target_point, dtype=np.float32).copy()],
-                        "stages": beam["stages"] + [stage_row],
+                        "seq": beam["seq"] + route_seq + [(label, q_goal.copy(), float(duration))],
+                        "points": beam["points"] + route_points + [np.array(target_point, dtype=np.float32).copy()],
+                        "stages": beam["stages"] + route_stages + [stage_row],
                         "cost": total_cost,
-                        "weighted_angle": float(beam["weighted_angle"]) + float(motion["weighted_angle"]),
-                        "estimated_time": float(beam["estimated_time"]) + float(motion["estimated_time"]),
+                        "weighted_angle": float(beam["weighted_angle"]) + route_weighted_angle + float(motion["weighted_angle"]),
+                        "estimated_time": float(beam["estimated_time"]) + route_estimated_time + float(motion["estimated_time"]),
+                    }
+                )
+                continue
+
+            if label == "secure_load":
+                boom_idx = CTRL.name_to_idx.get("boom", 1)
+                arm_idx = CTRL.name_to_idx.get("arm", 2)
+                bucket_idx = CTRL.name_to_idx.get("bucket", 3)
+                secure_rows = []
+
+                for boom_lift_deg, arm_retract_deg in [
+                    (3.0, 0.0),
+                    (4.5, -1.5),
+                    (6.0, -2.5),
+                    (7.5, -3.0),
+                    (2.0, 1.0),
+                ]:
+                    if planning_deadline_exceeded(deadline):
+                        secure_rows.append({"ok": False, "reason": "planning budget exceeded"})
+                        break
+                    q_secure = q_seed.copy()
+                    q_secure[boom_idx] = float(q_secure[boom_idx]) + deg_to_rad(float(boom_lift_deg))
+                    q_secure[arm_idx] = float(q_secure[arm_idx]) + deg_to_rad(float(arm_retract_deg))
+                    q_secure = clip_command_near(q_secure, reference=q_seed)
+                    q_secure_base = q_secure.copy()
+                    q_secure, carry_report = carry_hold_adjusted_q(q_secure, q_seed, end_effector="load")
+                    if not bool((carry_report or {}).get("ok", False)):
+                        secure_rows.append({
+                            "ok": False,
+                            "reason": f"carry hold failed: {(carry_report or {}).get('reason', 'unknown')}",
+                            "q": q_secure.copy(),
+                            "carry_report": carry_report,
+                        })
+                        continue
+                    if not bool((carry_report or {}).get("retains_material", False)):
+                        secure_rows.append({
+                            "ok": False,
+                            "reason": f"carry would spill; pour_above_load_z={fmt_optional((carry_report or {}).get('pour_above_load_z'))}",
+                            "q": q_secure.copy(),
+                            "carry_report": carry_report,
+                        })
+                        continue
+                    secure_report = predicted_phase_ground_report(q_secure, label, reference_q=q_seed)
+                    secure_ok, secure_reason = phase_ground_ok(label, secure_report)
+                    if not secure_ok:
+                        secure_rows.append({
+                            "ok": False,
+                            "reason": str(secure_reason),
+                            "q": q_secure.copy(),
+                            "carry_report": carry_report,
+                        })
+                        continue
+                    if deadline is not None:
+                        phase_ok, phase_reason, phase_sample, _phase_report = path_phase_check(
+                            q_seed, q_secure, label, samples=2, deadline=deadline
+                        )
+                        obstacle_ok, obstacle_reason, obstacle_sample, _obstacle_report = path_obstacle_check(
+                            q_seed, q_secure, label, samples=2, deadline=deadline
+                        )
+                        if not (phase_ok and obstacle_ok):
+                            secure_rows.append({
+                                "ok": False,
+                                "reason": (
+                                    "auto_budget_direct_secure_load_failed: "
+                                    f"phase={phase_reason} obstacle={obstacle_reason}"
+                                ),
+                                "q": q_secure.copy(),
+                                "carry_report": carry_report,
+                            })
+                            continue
+                        routed = {
+                            "q_motion_seed": q_seed.copy(),
+                            "route_seq": [],
+                            "route_points": [],
+                            "route_stages": [],
+                            "route_cost": 0.0,
+                            "route_weighted_angle": 0.0,
+                            "route_estimated_time": 0.0,
+                            "path_penalty": 0.0,
+                            "path_detail": {
+                                "phase_ok": True,
+                                "obstacle_ok": True,
+                                "phase_reason": str(phase_reason),
+                                "obstacle_reason": str(obstacle_reason),
+                                "phase_sample": int(phase_sample),
+                                "obstacle_sample": int(obstacle_sample),
+                                "route_inserted": False,
+                                "route_reason": "auto_budget_direct_secure_load",
+                                "path_penalty": 0.0,
+                                "budget_fast_path": True,
+                            },
+                        }
+                    else:
+                        routed, route_reason = routed_stage_components(q_seed, q_secure, label, duration, point, ik_effector)
+                        if routed is None:
+                            secure_rows.append({
+                                "ok": False,
+                                "reason": str(route_reason),
+                                "q": q_secure.copy(),
+                                "carry_report": carry_report,
+                            })
+                            continue
+                    motion = plan_joint_motion_metrics(q_secure, routed["q_motion_seed"], duration)
+                    target_point = predicted_end_world_point(q_secure, end_effector="load", reference_q=routed["q_motion_seed"])
+                    if target_point is None:
+                        target_point = np.array(point, dtype=np.float32).copy()
+                    score = (
+                        float(routed["route_cost"])
+                        + float(motion["cost"])
+                        + float(routed["path_penalty"])
+                        + carry_spill_risk_penalty(carry_report)
+                        - 12.0 * max(0.0, float((carry_report or {}).get("pour_above_load_z", 0.0) or 0.0))
+                    )
+                    secure_rows.append(
+                        {
+                            "ok": True,
+                            "score": float(score),
+                            "q": q_secure.copy(),
+                            "boom_lift_deg": float(boom_lift_deg),
+                            "arm_retract_deg": float(arm_retract_deg),
+                            "carry_report": carry_report,
+                            "ground_report": secure_report,
+                            "routed": routed,
+                            "motion": motion,
+                            "target_point": np.array(target_point, dtype=np.float32).copy(),
+                        }
+                    )
+
+                valid_secure = [row for row in secure_rows if bool(row.get("ok", False))]
+                if not valid_secure:
+                    if planning_deadline_exceeded(deadline):
+                        fail_reasons.append("planning budget exceeded")
+                        break
+                    best_diag = sorted(
+                        secure_rows,
+                        key=lambda row: float((row.get("carry_report") or {}).get("pour_above_load_z", -999.0) or -999.0),
+                        reverse=True,
+                    )[0] if secure_rows else {}
+                    fail_reasons.append(f"{label}: no retaining secure-load pose; {best_diag.get('reason', 'no candidates')}")
+                    continue
+
+                best_secure = sorted(valid_secure, key=lambda row: float(row["score"]))[0]
+                q_goal = best_secure["q"].copy()
+                routed = best_secure["routed"]
+                motion = best_secure["motion"]
+                carry_report = best_secure["carry_report"]
+                stage_row = {
+                    "phase": label,
+                    "planned": True,
+                    "required": bool(required),
+                    "target_point": vec_list(best_secure["target_point"], 3),
+                    "q_goal_rad": vec_list(q_goal, 4),
+                    "q_goal_deg": q_deg_values(q_goal, wrap_swing_for_display=True),
+                    "duration": float(duration),
+                    "effector": "load",
+                    "secure_load": {
+                        "boom_lift_deg": float(best_secure["boom_lift_deg"]),
+                        "arm_retract_deg": float(best_secure["arm_retract_deg"]),
+                        "candidate_count": len(secure_rows),
+                    },
+                    "material_hold": carry_report,
+                    "ground": {
+                        "ok": True,
+                        "reason": "ok",
+                        "tip_depth": best_secure["ground_report"].get("tip_sand_depth"),
+                        "bucket_mid_depth": best_secure["ground_report"].get("bucket_mid_sand_depth"),
+                        "pour_depth": best_secure["ground_report"].get("pour_sand_depth"),
+                        "load_depth": best_secure["ground_report"].get("load_sand_depth"),
+                        "surface_source": best_secure["ground_report"].get("tip_sand_surface_source"),
+                    },
+                    "motion": motion,
+                    "path": routed["path_detail"],
+                    "clearance_route": {
+                        "inserted": bool(routed["route_seq"]),
+                        "required": bool(routed["route_seq"]),
+                        "waypoints": len(routed["route_seq"]),
+                    },
+                    "stage_cost": float(routed["route_cost"] + motion["cost"] + routed["path_penalty"]),
+                }
+                new_beams.append(
+                    {
+                        "q": q_goal.copy(),
+                        "seq": beam["seq"] + routed["route_seq"] + [(label, q_goal.copy(), float(duration))],
+                        "points": beam["points"] + routed["route_points"] + [best_secure["target_point"].copy()],
+                        "stages": beam["stages"] + routed["route_stages"] + [stage_row],
+                        "cost": float(beam["cost"]) + float(routed["route_cost"]) + float(motion["cost"]) + float(routed["path_penalty"]),
+                        "weighted_angle": float(beam["weighted_angle"]) + float(routed["route_weighted_angle"]) + float(motion["weighted_angle"]),
+                        "estimated_time": float(beam["estimated_time"]) + float(routed["route_estimated_time"]) + float(motion["estimated_time"]),
                     }
                 )
                 continue
@@ -12916,19 +16628,40 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                 bucket_motion_weight=motion_weight,
                 bucket_preference_weight=preference_weight,
                 max_solutions=DIG_PLAN_TOPK_IK,
+                deadline=deadline,
             )
             if not pose_rows:
                 fail_reasons.append(f"{label}: {pose_reason}")
                 continue
 
             for pose in pose_rows:
+                if planning_deadline_exceeded(deadline):
+                    fail_reasons.append("planning budget exceeded")
+                    break
                 q_goal = np.array(pose["q_goal"], dtype=np.float32).copy()
+                carry_report = None
                 if label == "lift_carry":
-                    bucket_idx = CTRL.name_to_idx.get("bucket", 3)
-                    q_goal[bucket_idx] = float(q_seed[bucket_idx])
+                    q_goal, carry_report = carry_hold_adjusted_q(q_goal, q_seed, end_effector="load")
+                    if not bool((carry_report or {}).get("ok", False)):
+                        fail_reasons.append(f"{label}: carry hold failed: {(carry_report or {}).get('reason', 'unknown')}")
+                        continue
+                    if not bool((carry_report or {}).get("retains_material", False)):
+                        fail_reasons.append(
+                            f"{label}: carry angle would spill material; "
+                            f"pour_above_load_z={fmt_optional((carry_report or {}).get('pour_above_load_z'))}"
+                        )
+                        continue
                 info = pose.get("info", {})
-                motion = plan_joint_motion_metrics(q_goal, q_seed, duration)
-                path_penalty, path_detail = plan_path_penalty(q_seed, q_goal, label)
+                routed, route_reason = routed_stage_components(q_seed, q_goal, label, duration, point, ik_effector)
+                if routed is None:
+                    fail_reasons.append(str(route_reason))
+                    continue
+                if planning_deadline_exceeded(deadline):
+                    fail_reasons.append("planning budget exceeded")
+                    break
+                motion = plan_joint_motion_metrics(q_goal, routed["q_motion_seed"], duration)
+                path_penalty = float(routed["path_penalty"])
+                path_detail = routed["path_detail"]
                 front_report = predicted_phase_ground_report(q_goal, label, reference_q=q_seed)
                 front_ok, front_reason, front_penalty = cut_front_edge_quality(label, front_report)
                 if not front_ok:
@@ -12936,7 +16669,16 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                     continue
                 ik_penalty = float(DIG_PLAN_IK_ERR_COST) * float(info.get("planar_err", 0.0) or 0.0)
                 angle_penalty = 0.35 * max(0.0, float(info.get("world_angle_err_deg", 0.0) or 0.0))
-                total_cost = float(beam["cost"]) + motion["cost"] + path_penalty + ik_penalty + angle_penalty + front_penalty
+                total_cost = (
+                    float(beam["cost"])
+                    + float(routed["route_cost"])
+                    + motion["cost"]
+                    + path_penalty
+                    + ik_penalty
+                    + angle_penalty
+                    + front_penalty
+                    + carry_spill_risk_penalty(carry_report)
+                )
                 stage_row = {
                     "phase": label,
                     "planned": True,
@@ -12961,35 +16703,72 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                         "load_depth": front_report.get("load_sand_depth"),
                         "surface_source": front_report.get("tip_sand_surface_source"),
                     },
-                    "stage_cost": float(motion["cost"] + path_penalty + ik_penalty + angle_penalty + front_penalty),
+                    "material_hold": {} if carry_report is None else carry_report,
+                    "clearance_route": {
+                        "inserted": bool(routed["route_seq"]),
+                        "required": bool(routed["route_seq"]),
+                        "waypoints": len(routed["route_seq"]),
+                    },
+                    "stage_cost": float(
+                        routed["route_cost"]
+                        + motion["cost"]
+                        + path_penalty
+                        + ik_penalty
+                        + angle_penalty
+                        + front_penalty
+                        + carry_spill_risk_penalty(carry_report)
+                    ),
                 }
                 if bucket_world_use is not None:
                     stage_row["bucket_world_deg"] = float(bucket_world_use)
                 new_beams.append(
                     {
                         "q": q_goal.copy(),
-                        "seq": beam["seq"] + [(label, q_goal.copy(), float(duration))],
-                        "points": beam["points"] + [np.array(point, dtype=np.float32).copy()],
-                        "stages": beam["stages"] + [stage_row],
+                        "seq": beam["seq"] + routed["route_seq"] + [(label, q_goal.copy(), float(duration))],
+                        "points": beam["points"] + routed["route_points"] + [np.array(point, dtype=np.float32).copy()],
+                        "stages": beam["stages"] + routed["route_stages"] + [stage_row],
                         "cost": total_cost,
-                        "weighted_angle": float(beam["weighted_angle"]) + float(motion["weighted_angle"]),
-                        "estimated_time": float(beam["estimated_time"]) + float(motion["estimated_time"]),
+                        "weighted_angle": float(beam["weighted_angle"]) + float(routed["route_weighted_angle"]) + float(motion["weighted_angle"]),
+                        "estimated_time": float(beam["estimated_time"]) + float(routed["route_estimated_time"]) + float(motion["estimated_time"]),
                     }
                 )
+
+        if planning_deadline_exceeded(deadline):
+            if new_beams and label == specs[-1][0]:
+                info_print(
+                    "[DIG PLAN DEADLINE GRACE]",
+                    f"candidate={candidate.get('id', 'candidate')}",
+                    f"final_stage={label}",
+                    f"beams={len(new_beams)}",
+                    "accepting_complete_plan=True",
+                )
+            else:
+                partial = sorted(new_beams, key=lambda x: float(x.get("cost", 1.0e9)))[0] if new_beams else best_partial
+                return budget_failure(label, partial=partial, reasons=fail_reasons)
 
         if not new_beams:
             prefix_beams = sorted(beams, key=lambda x: float(x.get("cost", 1.0e9)))
             best_partial = prefix_beams[0] if prefix_beams else best_partial
             last_reason = "; ".join(fail_reasons[:4]) if fail_reasons else f"{label} produced no beam"
+            partial_stages = list(best_partial.get("stages", []))
             return None, list(best_partial.get("points", [])), {
                 "id": str(candidate.get("id", "candidate")),
+                "dig_primitive": compact_dig_primitive_params(candidate),
                 "planned": False,
                 "failed_stage": label,
                 "failure_reason": last_reason,
                 "planned_prefix": len(best_partial.get("seq", [])),
                 "best_partial_cost": float(best_partial.get("cost", 0.0)),
                 "best_partial_q_deg": q_deg_values(best_partial.get("q", CTRL.q_cmd), wrap_swing_for_display=True),
-                "stages": list(best_partial.get("stages", [])),
+                "stages": partial_stages,
+                "route_diagnostics": route_diagnostics_from_stages(partial_stages),
+                "unload_ballistics": unload_ballistics_from_stages(partial_stages),
+                "fsm_contract": validate_dig_plan_contract(
+                    seq=best_partial.get("seq", []),
+                    points=best_partial.get("points", []),
+                    stages=partial_stages,
+                    trace_points=[],
+                ),
             }
 
         new_beams.sort(key=lambda x: float(x.get("cost", 1.0e9)))
@@ -13009,11 +16788,19 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
             unload_release_point = np.array(drop.get("release"), dtype=np.float32).reshape(-1)[:3]
         if unload_stage.get("target_point") is not None:
             unload_landing_point = np.array(unload_stage.get("target_point"), dtype=np.float32).reshape(-1)[:3]
+    best_stages = list(best.get("stages", []))
+    fsm_contract = validate_dig_plan_contract(
+        seq=best.get("seq", []),
+        points=best.get("points", []),
+        stages=best_stages,
+        trace_points=[],
+    )
     return best["seq"], best["points"], {
         "id": str(candidate.get("id", "candidate")),
+        "dig_primitive": compact_dig_primitive_params(candidate),
         "planned": True,
         "steps": len(best["seq"]),
-        "stages": best["stages"],
+        "stages": best_stages,
         "unload_point_xyz": vec_list(unload_release_point, 3),
         "unload_release_xyz": vec_list(unload_release_point, 3),
         "unload_landing_xyz": vec_list(unload_landing_point, 3),
@@ -13021,21 +16808,54 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
         "weighted_angle": float(best["weighted_angle"]),
         "estimated_time": float(best["estimated_time"]),
         "beam_size": int(DIG_PLAN_BEAM_SIZE),
+        "route_diagnostics": route_diagnostics_from_stages(best_stages),
+        "unload_ballistics": unload_ballistics_from_stages(best_stages),
+        "fsm_contract": fsm_contract,
     }
 
 
-def evaluate_dig_plan_candidate(seq, points, candidate):
+def evaluate_dig_plan_candidate(seq, points, candidate, stages=None):
     if not seq:
         return -1.0e9, "no_sequence", []
 
     q_prev = CTRL.q_cmd.copy()
     penalties = 0.0
     reports = []
-    for stage_name, q_goal, duration in seq:
-        phase_ok, phase_reason, phase_sample, phase_report = path_phase_check(q_prev, q_goal, stage_name)
-        obstacle_ok, obstacle_reason, obstacle_sample, obstacle_report = path_obstacle_check(q_prev, q_goal, stage_name)
-        deltas = q_delta_abs_deg(q_goal, q_prev)
-        motion_cost = 0.025 * float(sum(deltas))
+    stage_rows = [row for row in (stages or []) if isinstance(row, dict) and row.get("q_goal_rad") is not None]
+    if stage_rows:
+        iterable = []
+        for row in stage_rows:
+            try:
+                q_goal = np.array(row.get("q_goal_rad"), dtype=np.float32).reshape(-1)[:4]
+                if len(q_goal) < 4:
+                    continue
+            except Exception:
+                continue
+            iterable.append((str(row.get("phase", "")), q_goal.copy(), float(row.get("duration", 0.0) or 0.0), row))
+    else:
+        iterable = [(stage_name, np.array(q_goal, dtype=np.float32).copy(), float(duration), None) for stage_name, q_goal, duration in seq]
+
+    for stage_name, q_goal, duration, stage_row in iterable:
+        if isinstance(stage_row, dict):
+            path = stage_row.get("path") if isinstance(stage_row.get("path"), dict) else {}
+            motion = stage_row.get("motion") if isinstance(stage_row.get("motion"), dict) else {}
+            phase_ok = bool(path.get("phase_ok", True))
+            obstacle_ok = bool(path.get("obstacle_ok", True))
+            phase_reason = str(path.get("phase_reason", "cached"))
+            obstacle_reason = str(path.get("obstacle_reason", "cached"))
+            phase_sample = int(path.get("phase_sample", -1) or -1)
+            obstacle_sample = int(path.get("obstacle_sample", -1) or -1)
+            phase_report = None
+            obstacle_report = None
+            deltas = motion.get("joint_delta_deg")
+            if not isinstance(deltas, (list, tuple)) or not deltas:
+                deltas = q_delta_abs_deg(q_goal, q_prev)
+            motion_cost = float(motion.get("cost", 0.025 * float(sum(float(x) for x in deltas))) or 0.0)
+        else:
+            phase_ok, phase_reason, phase_sample, phase_report = path_phase_check(q_prev, q_goal, stage_name)
+            obstacle_ok, obstacle_reason, obstacle_sample, obstacle_report = path_obstacle_check(q_prev, q_goal, stage_name)
+            deltas = q_delta_abs_deg(q_goal, q_prev)
+            motion_cost = 0.025 * float(sum(deltas))
         penalties += motion_cost
         stage_report = {
             "phase": stage_name,
@@ -13045,8 +16865,9 @@ def evaluate_dig_plan_candidate(seq, points, candidate):
             "obstacle_reason": str(obstacle_reason),
             "phase_sample": int(phase_sample),
             "obstacle_sample": int(obstacle_sample),
-            "joint_delta_deg": deltas,
+            "joint_delta_deg": [float(x) for x in deltas],
             "motion_cost": motion_cost,
+            "source": "cached_stage" if isinstance(stage_row, dict) else "recomputed",
         }
         if not phase_ok:
             penalties += 10.0
@@ -13105,6 +16926,12 @@ def build_shared_dig_plan_object(target_xyz, seq, points, chosen_row):
     )
     plan_id = f"plan_{int(time.time() * 1000)}_{stable_json_hash([vec_list(target_xyz, 3), unload_landing, unload_release])}"
     total_duration = float(sum(float(item[2]) for item in seq)) if seq else 0.0
+    fsm_contract = validate_dig_plan_contract(
+        seq=seq,
+        points=points,
+        stages=chosen_row.get("stages", []),
+        trace_points=trace_points,
+    )
     plan = {
         "plan_id": plan_id,
         "episode_id": str(STATE.get("dataset_episode_uid", "")),
@@ -13123,6 +16950,14 @@ def build_shared_dig_plan_object(target_xyz, seq, points, chosen_row):
         "auto_dig_target_scores": STATE.get("last_auto_dig_target_scores", []),
         "auto_unload_scores": STATE.get("last_auto_unload_scores", []),
         "chosen_candidate": compact_plan_candidate(chosen_row, include_stages=True),
+        "dig_primitive": chosen_row.get("dig_primitive", {}),
+        "route_diagnostics": route_diagnostics_from_stages(chosen_row.get("stages", [])),
+        "unload_ballistics": chosen_row.get("unload_ballistics", {}) or unload_ballistics_from_stages(chosen_row.get("stages", [])),
+        "fsm_contract": fsm_contract,
+        "staged_execution": bool(chosen_row.get("staged_execution", False)),
+        "staged_prefix_ready": bool(chosen_row.get("staged_prefix_ready", False)),
+        "staged_post_secure_load_pending": bool(chosen_row.get("staged_post_secure_load_pending", False)),
+        "staged_source_failure": chosen_row.get("staged_source_failure", {}),
         "total_plan_cost": None if chosen_row.get("planner_cost") is None else float(chosen_row.get("planner_cost")),
         "rank_cost": None if chosen_row.get("rank_cost") is None else float(chosen_row.get("rank_cost")),
         "score": None if chosen_row.get("score") is None else float(chosen_row.get("score")),
@@ -13132,6 +16967,30 @@ def build_shared_dig_plan_object(target_xyz, seq, points, chosen_row):
             "build_ms": float(STATE.get("dig_plan_last_build_ms", 0.0)),
             "planning_version": int(STATE.get("dig_plan_planning_version", 0)),
             "start_q_deg": q_deg_values(STATE.get("dig_plan_start_q", CTRL.q_cmd), wrap_swing_for_display=True),
+            "rigid_collision_model": {
+                "type": "link_segment_vs_expanded_aabb",
+                "link_radius_m": float(PATH_LINK_COLLISION_RADIUS_M),
+                "segment_samples": int(PATH_LINK_COLLISION_SEGMENT_SAMPLES),
+                "obstacle_margin_xy": float(PATH_OBSTACLE_MARGIN_XY),
+                "obstacle_margin_z": float(PATH_OBSTACLE_MARGIN_Z),
+            },
+            "joint_space_route_planner": {
+                "type": "rrt_connect_with_shortcut_fallback_bbox",
+                "max_iters": int(PATH_RRT_MAX_ITERS),
+                "step_deg": float(PATH_RRT_STEP_DEG),
+                "goal_bias": float(PATH_RRT_GOAL_BIAS),
+                "joint_weights": list(PATH_RRT_JOINT_WEIGHTS),
+                "smooth_rounds": int(PATH_RRT_SMOOTH_ROUNDS),
+                "smooth_alpha": float(PATH_RRT_SMOOTH_ALPHA),
+                "smooth_bend_weight": float(PATH_RRT_SMOOTH_BEND_WEIGHT),
+                "smooth_min_improvement": float(PATH_RRT_SMOOTH_MIN_IMPROVEMENT),
+            },
+            "planning_world": planning_world_snapshot(force=False),
+            "path_penalty_cache": {
+                "hits": int(STATE.get("planning_path_penalty_cache_hits", 0)),
+                "misses": int(STATE.get("planning_path_penalty_cache_misses", 0)),
+                "entries": len(STATE.get("planning_path_penalty_cache", {}) or {}),
+            },
         },
     }
     STATE["current_dig_plan"] = plan
@@ -13198,7 +17057,1556 @@ def planned_unload_stage_detail(stage_index=None, stage_name=None):
     }
 
 
-def plan_dig_sequence_from_target(target_xyz):
+def dig_plan_staged_prefix_requirements():
+    out = []
+    for phase in DIG_PLAN_REQUIRED_PHASE_ORDER:
+        out.append(phase)
+        if phase == "pull_exit_cut":
+            break
+    return out
+
+
+def seq_points_from_plan_stages(stages, fallback_point=None):
+    seq = []
+    points = []
+    fallback = None if fallback_point is None else np.array(fallback_point, dtype=np.float32).reshape(-1)[:3].copy()
+    for stage in stages or []:
+        if not isinstance(stage, dict):
+            continue
+        q_goal = _planned_stage_q(stage, "q_goal_rad")
+        if q_goal is None:
+            continue
+        phase = str(stage.get("phase", ""))
+        if not phase:
+            continue
+        try:
+            duration = float(stage.get("duration", 0.8) or 0.8)
+        except Exception:
+            duration = 0.8
+        seq.append((phase, q_goal.copy(), max(0.08, duration)))
+        point = stage.get("target_point")
+        try:
+            p = np.array(point, dtype=np.float32).reshape(-1)[:3].copy()
+            if len(p) < 3:
+                p = None
+        except Exception:
+            p = None
+        if p is None:
+            p = predicted_end_world_point(q_goal, end_effector=path_end_effector_for_mode(phase), reference_q=CTRL.q_cmd)
+        if p is None:
+            p = fallback.copy() if fallback is not None else np.zeros(3, dtype=np.float32)
+        points.append(np.array(p, dtype=np.float32).reshape(-1)[:3].copy())
+    return seq, points
+
+
+def staged_prefix_stages_from_failure(failure_row):
+    if not isinstance(failure_row, dict):
+        return [], "missing_failure_row"
+    stages = [stage for stage in failure_row.get("stages", []) if isinstance(stage, dict)]
+    if not stages:
+        return [], "missing_partial_stages"
+
+    prefix = []
+    main_semantic = []
+    for stage in stages:
+        prefix.append(dict(stage))
+        sem = dig_plan_semantic_phase_name(str(stage.get("phase", "")))
+        if sem != "clearance_route":
+            main_semantic.append(sem)
+        if sem == "secure_load":
+            break
+
+    required = dig_plan_staged_prefix_requirements()
+    cursor = 0
+    missing = []
+    for phase in required:
+        try:
+            found = main_semantic.index(phase, cursor)
+            cursor = found + 1
+        except ValueError:
+            missing.append(phase)
+    if missing:
+        return [], "missing_staged_prefix_phases:" + ",".join(missing)
+    return prefix, "ok"
+
+
+def install_staged_prefix_plan_from_failure(target_xyz, failure_row):
+    prefix_stages, reason = staged_prefix_stages_from_failure(failure_row)
+    if not prefix_stages:
+        info_print("[DIG PLAN STAGED SKIP]", reason)
+        return None
+
+    seq, points = seq_points_from_plan_stages(prefix_stages, fallback_point=target_xyz)
+    if not seq:
+        info_print("[DIG PLAN STAGED SKIP] empty staged sequence")
+        return None
+
+    chosen = dict(failure_row)
+    chosen["planned"] = True
+    chosen["selected"] = True
+    chosen["staged_execution"] = True
+    chosen["staged_prefix_ready"] = True
+    semantic = [dig_plan_semantic_phase_name(str(stage.get("phase", ""))) for stage in prefix_stages]
+    prefix_has_secure = "secure_load" in semantic
+    chosen["staged_post_secure_load_pending"] = bool(prefix_has_secure)
+    chosen["staged_post_dig_secure_pending"] = bool((not prefix_has_secure) and ("pull_exit_cut" in semantic))
+    chosen["staged_prefix_terminal_phase"] = str(next((phase for phase in reversed(semantic) if phase != "clearance_route"), ""))
+    chosen["staged_source_failure"] = {
+        "failed_stage": str(failure_row.get("failed_stage", "")),
+        "failure_reason": str(failure_row.get("failure_reason", "")),
+        "planned_prefix": int(failure_row.get("planned_prefix", len(seq)) or len(seq)),
+        "prefix_terminal_phase": chosen["staged_prefix_terminal_phase"],
+    }
+    chosen["steps"] = len(seq)
+    chosen["stages"] = prefix_stages
+    chosen["unload_landing_xyz"] = vec_list(unload_bin_landing_point(), 3)
+    chosen["unload_release_xyz"] = vec_list(unload_bin_dump_point(), 3)
+    chosen["unload_point_xyz"] = chosen["unload_release_xyz"]
+    chosen["planner_cost"] = float(failure_row.get("best_partial_cost", 0.0) or 0.0)
+    chosen["rank_cost"] = chosen["planner_cost"]
+    chosen["score"] = float(1000.0 - chosen["planner_cost"])
+    chosen["score_reason"] = (
+        "staged_prefix_from_best_partial; "
+        f"source_failed_stage={chosen['staged_source_failure']['failed_stage']}; "
+        f"source_reason={chosen['staged_source_failure']['failure_reason']}"
+    )
+    chosen["route_diagnostics"] = route_diagnostics_from_stages(prefix_stages)
+    chosen["unload_ballistics"] = {}
+
+    STATE["dig_plan_candidate"] = chosen
+    STATE["dig_plan_points"] = [np.array(p, dtype=np.float32).copy() for p in points]
+    cache_dig_plan_trace_points(seq, start_q=STATE.get("dig_plan_start_q", CTRL.q_cmd.copy()))
+    plan = build_shared_dig_plan_object(target_xyz, seq, points, chosen)
+    plan["staged_execution"] = True
+    plan["staged_prefix_ready"] = True
+    plan["staged_post_secure_load_pending"] = bool(prefix_has_secure)
+    plan["staged_post_dig_secure_pending"] = bool((not prefix_has_secure) and ("pull_exit_cut" in semantic))
+    plan["staged_prefix_terminal_phase"] = chosen["staged_prefix_terminal_phase"]
+    plan["staged_source_failure"] = dict(chosen["staged_source_failure"])
+    info_print(
+        "[DIG PLAN STAGED]",
+        f"steps={len(seq)}",
+        f"prefix_through={chosen['staged_prefix_terminal_phase']}",
+        f"source_failed_stage={chosen['staged_source_failure']['failed_stage']}",
+        f"reason={chosen['staged_source_failure']['failure_reason']}",
+    )
+    return seq
+
+
+def make_stage_row_from_q(phase, q_goal, q_from, duration, target_point=None, extra=None, deadline=None):
+    q_goal = np.array(q_goal, dtype=np.float32).reshape(-1)[:4].copy()
+    q_from = np.array(q_from, dtype=np.float32).reshape(-1)[:4].copy()
+    duration = max(0.08, float(duration))
+    motion = plan_joint_motion_metrics(q_goal, q_from, duration)
+    try:
+        phase_ok, phase_reason, phase_sample, _phase_report = path_phase_check(
+            q_from, q_goal, phase, samples=DIG_PLAN_PATH_CHECK_SAMPLES, deadline=deadline
+        )
+        obstacle_ok, obstacle_reason, obstacle_sample, _obstacle_report = path_obstacle_check(
+            q_from, q_goal, phase, samples=DIG_PLAN_PATH_CHECK_SAMPLES, deadline=deadline
+        )
+    except Exception as e:
+        phase_ok, phase_reason, phase_sample = True, "unchecked:" + type(e).__name__, -1
+        obstacle_ok, obstacle_reason, obstacle_sample = True, "unchecked:" + type(e).__name__, -1
+    if target_point is None:
+        target_point = predicted_end_world_point(q_goal, end_effector=path_end_effector_for_mode(phase), reference_q=q_from)
+    if target_point is None:
+        target_point = np.zeros(3, dtype=np.float32)
+    row = {
+        "phase": str(phase),
+        "planned": True,
+        "required": True,
+        "target_point": vec_list(target_point, 3),
+        "q_goal_rad": vec_list(q_goal, 4),
+        "q_goal_deg": q_deg_values(q_goal, wrap_swing_for_display=True),
+        "duration": float(duration),
+        "effector": path_end_effector_for_mode(phase),
+        "motion": motion,
+        "path": {
+            "phase_ok": bool(phase_ok),
+            "obstacle_ok": bool(obstacle_ok),
+            "phase_reason": str(phase_reason),
+            "obstacle_reason": str(obstacle_reason),
+            "phase_sample": int(phase_sample),
+            "obstacle_sample": int(obstacle_sample),
+            "path_penalty": 0.0,
+            "staged_runtime_plan": True,
+        },
+        "stage_cost": float(motion.get("cost", 0.0) or 0.0),
+    }
+    if isinstance(extra, dict):
+        row.update(extra)
+    return row
+
+
+def bucket_is_dump_branch_for_carry(bucket_deg):
+    try:
+        return float(bucket_deg) > float(BUCKET_CARRY_MAX_DUMP_BRANCH_DEG)
+    except Exception:
+        return False
+
+
+def bucket_joint_in_loaded_carry_state(bucket_deg):
+    try:
+        return float(bucket_deg) <= float(CURL_HOLD_ACCEPT_BUCKET_DEG)
+    except Exception:
+        return False
+
+
+def set_bucket_loaded_carry_joint(q_pose, reference=None):
+    q = np.array(q_pose, dtype=np.float32).reshape(-1)[:4].copy()
+    bucket_idx = CTRL.name_to_idx.get("bucket", 3)
+    q[bucket_idx] = deg_to_rad(float(CURL_HOLD_TARGET_DEG))
+    return clip_command_near(q, reference=(q_pose if reference is None else reference))
+
+
+def phase_metric_sand_counts(name):
+    phase_metrics = STATE.get("dataset_phase_metrics")
+    if not isinstance(phase_metrics, dict):
+        return None
+    row = phase_metrics.get(str(name), {})
+    if not isinstance(row, dict):
+        return None
+    sand = row.get("sand", {})
+    if not isinstance(sand, dict):
+        return None
+    return sand
+
+
+def secure_material_baseline_sand():
+    # after_cut is the physical state immediately before curl/secure. Using
+    # after_dig hides catastrophic loss that happens during the curl itself.
+    for name in ("after_cut", "after_dig"):
+        sand = phase_metric_sand_counts(name)
+        if sand is not None:
+            return str(name), sand
+    return "", None
+
+
+def carry_material_report_for_q(q_pose, end_effector="load"):
+    q_pose = CTRL.clip_limits(np.array(q_pose, dtype=np.float32).reshape(-1)[:4].copy())
+    bucket_idx = CTRL.name_to_idx.get("bucket", 3)
+    angles = chain_angles_from_q(q_pose, end_effector=end_effector)
+    load = predicted_end_world_point(q_pose, end_effector="load", reference_q=q_pose)
+    pour = predicted_end_world_point(q_pose, end_effector="pour", reference_q=q_pose)
+    bucket_deg = rad_to_deg(float(q_pose[bucket_idx]))
+    dump_branch = bucket_is_dump_branch_for_carry(bucket_deg)
+    if angles is None or load is None or pour is None:
+        return {
+            "ok": False,
+            "reason": "missing_carry_geometry",
+            "end_effector": str(end_effector),
+            "retains_material": False,
+            "bucket_deg": bucket_deg,
+            "dump_branch_for_carry": bool(dump_branch),
+        }
+    load = np.array(load, dtype=np.float32).reshape(-1)[:3]
+    pour = np.array(pour, dtype=np.float32).reshape(-1)[:3]
+    pour_above = float(pour[2] - load[2])
+    height_ok = bool(pour_above >= float(BUCKET_CARRY_MIN_POUR_ABOVE_LOAD_Z))
+    loaded_joint_ok = bucket_joint_in_loaded_carry_state(bucket_deg)
+    retains = bool(height_ok and loaded_joint_ok and not dump_branch)
+    if dump_branch:
+        reason = "bucket_in_dump_branch_for_carry"
+    elif not loaded_joint_ok:
+        reason = "bucket_not_loaded_carry_joint"
+    elif not height_ok:
+        reason = "pour_edge_below_carry_window"
+    else:
+        reason = "ok"
+    return {
+        "ok": True,
+        "reason": reason,
+        "end_effector": str(end_effector),
+        "retains_material": bool(retains),
+        "pour_above_load_z": pour_above,
+        "min_pour_above_load_z": float(BUCKET_CARRY_MIN_POUR_ABOVE_LOAD_Z),
+        "bucket_deg": bucket_deg,
+        "loaded_carry_joint_ok": bool(loaded_joint_ok),
+        "loaded_carry_target_deg": float(CURL_HOLD_TARGET_DEG),
+        "loaded_carry_accept_deg": float(CURL_HOLD_ACCEPT_BUCKET_DEG),
+        "dump_branch_for_carry": bool(dump_branch),
+        "max_carry_dump_branch_deg": float(BUCKET_CARRY_MAX_DUMP_BRANCH_DEG),
+        "actual_world_deg": rad_to_deg(float(angles[2])),
+        "load": vec_list(load, 3),
+        "pour": vec_list(pour, 3),
+    }
+
+
+def secure_phase_delta_report(current_metrics=None):
+    current_metrics = sand_metrics_current(force=True) if current_metrics is None else current_metrics
+    current_metrics = current_metrics if isinstance(current_metrics, dict) else {}
+    current_bucket = int(current_metrics.get("bucket_from_pile_count", 0) or 0)
+    current_spill = int(current_metrics.get("spill_from_pile_count", 0) or 0)
+    baseline_name, baseline_sand = secure_material_baseline_sand()
+    baseline_sand = baseline_sand if isinstance(baseline_sand, dict) else {}
+    start_bucket = int(baseline_sand.get("bucket_from_pile", current_bucket) or 0)
+    start_spill = int(baseline_sand.get("spill_from_pile", current_spill) or 0)
+    bucket_loss = max(0, start_bucket - current_bucket)
+    spill_delta = max(0, current_spill - start_spill)
+    spill_limit = max(
+        int(SECURE_HOLD_MAX_SPILL_PARTICLES),
+        int(float(max(current_bucket, start_bucket, 1)) * float(SECURE_HOLD_MAX_SPILL_FRACTION)),
+    )
+    loss_limit = max(
+        int(CURL_HOLD_MIN_BUCKET_PARTICLES),
+        int(float(max(start_bucket, current_bucket, 1)) * float(SECURE_HOLD_MAX_BUCKET_LOSS_FRACTION)),
+    )
+    retained_fraction = 1.0 if start_bucket <= 0 else float(current_bucket) / float(max(1, start_bucket))
+    min_retained_fraction = float(SECURE_HOLD_MIN_RETAINED_FROM_CUT_FRACTION)
+    fraction_ok = bool(start_bucket <= 0 or retained_fraction >= min_retained_fraction)
+    ok = spill_delta <= spill_limit and bucket_loss <= loss_limit and fraction_ok
+    return {
+        "ok": bool(ok),
+        "reason": "ok" if ok else (
+            f"secure_material_loss spill_delta={spill_delta}/{spill_limit} "
+            f"bucket_loss={bucket_loss}/{loss_limit} retained={retained_fraction:.2f}/{min_retained_fraction:.2f}"
+        ),
+        "baseline": str(baseline_name),
+        "bucket_before": int(start_bucket),
+        "bucket_after": int(current_bucket),
+        "bucket_loss": int(bucket_loss),
+        "bucket_loss_limit": int(loss_limit),
+        "retained_fraction": float(retained_fraction),
+        "min_retained_fraction": float(min_retained_fraction),
+        "spill_before": int(start_spill),
+        "spill_after": int(current_spill),
+        "spill_delta": int(spill_delta),
+        "spill_limit": int(spill_limit),
+    }
+
+
+def secure_post_gate_report(q_start, current_metrics=None):
+    q_start = CTRL.clip_limits(np.array(q_start, dtype=np.float32).reshape(-1)[:4].copy())
+    carry_report = carry_material_report_for_q(q_start, end_effector="load")
+    delta_report = secure_phase_delta_report(current_metrics=current_metrics)
+    bucket_after = int(delta_report.get("bucket_after", 0) or 0)
+    geometry_retains = bool(carry_report.get("ok", False)) and bool(carry_report.get("retains_material", False))
+    real_loaded_hold = real_loaded_secure_hold_allowed(carry_report, loaded_count=bucket_after)
+    carry_ok = bool(geometry_retains or real_loaded_hold)
+    delta_ok = bool(delta_report.get("ok", False))
+    ok = carry_ok and delta_ok
+    if ok:
+        reason = "ok"
+    elif not delta_ok:
+        reason = str(delta_report.get("reason", "secure_material_loss"))
+    elif real_loaded_hold:
+        reason = "ok_real_loaded_hold"
+    else:
+        reason = str(carry_report.get("reason", "current_pose_not_retaining_material"))
+    return {
+        "ok": bool(ok),
+        "reason": reason,
+        "q_secure_deg": q_deg_values(q_start, wrap_swing_for_display=True),
+        "carry_report": carry_report,
+        "material_delta": delta_report,
+        "spill_gate_ok": bool(delta_report.get("ok", False)),
+        "carry_gate_ok": bool(carry_ok),
+        "geometry_retains_material": bool(geometry_retains),
+        "real_loaded_hold_allowed": bool(real_loaded_hold),
+    }
+
+
+def post_lift_material_gate_report(current_metrics=None):
+    current_metrics = sand_metrics_current(force=True) if current_metrics is None else current_metrics
+    current_metrics = current_metrics if isinstance(current_metrics, dict) else {}
+    current_bucket = int(current_metrics.get("bucket_from_pile_count", 0) or 0)
+    current_spill = int(current_metrics.get("spill_from_pile_count", 0) or 0)
+    baseline_name, baseline_sand = secure_material_baseline_sand()
+    baseline_sand = baseline_sand if isinstance(baseline_sand, dict) else {}
+    start_bucket = int(baseline_sand.get("bucket_from_pile", current_bucket) or 0)
+    start_spill = int(baseline_sand.get("spill_from_pile", current_spill) or 0)
+    retained_fraction = 1.0 if start_bucket <= 0 else float(current_bucket) / float(max(1, start_bucket))
+    min_bucket = max(
+        int(CURL_HOLD_MIN_BUCKET_PARTICLES),
+        int(float(max(start_bucket, 1)) * float(LIFT_CARRY_MIN_RETAINED_FROM_CUT_FRACTION)),
+    )
+    ok = bool(current_bucket >= min_bucket)
+    return {
+        "ok": bool(ok),
+        "reason": "ok" if ok else (
+            f"lift_lost_material bucket={current_bucket}/{min_bucket} "
+            f"retained={retained_fraction:.2f}/{float(LIFT_CARRY_MIN_RETAINED_FROM_CUT_FRACTION):.2f}"
+        ),
+        "baseline": str(baseline_name),
+        "bucket_before": int(start_bucket),
+        "bucket_after": int(current_bucket),
+        "bucket_min": int(min_bucket),
+        "retained_fraction": float(retained_fraction),
+        "min_retained_fraction": float(LIFT_CARRY_MIN_RETAINED_FROM_CUT_FRACTION),
+        "spill_before": int(start_spill),
+        "spill_after": int(current_spill),
+        "spill_delta": int(max(0, current_spill - start_spill)),
+    }
+
+
+def staged_carry_safe_projection_candidates(q_start):
+    q_start = CTRL.clip_limits(np.array(q_start, dtype=np.float32).reshape(-1)[:4].copy())
+    boom_idx = CTRL.name_to_idx["boom"]
+    arm_idx = CTRL.name_to_idx["arm"]
+    try:
+        metrics_now = sand_metrics_current(force=False)
+        loaded_now = int(metrics_now.get("bucket_from_pile_count", 0) or 0) if isinstance(metrics_now, dict) else 0
+    except Exception:
+        loaded_now = 0
+    rows = []
+    for boom_lift_deg, arm_retract_deg in [
+        (0.0, 0.0),
+        (3.0, -1.0),
+        (6.0, -2.5),
+        (9.0, -4.0),
+        (12.0, -5.5),
+        (16.0, -7.0),
+        (22.0, -9.5),
+        (28.0, -12.0),
+        (34.0, -14.0),
+    ]:
+        q = q_start.copy()
+        q[boom_idx] = float(q[boom_idx]) + deg_to_rad(float(boom_lift_deg))
+        q[arm_idx] = float(q[arm_idx]) + deg_to_rad(float(arm_retract_deg))
+        q = clip_command_near(q, reference=q_start)
+        q, carry_report = carry_hold_adjusted_q(q, q_reference=q_start, end_effector="load")
+        actual_report = carry_material_report_for_q(q, end_effector="load")
+        retains_material = bool((carry_report or {}).get("retains_material", False)) and bool(
+            actual_report.get("retains_material", False)
+        )
+        real_loaded_hold = real_loaded_secure_hold_allowed(actual_report, loaded_count=loaded_now) or real_loaded_secure_hold_allowed(
+            carry_report,
+            loaded_count=loaded_now,
+        )
+        if not bool((carry_report or {}).get("ok", False)):
+            rows.append({
+                "ok": False,
+                "reason": f"carry_hold_failed:{(carry_report or {}).get('reason', 'unknown')}",
+                "carry_report": carry_report,
+                "actual_report": actual_report,
+            })
+            continue
+        if not (retains_material or real_loaded_hold):
+            rows.append({
+                "ok": False,
+                "reason": f"carry_would_spill:{actual_report.get('reason', carry_report.get('reason', 'unknown'))}",
+                "carry_report": carry_report,
+                "actual_report": actual_report,
+            })
+            continue
+        ok, kind, reason, sample, report = path_segment_check(
+            q_start,
+            q,
+            "secure_carry_safe",
+            samples=max(3, min(DIG_PLAN_PATH_CHECK_SAMPLES, 5)),
+        )
+        if not ok:
+            rows.append({
+                "ok": False,
+                "reason": f"{kind}:{reason}",
+                "sample": sample,
+                "report": report,
+                "carry_report": carry_report,
+                "actual_report": actual_report,
+            })
+            continue
+        duration = estimate_stage_motion_seconds(q_start, q, requested_seconds=0.75)
+        motion = plan_joint_motion_metrics(q, q_start, duration)
+        score = float(motion.get("cost", 0.0) or 0.0)
+        if real_loaded_hold and not retains_material:
+            score += carry_spill_risk_penalty(actual_report)
+        rows.append({
+            "ok": True,
+            "q": q.copy(),
+            "duration": float(duration),
+            "score": float(score),
+            "target_point": predicted_end_world_point(q, end_effector="load", reference_q=q_start),
+            "carry_report": carry_report,
+            "actual_report": actual_report,
+            "retains_material": bool(retains_material),
+            "real_loaded_hold_allowed": bool(real_loaded_hold),
+            "motion": motion,
+            "boom_lift_deg": float(boom_lift_deg),
+            "arm_retract_deg": float(arm_retract_deg),
+        })
+    return rows
+
+
+def staged_lift_candidates(q_start):
+    rows = []
+    boom_idx = CTRL.name_to_idx["boom"]
+    arm_idx = CTRL.name_to_idx["arm"]
+    bucket_idx = CTRL.name_to_idx["bucket"]
+    q_start = np.array(q_start, dtype=np.float32).reshape(-1)[:4].copy()
+    try:
+        metrics_now = sand_metrics_current(force=False)
+        loaded_now = int(metrics_now.get("bucket_from_pile_count", 0) or 0) if isinstance(metrics_now, dict) else 0
+    except Exception:
+        loaded_now = 0
+    for boom_lift_deg, arm_retract_deg in [(8.0, -3.0), (14.0, -6.0), (20.0, -9.0), (26.0, -12.0), (32.0, -14.0)]:
+        q = q_start.copy()
+        q[boom_idx] = float(q[boom_idx]) + deg_to_rad(boom_lift_deg)
+        q[arm_idx] = float(q[arm_idx]) + deg_to_rad(arm_retract_deg)
+        q[bucket_idx] = float(q_start[bucket_idx])
+        q = clip_command_near(q, reference=q_start)
+        q, carry_report = carry_hold_adjusted_q(q, q_reference=q_start, end_effector="load")
+        if not bool((carry_report or {}).get("ok", False)):
+            continue
+        retains_material = bool((carry_report or {}).get("retains_material", False))
+        transitional_material_hold = bool(real_loaded_secure_hold_allowed(carry_report, loaded_count=loaded_now))
+        if not (retains_material or transitional_material_hold):
+            rows.append({
+                "ok": False,
+                "q": q,
+                "reason": (
+                    "carry_would_spill_before_lift:"
+                    f"pour_above_load_z={fmt_optional((carry_report or {}).get('pour_above_load_z'))}"
+                ),
+                "carry_report": carry_report,
+                "transitional_material_hold": bool(transitional_material_hold),
+                "loaded_now": int(loaded_now),
+            })
+            continue
+        ok, kind, reason, sample, report = path_segment_check(
+            q_start, q, "lift_carry", samples=DIG_PLAN_PATH_CHECK_SAMPLES
+        )
+        if not ok:
+            rows.append({
+                "ok": False,
+                "q": q,
+                "reason": f"{kind}:{reason}",
+                "sample": sample,
+                "report": report,
+                "carry_report": carry_report,
+            })
+            continue
+        duration = estimate_stage_motion_seconds(q_start, q, requested_seconds=1.0)
+        motion = plan_joint_motion_metrics(q, q_start, duration)
+        target_point = predicted_end_world_point(q, end_effector="load", reference_q=q_start)
+        score = (
+            float(motion.get("cost", 0.0) or 0.0)
+            + carry_spill_risk_penalty(carry_report)
+            + (24.0 if transitional_material_hold and not retains_material else 0.0)
+        )
+        rows.append({
+            "ok": True,
+            "q": q.copy(),
+            "duration": float(duration),
+            "score": float(score),
+            "target_point": target_point,
+            "carry_report": carry_report,
+            "retains_material": bool(retains_material),
+            "transitional_material_hold": bool(transitional_material_hold and not retains_material),
+            "loaded_now": int(loaded_now),
+            "boom_lift_deg": float(boom_lift_deg),
+            "arm_retract_deg": float(arm_retract_deg),
+        })
+    return rows
+
+
+def staged_high_carry_unload_fallback(q_lift, q_pre_dump, deadline=None):
+    boom_idx = CTRL.name_to_idx["boom"]
+    arm_idx = CTRL.name_to_idx["arm"]
+    bucket_idx = CTRL.name_to_idx["bucket"]
+    q_lift = np.array(q_lift, dtype=np.float32).reshape(-1)[:4].copy()
+    q_pre_dump = np.array(q_pre_dump, dtype=np.float32).reshape(-1)[:4].copy()
+    try:
+        metrics_now = sand_metrics_current(force=False)
+        loaded_now = int(metrics_now.get("bucket_from_pile_count", 0) or 0) if isinstance(metrics_now, dict) else 0
+    except Exception:
+        loaded_now = 0
+    failures = []
+    fallback_deadline = time.time() + 4.0
+    for boom_extra_deg, arm_extra_deg in [(10.0, -4.0), (18.0, -7.0), (26.0, -10.0), (34.0, -12.0), (42.0, -14.0)]:
+        if planning_deadline_exceeded(fallback_deadline):
+            break
+        q_high = q_lift.copy()
+        q_high[boom_idx] = float(q_high[boom_idx]) + deg_to_rad(boom_extra_deg)
+        q_high[arm_idx] = float(q_high[arm_idx]) + deg_to_rad(arm_extra_deg)
+        q_high[bucket_idx] = float(q_lift[bucket_idx])
+        q_high = clip_command_near(q_high, reference=q_lift)
+        q_high, carry_report = carry_hold_adjusted_q(q_high, q_reference=q_lift, end_effector="load")
+        if not bool((carry_report or {}).get("ok", False)):
+            failures.append(f"carry_hold_failed:{(carry_report or {}).get('reason', 'unknown')}")
+            continue
+        retains_material = bool((carry_report or {}).get("retains_material", False))
+        transitional_hold = bool(real_loaded_secure_hold_allowed(carry_report, loaded_count=loaded_now))
+        if not (retains_material or transitional_hold):
+            failures.append(
+                "high_carry_would_spill:"
+                f"pour_above_load_z={fmt_optional((carry_report or {}).get('pour_above_load_z'))}"
+            )
+            continue
+        q_high, _limited, _old_bucket = apply_loaded_bucket_closed_limit(q_high, label="staged_high_carry_route")
+
+        q_pre = q_pre_dump.copy()
+        reference_angles = chain_angles_from_q(q_high, end_effector="load")
+        if reference_angles is not None:
+            carry_world = nearest_bucket_carry_world_angle(reference_angles[2], q_reference=q_high, end_effector="load")
+            carry_calc = bucket_joint_for_world_angle(q_pre, carry_world, end_effector="load")
+            if carry_calc is not None:
+                q_pre[bucket_idx] = float(carry_calc["bucket"])
+        q_pre = clip_command_near(q_pre, reference=q_high)
+        q_pre, _limited_pre, _old_pre = apply_loaded_bucket_closed_limit(q_pre, label="staged_high_carry_pre_dump")
+
+        ok1, kind1, reason1, sample1, report1 = path_segment_check(
+            q_lift,
+            q_high,
+            "lift_carry",
+            samples=max(4, min(DIG_PLAN_PATH_CHECK_SAMPLES, 8)),
+            deadline=fallback_deadline,
+        )
+        if not ok1:
+            failures.append(f"high_lift:{kind1}:{reason1}; sample={sample1}")
+            continue
+        ok2, kind2, reason2, sample2, report2 = path_segment_check(
+            q_high,
+            q_pre,
+            "unload_to_bin",
+            samples=max(4, min(DIG_PLAN_PATH_CHECK_SAMPLES, 8)),
+            deadline=fallback_deadline,
+        )
+        if not ok2:
+            route2, route2_reason = find_clearance_route(
+                q_high,
+                q_pre,
+                "unload_to_bin",
+                "staged_high_carry_unload_fallback",
+                deadline=fallback_deadline,
+                samples=max(5, min(PATH_ROUTE_PLANNING_SAMPLE_COUNT, 9)),
+            )
+            if route2 is None:
+                failures.append(
+                    f"high_to_unload:{kind2}:{reason2}; route={route2_reason}; sample={sample2}"
+                )
+                continue
+            return {
+                "route": [q_high.copy()] + [np.array(q, dtype=np.float32).copy() for q in route2],
+                "q_pre_dump": q_pre.copy(),
+                "reason": (
+                    "high_carry_fallback_with_route "
+                    f"boom_extra={boom_extra_deg:.1f}deg arm_extra={arm_extra_deg:.1f}deg "
+                    f"route={route2_reason}"
+                ),
+                "carry_report": carry_report,
+                "reports": [report1, report2],
+            }, "ok"
+        return {
+            "route": [q_high.copy()],
+            "q_pre_dump": q_pre.copy(),
+            "reason": (
+                "high_carry_fallback "
+                f"boom_extra={boom_extra_deg:.1f}deg arm_extra={arm_extra_deg:.1f}deg"
+            ),
+            "carry_report": carry_report,
+            "reports": [report1, report2],
+        }, "ok"
+    return None, "; ".join(failures[:4]) or "no high carry fallback route"
+
+
+def staged_dig_secure_candidates(q_start, loaded_count_hint=None):
+    q_start = np.array(q_start, dtype=np.float32).reshape(-1)[:4].copy()
+    bucket_idx = CTRL.name_to_idx.get("bucket", 3)
+    boom_idx = CTRL.name_to_idx.get("boom", 1)
+    arm_idx = CTRL.name_to_idx.get("arm", 2)
+    try:
+        metrics_now = sand_metrics_current(force=False)
+        loaded_now = int(metrics_now.get("bucket_from_pile_count", 0) or 0) if isinstance(metrics_now, dict) else 0
+    except Exception:
+        loaded_now = 0
+    try:
+        loaded_hint = int(loaded_count_hint or 0)
+    except Exception:
+        loaded_hint = 0
+    loaded_count_for_secure = max(int(loaded_now), int(loaded_hint))
+
+    secure_rows = []
+    pose_offsets = [
+        (0.0, 0.0),
+        (2.0, 0.0),
+        (3.5, -1.0),
+        (5.0, -2.0),
+        (7.0, -3.0),
+        (9.0, -4.0),
+        (12.0, -5.5),
+        (16.0, -7.0),
+        (21.0, -9.0),
+        (27.0, -11.5),
+        (34.0, -14.0),
+        (42.0, -16.0),
+        (52.0, -18.0),
+        (62.0, -20.0),
+        (6.0, 1.0),
+        (10.0, 1.5),
+    ]
+
+    def add_secure_candidate(q_seed_base, source, boom_lift_deg=0.0, arm_retract_deg=0.0):
+        q_base = np.array(q_seed_base, dtype=np.float32).reshape(-1)[:4].copy()
+        q_base[boom_idx] = float(q_base[boom_idx]) + deg_to_rad(float(boom_lift_deg))
+        q_base[arm_idx] = float(q_base[arm_idx]) + deg_to_rad(float(arm_retract_deg))
+        q_base = clip_command_near(q_base, reference=q_start)
+
+        q_adjusted, adjusted_carry_report = carry_hold_adjusted_q(
+            q_base,
+            q_reference=q_start,
+            end_effector="load",
+            max_bucket_adjust_deg=105.0,
+        )
+        adjusted_actual_report = carry_material_report_for_q(q_adjusted, end_effector="load")
+
+        q_forced = set_bucket_loaded_carry_joint(q_base, reference=q_start)
+        q_forced, forced_limited, forced_old_bucket_deg = apply_loaded_bucket_closed_limit(
+            q_forced,
+            label="staged_secure_force_closed",
+        )
+        forced_report = carry_material_report_for_q(q_forced, end_effector="load")
+        forced_loaded_hold = bool(real_loaded_secure_hold_allowed(forced_report, loaded_count=loaded_count_for_secure))
+        adjusted_loaded_hold = bool(
+            real_loaded_secure_hold_allowed(adjusted_actual_report, loaded_count=loaded_count_for_secure)
+            or real_loaded_secure_hold_allowed(adjusted_carry_report, loaded_count=loaded_count_for_secure)
+        )
+        forced_joint_safe = bool((forced_report or {}).get("ok", False)) and bool(
+            (forced_report or {}).get("loaded_carry_joint_ok", False)
+        ) and not bool((forced_report or {}).get("dump_branch_for_carry", False))
+        prefer_forced_closed = bool(
+            loaded_count_for_secure >= int(CURL_HOLD_MIN_BUCKET_PARTICLES)
+            and forced_joint_safe
+        )
+
+        if prefer_forced_closed:
+            q_secure = q_forced.copy()
+            carry_report = dict(forced_report)
+            carry_report.update({
+                "secure_source": "forced_loaded_closed",
+                "forced_bucket_closed": True,
+                "forced_bucket_limited": bool(forced_limited),
+                "forced_old_bucket_deg": forced_old_bucket_deg,
+                "adjusted_carry_report": adjusted_carry_report,
+                "adjusted_actual_report": adjusted_actual_report,
+            })
+            actual_report = dict(forced_report)
+            secure_source = "forced_loaded_closed"
+        else:
+            q_secure = np.array(q_adjusted, dtype=np.float32).reshape(-1)[:4].copy()
+            carry_report = dict(adjusted_carry_report or {})
+            carry_report.update({
+                "secure_source": "carry_hold_adjusted",
+                "forced_bucket_closed": False,
+                "forced_report": forced_report,
+                "forced_bucket_limited": bool(forced_limited),
+                "forced_old_bucket_deg": forced_old_bucket_deg,
+            })
+            actual_report = dict(adjusted_actual_report or {})
+            secure_source = "carry_hold_adjusted"
+
+        if not bool((carry_report or {}).get("ok", False)) and not prefer_forced_closed:
+            secure_rows.append({
+                "ok": False,
+                "source": str(source),
+                "reason": f"carry_hold_failed:{(carry_report or {}).get('reason', 'unknown')}",
+                "carry_report": carry_report,
+                "actual_report": actual_report,
+                "forced_report": forced_report,
+            })
+            return
+        retains_material = bool((carry_report or {}).get("retains_material", False)) and bool(
+            actual_report.get("retains_material", False)
+        )
+        transitional_material_hold = bool(
+            forced_loaded_hold
+            or adjusted_loaded_hold
+            or real_loaded_secure_hold_allowed(actual_report, loaded_count=loaded_count_for_secure)
+            or real_loaded_secure_hold_allowed(carry_report, loaded_count=loaded_count_for_secure)
+        )
+        if not (retains_material or transitional_material_hold):
+            secure_rows.append({
+                "ok": False,
+                "source": str(source),
+                "reason": (
+                    "secure_carry_would_spill:"
+                    f"secure_source={secure_source} "
+                    f"q_secure_bucket={rad_to_deg(float(q_secure[bucket_idx])):.2f}deg "
+                    f"forced_bucket={rad_to_deg(float(q_forced[bucket_idx])):.2f}deg "
+                    f"pour_above_load_z={fmt_optional(actual_report.get('pour_above_load_z', (carry_report or {}).get('pour_above_load_z')))}"
+                ),
+                "carry_report": carry_report,
+                "actual_report": actual_report,
+                "forced_report": forced_report,
+                "transitional_material_hold": bool(transitional_material_hold),
+                "forced_loaded_hold": bool(forced_loaded_hold),
+                "adjusted_loaded_hold": bool(adjusted_loaded_hold),
+            })
+            return
+
+        # Close the bucket first, but do not hold boom/arm fixed if that would
+        # drive the bucket through hard ground or into a rigid obstacle. Try a
+        # small lattice of synchronized boom/arm corrections before rejecting
+        # the secure pose.
+        curl_attempts = []
+        selected_curl = None
+        for boom_fraction, arm_fraction in [
+            (0.25, 0.10),
+            (0.35, 0.20),
+            (0.45, 0.25),
+            (0.55, 0.35),
+            (0.65, 0.45),
+            (0.75, 0.55),
+            (0.85, 0.65),
+            (0.95, 0.75),
+            (1.00, 0.85),
+            (1.00, 1.00),
+        ]:
+            q_curl = q_start.copy()
+            q_curl[bucket_idx] = float(q_secure[bucket_idx])
+            q_curl[boom_idx] = float(q_start[boom_idx]) + float(boom_fraction) * float(q_secure[boom_idx] - q_start[boom_idx])
+            q_curl[arm_idx] = float(q_start[arm_idx]) + float(arm_fraction) * float(q_secure[arm_idx] - q_start[arm_idx])
+            q_curl = clip_command_near(q_curl, reference=q_start)
+            curl_bucket_deg = float(rad_to_deg(q_curl[bucket_idx]))
+
+            curl_report = predicted_phase_ground_report(q_curl, "curl_to_hold_material", reference_q=q_start)
+            curl_ok, curl_reason = phase_ground_ok("curl_to_hold_material", curl_report)
+            if not curl_ok:
+                curl_attempts.append({
+                    "ok": False,
+                    "reason": f"curl_ground:{curl_reason}",
+                    "boom_fraction": float(boom_fraction),
+                    "arm_fraction": float(arm_fraction),
+                    "curl_report": curl_report,
+                })
+                continue
+            curl_path_ok, curl_kind, curl_path_reason, curl_sample, curl_path_report = path_segment_check(
+                q_start,
+                q_curl,
+                "curl_to_hold_material",
+                samples=2,
+            )
+            if not curl_path_ok:
+                curl_attempts.append({
+                    "ok": False,
+                    "reason": f"curl_{curl_kind}:{curl_path_reason}",
+                    "sample": curl_sample,
+                    "report": curl_path_report,
+                    "boom_fraction": float(boom_fraction),
+                    "arm_fraction": float(arm_fraction),
+                    "curl_report": curl_report,
+                })
+                continue
+            selected_curl = {
+                "q": q_curl.copy(),
+                "bucket_deg": float(curl_bucket_deg),
+                "report": curl_report,
+                "boom_fraction": float(boom_fraction),
+                "arm_fraction": float(arm_fraction),
+                "attempts": curl_attempts,
+            }
+            break
+        if selected_curl is None:
+            best_reason = "; ".join(str(row.get("reason", "")) for row in curl_attempts[:3]) or "curl no executable boom/arm adjustment"
+            secure_rows.append({
+                "ok": False,
+                "source": str(source),
+                "reason": best_reason,
+                "carry_report": carry_report,
+                "actual_report": actual_report,
+                "forced_report": forced_report,
+                "curl_attempts": curl_attempts[:5],
+                "secure_source": str(secure_source),
+                "q_secure_bucket_deg": float(rad_to_deg(q_secure[bucket_idx])),
+                "forced_bucket_deg": float(rad_to_deg(q_forced[bucket_idx])),
+            })
+            return
+        q_curl = selected_curl["q"].copy()
+        curl_bucket_deg = float(selected_curl["bucket_deg"])
+        curl_report = selected_curl["report"]
+
+        secure_report = predicted_phase_ground_report(q_secure, "secure_load", reference_q=q_curl)
+        secure_ok, secure_reason = phase_ground_ok("secure_load", secure_report)
+        if not secure_ok:
+            secure_rows.append({
+                "ok": False,
+                "source": str(source),
+                "reason": (
+                    f"secure_ground:{secure_reason}; "
+                    f"secure_source={secure_source} "
+                    f"q_secure_bucket={rad_to_deg(float(q_secure[bucket_idx])):.2f}deg "
+                    f"forced_bucket={rad_to_deg(float(q_forced[bucket_idx])):.2f}deg"
+                ),
+                "carry_report": carry_report,
+                "actual_report": actual_report,
+                "forced_report": forced_report,
+                "ground_report": secure_report,
+                "secure_source": str(secure_source),
+            })
+            return
+        ok, kind, reason, sample, report = path_segment_check(
+            q_curl,
+            q_secure,
+            "secure_load",
+            samples=2,
+        )
+        if not ok:
+            secure_rows.append({
+                "ok": False,
+                "source": str(source),
+                "reason": f"{kind}:{reason}",
+                "sample": sample,
+                "report": report,
+                "carry_report": carry_report,
+                "actual_report": actual_report,
+                "forced_report": forced_report,
+                "secure_source": str(secure_source),
+                "q_secure_bucket_deg": float(rad_to_deg(q_secure[bucket_idx])),
+            })
+            return
+        curl_duration = estimate_stage_motion_seconds(q_start, q_curl, requested_seconds=0.90)
+        secure_duration = estimate_stage_motion_seconds(q_curl, q_secure, requested_seconds=0.85)
+        curl_motion = plan_joint_motion_metrics(q_curl, q_start, curl_duration)
+        secure_motion = plan_joint_motion_metrics(q_secure, q_curl, secure_duration)
+        target_point = predicted_end_world_point(q_secure, end_effector="load", reference_q=q_curl)
+        score = (
+            float(curl_motion.get("cost", 0.0) or 0.0)
+            + float(secure_motion.get("cost", 0.0) or 0.0)
+            + carry_spill_risk_penalty(carry_report)
+            - 16.0 * max(0.0, float(actual_report.get("pour_above_load_z", (carry_report or {}).get("pour_above_load_z", 0.0)) or 0.0))
+        )
+        secure_rows.append({
+            "ok": True,
+            "source": str(source),
+            "retains_material": bool(retains_material),
+            "transitional_material_hold": bool(transitional_material_hold and not retains_material),
+            "loaded_count_for_secure": int(loaded_count_for_secure),
+            "score": float(score),
+            "q_curl": q_curl.copy(),
+            "q": q_secure.copy(),
+            "curl_duration": float(curl_duration),
+            "duration": float(secure_duration),
+            "target_point": target_point,
+            "curl_motion": curl_motion,
+            "motion": secure_motion,
+            "carry_report": carry_report,
+            "actual_report": actual_report,
+            "forced_report": forced_report,
+            "secure_source": str(secure_source),
+            "forced_bucket_closed": bool(prefer_forced_closed),
+            "q_secure_bucket_deg": float(rad_to_deg(q_secure[bucket_idx])),
+            "forced_bucket_deg": float(rad_to_deg(q_forced[bucket_idx])),
+            "curl_report": curl_report,
+            "ground_report": secure_report,
+            "curl_bucket_deg": float(curl_bucket_deg),
+            "curl_joint_closed_ok_deprecated": bool(curl_bucket_deg <= float(CURL_HOLD_ACCEPT_BUCKET_DEG) + 0.25),
+            "curl_boom_fraction": float(selected_curl.get("boom_fraction", 0.0)),
+            "curl_arm_fraction": float(selected_curl.get("arm_fraction", 0.0)),
+            "boom_lift_deg": float(boom_lift_deg),
+            "arm_retract_deg": float(arm_retract_deg),
+        })
+
+    for boom_lift_deg, arm_retract_deg in pose_offsets:
+        add_secure_candidate(
+            q_start,
+            "carry_projection_from_pull_exit",
+            boom_lift_deg=boom_lift_deg,
+            arm_retract_deg=arm_retract_deg,
+        )
+
+    valid_secure = [row for row in secure_rows if bool(row.get("ok", False))]
+    if not valid_secure:
+        try:
+            cut_metrics = sand_metrics_current(force=True)
+            cut_bucket = int(cut_metrics.get("bucket_from_pile_count", 0) or 0) if isinstance(cut_metrics, dict) else 0
+        except Exception:
+            cut_bucket = 0
+        try:
+            hint_bucket = int(loaded_count_hint or 0)
+        except Exception:
+            hint_bucket = 0
+        cut_bucket = max(cut_bucket, hint_bucket)
+        transitional_report = carry_material_report_for_q(q_start, end_effector="load")
+        best_diag = sorted(
+            secure_rows,
+            key=lambda row: float((row.get("actual_report") or row.get("carry_report") or {}).get("pour_above_load_z", -999.0) or -999.0),
+            reverse=True,
+        )[0] if secure_rows else {}
+        return [], (
+            "secure_load no retaining pose: "
+            f"{best_diag.get('reason', 'no candidates')}; "
+            f"loaded_count={int(cut_bucket)} "
+            f"transitional={bool(loaded_transitional_hold_allowed(transitional_report, loaded_count=cut_bucket))} "
+            f"current_bucket={rad_to_deg(float(q_start[bucket_idx])):.2f}deg "
+            f"target_bucket={float(CURL_HOLD_TARGET_DEG):.2f}deg"
+        )
+
+    best_secure = sorted(valid_secure, key=lambda row: float(row.get("score", 1.0e9)))[0]
+    q_curl = np.array(best_secure["q_curl"], dtype=np.float32).copy()
+    q_secure = np.array(best_secure["q"], dtype=np.float32).copy()
+    curl_duration = float(best_secure.get("curl_duration", 0.90))
+    curl_target = predicted_end_world_point(q_curl, end_effector="tip", reference_q=q_start)
+    curl_report = best_secure.get("curl_report") or {}
+    curl_row = make_stage_row_from_q(
+        "curl_to_hold_material",
+        q_curl,
+        q_start,
+        curl_duration,
+        target_point=curl_target,
+        extra={
+            "staged_runtime_plan": True,
+            "staged_append_source": "post_pull_exit",
+            "seal_bucket_first": True,
+            "material_hold": {
+                "ok": True,
+                "reason": "curl_bucket_toward_retaining_secure_pose"
+                if bool(best_secure.get("retains_material", False))
+                else "curl_bucket_toward_real_loaded_secure_pose",
+                "bucket_deg": float(rad_to_deg(q_curl[bucket_idx])),
+                "joint_closed_ok_deprecated": bool(best_secure.get("curl_joint_closed_ok_deprecated", False)),
+                "target_secure_bucket_deg": float(rad_to_deg(q_secure[bucket_idx])),
+                "retaining_secure_report": best_secure.get("actual_report", best_secure.get("carry_report", {})),
+                "real_loaded_hold_allowed": bool(best_secure.get("transitional_material_hold", False)),
+                "loaded_count_for_secure": int(best_secure.get("loaded_count_for_secure", 0) or 0),
+                "curl_boom_fraction": float(best_secure.get("curl_boom_fraction", 0.0) or 0.0),
+                "curl_arm_fraction": float(best_secure.get("curl_arm_fraction", 0.0) or 0.0),
+            },
+            "ground": {
+                "ok": True,
+                "reason": "ok",
+                "tip_depth": curl_report.get("tip_sand_depth"),
+                "bucket_mid_depth": curl_report.get("bucket_mid_sand_depth"),
+                "pour_depth": curl_report.get("pour_sand_depth"),
+                "load_depth": curl_report.get("load_sand_depth"),
+                "surface_source": curl_report.get("tip_sand_surface_source"),
+            },
+        },
+    )
+    secure_row = make_stage_row_from_q(
+        "secure_load",
+        q_secure,
+        q_curl,
+        float(best_secure.get("duration", 0.85)),
+        target_point=best_secure.get("target_point"),
+        extra={
+            "effector": "load",
+            "staged_runtime_plan": True,
+            "staged_append_source": "post_pull_exit",
+            "secure_load": {
+                "boom_lift_deg": float(best_secure.get("boom_lift_deg", 0.0)),
+                "arm_retract_deg": float(best_secure.get("arm_retract_deg", 0.0)),
+                "candidate_count": len(secure_rows),
+                "source": str(best_secure.get("source", "")),
+                "retains_material": bool(best_secure.get("retains_material", False)),
+                "transitional_material_hold": bool(best_secure.get("transitional_material_hold", False)),
+            },
+            "material_hold": best_secure.get("actual_report", best_secure.get("carry_report", {})),
+            "carry_projection": best_secure.get("carry_report", {}),
+            "ground": {
+                "ok": True,
+                "reason": "ok",
+                "tip_depth": (best_secure.get("ground_report") or {}).get("tip_sand_depth"),
+                "bucket_mid_depth": (best_secure.get("ground_report") or {}).get("bucket_mid_sand_depth"),
+                "pour_depth": (best_secure.get("ground_report") or {}).get("pour_sand_depth"),
+                "load_depth": (best_secure.get("ground_report") or {}).get("load_sand_depth"),
+                "surface_source": (best_secure.get("ground_report") or {}).get("tip_sand_surface_source"),
+            },
+        },
+    )
+    return [
+        ("curl_to_hold_material", q_curl.copy(), float(curl_duration), curl_target, curl_row),
+        ("secure_load", q_secure.copy(), float(best_secure.get("duration", 0.85)), best_secure.get("target_point"), secure_row),
+    ], "ok"
+
+
+def append_staged_post_dig_secure_plan(task_label="dig_target_ball"):
+    plan = STATE.get("current_dig_plan")
+    if not (isinstance(plan, dict) and bool(plan.get("staged_execution", False))):
+        return True
+    if bool(plan.get("staged_post_dig_secure_appended", False)):
+        return True
+    if not bool(plan.get("staged_post_dig_secure_pending", False)):
+        return True
+
+    seq = STATE.get("dig_plan_sequence")
+    points = STATE.get("dig_plan_points")
+    candidate = STATE.get("dig_plan_candidate")
+    if not isinstance(seq, list) or not isinstance(points, list) or not isinstance(candidate, dict):
+        set_execution_failure_reason("execution_failed/staged_plan_state_missing")
+        return False
+
+    q_start = sync_motion_start_q("staged_post_dig_secure")
+    cut_metrics = record_phase_metrics("after_cut", q_cmd=q_start, q_real=q_start)
+    cut_sand = cut_metrics.get("sand", {}) if isinstance(cut_metrics, dict) else {}
+    cut_bucket = int(cut_sand.get("bucket_from_pile", 0) or 0) if isinstance(cut_sand, dict) else 0
+    rows, reason = staged_dig_secure_candidates(q_start, loaded_count_hint=cut_bucket)
+    if not rows:
+        if cut_bucket >= int(CURL_HOLD_MIN_BUCKET_PARTICLES):
+            set_execution_failure_reason("quality_rejected/secure_not_retaining_material:" + str(reason))
+        else:
+            set_execution_failure_reason("planning_failed/staged_secure_unreachable:" + str(reason))
+        info_print("[DIG PLAN STAGED FAILED]", "stage=post_pull_exit_secure", reason)
+        return False
+
+    stages = list(candidate.get("stages", []) or [])
+    for phase, q_goal, duration, point, row in rows:
+        seq.append((phase, np.array(q_goal, dtype=np.float32).copy(), float(duration)))
+        if point is None:
+            point = predicted_end_world_point(q_goal, end_effector=path_end_effector_for_mode(phase), reference_q=q_start)
+        if point is None:
+            point = np.zeros(3, dtype=np.float32)
+        points.append(np.array(point, dtype=np.float32).reshape(-1)[:3].copy())
+        stages.append(row)
+
+    candidate["stages"] = stages
+    candidate["steps"] = len(seq)
+    candidate["planned"] = True
+    candidate["staged_post_dig_secure_pending"] = False
+    candidate["staged_post_dig_secure_appended"] = True
+    candidate["staged_post_secure_load_pending"] = True
+    candidate["route_diagnostics"] = route_diagnostics_from_stages(stages)
+    candidate["unload_ballistics"] = unload_ballistics_from_stages(stages)
+    STATE["dig_plan_candidate"] = candidate
+    STATE["dig_plan_points"] = points
+    cache_dig_plan_trace_points(seq, start_q=STATE.get("dig_plan_start_q", CTRL.q_cmd.copy()))
+    new_plan = build_shared_dig_plan_object(STATE.get("dig_plan_target", get_target_pos()), seq, points, candidate)
+    new_plan["staged_execution"] = True
+    new_plan["staged_prefix_ready"] = True
+    new_plan["staged_post_dig_secure_pending"] = False
+    new_plan["staged_post_dig_secure_appended"] = True
+    new_plan["staged_post_secure_load_pending"] = True
+    new_plan["staged_prefix_terminal_phase"] = "secure_load"
+    if current_trace_mode() == 2:
+        draw_trace(force=True)
+    info_print(
+        "[DIG PLAN STAGED APPEND]",
+        "added=" + ",".join(str(row[0]) for row in rows),
+        f"steps={len(seq)}",
+        f"source={task_label}",
+        f"reason={reason}",
+        f"after_cut_bucket={cut_bucket}",
+    )
+    return True
+
+
+def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
+    plan = STATE.get("current_dig_plan")
+    if not (isinstance(plan, dict) and bool(plan.get("staged_execution", False))):
+        return True
+    if bool(plan.get("staged_post_secure_load_appended", False)):
+        return True
+
+    seq = STATE.get("dig_plan_sequence")
+    points = STATE.get("dig_plan_points")
+    candidate = STATE.get("dig_plan_candidate")
+    if not isinstance(seq, list) or not isinstance(points, list) or not isinstance(candidate, dict):
+        set_execution_failure_reason("execution_failed/staged_plan_state_missing")
+        return False
+
+    q_start = sync_motion_start_q("staged_post_secure_load")
+    secure_metrics = record_phase_metrics("after_secure_load")
+    secure_gate = secure_post_gate_report(q_start, current_metrics=secure_metrics)
+    candidate["post_secure_gate"] = secure_gate
+    STATE["dig_plan_candidate"] = candidate
+    debug_timeline_record(
+        "SECURE_GATE",
+        stage="secure_load",
+        result="ok" if bool(secure_gate.get("ok", False)) else "project_required",
+        reason=str(secure_gate.get("reason", "")),
+        q_cmd=q_start,
+        q_real=q_start,
+        data=secure_gate,
+        include_sand=True,
+    )
+    carry_safe_seq = []
+    carry_safe_points = []
+    carry_safe_stages = []
+    q_lift_start = q_start.copy()
+    if not bool(secure_gate.get("ok", False)):
+        if not bool(secure_gate.get("spill_gate_ok", False)):
+            reason = str(secure_gate.get("reason", "secure_material_loss"))
+            candidate["post_secure_projection"] = {
+                "ok": False,
+                "reason": reason,
+                "skipped": True,
+                "skip_reason": "secure_material_loss_not_recoverable_by_projection",
+            }
+            STATE["dig_plan_candidate"] = candidate
+            set_execution_failure_reason("quality_rejected/secure_not_retaining_material:" + reason)
+            info_print("[SECURE GATE FAILED]", reason)
+            debug_timeline_record(
+                "CARRY_SAFE_PROJECT",
+                stage="secure_carry_safe",
+                result="skipped",
+                reason=reason,
+                q_cmd=q_start,
+                q_real=q_start,
+                data={"secure_gate": secure_gate},
+                include_sand=True,
+            )
+            return False
+        if bool(candidate.get("staged_secure_carry_safe_appended", False)):
+            reason = "secure_carry_safe_still_not_retaining:" + str(
+                secure_gate.get("reason", "current pose does not retain material")
+            )
+            candidate["post_secure_projection"] = {
+                "ok": False,
+                "reason": reason,
+                "secure_gate": secure_gate,
+                "already_appended": True,
+            }
+            STATE["dig_plan_candidate"] = candidate
+            set_execution_failure_reason("quality_rejected/secure_not_retaining_material:" + reason)
+            info_print("[SECURE GATE FAILED]", reason)
+            debug_timeline_record(
+                "CARRY_SAFE_PROJECT",
+                stage="secure_carry_safe",
+                result="failed_after_execution",
+                reason=reason,
+                q_cmd=q_start,
+                q_real=q_start,
+                data={"secure_gate": secure_gate},
+                include_sand=True,
+            )
+            return False
+        projection_rows = staged_carry_safe_projection_candidates(q_start)
+        valid_projection = [row for row in projection_rows if bool(row.get("ok", False))]
+        if not valid_projection:
+            reason = "; ".join(str(row.get("reason", "")) for row in projection_rows[:4]) or str(
+                secure_gate.get("reason", "current pose does not retain material")
+            )
+            candidate["post_secure_projection"] = {
+                "ok": False,
+                "reason": reason,
+                "candidate_count": int(len(projection_rows)),
+            }
+            STATE["dig_plan_candidate"] = candidate
+            set_execution_failure_reason("quality_rejected/secure_not_retaining_material:" + reason)
+            info_print("[SECURE GATE FAILED]", reason)
+            debug_timeline_record(
+                "CARRY_SAFE_PROJECT",
+                stage="secure_carry_safe",
+                result="failed",
+                reason=reason,
+                q_cmd=q_start,
+                q_real=q_start,
+                data={
+                    "secure_gate": secure_gate,
+                    "projection_candidates": [
+                        {
+                            "ok": bool(row.get("ok", False)),
+                            "reason": str(row.get("reason", "")),
+                            "carry_report": row.get("carry_report", {}),
+                            "actual_report": row.get("actual_report", {}),
+                        }
+                        for row in projection_rows[:6]
+                    ],
+                },
+                include_sand=True,
+            )
+            return False
+
+        projection = sorted(valid_projection, key=lambda row: float(row.get("score", 1.0e9)))[0]
+        q_carry_safe = np.array(projection["q"], dtype=np.float32).copy()
+        q_lift_start = q_carry_safe.copy()
+        projection_duration = float(projection.get("duration", 0.75) or 0.75)
+        projection_target = projection.get("target_point")
+        carry_safe_row = make_stage_row_from_q(
+            "secure_carry_safe",
+            q_carry_safe,
+            q_start,
+            projection_duration,
+            target_point=projection_target,
+            extra={
+                "effector": "load",
+                "staged_runtime_plan": True,
+                "secure_gate": secure_gate,
+                "carry_safe_projection": {
+                    "ok": True,
+                    "reason": "projected_to_retaining_pose",
+                    "boom_lift_deg": float(projection.get("boom_lift_deg", 0.0)),
+                    "arm_retract_deg": float(projection.get("arm_retract_deg", 0.0)),
+                    "candidate_count": int(len(projection_rows)),
+                },
+                "material_hold": projection.get("carry_report", {}),
+            },
+        )
+        carry_safe_seq.append(("secure_carry_safe", q_carry_safe.copy(), projection_duration))
+        if projection_target is None:
+            projection_target = predicted_end_world_point(q_carry_safe, end_effector="load", reference_q=q_start)
+        carry_safe_points.append(np.array(projection_target if projection_target is not None else unload_bin_landing_point(), dtype=np.float32).reshape(-1)[:3].copy())
+        carry_safe_stages.append(carry_safe_row)
+        candidate["post_secure_projection"] = {
+            "ok": True,
+            "q_carry_safe_deg": q_deg_values(q_carry_safe, wrap_swing_for_display=True),
+            "carry_report": projection.get("carry_report", {}),
+            "actual_report": projection.get("actual_report", {}),
+        }
+        STATE["dig_plan_candidate"] = candidate
+        debug_timeline_record(
+            "CARRY_SAFE_PROJECT",
+            stage="secure_carry_safe",
+            result="ok",
+            reason="projected_to_retaining_pose",
+            q_cmd=q_carry_safe,
+            q_real=q_start,
+            data=candidate["post_secure_projection"],
+            include_sand=True,
+        )
+        info_print(
+            "[CARRY SAFE PROJECT]",
+            f"q_start={q_deg_values(q_start, wrap_swing_for_display=True)}",
+            f"q_safe={q_deg_values(q_carry_safe, wrap_swing_for_display=True)}",
+            f"pour_above_load_z={fmt_optional((projection.get('carry_report') or {}).get('pour_above_load_z'))}",
+        )
+
+        # Enforce the physical order: first execute the bucket carry-safe
+        # projection, then re-enter this function from the executed
+        # secure_carry_safe stage to plan lift/carry/unload from the real
+        # post-projection joint state.
+        seq.extend(carry_safe_seq)
+        points.extend(carry_safe_points)
+        stages = list(candidate.get("stages", []) or [])
+        stages.extend(carry_safe_stages)
+        candidate["stages"] = stages
+        candidate["steps"] = len(seq)
+        candidate["planned"] = True
+        candidate["staged_secure_carry_safe_appended"] = True
+        candidate["staged_post_secure_load_pending"] = True
+        candidate["staged_post_secure_load_appended"] = False
+        candidate["staged_prefix_terminal_phase"] = "secure_carry_safe"
+        candidate["route_diagnostics"] = route_diagnostics_from_stages(stages)
+        candidate["unload_ballistics"] = unload_ballistics_from_stages(stages)
+        STATE["dig_plan_candidate"] = candidate
+        STATE["dig_plan_points"] = points
+        cache_dig_plan_trace_points(seq, start_q=STATE.get("dig_plan_start_q", CTRL.q_cmd.copy()))
+        new_plan = build_shared_dig_plan_object(STATE.get("dig_plan_target", get_target_pos()), seq, points, candidate)
+        new_plan["staged_execution"] = True
+        new_plan["staged_prefix_ready"] = True
+        new_plan["staged_post_secure_load_pending"] = True
+        new_plan["staged_post_secure_load_appended"] = False
+        new_plan["staged_prefix_terminal_phase"] = "secure_carry_safe"
+        if current_trace_mode() == 2:
+            draw_trace(force=True)
+        info_print(
+            "[DIG PLAN STAGED APPEND]",
+            "added=secure_carry_safe",
+            f"steps={len(seq)}",
+            f"source={task_label}",
+            "next=plan_lift_after_real_secure_carry_safe",
+        )
+        return True
+
+    lift_rows = staged_lift_candidates(q_lift_start)
+    valid_lift = [row for row in lift_rows if bool(row.get("ok", False))]
+    if not valid_lift:
+        reason = "; ".join(str(row.get("reason", "")) for row in lift_rows[:3]) or "no lift candidate"
+        set_execution_failure_reason("planning_failed/staged_lift_unreachable:" + reason)
+        info_print("[DIG PLAN STAGED FAILED]", "stage=lift_carry", reason)
+        return False
+
+    lift = sorted(valid_lift, key=lambda row: float(row.get("score", 1.0e9)))[0]
+    q_lift = np.array(lift["q"], dtype=np.float32).copy()
+    lift_duration = float(lift.get("duration", 1.1) or 1.1)
+    lift_row = make_stage_row_from_q(
+        "lift_carry",
+        q_lift,
+        q_lift_start,
+        lift_duration,
+        target_point=lift.get("target_point"),
+        extra={
+            "material_hold": lift.get("carry_report", {}),
+            "staged_runtime_plan": True,
+            "secure_load_runtime_append": {
+                "source_task": str(task_label),
+                "boom_lift_deg": float(lift.get("boom_lift_deg", 0.0)),
+                "arm_retract_deg": float(lift.get("arm_retract_deg", 0.0)),
+            },
+        },
+    )
+
+    deadline = time.time() + 10.0
+    q_dump, dump_info = plan_dump_pose_to_bin(
+        q_seed=q_lift,
+        dump_deg=unload_dump_target_deg(),
+        label="staged_unload_to_bin",
+        log=True,
+        allow_unaligned=True,
+        deadline=deadline,
+    )
+    if q_dump is None:
+        set_execution_failure_reason("planning_failed/staged_unload_dump_pose:" + str(dump_info))
+        info_print("[DIG PLAN STAGED FAILED]", "stage=unload_to_bin", dump_info)
+        return False
+
+    q_pre_dump = np.array(q_dump, dtype=np.float32).copy()
+    bucket_idx = CTRL.name_to_idx["bucket"]
+    reference_angles = chain_angles_from_q(q_lift, end_effector="load")
+    carry_calc = None
+    if reference_angles is not None:
+        carry_world = nearest_bucket_carry_world_angle(reference_angles[2], q_reference=q_lift, end_effector="load")
+        carry_calc = bucket_joint_for_world_angle(q_pre_dump, carry_world, end_effector="load")
+    if carry_calc is not None:
+        q_pre_dump[bucket_idx] = carry_calc["bucket"]
+    else:
+        q_pre_dump[bucket_idx] = float(q_lift[bucket_idx])
+    q_pre_dump = clip_command_near(q_pre_dump, reference=q_lift)
+    q_pre_dump, pre_dump_loaded_limited, pre_dump_old_bucket_deg = apply_loaded_bucket_closed_limit(
+        q_pre_dump,
+        label="staged_unload_to_bin",
+    )
+    if pre_dump_loaded_limited:
+        info_print(
+            "[LOADED BUCKET LIMIT]",
+            "stage=staged_unload_to_bin",
+            f"requested={pre_dump_old_bucket_deg:.2f}deg",
+            f"limited_to={float(BUCKET_LOADED_CLOSED_LIMIT_DEG):.2f}deg",
+            "reason=pre_dump_carry_executable_limit",
+        )
+
+    direct_ok, kind, reason, sample, report = path_segment_check(
+        q_lift, q_pre_dump, "unload_to_bin", samples=DIG_PLAN_PATH_CHECK_SAMPLES, deadline=deadline
+    )
+    route_seq = []
+    route_points = []
+    route_stages = []
+    q_route_seed = q_lift.copy()
+    if not direct_ok:
+        route, route_reason = find_clearance_route(
+            q_lift,
+            q_pre_dump,
+            "unload_to_bin",
+            "staged_unload_to_bin",
+            deadline=deadline,
+            samples=PATH_ROUTE_PLANNING_SAMPLE_COUNT,
+        )
+        if route is None:
+            fallback, fallback_reason = staged_high_carry_unload_fallback(q_lift, q_pre_dump, deadline=deadline)
+            if fallback is not None:
+                route = fallback.get("route", [])
+                route_reason = (
+                    f"{fallback.get('reason', 'high_carry_fallback')}; "
+                    f"original_route={route_reason}; original={kind}:{reason}; sample={sample}"
+                )
+                q_pre_dump = np.array(fallback.get("q_pre_dump", q_pre_dump), dtype=np.float32).copy()
+                deadline = time.time() + 5.0
+                info_print(
+                    "[DIG PLAN STAGED FALLBACK]",
+                    "stage=unload_to_bin",
+                    "method=high_carry_route",
+                    f"route_waypoints={len(route)}",
+                    f"reason={route_reason}",
+                )
+            else:
+                set_execution_failure_reason(
+                    f"planning_failed/staged_unload_route:{kind}:{reason}; route={route_reason}; "
+                    f"fallback={fallback_reason}; sample={sample}"
+                )
+                info_print(
+                    "[DIG PLAN STAGED FAILED]",
+                    "stage=unload_to_bin",
+                    f"kind={kind}",
+                    f"reason={reason}",
+                    f"route={route_reason}",
+                    f"fallback={fallback_reason}",
+                )
+                return False
+        for route_idx, q_route_raw in enumerate(route):
+            q_route = np.array(q_route_raw, dtype=np.float32).copy()
+            route_label = f"clearance_route_post_{route_idx + 1}"
+            route_duration = estimate_stage_motion_seconds(q_route_seed, q_route, requested_seconds=0.55)
+            route_target = predicted_end_world_point(q_route, end_effector=path_end_effector_for_mode("unload_to_bin"), reference_q=q_route_seed)
+            route_row = make_stage_row_from_q(
+                route_label,
+                q_route,
+                q_route_seed,
+                route_duration,
+                target_point=route_target,
+                extra={
+                    "route_source": "staged_post_secure_load",
+                    "route_reason": str(route_reason),
+                    "route_index": int(route_idx + 1),
+                    "route_count": int(len(route)),
+                    "clearance_route": {
+                        "inserted": True,
+                        "required": True,
+                        "waypoints": int(len(route)),
+                        "reason": str(route_reason),
+                    },
+                },
+                deadline=deadline,
+            )
+            route_seq.append((route_label, q_route.copy(), float(route_duration)))
+            route_points.append(np.array(route_target if route_target is not None else unload_bin_landing_point(), dtype=np.float32).copy())
+            route_stages.append(route_row)
+            q_route_seed = q_route.copy()
+
+    unload_duration = estimate_stage_motion_seconds(q_route_seed, q_pre_dump, requested_seconds=1.2)
+    drop = unload_drop_report(q=q_dump, reference_q=q_pre_dump)
+    unload_row = make_stage_row_from_q(
+        "unload_to_bin",
+        q_pre_dump,
+        q_route_seed,
+        unload_duration,
+        target_point=unload_bin_landing_point(),
+        extra={
+            "q_dump_rad": vec_list(q_dump, 4),
+            "q_dump_deg": q_deg_values(q_dump, wrap_swing_for_display=True),
+            "effector": "landing",
+            "drop": compact_unload_drop(drop),
+            "drop_alignment_ready": bool(drop.get("ok", False) and drop.get("close_xy", False)),
+            "drop_alignment_policy": "staged_runtime_execute_then_score",
+            "clearance_route": {
+                "inserted": bool(route_seq),
+                "required": bool(route_seq or not direct_ok),
+                "waypoints": int(len(route_seq)),
+                "reason": "direct_ok" if direct_ok else "staged_post_secure_load_route",
+            },
+            "staged_runtime_plan": True,
+        },
+        deadline=deadline,
+    )
+
+    seq.extend(carry_safe_seq)
+    points.extend(carry_safe_points)
+    seq.extend([("lift_carry", q_lift.copy(), lift_duration)])
+    points.append(np.array(lift.get("target_point") if lift.get("target_point") is not None else unload_bin_landing_point(), dtype=np.float32).reshape(-1)[:3].copy())
+    seq.extend(route_seq)
+    points.extend(route_points)
+    seq.append(("unload_to_bin", q_pre_dump.copy(), unload_duration))
+    points.append(np.array(unload_bin_landing_point(), dtype=np.float32).reshape(-1)[:3].copy())
+
+    stages = list(candidate.get("stages", []) or [])
+    stages.extend(carry_safe_stages)
+    stages.append(lift_row)
+    stages.extend(route_stages)
+    stages.append(unload_row)
+    candidate["stages"] = stages
+    candidate["steps"] = len(seq)
+    candidate["planned"] = True
+    candidate["staged_post_secure_load_pending"] = False
+    candidate["staged_post_secure_load_appended"] = True
+    candidate["unload_landing_xyz"] = vec_list(unload_bin_landing_point(), 3)
+    release_target = None
+    if isinstance(dump_info, dict):
+        release_target = dump_info.get("release_target")
+    if release_target is None:
+        release_target = unload_bin_dump_point()
+    candidate["unload_release_xyz"] = vec_list(release_target, 3)
+    candidate["unload_point_xyz"] = candidate["unload_release_xyz"]
+    candidate["route_diagnostics"] = route_diagnostics_from_stages(stages)
+    candidate["unload_ballistics"] = unload_ballistics_from_stages(stages)
+    STATE["dig_plan_candidate"] = candidate
+    STATE["dig_plan_points"] = points
+    cache_dig_plan_trace_points(seq, start_q=STATE.get("dig_plan_start_q", CTRL.q_cmd.copy()))
+    new_plan = build_shared_dig_plan_object(STATE.get("dig_plan_target", get_target_pos()), seq, points, candidate)
+    new_plan["staged_execution"] = True
+    new_plan["staged_prefix_ready"] = True
+    new_plan["staged_post_secure_load_pending"] = False
+    new_plan["staged_post_secure_load_appended"] = True
+    if current_trace_mode() == 2:
+        draw_trace(force=True)
+    info_print(
+        "[DIG PLAN STAGED APPEND]",
+        "added=lift_carry,unload_to_bin",
+        f"route_waypoints={len(route_seq)}",
+        f"drop_xy_err={fmt_optional(drop.get('xy_err'))}",
+        f"inside_xy={drop.get('inside_xy')}",
+    )
+    return True
+
+
+def plan_dig_sequence_from_target(target_xyz, max_seconds=None):
     STATE["last_dig_plan_candidates"] = []
     STATE["dig_plan_candidate"] = None
     STATE["dig_plan_best_failure"] = None
@@ -13206,62 +18614,98 @@ def plan_dig_sequence_from_target(target_xyz):
     best_failure = None
 
     candidates = adaptive_dig_plan_candidates(target_xyz)
-    deadline = time.time() + float(DIG_PLAN_MAX_BUILD_SECONDS)
-    for candidate in candidates:
-        if time.time() > deadline:
-            info_print(
-                "[DIG PLAN TIMEOUT]",
-                f"budget={DIG_PLAN_MAX_BUILD_SECONDS:.2f}s",
-                f"evaluated={len(STATE.get('last_dig_plan_candidates', []))}",
-                f"best_ready={best is not None}",
+    budget_source = max_seconds if max_seconds is not None else STATE.get("dig_plan_build_budget_seconds", DIG_PLAN_MAX_BUILD_SECONDS)
+    budget_seconds = float(budget_source or DIG_PLAN_MAX_BUILD_SECONDS)
+    deadline = time.time() + budget_seconds
+    previous_perf_deadline = STATE.get("dig_plan_active_perf_deadline")
+    STATE["dig_plan_active_perf_deadline"] = time.perf_counter() + budget_seconds
+    try:
+        for candidate in candidates:
+            if planning_deadline_exceeded(deadline):
+                info_print(
+                    "[DIG PLAN TIMEOUT]",
+                    f"budget={budget_seconds:.2f}s",
+                    f"evaluated={len(STATE.get('last_dig_plan_candidates', []))}",
+                    f"best_ready={best is not None}",
+                )
+                break
+            candidate_t0 = time.perf_counter()
+            seq, points, detail = plan_dig_sequence_candidate(target_xyz, candidate, deadline=deadline)
+            candidate_ms = 1000.0 * max(0.0, time.perf_counter() - candidate_t0)
+            perf_block_record(
+                f"plan_candidate:{candidate.get('id', 'candidate')}",
+                candidate_ms,
+                data={
+                    "candidate": str(candidate.get("id", "candidate")),
+                    "planned": bool(seq),
+                    "failed_stage": "" if seq else str((detail or {}).get("failed_stage", "")),
+                    "prefix": 0 if seq else int((detail or {}).get("planned_prefix", 0) or 0),
+                    "budget_seconds": float(budget_seconds),
+                },
             )
-            break
-        seq, points, detail = plan_dig_sequence_candidate(target_xyz, candidate, deadline=deadline)
-        row = dict(detail)
-        row["candidate"] = dict(candidate)
-        if seq:
-            legacy_score, score_reason, reports = evaluate_dig_plan_candidate(seq, points, candidate)
-            planner_cost = float(row.get("planner_cost", 1.0e9))
-            row["rank_cost"] = planner_cost
-            row["score"] = float(1000.0 - planner_cost)
-            row["legacy_score"] = float(legacy_score)
-            row["score_reason"] = (
-                f"planner_cost={planner_cost:.2f}; "
-                f"weighted_angle={float(row.get('weighted_angle', 0.0)):.2f}; "
-                f"estimated_time={float(row.get('estimated_time', 0.0)):.2f}; "
-                + score_reason
-            )
-            row["path_reports"] = reports
-            if best is None or planner_cost < best["rank_cost"]:
-                best = {
-                    "score": float(row["score"]),
-                    "rank_cost": planner_cost,
-                    "sequence": seq,
-                    "points": points,
-                    "candidate": dict(candidate),
-                    "row": row,
-                }
-        else:
-            row["score"] = -1.0e9
-            row["score_reason"] = row.get("failure_reason", "planning_failed")
-            info_print(
-                f"[DIG PLAN CANDIDATE FAIL] {row.get('id')}: "
-                f"stage={row.get('failed_stage')} prefix={row.get('planned_prefix', 0)} "
-                f"reason={row.get('failure_reason')}"
-            )
-            if best_failure is None:
-                best_failure = row
+            row = dict(detail)
+            row["candidate"] = dict(candidate)
+            if seq:
+                if planning_deadline_exceeded(deadline):
+                    legacy_score = 0.0
+                    score_reason = "post_plan_eval_skipped_due_budget"
+                    reports = []
+                else:
+                    legacy_score, score_reason, reports = evaluate_dig_plan_candidate(seq, points, candidate, stages=row.get("stages"))
+                planner_cost = float(row.get("planner_cost", 1.0e9))
+                row["rank_cost"] = planner_cost
+                row["score"] = float(1000.0 - planner_cost)
+                row["legacy_score"] = float(legacy_score)
+                row["score_reason"] = (
+                    f"planner_cost={planner_cost:.2f}; "
+                    f"weighted_angle={float(row.get('weighted_angle', 0.0)):.2f}; "
+                    f"estimated_time={float(row.get('estimated_time', 0.0)):.2f}; "
+                    + score_reason
+                )
+                row["path_reports"] = reports
+                if best is None or planner_cost < best["rank_cost"]:
+                    best = {
+                        "score": float(row["score"]),
+                        "rank_cost": planner_cost,
+                        "sequence": seq,
+                        "points": points,
+                        "candidate": dict(candidate),
+                        "row": row,
+                    }
             else:
-                old_prefix = int(best_failure.get("planned_prefix", 0) or 0)
-                new_prefix = int(row.get("planned_prefix", 0) or 0)
-                if new_prefix > old_prefix:
+                row["score"] = -1.0e9
+                row["score_reason"] = row.get("failure_reason", "planning_failed")
+                info_print(
+                    f"[DIG PLAN CANDIDATE FAIL] {row.get('id')}: "
+                    f"stage={row.get('failed_stage')} prefix={row.get('planned_prefix', 0)} "
+                    f"reason={row.get('failure_reason')}"
+                )
+                if best_failure is None:
                     best_failure = row
-                elif new_prefix == old_prefix and float(row.get("best_partial_cost", 1.0e9)) < float(best_failure.get("best_partial_cost", 1.0e9)):
-                    best_failure = row
-        STATE["last_dig_plan_candidates"].append(row)
+                else:
+                    old_prefix = int(best_failure.get("planned_prefix", 0) or 0)
+                    new_prefix = int(row.get("planned_prefix", 0) or 0)
+                    if new_prefix > old_prefix:
+                        best_failure = row
+                    elif new_prefix == old_prefix and float(row.get("best_partial_cost", 1.0e9)) < float(best_failure.get("best_partial_cost", 1.0e9)):
+                        best_failure = row
+            STATE["last_dig_plan_candidates"].append(row)
+    finally:
+        STATE["dig_plan_active_perf_deadline"] = previous_perf_deadline
 
     if best is None:
         STATE["dig_plan_best_failure"] = best_failure
+        staged_seq = install_staged_prefix_plan_from_failure(target_xyz, best_failure)
+        if staged_seq:
+            plan = STATE.get("current_dig_plan")
+            terminal = ""
+            if isinstance(plan, dict):
+                terminal = str(plan.get("staged_prefix_terminal_phase", "") or "")
+            update_status(
+                f"[DIG PLAN STAGED] executable prefix ready through {terminal or 'partial dig'}",
+                force=True,
+            )
+            return staged_seq
         update_status("[DIG PLAN BLOCKED] all candidate plans failed", force=True)
         return None
 
@@ -13284,7 +18728,7 @@ def plan_dig_sequence_from_target(target_xyz):
     return best["sequence"]
 
 
-def build_dig_plan_from_current_target(force_status=True):
+def build_dig_plan_from_current_target(force_status=True, max_seconds=None):
     if bool(STATE.get("dig_plan_planning_active", False)):
         seq_existing = STATE.get("dig_plan_sequence", None)
         if seq_existing is not None and dig_plan_target_matches_current():
@@ -13292,14 +18736,35 @@ def build_dig_plan_from_current_target(force_status=True):
         update_status("[DIG PLAN] planner is already running; wait for current build", force=force_status)
         return None
 
+    STATE["planning_cancel_requested"] = False
+    STATE["planning_path_penalty_cache"] = {}
+    STATE["planning_path_penalty_cache_hits"] = 0
+    STATE["planning_path_penalty_cache_misses"] = 0
     STATE["dig_plan_planning_active"] = True
     STATE["dig_plan_planning_version"] = int(STATE.get("dig_plan_planning_version", 0)) + 1
-    STATE["dig_plan_planning_source"] = "manual_or_sync"
+    STATE["dig_plan_planning_source"] = "auto_collect" if bool(STATE.get("auto_collect_active", False)) else "manual_or_sync"
     build_t0 = time.time()
+    previous_planning_snapshot = STATE.get("planning_sand_snapshot")
+    previous_planning_snapshot_active = bool(STATE.get("planning_sand_snapshot_active", False))
     target = get_target_pos()
     target[2] = max(float(target[2]), GROUND_TOP_Z)
 
     try:
+        try:
+            snapshot_for_plan = None
+            cached_snapshot = STATE.get("auto_collect_episode_sand_snapshot")
+            cached_age = time.time() - float(STATE.get("auto_collect_episode_sand_snapshot_time", 0.0) or 0.0)
+            if isinstance(cached_snapshot, dict) and cached_age <= float(AUTO_COLLECT_PLANNING_SNAPSHOT_MAX_AGE):
+                snapshot_for_plan = cached_snapshot
+            if snapshot_for_plan is None:
+                snapshot_for_plan = get_sand_snapshot(force=False, label="dig_plan_build", max_age=3.0)
+            STATE["planning_sand_snapshot"] = snapshot_for_plan
+            STATE["planning_sand_snapshot_active"] = True
+        except Exception as e:
+            STATE["planning_sand_snapshot"] = None
+            STATE["planning_sand_snapshot_active"] = False
+            info_print("[WARN] [DIG PLAN SNAPSHOT] failed:", type(e).__name__, e)
+
         ok, reason = validate_dig_target(target, hard_block=False)
         if not ok:
             set_target_color(TARGET_COLOR_UNREACHABLE)
@@ -13314,7 +18779,7 @@ def build_dig_plan_from_current_target(force_status=True):
         STATE["dig_plan_best_failure"] = None
         STATE["current_dig_plan"] = None
         STATE["dig_plan_start_q"] = CTRL.q_cmd.copy()
-        seq = plan_dig_sequence_from_target(target)
+        seq = plan_dig_sequence_from_target(target, max_seconds=max_seconds)
         if not seq:
             best_failure = STATE.get("dig_plan_best_failure")
             STATE["dig_plan_points"] = None
@@ -13356,6 +18821,17 @@ def build_dig_plan_from_current_target(force_status=True):
         return seq
     finally:
         STATE["dig_plan_last_build_ms"] = 1000.0 * max(0.0, time.time() - build_t0)
+        perf_block_record(
+            "build_dig_plan_from_current_target",
+            STATE["dig_plan_last_build_ms"],
+            data={
+                "target": vec_list(target, 3),
+                "candidate_count": len(STATE.get("last_dig_plan_candidates", []) or []),
+                "plan_ready": STATE.get("dig_plan_sequence") is not None,
+            },
+        )
+        STATE["planning_sand_snapshot"] = previous_planning_snapshot
+        STATE["planning_sand_snapshot_active"] = previous_planning_snapshot_active
         STATE["dig_plan_planning_active"] = False
 
 
@@ -13406,6 +18882,7 @@ def reset_dig_plan():
     STATE["trace_active_motion"] = None
     STATE["trace_render_dirty"] = True
     STATE["trace_render_signature"] = None
+    clear_planning_runtime_caches("reset_dig_plan")
     ensure_unload_marker(label="reset_plan")
     if current_trace_mode() == 2:
         draw_trace(force=True)
@@ -13466,7 +18943,7 @@ def unload_dump_target_deg():
     return float(dump_deg)
 
 
-def plan_dump_pose_to_bin(q_seed=None, dump_deg=None, label="unload_dump", log=True, max_correction_iters=None, allow_unaligned=False):
+def plan_dump_pose_to_bin(q_seed=None, dump_deg=None, label="unload_dump", log=True, max_correction_iters=None, allow_unaligned=False, deadline=None):
     if q_seed is None:
         q_seed = CTRL.q_cmd.copy()
     else:
@@ -13495,7 +18972,11 @@ def plan_dump_pose_to_bin(q_seed=None, dump_deg=None, label="unload_dump", log=T
     last_reason = "no dump candidate evaluated"
 
     correction_iters = max(1, int(UNLOAD_DROP_IK_CORRECTION_ITERS if max_correction_iters is None else max_correction_iters))
+    if deadline is not None:
+        correction_iters = min(correction_iters, 1)
     for attempt in range(correction_iters):
+        if planning_deadline_exceeded(deadline):
+            return None, "planning budget exceeded"
         q_dump, info = solve_priority_ik_to_target(
             pour_target,
             q_seed=q_seed_dump,
@@ -13511,7 +18992,8 @@ def plan_dump_pose_to_bin(q_seed=None, dump_deg=None, label="unload_dump", log=T
             phase_mode="unload_dump",
             use_refinement=True,
             bucket_candidate_span_deg=95.0,
-            bucket_candidate_count=25,
+            bucket_candidate_count=9 if deadline is not None else 25,
+            deadline=deadline,
         )
 
         if q_dump is None:
@@ -13676,6 +19158,7 @@ async def execute_unload_sequence(stage_name, q_goal, duration, task_id=None):
     joint_delta = q_delta_abs_deg(q_goal, q_start)
     info_print(
         f"[UNLOAD ROUTE] {stage_name}: mode=direct_cached_plan "
+        "contract=dig_plan_no_runtime_replan "
         f"swing_delta={swing_delta_deg:.2f}deg "
         f"joint_delta={joint_delta} "
         f"q_start={q_deg_values(q_start, wrap_swing_for_display=True)} "
@@ -13721,18 +19204,21 @@ async def execute_unload_sequence(stage_name, q_goal, duration, task_id=None):
             detail_text = "; ".join(detail)
             strict_needs_route = strict_path_precheck_phase(stage_name)
             if strict_needs_route:
+                reason_text = f"execution_failed/path_precheck_failed:{stage_name}:{detail_text}"
+                set_execution_failure_reason(reason_text)
                 info_print(
-                    "[PLAN EXEC PRECHECK ROUTE]",
+                    "[PLAN EXEC PRECHECK FAILED]",
                     f"stage={stage_name}",
                     detail_text,
-                    "route_required=True",
+                    "hard_stop=True",
                 )
+                update_status(f"[DIG EXEC FAILED] {stage_name}: path_precheck_failed", force=True)
                 try:
                     debug_timeline_record(
-                        "PATH_PRECHECK_ROUTE",
+                        "PATH_PRECHECK_FAIL",
                         stage=stage_name,
-                        result="route_required",
-                        reason=detail_text,
+                        result="failed",
+                        reason=reason_text,
                         q_cmd=q_goal,
                         q_real=get_real_joint_positions(),
                         data={
@@ -13747,6 +19233,7 @@ async def execute_unload_sequence(stage_name, q_goal, duration, task_id=None):
                     )
                 except Exception:
                     pass
+                return False
             else:
                 info_print(
                     "[PLAN EXEC DIRECT WARN]",
@@ -13762,7 +19249,7 @@ async def execute_unload_sequence(stage_name, q_goal, duration, task_id=None):
             return False
         info_print("[WARN] [PLAN EXEC DIRECT] unload path precheck failed:", stage_name, type(e).__name__, e)
 
-    success = await move_to_profile_with_clearance(
+    success = await move_to_profile(
         q_goal,
         seconds=duration,
         label=stage_name,
@@ -14080,6 +19567,9 @@ async def execute_dig_plan_step(step_index=None):
     if not seq:
         return
 
+    if block_invalid_dig_plan_contract("debug_step"):
+        return
+
     if step_index is None:
         step_index = int(STATE.get("dig_plan_step_index", 0))
 
@@ -14095,6 +19585,14 @@ async def execute_dig_plan_step(step_index=None):
     STATE["active_plan_stage_index"] = int(step_index)
     task_id = start_task(f"dig_step_{stage_name}")
 
+    record_stage_audit(
+        stage_name,
+        step_index,
+        "start",
+        q_goal=q_goal,
+        duration=duration,
+        include_sand=is_sand_contact_phase(stage_name) or "unload" in stage_name,
+    )
     log_phase_ground("[DIG GUARD CURRENT]", stage_name)
     try:
         guard_reference_q = q_real_near_command(get_real_joint_positions(), CTRL.q_cmd)
@@ -14112,6 +19610,16 @@ async def execute_dig_plan_step(step_index=None):
             f"[DIG PREDICTED CONTACT] {stage_name} target: {msg}; executing with live freeze guard",
             force=True,
         )
+        record_stage_audit(
+            stage_name,
+            step_index,
+            "predicted_contact",
+            reason=msg,
+            q_goal=q_goal,
+            duration=duration,
+            data={"predicted_ground_ok": False},
+            include_sand=is_sand_contact_phase(stage_name),
+        )
 
     update_status(f"[DIG STEP {step_index + 1}/{len(seq)}] {stage_name}", force=True)
     if "unload" in stage_name:
@@ -14120,18 +19628,53 @@ async def execute_dig_plan_step(step_index=None):
         success = await ik_movement.move_unload_stage(runtime_module(), stage_name, q_goal, duration, task_id=task_id)
         if not success or not task_alive(task_id):
             update_status(execution_failure_status_text(stage_name), force=True)
+            record_stage_audit(
+                stage_name,
+                step_index,
+                "failed",
+                reason=str(STATE.get("last_execution_failure_reason", "") or "unload_stage_failed"),
+                q_goal=q_goal,
+                duration=duration,
+                include_sand=True,
+            )
             return
         if int(STATE.get("dig_plan_step_index", 0)) <= step_index:
             STATE["dig_plan_step_index"] = step_index + 1
         if not await dump_bucket_at_target(stage_name, task_id=task_id, planned_q_dump=planned_q_dump):
+            record_stage_audit(
+                stage_name,
+                step_index,
+                "failed",
+                reason=str(STATE.get("last_execution_failure_reason", "") or "dump_failed"),
+                q_goal=q_goal,
+                duration=duration,
+                include_sand=True,
+            )
             return
         log_phase_ground("[DIG GUARD AFTER]", stage_name)
+        record_stage_audit(
+            stage_name,
+            step_index,
+            "done",
+            q_goal=q_goal,
+            duration=duration,
+            include_sand=True,
+        )
         update_status(f"[DIG STEP DONE] {stage_name}", force=True)
         return
 
     success = await ik_movement.move_planned_stage(runtime_module(), stage_name, q_goal, duration, task_id=task_id)
     if not success or not task_alive(task_id):
         update_status(execution_failure_status_text(stage_name), force=True)
+        record_stage_audit(
+            stage_name,
+            step_index,
+            "failed",
+            reason=str(STATE.get("last_execution_failure_reason", "") or "stage_failed"),
+            q_goal=q_goal,
+            duration=duration,
+            include_sand=is_sand_contact_phase(stage_name),
+        )
         return
 
     if int(STATE.get("dig_plan_step_index", 0)) <= step_index:
@@ -14139,15 +19682,83 @@ async def execute_dig_plan_step(step_index=None):
 
     if "unload" in stage_name:
         if not await dump_bucket_at_target(stage_name, task_id=task_id):
+            record_stage_audit(
+                stage_name,
+                step_index,
+                "failed",
+                reason=str(STATE.get("last_execution_failure_reason", "") or "dump_failed"),
+                q_goal=q_goal,
+                duration=duration,
+                include_sand=True,
+            )
             return
     else:
         notify_sand_site_step_done(stage_name)
         if stage_name == "curl_to_hold_material":
             record_phase_metrics("after_dig")
         elif stage_name == "lift_carry":
-            record_phase_metrics("after_lift")
+            lift_metrics = record_phase_metrics("after_lift")
+            lift_gate = post_lift_material_gate_report(current_metrics=lift_metrics)
+            debug_timeline_record(
+                "LIFT_MATERIAL_GATE",
+                stage=stage_name,
+                result="ok" if bool(lift_gate.get("ok", False)) else "failed",
+                reason=str(lift_gate.get("reason", "")),
+                q_cmd=CTRL.q_cmd.copy(),
+                q_real=get_real_joint_positions(),
+                data=lift_gate,
+                include_sand=True,
+            )
+            if not bool(lift_gate.get("ok", False)):
+                reason_text = f"quality_rejected/lift_lost_material:{lift_gate.get('reason', '')}"
+                set_execution_failure_reason(reason_text)
+                record_stage_audit(
+                    stage_name,
+                    step_index,
+                    "failed",
+                    reason=reason_text,
+                    q_goal=q_goal,
+                    duration=duration,
+                    data={"lift_material_gate": lift_gate},
+                    include_sand=True,
+                )
+                return
 
     log_phase_ground("[DIG GUARD AFTER]", stage_name)
+    record_stage_audit(
+        stage_name,
+        step_index,
+        "done",
+        q_goal=q_goal,
+        duration=duration,
+        include_sand=is_sand_contact_phase(stage_name) or stage_name in ("curl_to_hold_material", "lift_carry"),
+    )
+    if dig_plan_semantic_phase_name(stage_name) == "pull_exit_cut":
+        if not append_staged_post_dig_secure_plan(task_label="debug_step"):
+            update_status(execution_failure_status_text(stage_name), force=True)
+            record_stage_audit(
+                stage_name,
+                step_index,
+                "failed",
+                reason=str(STATE.get("last_execution_failure_reason", "") or "staged_post_dig_secure_plan_failed"),
+                q_goal=q_goal,
+                duration=duration,
+                include_sand=True,
+            )
+            return
+    if dig_plan_semantic_phase_name(stage_name) in ("secure_load", "secure_carry_safe"):
+        if not append_staged_post_secure_load_plan(task_label="debug_step"):
+            update_status(execution_failure_status_text(stage_name), force=True)
+            record_stage_audit(
+                stage_name,
+                step_index,
+                "failed",
+                reason=str(STATE.get("last_execution_failure_reason", "") or "staged_post_secure_load_plan_failed"),
+                q_goal=q_goal,
+                duration=duration,
+                include_sand=True,
+            )
+            return
     update_status(f"[DIG STEP DONE] {stage_name}", force=True)
 
 
@@ -14162,13 +19773,26 @@ async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"
     if not seq:
         return False
 
+    if block_invalid_dig_plan_contract(task_name):
+        return False
+
     task_id = start_task(task_name)
 
-    for stage_index, (stage_name, q_goal, duration) in enumerate(seq):
+    stage_index = 0
+    while stage_index < len(seq):
+        stage_name, q_goal, duration = seq[stage_index]
         STATE["active_plan_stage_index"] = int(stage_index)
         if not task_alive(task_id):
             return False
 
+        record_stage_audit(
+            stage_name,
+            stage_index,
+            "start",
+            q_goal=q_goal,
+            duration=duration,
+            include_sand=is_sand_contact_phase(stage_name) or "unload" in stage_name,
+        )
         log_phase_ground("[DIG GUARD CURRENT]", stage_name)
         try:
             guard_reference_q = q_real_near_command(get_real_joint_positions(), CTRL.q_cmd)
@@ -14186,6 +19810,16 @@ async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"
                 f"[DIG PREDICTED CONTACT] {stage_name} target: {msg}; executing with live freeze guard",
                 force=True,
             )
+            record_stage_audit(
+                stage_name,
+                stage_index,
+                "predicted_contact",
+                reason=msg,
+                q_goal=q_goal,
+                duration=duration,
+                data={"predicted_ground_ok": False},
+                include_sand=is_sand_contact_phase(stage_name),
+            )
 
         update_status(f"[DIG] {stage_name}", force=True)
         if "unload" in stage_name:
@@ -14194,28 +19828,133 @@ async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"
             success = await ik_movement.move_unload_stage(runtime_module(), stage_name, q_goal, duration, task_id=task_id)
             if not success or not task_alive(task_id):
                 update_status(execution_failure_status_text(stage_name), force=True)
+                record_stage_audit(
+                    stage_name,
+                    stage_index,
+                    "failed",
+                    reason=str(STATE.get("last_execution_failure_reason", "") or "unload_stage_failed"),
+                    q_goal=q_goal,
+                    duration=duration,
+                    include_sand=True,
+                )
                 return False
             STATE["dig_plan_step_index"] = int(STATE.get("dig_plan_step_index", 0)) + 1
             if not await dump_bucket_at_target(stage_name, task_id=task_id, planned_q_dump=planned_q_dump):
+                record_stage_audit(
+                    stage_name,
+                    stage_index,
+                    "failed",
+                    reason=str(STATE.get("last_execution_failure_reason", "") or "dump_failed"),
+                    q_goal=q_goal,
+                    duration=duration,
+                    include_sand=True,
+                )
                 return False
             log_phase_ground("[DIG GUARD AFTER]", stage_name)
+            record_stage_audit(
+                stage_name,
+                stage_index,
+                "done",
+                q_goal=q_goal,
+                duration=duration,
+                include_sand=True,
+            )
+            stage_index += 1
             continue
 
         success = await ik_movement.move_planned_stage(runtime_module(), stage_name, q_goal, duration, task_id=task_id)
         if not success or not task_alive(task_id):
             update_status(execution_failure_status_text(stage_name), force=True)
+            record_stage_audit(
+                stage_name,
+                stage_index,
+                "failed",
+                reason=str(STATE.get("last_execution_failure_reason", "") or "stage_failed"),
+                q_goal=q_goal,
+                duration=duration,
+                include_sand=is_sand_contact_phase(stage_name),
+            )
             return False
         STATE["dig_plan_step_index"] = int(STATE.get("dig_plan_step_index", 0)) + 1
         if "unload" in stage_name:
             if not await dump_bucket_at_target(stage_name, task_id=task_id):
+                record_stage_audit(
+                    stage_name,
+                    stage_index,
+                    "failed",
+                    reason=str(STATE.get("last_execution_failure_reason", "") or "dump_failed"),
+                    q_goal=q_goal,
+                    duration=duration,
+                    include_sand=True,
+                )
                 return False
         else:
             notify_sand_site_step_done(stage_name)
             if stage_name == "curl_to_hold_material":
                 record_phase_metrics("after_dig")
             elif stage_name == "lift_carry":
-                record_phase_metrics("after_lift")
+                lift_metrics = record_phase_metrics("after_lift")
+                lift_gate = post_lift_material_gate_report(current_metrics=lift_metrics)
+                debug_timeline_record(
+                    "LIFT_MATERIAL_GATE",
+                    stage=stage_name,
+                    result="ok" if bool(lift_gate.get("ok", False)) else "failed",
+                    reason=str(lift_gate.get("reason", "")),
+                    q_cmd=CTRL.q_cmd.copy(),
+                    q_real=get_real_joint_positions(),
+                    data=lift_gate,
+                    include_sand=True,
+                )
+                if not bool(lift_gate.get("ok", False)):
+                    reason_text = f"quality_rejected/lift_lost_material:{lift_gate.get('reason', '')}"
+                    set_execution_failure_reason(reason_text)
+                    record_stage_audit(
+                        stage_name,
+                        stage_index,
+                        "failed",
+                        reason=reason_text,
+                        q_goal=q_goal,
+                        duration=duration,
+                        data={"lift_material_gate": lift_gate},
+                        include_sand=True,
+                    )
+                    return False
         log_phase_ground("[DIG GUARD AFTER]", stage_name)
+        record_stage_audit(
+            stage_name,
+            stage_index,
+            "done",
+            q_goal=q_goal,
+            duration=duration,
+            include_sand=is_sand_contact_phase(stage_name) or stage_name in ("curl_to_hold_material", "lift_carry"),
+        )
+        if dig_plan_semantic_phase_name(stage_name) == "pull_exit_cut":
+            if not append_staged_post_dig_secure_plan(task_label=task_name):
+                update_status(execution_failure_status_text(stage_name), force=True)
+                record_stage_audit(
+                    stage_name,
+                    stage_index,
+                    "failed",
+                    reason=str(STATE.get("last_execution_failure_reason", "") or "staged_post_dig_secure_plan_failed"),
+                    q_goal=q_goal,
+                    duration=duration,
+                    include_sand=True,
+                )
+                return False
+        if dig_plan_semantic_phase_name(stage_name) in ("secure_load", "secure_carry_safe"):
+            if not append_staged_post_secure_load_plan(task_label=task_name):
+                update_status(execution_failure_status_text(stage_name), force=True)
+                record_stage_audit(
+                    stage_name,
+                    stage_index,
+                    "failed",
+                    reason=str(STATE.get("last_execution_failure_reason", "") or "staged_post_secure_load_plan_failed"),
+                    q_goal=q_goal,
+                    duration=duration,
+                    include_sand=True,
+                )
+                return False
+        stage_index += 1
 
     if task_alive(task_id):
         update_status("[DIG FINISHED] direct home pose set", force=True)

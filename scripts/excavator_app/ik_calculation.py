@@ -22,7 +22,7 @@ def joint_motion_metrics(rt, q_to, q_from, duration=0.0):
     }
 
 
-def path_penalty(rt, q_start, q_goal, mode):
+def path_penalty(rt, q_start, q_goal, mode, deadline=None):
     penalty = 0.0
     detail = {
         "phase_ok": True,
@@ -32,7 +32,9 @@ def path_penalty(rt, q_start, q_goal, mode):
     }
     try:
         samples = max(3, int(getattr(rt, "DIG_PLAN_PATH_CHECK_SAMPLES", rt.PATH_CHECK_SAMPLES)))
-        phase_ok, phase_reason, phase_sample, phase_report = rt.path_phase_check(q_start, q_goal, mode, samples=samples)
+        phase_ok, phase_reason, phase_sample, phase_report = rt.path_phase_check(
+            q_start, q_goal, mode, samples=samples, deadline=deadline
+        )
         detail.update(
             {
                 "phase_ok": bool(phase_ok),
@@ -50,7 +52,9 @@ def path_penalty(rt, q_start, q_goal, mode):
 
     try:
         samples = max(3, int(getattr(rt, "DIG_PLAN_PATH_CHECK_SAMPLES", rt.PATH_CHECK_SAMPLES)))
-        obstacle_ok, obstacle_reason, obstacle_sample, obstacle_report = rt.path_obstacle_check(q_start, q_goal, mode, samples=samples)
+        obstacle_ok, obstacle_reason, obstacle_sample, obstacle_report = rt.path_obstacle_check(
+            q_start, q_goal, mode, samples=samples, deadline=deadline
+        )
         detail.update(
             {
                 "obstacle_ok": bool(obstacle_ok),

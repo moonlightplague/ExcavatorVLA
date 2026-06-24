@@ -20525,12 +20525,43 @@ def clone_candidate_plan_result(seq, points, detail):
     return seq_copy, points_copy, copy.deepcopy(detail)
 
 
+def planning_sand_snapshot_cache_key():
+    snapshot = STATE.get("planning_sand_snapshot") if bool(STATE.get("planning_sand_snapshot_active", False)) else None
+    if not isinstance(snapshot, dict):
+        return None
+    try:
+        ctx = snapshot.get("ctx", {}) if isinstance(snapshot.get("ctx"), dict) else {}
+        settle = snapshot.get("settle", {}) if isinstance(snapshot.get("settle"), dict) else {}
+        points = snapshot.get("points")
+        settled = snapshot.get("settled_points")
+        particle_count = int(snapshot.get("particle_count", len(points) if points is not None else 0) or 0)
+        settled_count = int(snapshot.get("settled_count", len(settled) if settled is not None else 0) or 0)
+        return stable_json_hash(
+            {
+                "created_at": round(float(snapshot.get("created_at", 0.0) or 0.0), 3),
+                "particle_count": particle_count,
+                "settled_count": settled_count,
+                "ctx": ctx,
+                "settle_ok": bool(settle.get("ok", False)),
+                "settle_reason": str(settle.get("reason", "")),
+            }
+        )
+    except Exception:
+        return stable_json_hash(
+            {
+                "created_at": str(snapshot.get("created_at", "")),
+                "label": str(snapshot.get("label", "")),
+            }
+        )
+
+
 def dig_candidate_result_cache_key(target_xyz, candidate):
     try:
         q_start = tuple(float(x) for x in np.round(np.array(CTRL.q_cmd, dtype=np.float32).reshape(-1)[:4], 4))
         target_key = tuple(float(x) for x in np.round(np.array(target_xyz, dtype=np.float32).reshape(-1)[:3], 4))
         candidate_hash = stable_json_hash(candidate)
         ik_hash = stable_json_hash(STATE.get("ik_calibration_report", {}) or {})
+        sand_snapshot_hash = planning_sand_snapshot_cache_key()
         unload_landing = vec_list(STATE.get("active_unload_landing_point"), 3)
         unload_release = vec_list(STATE.get("active_unload_release_point"), 3)
         return (
@@ -20538,6 +20569,7 @@ def dig_candidate_result_cache_key(target_xyz, candidate):
             candidate_hash,
             q_start,
             ik_hash,
+            sand_snapshot_hash,
             int(STATE.get("rigid_obstacle_cache_version", 0) or 0),
             tuple(unload_landing or []),
             tuple(unload_release or []),

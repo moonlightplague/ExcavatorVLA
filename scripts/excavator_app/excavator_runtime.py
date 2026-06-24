@@ -1742,6 +1742,7 @@ def apply_debug_visuals_visibility(visible=None, force_status=True):
     if visible is None:
         visible = bool(STATE.get("debug_visuals_visible", True))
     visible = bool(visible)
+    previous = bool(STATE.get("debug_visuals_visible", True))
     STATE["debug_visuals_visible"] = visible
     touched = 0
     for path in debug_visual_root_paths():
@@ -1757,7 +1758,8 @@ def apply_debug_visuals_visibility(visible=None, force_status=True):
             hide_trace_prims()
         except Exception:
             pass
-    info_print("[DEBUG VISUALS]", f"visible={visible}", f"roots={touched}")
+    if force_status or previous != visible:
+        info_print("[DEBUG VISUALS]", f"visible={visible}", f"roots={touched}")
     if force_status:
         update_status(f"Calc Viz {'ON' if visible else 'OFF'}; roots={touched}", force=True)
     return visible

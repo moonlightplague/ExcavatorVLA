@@ -286,6 +286,8 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_camera_resolution": [256, 256],
     "dataset_camera_frequency": 10,
     "dataset_camera_sample_stride": 1,
+    "dataset_camera_keep_invisible": True,
+    "dataset_camera_last_hide_time": 0.0,
     "dataset_camera_png_compress_level": 9,
     "dataset_camera_png_optimize": True,
     "dataset_camera_retry_after_time": 0.0,
@@ -502,6 +504,11 @@ DATASET_DEBUG_PLAN_FILE = "plan_debug.json"
 DATASET_DEBUG_TIMELINE_FILE = "debug_timeline.jsonl"
 AUTO_COLLECT_MAX_ATTEMPT_MULTIPLIER = 5
 AUTO_COLLECT_DEFAULT_MAX_ATTEMPTS = AUTO_COLLECT_DEFAULT_COUNT * AUTO_COLLECT_MAX_ATTEMPT_MULTIPLIER
+AUTO_COLLECT_EXPORT_LEROBOT_V3_ON_FINISH = str(
+    os.environ.get("EXCAVATOR_AUTO_EXPORT_LEROBOT_V3", "1")
+).strip().lower() not in ("0", "false", "no", "off")
+AUTO_COLLECT_LEROBOT_V3_SPLIT = str(os.environ.get("EXCAVATOR_LEROBOT_V3_SPLIT", "trainable") or "trainable")
+AUTO_COLLECT_LEROBOT_V3_DIRNAME = str(os.environ.get("EXCAVATOR_LEROBOT_V3_DIRNAME", "lerobot_v3") or "lerobot_v3")
 PLANNER_VERSION = "dig_plan_v4_joint_space_world_debug"
 QUALITY_GATE_VERSION = "quality_gate_v2_particles_no_freeze"
 AUTO_PREFLIGHT_MIN_PARTICLES = 1000
@@ -1679,6 +1686,7 @@ def apply_excavator_render_mode(render_on=None, force_status=True):
         set_prim_visibility(path, not render_on)
     for path in render_roots:
         set_prim_visibility(path, render_on)
+    dataset_camera_hidden_count = set_dataset_camera_prims_invisible()
 
     mode = "render" if render_on else "physics"
     msg = (
@@ -1692,6 +1700,7 @@ def apply_excavator_render_mode(render_on=None, force_status=True):
         f"world_model_visible={world_model_visible}",
         f"render_roots={len(render_roots)}",
         f"physical_visuals={len(physical_roots)}",
+        f"dataset_cameras_hidden={dataset_camera_hidden_count}",
     )
     if force_status:
         update_status(msg, force=True)
@@ -5527,6 +5536,9 @@ def auto_dataset_config_snapshot():
         "default_count": AUTO_COLLECT_DEFAULT_COUNT,
         "default_max_attempts": AUTO_COLLECT_DEFAULT_MAX_ATTEMPTS,
         "max_attempt_multiplier": AUTO_COLLECT_MAX_ATTEMPT_MULTIPLIER,
+        "export_lerobot_v3_on_finish": bool(AUTO_COLLECT_EXPORT_LEROBOT_V3_ON_FINISH),
+        "lerobot_v3_split": AUTO_COLLECT_LEROBOT_V3_SPLIT,
+        "lerobot_v3_dirname": AUTO_COLLECT_LEROBOT_V3_DIRNAME,
         "max_plan_retries": AUTO_COLLECT_MAX_PLAN_RETRIES,
         "global_plan_failure_limit": AUTO_COLLECT_GLOBAL_PLAN_FAILURE_LIMIT,
         "target_center": vec_list(AUTO_COLLECT_TARGET_CENTER, 3),
@@ -7942,8 +7954,118 @@ def auto_collect_write_run_summary():
             "sand_site_last_reset_label": STATE.get("sand_site_last_reset_label", ""),
             "auto_reset_sand_after_ui_ready": AUTO_RESET_SAND_AFTER_UI_READY,
             "perf_last": dict(STATE.get("sand_perf_last", {}) or {}),
+            "lerobot_v3_export": STATE.get("auto_collect_lerobot_v3_export", {}),
         },
     )
+
+
+def auto_collect_export_lerobot_v3_sync(run_dir):
+    run_dir = str(run_dir or "")
+    started = time.time()
+    result_path = os.path.join(run_dir, "lerobot_v3_export.json") if run_dir else ""
+    export_record = {
+        "enabled": bool(AUTO_COLLECT_EXPORT_LEROBOT_V3_ON_FINISH),
+        "ok": False,
+        "run_dir": run_dir,
+        "export_dir": os.path.join(run_dir, AUTO_COLLECT_LEROBOT_V3_DIRNAME) if run_dir else "",
+        "split": AUTO_COLLECT_LEROBOT_V3_SPLIT,
+        "started_at": started,
+        "finished_at": None,
+        "elapsed_ms": None,
+        "reason": "not_started",
+    }
+    try:
+        if not run_dir or not os.path.isdir(run_dir):
+            export_record["reason"] = "run_dir_missing"
+            return export_record
+        tool_path = project_path("excavator_dataset_tools.py")
+        if not os.path.isfile(tool_path):
+            export_record["reason"] = f"export_tool_missing:{tool_path}"
+            return export_record
+        spec = importlib.util.spec_from_file_location("excavator_dataset_tools_runtime_export", tool_path)
+        if spec is None or spec.loader is None:
+            export_record["reason"] = "export_tool_spec_unavailable"
+            return export_record
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        manifest = module.export_lerobot_dataset(
+            run_dir,
+            output_dir=export_record["export_dir"],
+            split=AUTO_COLLECT_LEROBOT_V3_SPLIT,
+            overwrite=True,
+            require_vla=False,
+        )
+        export_record["manifest"] = manifest
+        export_record["ok"] = bool(manifest.get("vla_training_ready", False)) if isinstance(manifest, dict) else False
+        export_record["reason"] = "ok" if export_record["ok"] else "export_incomplete"
+        return export_record
+    except Exception as exc:
+        export_record["reason"] = f"{type(exc).__name__}:{exc}"
+        export_record["traceback"] = traceback.format_exc(limit=8)
+        return export_record
+    finally:
+        export_record["finished_at"] = time.time()
+        export_record["elapsed_ms"] = round((float(export_record["finished_at"]) - started) * 1000.0, 1)
+        if result_path:
+            try:
+                write_json_file(result_path, export_record)
+            except Exception:
+                pass
+
+
+async def auto_collect_export_lerobot_v3_on_finish(run_dir):
+    run_dir = str(run_dir or "")
+    if not AUTO_COLLECT_EXPORT_LEROBOT_V3_ON_FINISH:
+        STATE["auto_collect_lerobot_v3_export"] = {
+            "enabled": False,
+            "ok": False,
+            "run_dir": run_dir,
+            "reason": "disabled",
+        }
+        return STATE["auto_collect_lerobot_v3_export"]
+    info_print(
+        "[LEROBOT V3 EXPORT]",
+        "start",
+        f"run_dir={run_dir}",
+        f"split={AUTO_COLLECT_LEROBOT_V3_SPLIT}",
+        f"dir={AUTO_COLLECT_LEROBOT_V3_DIRNAME}",
+    )
+    try:
+        if hasattr(asyncio, "to_thread"):
+            result = await asyncio.to_thread(auto_collect_export_lerobot_v3_sync, run_dir)
+        else:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, auto_collect_export_lerobot_v3_sync, run_dir)
+    except Exception as exc:
+        result = {
+            "enabled": True,
+            "ok": False,
+            "run_dir": run_dir,
+            "export_dir": os.path.join(run_dir, AUTO_COLLECT_LEROBOT_V3_DIRNAME) if run_dir else "",
+            "split": AUTO_COLLECT_LEROBOT_V3_SPLIT,
+            "reason": f"async_export_failed:{type(exc).__name__}:{exc}",
+            "traceback": traceback.format_exc(limit=8),
+        }
+    STATE["auto_collect_lerobot_v3_export"] = result
+    if bool(result.get("ok", False)):
+        info_print(
+            "[LEROBOT V3 EXPORT]",
+            "done",
+            f"export_dir={result.get('export_dir')}",
+            f"elapsed_ms={result.get('elapsed_ms')}",
+        )
+    else:
+        info_print(
+            "[WARN] [LEROBOT V3 EXPORT]",
+            "incomplete",
+            f"reason={result.get('reason')}",
+            f"export_dir={result.get('export_dir')}",
+        )
+    try:
+        auto_collect_write_run_summary()
+    except Exception as exc:
+        info_print("[WARN] [LEROBOT V3 EXPORT]", "summary_update_failed", type(exc).__name__, exc)
+    return result
 
 
 def auto_collect_episode_dir(attempt_index):
@@ -9992,6 +10114,7 @@ async def auto_collect_loop(count, max_attempts=None):
     STATE["auto_collect_planning_diagnostics"] = 0
     STATE["auto_collect_run_dir"] = ""
     STATE["auto_collect_run_id"] = ""
+    STATE["auto_collect_lerobot_v3_export"] = {}
     STATE["debug_timeline_path"] = ""
     STATE["auto_collect_sand_reset_done"] = False
     ensure_auto_collect_run_dir()
@@ -10071,6 +10194,13 @@ async def auto_collect_loop(count, max_attempts=None):
         STATE["auto_collect_episode_sand_snapshot_time"] = 0.0
         clear_planning_runtime_caches("auto_collect_loop_end")
         auto_collect_write_run_summary()
+        finished_run_dir = str(STATE.get("auto_collect_run_dir", "") or "")
+        if finished_run_dir:
+            register_async_task(
+                "lerobot_v3_export",
+                auto_collect_export_lerobot_v3_on_finish(finished_run_dir),
+                replace=True,
+            )
         update_status(auto_collect_status_text(), force=True)
 
 

@@ -1266,6 +1266,19 @@ def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Di
             reasons.append(f"{key}/shape_not_256")
         if "storage" in ft:
             reasons.append(f"{key}/storage_should_be_absent")
+    episodes_path = os.path.join(export_dir, "meta", "episodes", "chunk-000", "file-000.parquet")
+    if os.path.exists(episodes_path):
+        try:
+            import pandas as pd  # type: ignore
+
+            episodes_df = pd.read_parquet(episodes_path)
+            for key in image_keys:
+                for suffix in ["chunk_index", "file_index", "from_timestamp", "to_timestamp"]:
+                    column = f"videos/{key}/{suffix}"
+                    if column not in episodes_df.columns:
+                        reasons.append(f"episodes/missing_{column}")
+        except Exception as exc:
+            reasons.append(f"episodes/read_failed:{type(exc).__name__}:{exc}")
     return {
         "ok": not reasons,
         "reasons": reasons,
@@ -1527,6 +1540,8 @@ def export_lerobot_dataset(
         for key in LEROBOT_IMAGE_KEYS:
             meta_row[f"videos/{key}/chunk_index"] = 0
             meta_row[f"videos/{key}/file_index"] = 0
+            meta_row[f"videos/{key}/from_timestamp"] = float(start) / float(export_fps)
+            meta_row[f"videos/{key}/to_timestamp"] = float(end) / float(export_fps)
         episode_meta_rows.append(meta_row)
     episodes_path = os.path.join(episodes_dir, "file-000.parquet")
     episodes_df = pd.DataFrame(episode_meta_rows)

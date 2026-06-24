@@ -1711,6 +1711,26 @@ def set_prim_visibility(prim_or_path, visible):
         return False
 
 
+def set_dataset_camera_prims_invisible():
+    if not bool(STATE.get("dataset_camera_keep_invisible", True)):
+        return 0
+    hidden = 0
+    try:
+        specs = dataset_camera_specs()
+    except Exception:
+        specs = []
+    for spec in specs:
+        path = str(spec.get("path", "")) if isinstance(spec, dict) else ""
+        if not path:
+            continue
+        prim = get_prim(path)
+        if not is_camera_prim(prim):
+            continue
+        if set_prim_visibility(prim, False):
+            hidden += 1
+    return hidden
+
+
 def restore_excavator_control_visibility():
     paths = []
     if ROBOT_ROOT:

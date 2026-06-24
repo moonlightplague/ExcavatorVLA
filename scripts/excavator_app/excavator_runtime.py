@@ -281,9 +281,12 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_camera_init_attempted": False,
     "dataset_camera_last_error_time": 0.0,
     "dataset_camera_last_status": {},
-    "dataset_camera_resolution": [320, 240],
+    "dataset_camera_resolution": [256, 256],
     "dataset_camera_frequency": 10,
     "dataset_camera_sample_stride": 1,
+    "dataset_camera_png_compress_level": 9,
+    "dataset_camera_png_optimize": True,
+    "dataset_camera_retry_after_time": 0.0,
     "dataset_image_dir": "",
     "dataset_camera_frame_count": 0,
     "last_execution_failure_reason": "",
@@ -491,8 +494,8 @@ AUTO_COLLECT_TARGET_MAX_Z = 5.00
 AUTO_COLLECT_SCHEMA = "excavator_auto_state_action_v4"
 DATASET_TRAJECTORY_FORMAT = "compact_jsonl_v5"
 DATASET_CAMERA_SCHEMA = "excavator_camera_observation_v1"
-DATASET_CAMERA_NAMES = ["front", "bucket", "side"]
-DATASET_CAMERA_DEFAULT_RESOLUTION = [320, 240]
+DATASET_CAMERA_NAMES = ["camera", "cameraleft", "cameraright"]
+DATASET_CAMERA_DEFAULT_RESOLUTION = [256, 256]
 DATASET_DEBUG_PLAN_FILE = "plan_debug.json"
 DATASET_DEBUG_TIMELINE_FILE = "debug_timeline.jsonl"
 AUTO_COLLECT_MAX_ATTEMPT_MULTIPLIER = 5
@@ -4843,30 +4846,30 @@ def dataset_camera_specs():
     side_parent = f"{CONTROL_ROOT}/DatasetCameras" if CONTROL_ROOT else "/World/ControlRig/DatasetCameras"
     return [
         {
-            "name": "front",
-            "meaning": "front / cabin / scene camera image from the simulator",
+            "name": "camera",
+            "meaning": "main excavator camera image from the simulator",
             "parent": swing_parent,
-            "path": f"{swing_parent}/dataset_front_camera" if swing_parent else "",
+            "path": f"{swing_parent}/dataset_camera" if swing_parent else "",
             "translate": [1.5, 0.0, 1.2],
             "rotate_xyz_deg": [90.0, 0.0, -90.0],
             "focal_length": 18.0,
             "horizontal_aperture": 20.955,
         },
         {
-            "name": "bucket",
-            "meaning": "camera focused near bucket / digging area",
+            "name": "cameraleft",
+            "meaning": "left / bucket-focused camera image from the simulator",
             "parent": bucket_parent,
-            "path": f"{bucket_parent}/dataset_bucket_camera" if bucket_parent else "",
+            "path": f"{bucket_parent}/dataset_cameraleft" if bucket_parent else "",
             "translate": [0.35, 0.0, 0.35],
             "rotate_xyz_deg": [75.0, 0.0, -90.0],
             "focal_length": 16.0,
             "horizontal_aperture": 20.955,
         },
         {
-            "name": "side",
-            "meaning": "side-view or third-person camera",
+            "name": "cameraright",
+            "meaning": "right / third-person camera image from the simulator",
             "parent": side_parent,
-            "path": f"{side_parent}/side_camera",
+            "path": f"{side_parent}/dataset_cameraright",
             "translate": [-3.5, 8.5, 5.2],
             "rotate_xyz_deg": [62.0, 0.0, -155.0],
             "focal_length": 18.0,
@@ -4963,7 +4966,14 @@ def save_rgb_image(path, rgb):
     if rgb.dtype != np.uint8:
         rgb = np.clip(rgb, 0, 255).astype(np.uint8)
     if Image is not None and str(path).lower().endswith(".png"):
-        Image.fromarray(rgb).save(str(path))
+        compress_level = int(STATE.get("dataset_camera_png_compress_level", 9) or 9)
+        compress_level = max(0, min(9, compress_level))
+        Image.fromarray(np.ascontiguousarray(rgb[:, :, :3])).save(
+            str(path),
+            format="PNG",
+            optimize=bool(STATE.get("dataset_camera_png_optimize", True)),
+            compress_level=compress_level,
+        )
         return "png"
     with open(str(path), "wb") as f:
         h, w = int(rgb.shape[0]), int(rgb.shape[1])
@@ -4972,12 +4982,46 @@ def save_rgb_image(path, rgb):
     return "ppm"
 
 
+def dataset_camera_runtime_ready():
+    if not bool(STATE.get("running", False)):
+        return False, "runtime_not_running"
+    if not simulation_timeline_is_playing():
+        return False, "timeline_not_playing"
+    try:
+        ctx = omni.usd.get_context()
+        if ctx is None:
+            return False, "usd_context_missing"
+        stage_obj = ctx.get_stage()
+        if stage_obj is None:
+            return False, "stage_missing"
+        if hasattr(ctx, "get_stage_id"):
+            stage_id = ctx.get_stage_id()
+            try:
+                if int(stage_id) < 0:
+                    return False, f"stage_id_not_ready:{stage_id}"
+            except Exception:
+                pass
+    except Exception as exc:
+        return False, f"stage_not_ready:{type(exc).__name__}:{exc}"
+    return True, "ok"
+
+
 def dataset_camera_initialize(force=False):
     if not bool(STATE.get("dataset_camera_enabled", True)):
         STATE["dataset_camera_last_status"] = {"enabled": False, "reason": "disabled"}
         return False
     if not HAS_ISAAC_CAMERA or IsaacCamera is None:
         STATE["dataset_camera_last_status"] = {"enabled": True, "available": False, "reason": "isaac_camera_api_unavailable"}
+        return False
+    now = time.time()
+    retry_after = float(STATE.get("dataset_camera_retry_after_time", 0.0) or 0.0)
+    if not force and now < retry_after:
+        STATE["dataset_camera_last_status"] = {"enabled": True, "available": False, "reason": "camera_init_backoff"}
+        return False
+    ready, ready_reason = dataset_camera_runtime_ready()
+    if not ready:
+        STATE["dataset_camera_retry_after_time"] = now + 0.5
+        STATE["dataset_camera_last_status"] = {"enabled": True, "available": False, "reason": ready_reason}
         return False
     if bool(STATE.get("dataset_camera_initialized", False)) and not force:
         objects = STATE.get("dataset_camera_objects")
@@ -5014,6 +5058,7 @@ def dataset_camera_initialize(force=False):
             view_status.update({"available": True, "reason": "ok"})
         except Exception as exc:
             view_status.update({"available": False, "reason": f"{type(exc).__name__}:{exc}", "prim_path": path})
+            STATE["dataset_camera_retry_after_time"] = time.time() + 1.0
         status["views"][name] = view_status
 
     STATE["dataset_camera_objects"] = objects
@@ -5053,9 +5098,9 @@ def dataset_camera_episode_metadata():
 
 def dataset_capture_camera_observations(sample_index):
     payload = {
-        "observation.images.front": None,
-        "observation.images.bucket": None,
-        "observation.images.side": None,
+        "observation.images.camera": None,
+        "observation.images.cameraleft": None,
+        "observation.images.cameraright": None,
         "observation.camera": {
             "schema": DATASET_CAMERA_SCHEMA,
             "available": False,
@@ -5379,6 +5424,11 @@ def camera_config_snapshot():
         "frequency": int(STATE.get("dataset_camera_frequency", 10) or 10),
         "sample_stride": max(1, int(STATE.get("dataset_camera_sample_stride", 1) or 1)),
         "image_format": dataset_camera_image_extension(),
+        "png_compression": {
+            "compress_level": int(STATE.get("dataset_camera_png_compress_level", 9) or 9),
+            "optimize": bool(STATE.get("dataset_camera_png_optimize", True)),
+            "lossless": True,
+        },
         "views": dataset_camera_specs(),
         "pil_available": bool(Image is not None),
         "effort_available": False,
@@ -7523,9 +7573,9 @@ def ensure_auto_collect_run_dir():
             "phase_names": DATASET_PHASE_NAMES,
             "camera_observations": dataset_camera_episode_metadata(),
             "lerobot_schema_notes": {
-                "observation.images.front": "relative image path in each trajectory row; convert to torch.Tensor [3,H,W] during export",
-                "observation.images.bucket": "relative image path in each trajectory row; optional bucket-focused view",
-                "observation.images.side": "relative image path in each trajectory row; optional side/third-person view",
+                "observation.images.camera": "relative image path in each trajectory row; convert to torch.Tensor [3,H,W] during export",
+                "observation.images.cameraleft": "relative image path in each trajectory row; optional left / bucket-focused view",
+                "observation.images.cameraright": "relative image path in each trajectory row; optional right / third-person view",
                 "observation.state": DATASET_STATE_NAMES,
                 "observation.effort": "unavailable in this runtime unless articulation effort sensing is added",
                 "action": DATASET_ACTION_NAMES,
@@ -7534,15 +7584,15 @@ def ensure_auto_collect_run_dir():
             "trajectory_fields": {
                 "task": "natural language task string",
                 "observation.state": DATASET_STATE_NAMES,
-                "observation.images.front": "relative path to RGB image",
-                "observation.images.bucket": "relative path to RGB image",
-                "observation.images.side": "relative path to RGB image",
+                "observation.images.camera": "relative path to RGB image",
+                "observation.images.cameraleft": "relative path to RGB image",
+                "observation.images.cameraright": "relative path to RGB image",
                 "observation.camera": [
                     "schema",
                     "frame_index",
-                    "views.{front,bucket,side}.path",
-                    "views.{front,bucket,side}.shape",
-                    "views.{front,bucket,side}.pose",
+                    "views.{camera,cameraleft,cameraright}.path",
+                    "views.{camera,cameraleft,cameraright}.shape",
+                    "views.{camera,cameraleft,cameraright}.pose",
                 ],
                 "obs.state": DATASET_STATE_NAMES,
                 "obs.q": DOF_ORDER,
@@ -8556,7 +8606,6 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
     STATE["dataset_phase_metrics"] = {}
     if bool(STATE.get("dataset_camera_enabled", True)):
         os.makedirs(STATE["dataset_image_dir"], exist_ok=True)
-        dataset_camera_initialize(force=False)
     initial_ids = capture_initial_pile_particle_ids()
     STATE["dataset_episode_sample_start"] = int(STATE.get("dataset_samples", 0))
     STATE["dataset_recording"] = True
@@ -8644,9 +8693,9 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
         "trajectory_format": DATASET_TRAJECTORY_FORMAT,
         "camera_observations": dataset_camera_episode_metadata(),
         "lerobot_schema_notes": {
-            "observation.images.front": "relative image path; export loader should read as torch.Tensor [3,H,W]",
-            "observation.images.bucket": "relative image path; optional bucket-focused view",
-            "observation.images.side": "relative image path; optional side/third-person view",
+            "observation.images.camera": "relative image path; export loader should read as torch.Tensor [3,H,W]",
+            "observation.images.cameraleft": "relative image path; optional left / bucket-focused view",
+            "observation.images.cameraright": "relative image path; optional right / third-person view",
             "observation.state": DATASET_STATE_NAMES,
             "observation.effort": "unavailable in this runtime unless articulation effort sensing is added",
             "action": DATASET_ACTION_NAMES,
@@ -8686,9 +8735,9 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
         "trajectory_fields_added_v4": [
             "task",
             "observation.state",
-            "observation.images.front",
-            "observation.images.bucket",
-            "observation.images.side",
+            "observation.images.camera",
+            "observation.images.cameraleft",
+            "observation.images.cameraright",
             "observation.camera",
         ],
         "paths": {

@@ -44,9 +44,9 @@ excavator_auto_dataset/
       plan_debug.json
       score.json
       images/                          # 新 run 会有
-        front/
-        bucket/
-        side/
+        camera/
+        cameraleft/
+        cameraright/
 ```
 
 ### Index 文件含义
@@ -273,9 +273,9 @@ spill_from_pile
 ```text
 task
 observation.state
-observation.images.front
-observation.images.bucket
-observation.images.side
+observation.images.camera
+observation.images.cameraleft
+observation.images.cameraright
 observation.camera
 camera_config.json
 episode_xxxxxx/images/
@@ -310,9 +310,9 @@ sand: present
 env: present
 task: missing
 observation.state: missing
-observation.images.front: missing
-observation.images.bucket: missing
-observation.images.side: missing
+observation.images.camera: missing
+observation.images.cameraleft: missing
+observation.images.cameraright: missing
 observation.camera: missing
 ```
 
@@ -331,9 +331,9 @@ camera_schema: excavator_camera_observation_v1
 ```text
 task
 observation.state
-observation.images.front
-observation.images.bucket
-observation.images.side
+observation.images.camera
+observation.images.cameraleft
+observation.images.cameraright
 observation.camera
 ```
 
@@ -374,9 +374,9 @@ observation.camera
 
 ```json
 {
-  "observation.images.front": "images/front/000000.png",
-  "observation.images.bucket": "images/bucket/000000.png",
-  "observation.images.side": "images/side/000000.png"
+  "observation.images.camera": "images/camera/000000.png",
+  "observation.images.cameraleft": "images/cameraleft/000000.png",
+  "observation.images.cameraright": "images/cameraright/000000.png"
 }
 ```
 
@@ -389,9 +389,9 @@ observation.camera
 ### Camera views
 
 ```text
-front   front / cabin / scene camera
-bucket  bucket-focused camera
-side    side-view / third-person camera
+camera       main excavator camera
+cameraleft   left / bucket-focused camera
+cameraright  right / third-person camera
 ```
 
 ### `observation.camera`
@@ -404,11 +404,11 @@ side    side-view / third-person camera
   "available": true,
   "frame_index": 0,
   "image_format": "png",
-  "resolution": [320, 240],
+  "resolution": [256, 256],
   "views": {
-    "front": {
+    "camera": {
       "available": true,
-      "path": "images/front/000000.png",
+      "path": "images/camera/000000.png",
       "shape": [240, 320, 3],
       "dtype": "uint8",
       "format": "png",
@@ -506,10 +506,10 @@ for sample in read_jsonl(trajectory_path):
     action = sample["action"]
     task = sample.get("task", "Dig soil from the marked area and dump it into the target container.")
 
-    front_rel = sample.get("observation.images.front")
-    front_path = episode_dir / front_rel if front_rel else None
+    camera_rel = sample.get("observation.images.camera")
+    camera_path = episode_dir / camera_rel if camera_rel else None
 
-    print(sample["i"], sample["phase"], len(state), len(action), front_path)
+    print(sample["i"], sample["phase"], len(state), len(action), camera_path)
     break
 ```
 
@@ -529,10 +529,10 @@ def image_to_tensor(path):
     return x
 
 sample = next(read_jsonl(trajectory_path))
-front_rel = sample.get("observation.images.front")
+camera_rel = sample.get("observation.images.camera")
 
-if front_rel:
-    image = image_to_tensor(episode_dir / front_rel)
+if camera_rel:
+    image = image_to_tensor(episode_dir / camera_rel)
     print(image.shape)  # [3, H, W]
 ```
 
@@ -543,9 +543,9 @@ if front_rel:
 ```python
 lerobot_sample = {
     "observation.state": sample.get("observation.state") or sample.get("obs.state"),
-    "observation.images.front": front_tensor,
-    "observation.images.bucket": bucket_tensor,
-    "observation.images.side": side_tensor,
+    "observation.images.camera": camera_tensor,
+    "observation.images.cameraleft": cameraleft_tensor,
+    "observation.images.cameraright": cameraright_tensor,
     "action": sample["action"],
     "task": sample.get("task", episode_meta.get("task", "")),
 }
@@ -570,7 +570,70 @@ native_action_names = [
 ]
 ```
 
-## 7. 快速结论
+## 7. Clean Training Export Subfolder
+
+Raw auto-collection runs keep all debug files in place. Training-ready data should be
+generated into a separate subfolder:
+
+```text
+run_xxxxxxxx/
+  episode_000001/
+  episode_000002/
+  trainable_episodes.jsonl
+  summary.json
+  ...
+  lerobot_export/
+    manifest.json
+    README.md
+    meta/
+      info.json
+      tasks.jsonl
+      episodes.jsonl
+      episodes_stats.jsonl
+    data/
+      chunk-000/
+        file-000.parquet
+        file-000.jsonl
+    videos/
+      chunk-000/
+        observation.images.camera/
+          file-000.mp4
+        observation.images.cameraleft/
+          file-000.mp4
+        observation.images.cameraright/
+          file-000.mp4
+```
+
+Generate it with:
+
+```powershell
+python excavator_dataset_tools.py excavator_auto_dataset/run_xxxxxxxx --export-lerobot --export-overwrite
+```
+
+Use the newest run:
+
+```powershell
+python excavator_dataset_tools.py --latest --root excavator_auto_dataset --export-lerobot --export-overwrite
+```
+
+For a hard VLA-readiness check:
+
+```powershell
+python excavator_dataset_tools.py --latest --root excavator_auto_dataset --export-lerobot --export-overwrite --export-require-vla
+```
+
+Important status fields:
+
+- `manifest.json.standard_lerobot_ready`: parquet plus required video/image storage is available.
+- `manifest.json.state_action_ready`: state/action parquet is available.
+- `manifest.json.vla_training_ready`: image + state + action + task are available for VLA-style training.
+
+If `vla_training_ready=false`, do not send the folder to SmolVLA training yet. Usually this means
+the run is old and has no camera frames, or the local Python environment is missing `pyarrow` or
+a video encoder. The raw debug data remains untouched, so the export folder can be deleted and
+regenerated at any time.
+
+## 8. 快速结论
 
 旧数据：
 
@@ -584,8 +647,7 @@ native_action_names = [
 - 保留所有旧字段。
 - 新增 `task`。
 - 新增 `observation.state`。
-- 新增 front/bucket/side RGB image path。
+- 新增 camera/cameraleft/cameraright RGB image path。
 - 新增 camera metadata 和 pose。
 - 新增 `camera_config.json`。
 - effort 仍不可用，必须后续接入真实传感/仿真接口。
-

@@ -1,12 +1,15 @@
 import asyncio
+import copy
 import hashlib
 import importlib
 import importlib.util
 import json
 import math
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import numpy as np
@@ -296,11 +299,22 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_camera_sample_stride": 1,
     "dataset_camera_keep_invisible": True,
     "dataset_camera_last_hide_time": 0.0,
+    "dataset_camera_image_format": str(os.environ.get("EXCAVATOR_DATASET_CAMERA_FORMAT", "png") or "png").strip().lower(),
     "dataset_camera_png_compress_level": int(os.environ.get("EXCAVATOR_DATASET_CAMERA_PNG_COMPRESS", "3") or 3),
     "dataset_camera_png_optimize": str(os.environ.get("EXCAVATOR_DATASET_CAMERA_PNG_OPTIMIZE", "0") or "0").strip().lower()
     not in ("0", "false", "no", "off"),
     "dataset_camera_retry_after_time": 0.0,
     "dataset_image_dir": "",
+    "dataset_async_writer_enabled": str(os.environ.get("EXCAVATOR_DATASET_ASYNC_WRITER", "1") or "1").strip().lower()
+    not in ("0", "false", "no", "off"),
+    "dataset_async_writer_queue": None,
+    "dataset_async_writer_thread": None,
+    "dataset_async_writer_errors": [],
+    "dataset_async_writer_jobs_enqueued": 0,
+    "dataset_async_writer_jobs_done": 0,
+    "dataset_async_writer_sync_fallbacks": 0,
+    "dataset_async_writer_queue_max": int(os.environ.get("EXCAVATOR_DATASET_ASYNC_WRITER_QUEUE_MAX", "4096") or 4096),
+    "dataset_camera_episode_cache": {},
     "dataset_camera_frame_count": 0,
     "last_execution_failure_reason": "",
     "dataset_samples": 0,
@@ -345,6 +359,9 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "sand_snapshot_last": None,
     "bucket_load_fast_last_time": 0.0,
     "bucket_load_fast_last": None,
+    "bucket_load_spatial_hits": 0,
+    "bucket_load_spatial_misses": 0,
+    "bucket_load_spatial_fallbacks": 0,
     "auto_collect_episode_sand_snapshot": None,
     "auto_collect_episode_sand_snapshot_time": 0.0,
     "planning_sand_snapshot": None,
@@ -360,6 +377,13 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "path_obstacle_check_cache": {},
     "path_obstacle_check_cache_hits": 0,
     "path_obstacle_check_cache_misses": 0,
+    "predicted_segment_cache": {},
+    "predicted_segment_cache_hits": 0,
+    "predicted_segment_cache_misses": 0,
+    "dig_candidate_result_cache": {},
+    "dig_candidate_result_cache_hits": 0,
+    "dig_candidate_result_cache_misses": 0,
+    "rigid_obstacle_numpy_cache": None,
     "sand_site_stable_reset_done": False,
     "sand_site_reset_active": False,
     "sand_site_last_reset_label": "",
@@ -580,6 +604,16 @@ SAND_PARTICLE_MASS_DEFAULT = 0.535
 SAND_METRICS_INTERVAL = 0.45
 BUCKET_LOAD_FAST_AABB_MARGIN = 0.06
 BUCKET_LOAD_FAST_CACHE_INTERVAL = 0.02
+BUCKET_LOAD_SPATIAL_INDEX_ENABLED = str(os.environ.get("EXCAVATOR_BUCKET_LOAD_SPATIAL_INDEX", "1") or "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+BUCKET_LOAD_SPATIAL_GRID_RES_XY = int(os.environ.get("EXCAVATOR_BUCKET_LOAD_SPATIAL_GRID_XY", "48") or 48)
+BUCKET_LOAD_SPATIAL_GRID_RES_Z = int(os.environ.get("EXCAVATOR_BUCKET_LOAD_SPATIAL_GRID_Z", "24") or 24)
+BUCKET_LOAD_SPATIAL_MIN_PARTICLES = int(os.environ.get("EXCAVATOR_BUCKET_LOAD_SPATIAL_MIN_PARTICLES", "20000") or 20000)
+BUCKET_LOAD_SPATIAL_MAX_QUERY_CELLS = int(os.environ.get("EXCAVATOR_BUCKET_LOAD_SPATIAL_MAX_QUERY_CELLS", "4096") or 4096)
 SAND_SNAPSHOT_MAX_AGE = 0.35
 SAND_SNAPSHOT_GRID_RES = 64
 SAND_SNAPSHOT_GRID_MAX_RES = 96
@@ -5177,6 +5211,178 @@ def append_jsonl(path, data):
         f.write(json.dumps(json_sanitize(data), ensure_ascii=True) + "\n")
 
 
+def lru_cache_get(cache, key):
+    if not isinstance(cache, dict) or key is None:
+        return None
+    sentinel = object()
+    value = cache.pop(key, sentinel)
+    if value is sentinel:
+        return None
+    cache[key] = value
+    return value
+
+
+def lru_cache_put(cache, key, value, max_size):
+    if not isinstance(cache, dict) or key is None:
+        return
+    try:
+        max_size = max(1, int(max_size))
+    except Exception:
+        max_size = 2048
+    if key in cache:
+        try:
+            cache.pop(key)
+        except Exception:
+            pass
+    while len(cache) >= max_size:
+        try:
+            cache.pop(next(iter(cache)))
+        except Exception:
+            cache.clear()
+            break
+    cache[key] = value
+
+
+def dataset_async_writer_enabled():
+    return bool(STATE.get("dataset_async_writer_enabled", True))
+
+
+def dataset_writer_process_job(job):
+    kind = str(job.get("kind", "")) if isinstance(job, dict) else ""
+    if kind == "jsonl":
+        append_jsonl(job.get("path", ""), job.get("data"))
+        return
+    if kind == "image":
+        save_rgb_image(
+            job.get("path", ""),
+            job.get("rgb"),
+            ensure_dir=bool(job.get("ensure_dir", True)),
+        )
+        return
+    raise ValueError(f"unknown_dataset_writer_job:{kind}")
+
+
+def dataset_writer_loop(work_queue):
+    while True:
+        job = work_queue.get()
+        try:
+            if job is None or (isinstance(job, dict) and job.get("kind") == "stop"):
+                return
+            dataset_writer_process_job(job)
+            STATE["dataset_async_writer_jobs_done"] = int(STATE.get("dataset_async_writer_jobs_done", 0) or 0) + 1
+        except Exception as exc:
+            errors = STATE.get("dataset_async_writer_errors")
+            if not isinstance(errors, list):
+                errors = []
+            errors.append(
+                {
+                    "time": float(time.time()),
+                    "error": f"{type(exc).__name__}:{exc}",
+                    "kind": str(job.get("kind", "")) if isinstance(job, dict) else str(type(job).__name__),
+                    "path": str(job.get("path", "")) if isinstance(job, dict) else "",
+                }
+            )
+            STATE["dataset_async_writer_errors"] = errors[-32:]
+        finally:
+            try:
+                work_queue.task_done()
+            except Exception:
+                pass
+
+
+def dataset_writer_ensure():
+    if not dataset_async_writer_enabled():
+        return False
+    thread = STATE.get("dataset_async_writer_thread")
+    work_queue = STATE.get("dataset_async_writer_queue")
+    if thread is not None and getattr(thread, "is_alive", lambda: False)() and work_queue is not None:
+        return True
+    try:
+        max_queue = max(16, int(STATE.get("dataset_async_writer_queue_max", 4096) or 4096))
+        work_queue = queue.Queue(maxsize=max_queue)
+        thread = threading.Thread(
+            target=dataset_writer_loop,
+            args=(work_queue,),
+            name="excavator_dataset_writer",
+            daemon=True,
+        )
+        thread.start()
+        STATE["dataset_async_writer_queue"] = work_queue
+        STATE["dataset_async_writer_thread"] = thread
+        return True
+    except Exception as exc:
+        STATE["dataset_async_writer_errors"] = [
+            {
+                "time": float(time.time()),
+                "error": f"{type(exc).__name__}:{exc}",
+                "kind": "start",
+                "path": "",
+            }
+        ]
+        return False
+
+
+def dataset_writer_enqueue(job):
+    if not dataset_writer_ensure():
+        return False
+    work_queue = STATE.get("dataset_async_writer_queue")
+    if work_queue is None:
+        return False
+    try:
+        work_queue.put_nowait(job)
+        STATE["dataset_async_writer_jobs_enqueued"] = int(STATE.get("dataset_async_writer_jobs_enqueued", 0) or 0) + 1
+        return True
+    except queue.Full:
+        STATE["dataset_async_writer_sync_fallbacks"] = int(STATE.get("dataset_async_writer_sync_fallbacks", 0) or 0) + 1
+        return False
+    except Exception:
+        STATE["dataset_async_writer_sync_fallbacks"] = int(STATE.get("dataset_async_writer_sync_fallbacks", 0) or 0) + 1
+        return False
+
+
+def append_jsonl_dataset(path, data):
+    job = {"kind": "jsonl", "path": str(path), "data": data}
+    if dataset_writer_enqueue(job):
+        return
+    append_jsonl(path, data)
+
+
+def dataset_writer_flush(label=""):
+    work_queue = STATE.get("dataset_async_writer_queue")
+    if work_queue is not None:
+        try:
+            work_queue.join()
+        except Exception:
+            pass
+    errors = STATE.get("dataset_async_writer_errors")
+    if errors and str(label):
+        info_print(
+            "[WARN] [DATASET WRITER]",
+            f"flush={label}",
+            f"errors={len(errors)}",
+            f"last={errors[-1]}",
+        )
+
+
+def dataset_writer_shutdown(label="shutdown"):
+    work_queue = STATE.get("dataset_async_writer_queue")
+    thread = STATE.get("dataset_async_writer_thread")
+    if work_queue is not None:
+        try:
+            work_queue.put({"kind": "stop"})
+            work_queue.join()
+        except Exception:
+            pass
+    if thread is not None and getattr(thread, "is_alive", lambda: False)():
+        try:
+            thread.join(timeout=2.0)
+        except Exception:
+            pass
+    STATE["dataset_async_writer_queue"] = None
+    STATE["dataset_async_writer_thread"] = None
+    dataset_writer_flush(label)
+
+
 def ensure_xform_path(stage_obj, path):
     if stage_obj is None:
         return None
@@ -5195,6 +5401,9 @@ def ensure_xform_path(stage_obj, path):
 
 
 def dataset_camera_image_extension():
+    requested = str(STATE.get("dataset_camera_image_format", "png") or "png").strip().lower()
+    if requested in ("ppm", "raw", "raw_ppm"):
+        return "ppm"
     return "png" if Image is not None else "ppm"
 
 
@@ -5302,8 +5511,9 @@ def dataset_camera_world_pose(path):
 
 
 @debug_profiled("dataset_save_rgb_image", threshold_ms=2.0)
-def save_rgb_image(path, rgb):
-    ensure_parent_dir(path)
+def save_rgb_image(path, rgb, ensure_dir=True):
+    if ensure_dir:
+        ensure_parent_dir(path)
     rgb = np.asarray(rgb)
     if rgb.ndim == 3 and rgb.shape[-1] == 4:
         rgb = rgb[:, :, :3]
@@ -5462,6 +5672,66 @@ def dataset_camera_episode_metadata():
     return status
 
 
+def dataset_camera_episode_cache(reset=False):
+    episode_dir = str(STATE.get("dataset_episode_dir", "") or "")
+    image_dir = str(STATE.get("dataset_image_dir", "") or "")
+    extension = dataset_camera_image_extension()
+    resolution = dataset_camera_resolution()
+    key = (
+        episode_dir,
+        image_dir,
+        extension,
+        tuple(int(x) for x in resolution),
+        tuple(str(x) for x in DATASET_CAMERA_NAMES),
+    )
+    cache = STATE.get("dataset_camera_episode_cache")
+    if (
+        not reset
+        and isinstance(cache, dict)
+        and cache.get("key") == key
+        and isinstance(cache.get("views"), dict)
+    ):
+        return cache
+
+    specs = dataset_camera_specs()
+    spec_by_name = {str(item.get("name", "")): item for item in specs}
+    views = {}
+    if image_dir:
+        for name in DATASET_CAMERA_NAMES:
+            name = str(name)
+            abs_dir = os.path.join(image_dir, name)
+            try:
+                os.makedirs(abs_dir, exist_ok=True)
+            except Exception:
+                pass
+            rel_dir = ""
+            if episode_dir:
+                try:
+                    rel_dir = os.path.relpath(abs_dir, episode_dir).replace(os.sep, "/")
+                except Exception:
+                    rel_dir = f"images/{name}"
+            else:
+                rel_dir = f"images/{name}"
+            spec = spec_by_name.get(name, {})
+            views[name] = {
+                "name": name,
+                "spec": spec,
+                "prim_path": str(spec.get("path", "")),
+                "abs_dir": abs_dir,
+                "rel_dir": rel_dir,
+            }
+    cache = {
+        "key": key,
+        "episode_dir": episode_dir,
+        "image_dir": image_dir,
+        "extension": extension,
+        "resolution": resolution,
+        "views": views,
+    }
+    STATE["dataset_camera_episode_cache"] = cache
+    return cache
+
+
 @debug_profiled("dataset_capture_camera_observations", threshold_ms=5.0)
 def dataset_capture_camera_observations(sample_index):
     payload = {
@@ -5496,9 +5766,10 @@ def dataset_capture_camera_observations(sample_index):
     objects = STATE.get("dataset_camera_objects")
     if not isinstance(objects, dict):
         objects = {}
-    extension = dataset_camera_image_extension()
+    camera_cache = dataset_camera_episode_cache(reset=False)
+    extension = str(camera_cache.get("extension", dataset_camera_image_extension()))
     any_available = False
-    spec_by_name = {str(item.get("name", "")): item for item in dataset_camera_specs()}
+    view_cache = camera_cache.get("views", {}) if isinstance(camera_cache, dict) else {}
     for name in DATASET_CAMERA_NAMES:
         cam = objects.get(name)
         view_payload = {
@@ -5508,8 +5779,8 @@ def dataset_capture_camera_observations(sample_index):
             "shape": None,
             "dtype": None,
         }
-        spec = spec_by_name.get(str(name), {})
-        prim_path = str(spec.get("path", ""))
+        cached_view = view_cache.get(str(name), {}) if isinstance(view_cache, dict) else {}
+        prim_path = str(cached_view.get("prim_path", ""))
         view_payload["prim_path"] = prim_path
         view_payload["pose"] = dataset_camera_world_pose(prim_path)
         try:
@@ -5526,9 +5797,19 @@ def dataset_capture_camera_observations(sample_index):
                     if rgb.dtype != np.uint8:
                         rgb = np.clip(rgb, 0, 255).astype(np.uint8)
                     filename = f"{int(sample_index):06d}.{extension}"
-                    abs_path = os.path.join(image_dir, name, filename)
-                    fmt = save_rgb_image(abs_path, rgb)
-                    rel_path = os.path.relpath(abs_path, episode_dir).replace(os.sep, "/")
+                    abs_dir = str(cached_view.get("abs_dir", os.path.join(image_dir, name)))
+                    rel_dir = str(cached_view.get("rel_dir", f"images/{name}"))
+                    abs_path = os.path.join(abs_dir, filename)
+                    rel_path = f"{rel_dir}/{filename}".replace("\\", "/")
+                    fmt = extension
+                    image_job = {
+                        "kind": "image",
+                        "path": abs_path,
+                        "rgb": np.ascontiguousarray(rgb[:, :, :3]).copy(),
+                        "ensure_dir": False,
+                    }
+                    if not dataset_writer_enqueue(image_job):
+                        fmt = save_rgb_image(abs_path, rgb, ensure_dir=False)
                     payload[f"observation.images.{name}"] = rel_path
                     view_payload.update(
                         {
@@ -5796,11 +6077,17 @@ def camera_config_snapshot():
         "resolution": dataset_camera_resolution(),
         "frequency": int(STATE.get("dataset_camera_frequency", 10) or 10),
         "sample_stride": max(1, int(STATE.get("dataset_camera_sample_stride", 1) or 1)),
+        "requested_image_format": str(STATE.get("dataset_camera_image_format", "png") or "png"),
         "image_format": dataset_camera_image_extension(),
         "png_compression": {
             "compress_level": int(STATE.get("dataset_camera_png_compress_level", 3) or 3),
             "optimize": bool(STATE.get("dataset_camera_png_optimize", False)),
             "lossless": True,
+        },
+        "async_writer": {
+            "enabled": bool(STATE.get("dataset_async_writer_enabled", True)),
+            "queue_max": int(STATE.get("dataset_async_writer_queue_max", 4096) or 4096),
+            "content_unchanged": True,
         },
         "views": dataset_camera_specs(),
         "pil_available": bool(Image is not None),
@@ -5818,6 +6105,14 @@ def sand_config_snapshot():
         "sand_bucket_local_min": vec_list(SAND_BUCKET_LOCAL_MIN, 3),
         "sand_bucket_local_max": vec_list(SAND_BUCKET_LOCAL_MAX, 3),
         "sand_metrics_interval": SAND_METRICS_INTERVAL,
+        "bucket_load_spatial_index": {
+            "enabled": bool(BUCKET_LOAD_SPATIAL_INDEX_ENABLED),
+            "grid_xy": int(BUCKET_LOAD_SPATIAL_GRID_RES_XY),
+            "grid_z": int(BUCKET_LOAD_SPATIAL_GRID_RES_Z),
+            "min_particles": int(BUCKET_LOAD_SPATIAL_MIN_PARTICLES),
+            "max_query_cells": int(BUCKET_LOAD_SPATIAL_MAX_QUERY_CELLS),
+            "exact_bucket_local_filter": True,
+        },
     }
 
 
@@ -6677,6 +6972,98 @@ def bucket_local_box_world_aabb(expand=0.0):
     return np.min(arr, axis=0), np.max(arr, axis=0)
 
 
+def dataset_particle_snapshot(label="", build_bucket_index=False):
+    points = sand_particle_positions()
+    if points is None:
+        return {"available": False, "points": None, "label": str(label), "created_at": float(time.time())}
+    pts = np.ascontiguousarray(np.asarray(points, dtype=np.float32)[:, :3], dtype=np.float32)
+    snapshot = {
+        "available": True,
+        "points": pts,
+        "label": str(label),
+        "created_at": float(time.time()),
+        "bucket_spatial_index": None,
+    }
+    if build_bucket_index:
+        snapshot["bucket_spatial_index"] = build_bucket_particle_spatial_index(pts)
+    return snapshot
+
+
+def build_bucket_particle_spatial_index(points):
+    if not bool(BUCKET_LOAD_SPATIAL_INDEX_ENABLED):
+        return None
+    if points is None:
+        return None
+    pts = np.asarray(points, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] < 3 or len(pts) < int(BUCKET_LOAD_SPATIAL_MIN_PARTICLES):
+        return None
+    t0 = time.perf_counter()
+    pts = np.ascontiguousarray(pts[:, :3], dtype=np.float32)
+    try:
+        bbox_min = np.min(pts, axis=0).astype(np.float32) - np.array([0.02, 0.02, 0.02], dtype=np.float32)
+        bbox_max = np.max(pts, axis=0).astype(np.float32) + np.array([0.02, 0.02, 0.02], dtype=np.float32)
+        span = np.maximum(bbox_max - bbox_min, np.array([1.0e-4, 1.0e-4, 1.0e-4], dtype=np.float32))
+        rx = max(4, int(BUCKET_LOAD_SPATIAL_GRID_RES_XY))
+        ry = max(4, int(BUCKET_LOAD_SPATIAL_GRID_RES_XY))
+        rz = max(4, int(BUCKET_LOAD_SPATIAL_GRID_RES_Z))
+        ix = np.clip(np.floor((pts[:, 0] - bbox_min[0]) / span[0] * rx).astype(np.int32), 0, rx - 1)
+        iy = np.clip(np.floor((pts[:, 1] - bbox_min[1]) / span[1] * ry).astype(np.int32), 0, ry - 1)
+        iz = np.clip(np.floor((pts[:, 2] - bbox_min[2]) / span[2] * rz).astype(np.int32), 0, rz - 1)
+        flat = ix + iy * rx + iz * rx * ry
+        order = np.argsort(flat, kind="mergesort")
+        sorted_flat = flat[order]
+        unique, starts, counts = np.unique(sorted_flat, return_index=True, return_counts=True)
+        cell_slices = {int(cell): (int(start), int(start + count)) for cell, start, count in zip(unique, starts, counts)}
+        return {
+            "points": pts,
+            "bbox_min": bbox_min,
+            "bbox_max": bbox_max,
+            "span": span,
+            "res": (int(rx), int(ry), int(rz)),
+            "order": order,
+            "cell_slices": cell_slices,
+            "build_ms": float((time.perf_counter() - t0) * 1000.0),
+        }
+    except Exception:
+        return None
+
+
+def bucket_spatial_aabb_indices(index, aabb_min, aabb_max):
+    if not isinstance(index, dict) or aabb_min is None or aabb_max is None:
+        return None
+    try:
+        bbox_min = np.array(index["bbox_min"], dtype=np.float32).reshape(3)
+        span = np.array(index["span"], dtype=np.float32).reshape(3)
+        rx, ry, rz = [int(x) for x in index["res"]]
+        amin = np.array(aabb_min, dtype=np.float32).reshape(3)
+        amax = np.array(aabb_max, dtype=np.float32).reshape(3)
+        lo = np.minimum(amin, amax)
+        hi = np.maximum(amin, amax)
+        c0 = np.floor((lo - bbox_min) / np.maximum(span, 1.0e-6) * np.array([rx, ry, rz], dtype=np.float32)).astype(np.int32)
+        c1 = np.floor((hi - bbox_min) / np.maximum(span, 1.0e-6) * np.array([rx, ry, rz], dtype=np.float32)).astype(np.int32)
+        c0 = np.clip(c0, [0, 0, 0], [rx - 1, ry - 1, rz - 1])
+        c1 = np.clip(c1, [0, 0, 0], [rx - 1, ry - 1, rz - 1])
+        cell_count = int(c1[0] - c0[0] + 1) * int(c1[1] - c0[1] + 1) * int(c1[2] - c0[2] + 1)
+        if cell_count <= 0 or cell_count > int(BUCKET_LOAD_SPATIAL_MAX_QUERY_CELLS):
+            return None
+        chunks = []
+        order = index["order"]
+        cell_slices = index["cell_slices"]
+        for iz in range(int(c0[2]), int(c1[2]) + 1):
+            z_off = iz * rx * ry
+            for iy in range(int(c0[1]), int(c1[1]) + 1):
+                yz_off = z_off + iy * rx
+                for ix in range(int(c0[0]), int(c1[0]) + 1):
+                    sl = cell_slices.get(int(yz_off + ix))
+                    if sl is not None:
+                        chunks.append(order[sl[0] : sl[1]])
+        if not chunks:
+            return np.zeros(0, dtype=np.int64)
+        return np.concatenate(chunks).astype(np.int64, copy=False)
+    except Exception:
+        return None
+
+
 @debug_profiled("bucket_load_fast_current", threshold_ms=1.0)
 def bucket_load_fast_current(force=False, points=None):
     now = time.time()
@@ -6689,6 +7076,9 @@ def bucket_load_fast_current(force=False, points=None):
         return dict(STATE["bucket_load_fast_last"])
 
     t0 = time.perf_counter()
+    snapshot = points if isinstance(points, dict) else None
+    if isinstance(snapshot, dict):
+        points = snapshot.get("points")
     if points is None:
         points = sand_particle_positions()
     if points is None:
@@ -6725,16 +7115,38 @@ def bucket_load_fast_current(force=False, points=None):
         return dict(metrics)
     pts = np.ascontiguousarray(pts[:, :3], dtype=np.float32)
 
+    spatial_index = None
     aabb_min, aabb_max = bucket_local_box_world_aabb(expand=BUCKET_LOAD_FAST_AABB_MARGIN)
     if aabb_min is None or aabb_max is None:
         candidate_idx = np.arange(len(pts), dtype=np.int64)
         candidate_pts = pts
         source_detail = "full_projection_fallback"
     else:
-        candidate_mask = np.all(pts >= aabb_min.reshape(1, 3), axis=1) & np.all(pts <= aabb_max.reshape(1, 3), axis=1)
-        candidate_idx = np.nonzero(candidate_mask)[0].astype(np.int64, copy=False)
-        candidate_pts = pts[candidate_idx]
-        source_detail = "bucket_world_aabb"
+        if isinstance(snapshot, dict) and bool(BUCKET_LOAD_SPATIAL_INDEX_ENABLED):
+            spatial_index = snapshot.get("bucket_spatial_index")
+            if not isinstance(spatial_index, dict):
+                spatial_index = build_bucket_particle_spatial_index(pts)
+                snapshot["bucket_spatial_index"] = spatial_index
+        spatial_idx = bucket_spatial_aabb_indices(spatial_index, aabb_min, aabb_max) if isinstance(spatial_index, dict) else None
+        if spatial_idx is not None:
+            prefilter_pts = pts[spatial_idx]
+            candidate_mask = np.all(prefilter_pts >= aabb_min.reshape(1, 3), axis=1) & np.all(
+                prefilter_pts <= aabb_max.reshape(1, 3),
+                axis=1,
+            )
+            candidate_idx = spatial_idx[np.nonzero(candidate_mask)[0]].astype(np.int64, copy=False)
+            candidate_pts = pts[candidate_idx]
+            STATE["bucket_load_spatial_hits"] = int(STATE.get("bucket_load_spatial_hits", 0) or 0) + 1
+            source_detail = "bucket_spatial_grid_exact_aabb"
+        else:
+            candidate_mask = np.all(pts >= aabb_min.reshape(1, 3), axis=1) & np.all(pts <= aabb_max.reshape(1, 3), axis=1)
+            candidate_idx = np.nonzero(candidate_mask)[0].astype(np.int64, copy=False)
+            candidate_pts = pts[candidate_idx]
+            if isinstance(snapshot, dict) and bool(BUCKET_LOAD_SPATIAL_INDEX_ENABLED):
+                STATE["bucket_load_spatial_misses"] = int(STATE.get("bucket_load_spatial_misses", 0) or 0) + 1
+            else:
+                STATE["bucket_load_spatial_fallbacks"] = int(STATE.get("bucket_load_spatial_fallbacks", 0) or 0) + 1
+            source_detail = "bucket_world_aabb"
 
     if len(candidate_pts) == 0:
         mass = sand_particle_mass()
@@ -6780,13 +7192,17 @@ def bucket_load_fast_current(force=False, points=None):
     )
     bucket_idx = candidate_idx[np.nonzero(strict)[0]]
     bucket_count = int(len(bucket_idx))
-    ctx = task_scene_context()
-    _, _, _, _, z_min, z_expected_max = sand_pile_geometry_from_context(ctx)
-    pile_mask = sand_pile_xy_mask(pts, ctx) & (pts[:, 2] >= z_min) & (pts[:, 2] <= z_expected_max)
-    initial_mask = initial_pile_mask_for_points(pts, fallback_pile_mask=pile_mask)
+    initial_mask = initial_pile_mask_for_points(pts, fallback_pile_mask=None)
+    if not isinstance(initial_mask, np.ndarray) or len(initial_mask) != len(pts) or int(np.count_nonzero(initial_mask)) <= 0:
+        ctx = task_scene_context()
+        _, _, _, _, z_min, z_expected_max = sand_pile_geometry_from_context(ctx)
+        pile_mask = sand_pile_xy_mask(pts, ctx) & (pts[:, 2] >= z_min) & (pts[:, 2] <= z_expected_max)
+        initial_mask = initial_pile_mask_for_points(pts, fallback_pile_mask=pile_mask)
     raw_from_pile_bucket_count = int(np.count_nonzero(initial_mask[bucket_idx])) if bucket_count > 0 else 0
     source_tracking = "initial_mask"
     notes = [source_detail]
+    if isinstance(spatial_index, dict):
+        notes.append(f"spatial_build_ms={float(spatial_index.get('build_ms', 0.0) or 0.0):.3f}")
     from_pile_bucket_count = raw_from_pile_bucket_count
     if bucket_count >= int(SAND_SOURCE_FALLBACK_MIN_REGION_COUNT):
         ratio = float(raw_from_pile_bucket_count) / max(1.0, float(bucket_count))
@@ -8015,7 +8431,9 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False)
         action = dynamics["action"]
         joint_velocity = dynamics["dq_real"]
         joint_acceleration = dynamics["ddq_real"]
-        bucket_metrics = bucket_load_fast_current(force=True)
+        sample_index = int(STATE.get("dataset_samples", 0)) - int(STATE.get("dataset_episode_sample_start", 0))
+        particle_snapshot = dataset_particle_snapshot(label=f"sample:{sample_index}")
+        bucket_metrics = bucket_load_fast_current(force=True, points=particle_snapshot)
         update_episode_quality_trackers(bucket_metrics, phase, q_cmd=q_cmd, q_real=q_real, action=action)
         q_goal = STATE.get("dataset_current_q_goal")
         target = get_target_pos() if TARGET_PATH else None
@@ -8030,7 +8448,6 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False)
             else {}
         )
         constraint_flags = dataset_constraint_flags(cost_summary, contact_flags, phase_features) if debug_extra else []
-        sample_index = int(STATE.get("dataset_samples", 0)) - int(STATE.get("dataset_episode_sample_start", 0))
         obs_state = dataset_observation_state(q_real=q_real, bucket_load_metrics=bucket_metrics)
         effort_obs = dataset_joint_effort_observation()
         joint_force_obs = dataset_joint_force_torque_observation() if debug_extra else None
@@ -8090,10 +8507,10 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False)
         sample.update(dataset_capture_camera_observations(sample_index))
 
         path = str(STATE.get("dataset_path", "excavator_dataset.jsonl"))
-        append_jsonl(path, sample)
+        append_jsonl_dataset(path, sample)
         sand_path = str(STATE.get("dataset_sand_metrics_path", ""))
         if sand_path:
-            append_jsonl(
+            append_jsonl_dataset(
                 sand_path,
                 {
                     "episode_id": str(STATE.get("dataset_episode_uid", "")),
@@ -8446,6 +8863,35 @@ def auto_collect_write_run_summary():
             "sand_site_last_reset_label": STATE.get("sand_site_last_reset_label", ""),
             "auto_reset_sand_after_ui_ready": AUTO_RESET_SAND_AFTER_UI_READY,
             "perf_last": dict(STATE.get("sand_perf_last", {}) or {}),
+            "async_writer": {
+                "enabled": bool(STATE.get("dataset_async_writer_enabled", True)),
+                "jobs_enqueued": int(STATE.get("dataset_async_writer_jobs_enqueued", 0) or 0),
+                "jobs_done": int(STATE.get("dataset_async_writer_jobs_done", 0) or 0),
+                "sync_fallbacks": int(STATE.get("dataset_async_writer_sync_fallbacks", 0) or 0),
+                "errors": list(STATE.get("dataset_async_writer_errors", []) or [])[-8:],
+            },
+            "planning_cache": {
+                "path_penalty_entries": len(STATE.get("planning_path_penalty_cache", {}) or {}),
+                "path_obstacle_entries": len(STATE.get("path_obstacle_check_cache", {}) or {}),
+                "path_obstacle_hits": int(STATE.get("path_obstacle_check_cache_hits", 0) or 0),
+                "path_obstacle_misses": int(STATE.get("path_obstacle_check_cache_misses", 0) or 0),
+                "predicted_segment_entries": len(STATE.get("predicted_segment_cache", {}) or {}),
+                "predicted_segment_hits": int(STATE.get("predicted_segment_cache_hits", 0) or 0),
+                "predicted_segment_misses": int(STATE.get("predicted_segment_cache_misses", 0) or 0),
+                "dig_candidate_entries": len(STATE.get("dig_candidate_result_cache", {}) or {}),
+                "dig_candidate_hits": int(STATE.get("dig_candidate_result_cache_hits", 0) or 0),
+                "dig_candidate_misses": int(STATE.get("dig_candidate_result_cache_misses", 0) or 0),
+                "rigid_obstacle_cache_version": int(STATE.get("rigid_obstacle_cache_version", 0) or 0),
+                "rigid_obstacle_numpy_cached": isinstance(STATE.get("rigid_obstacle_numpy_cache"), dict),
+            },
+            "bucket_load_spatial": {
+                "enabled": bool(BUCKET_LOAD_SPATIAL_INDEX_ENABLED),
+                "hits": int(STATE.get("bucket_load_spatial_hits", 0) or 0),
+                "misses": int(STATE.get("bucket_load_spatial_misses", 0) or 0),
+                "fallbacks": int(STATE.get("bucket_load_spatial_fallbacks", 0) or 0),
+                "grid_xy": int(BUCKET_LOAD_SPATIAL_GRID_RES_XY),
+                "grid_z": int(BUCKET_LOAD_SPATIAL_GRID_RES_Z),
+            },
             "stage_timing_summary": dict(STATE.get("stage_timing_summary", {}) or {}),
             "stage_timing_recent": list(STATE.get("stage_timing_recent", []) or [])[-32:],
             "lerobot_v3_export": STATE.get("auto_collect_lerobot_v3_export", {}),
@@ -9561,6 +10007,8 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
     STATE["dataset_meta_path"] = os.path.join(episode_dir, "meta.json")
     STATE["dataset_sand_metrics_path"] = os.path.join(episode_dir, "sand_metrics.jsonl")
     STATE["dataset_image_dir"] = os.path.join(episode_dir, "images")
+    STATE["dataset_camera_episode_cache"] = {}
+    dataset_camera_episode_cache(reset=True)
     STATE["dataset_episode_start_time"] = time.time()
     STATE["dataset_episode_freezes"] = 0
     STATE["dataset_last_sample_time"] = 0.0
@@ -9775,6 +10223,7 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
 
 def auto_collect_finish_episode(meta, success, reason):
     now = time.time()
+    dataset_writer_flush("episode_finish")
     execution_success = bool(success)
     reason = str(reason)
     score_report = compute_episode_quality_score(execution_success, reason)
@@ -10996,6 +11445,7 @@ async def auto_collect_loop(count, max_attempts=None):
         STATE["auto_collect_episode_sand_snapshot"] = None
         STATE["auto_collect_episode_sand_snapshot_time"] = 0.0
         clear_planning_runtime_caches("auto_collect_loop_end")
+        dataset_writer_flush("auto_collect_loop_end")
         auto_collect_write_run_summary()
         finished_run_dir = str(STATE.get("auto_collect_run_dir", "") or "")
         if finished_run_dir:
@@ -11288,7 +11738,7 @@ def plan_path_penalty(q_start, q_goal, mode, deadline=None):
     cache_key = plan_path_penalty_cache_key(q_start, q_goal, mode)
     cache = STATE.setdefault("planning_path_penalty_cache", {})
     if bool(STATE.get("dig_plan_planning_active", False)) and cache_key is not None:
-        cached = cache.get(cache_key)
+        cached = lru_cache_get(cache, cache_key)
         if cached is not None:
             STATE["planning_path_penalty_cache_hits"] = int(STATE.get("planning_path_penalty_cache_hits", 0)) + 1
             return float(cached[0]), dict(cached[1])
@@ -11301,12 +11751,7 @@ def plan_path_penalty(q_start, q_goal, mode, deadline=None):
         and not planning_deadline_exceeded(deadline)
         and path_penalty_cacheable(detail)
     ):
-        if len(cache) >= int(PLANNING_PATH_PENALTY_CACHE_MAX):
-            try:
-                cache.pop(next(iter(cache)))
-            except Exception:
-                cache.clear()
-        cache[cache_key] = (float(penalty), dict(detail))
+        lru_cache_put(cache, cache_key, (float(penalty), dict(detail)), PLANNING_PATH_PENALTY_CACHE_MAX)
     return float(penalty), detail
 
 
@@ -11383,6 +11828,15 @@ def clear_planning_runtime_caches(reason=""):
     STATE["planning_path_penalty_cache"] = {}
     STATE["planning_path_penalty_cache_hits"] = 0
     STATE["planning_path_penalty_cache_misses"] = 0
+    STATE["path_obstacle_check_cache"] = {}
+    STATE["path_obstacle_check_cache_hits"] = 0
+    STATE["path_obstacle_check_cache_misses"] = 0
+    STATE["predicted_segment_cache"] = {}
+    STATE["predicted_segment_cache_hits"] = 0
+    STATE["predicted_segment_cache_misses"] = 0
+    STATE["dig_candidate_result_cache"] = {}
+    STATE["dig_candidate_result_cache_hits"] = 0
+    STATE["dig_candidate_result_cache_misses"] = 0
     STATE["planning_swing_corridor_cache"] = {}
     STATE["planning_swing_corridor_cache_hits"] = 0
     STATE["planning_swing_corridor_cache_misses"] = 0
@@ -14092,8 +14546,10 @@ AUTO_COLLECT_CANDIDATE_PLAN_SECONDS = 10.0
 AUTO_COLLECT_CANDIDATE_HARD_BUDGET_GRACE_SECONDS = 0.50
 AUTO_COLLECT_MAX_FULL_PLAN_ATTEMPTS = 2
 AUTO_COLLECT_PLANNING_SNAPSHOT_MAX_AGE = 6.0
-PLANNING_PATH_PENALTY_CACHE_MAX = 256
+PLANNING_PATH_PENALTY_CACHE_MAX = 2048
 PLANNING_SWING_CORRIDOR_CACHE_MAX = 128
+PREDICTED_SEGMENT_CACHE_MAX = 4096
+DIG_CANDIDATE_RESULT_CACHE_MAX = 128
 DIG_PLAN_MOTION_WEIGHTS = np.array([1.15, 1.0, 0.9, 0.7], dtype=np.float32)
 DIG_PLAN_ANGLE_COST_WEIGHT = 0.65
 DIG_PLAN_TIME_COST_WEIGHT = 0.35
@@ -14921,6 +15377,7 @@ def rigid_obstacle_bboxes(force=False):
     STATE["rigid_obstacle_cache"] = bboxes
     STATE["rigid_obstacle_cache_time"] = now
     STATE["rigid_obstacle_cache_version"] = int(STATE.get("rigid_obstacle_cache_version", 0) or 0) + 1
+    STATE["rigid_obstacle_numpy_cache"] = None
     STATE["path_obstacle_check_cache"] = {}
     return bboxes
 
@@ -14931,11 +15388,87 @@ def clear_rigid_obstacle_cache(reason=""):
     STATE["rigid_obstacle_cache_hits"] = 0
     STATE["rigid_obstacle_cache_misses"] = 0
     STATE["rigid_obstacle_cache_version"] = int(STATE.get("rigid_obstacle_cache_version", 0) or 0) + 1
+    STATE["rigid_obstacle_numpy_cache"] = None
     STATE["path_obstacle_check_cache"] = {}
     STATE["path_obstacle_check_cache_hits"] = 0
     STATE["path_obstacle_check_cache_misses"] = 0
+    STATE["predicted_segment_cache"] = {}
+    STATE["predicted_segment_cache_hits"] = 0
+    STATE["predicted_segment_cache_misses"] = 0
+    STATE["dig_candidate_result_cache"] = {}
+    STATE["dig_candidate_result_cache_hits"] = 0
+    STATE["dig_candidate_result_cache_misses"] = 0
     if reason:
         info_print("[OBSTACLE CACHE CLEAR]", f"reason={reason}")
+
+
+def rigid_obstacle_numpy_cache(obstacles=None):
+    obstacles = rigid_obstacle_bboxes() if obstacles is None else obstacles
+    version = int(STATE.get("rigid_obstacle_cache_version", 0) or 0)
+    cached = STATE.get("rigid_obstacle_numpy_cache")
+    if (
+        isinstance(cached, dict)
+        and int(cached.get("version", -1)) == version
+        and int(cached.get("obstacle_count", -1)) == len(obstacles or [])
+    ):
+        return cached
+    mins = []
+    maxs = []
+    indices = []
+    for idx, obstacle in enumerate(obstacles or []):
+        try:
+            mn = np.array(obstacle["min"], dtype=np.float32).reshape(-1)[:3]
+            mx = np.array(obstacle["max"], dtype=np.float32).reshape(-1)[:3]
+            if len(mn) < 3 or len(mx) < 3:
+                continue
+            mins.append(mn)
+            maxs.append(mx)
+            indices.append(int(idx))
+        except Exception:
+            continue
+    if mins:
+        min_arr = np.ascontiguousarray(np.vstack(mins), dtype=np.float32)
+        max_arr = np.ascontiguousarray(np.vstack(maxs), dtype=np.float32)
+        index_arr = np.array(indices, dtype=np.int32)
+    else:
+        min_arr = np.zeros((0, 3), dtype=np.float32)
+        max_arr = np.zeros((0, 3), dtype=np.float32)
+        index_arr = np.zeros(0, dtype=np.int32)
+    cached = {
+        "version": version,
+        "obstacle_count": len(obstacles or []),
+        "min": min_arr,
+        "max": max_arr,
+        "indices": index_arr,
+    }
+    STATE["rigid_obstacle_numpy_cache"] = cached
+    return cached
+
+
+def obstacle_aabb_candidate_indices(pa, pb, obstacle_np, margin_xy=0.0, margin_z=0.0, radius=0.0):
+    try:
+        mins = obstacle_np.get("min")
+        maxs = obstacle_np.get("max")
+        indices = obstacle_np.get("indices")
+        if mins is None or maxs is None or indices is None or len(indices) == 0:
+            return np.zeros(0, dtype=np.int32)
+        a = np.array(pa, dtype=np.float32).reshape(-1)[:3]
+        b = np.array(pb, dtype=np.float32).reshape(-1)[:3]
+        pad_xy = max(0.0, float(margin_xy) + float(radius))
+        pad_z = max(0.0, float(margin_z) + float(radius))
+        seg_min = np.minimum(a, b) - np.array([pad_xy, pad_xy, pad_z], dtype=np.float32)
+        seg_max = np.maximum(a, b) + np.array([pad_xy, pad_xy, pad_z], dtype=np.float32)
+        mask = (
+            (seg_max[0] >= mins[:, 0])
+            & (seg_min[0] <= maxs[:, 0])
+            & (seg_max[1] >= mins[:, 1])
+            & (seg_min[1] <= maxs[:, 1])
+            & (seg_max[2] >= mins[:, 2])
+            & (seg_min[2] <= maxs[:, 2])
+        )
+        return indices[mask]
+    except Exception:
+        return None
 
 
 def store_excavator_runtime_api():
@@ -15298,6 +15831,34 @@ def predicted_obstacle_check_segments(q, reference_q=None):
     return unique
 
 
+def predicted_segment_cache_key(q, reference_q=None):
+    try:
+        q_key = tuple(float(x) for x in np.round(np.array(q, dtype=np.float32).reshape(-1)[:4], 4))
+        if reference_q is None:
+            ref_key = None
+        else:
+            ref_key = tuple(float(x) for x in np.round(np.array(reference_q, dtype=np.float32).reshape(-1)[:4], 4))
+        ik_key = stable_json_hash(STATE.get("ik_calibration_report", {}) or {})
+        return (ik_key, q_key, ref_key)
+    except Exception:
+        return None
+
+
+def predicted_obstacle_check_segments_cached(q, reference_q=None):
+    key = predicted_segment_cache_key(q, reference_q=reference_q)
+    cache = STATE.setdefault("predicted_segment_cache", {})
+    if key is not None and isinstance(cache, dict):
+        cached = lru_cache_get(cache, key)
+        if cached is not None:
+            STATE["predicted_segment_cache_hits"] = int(STATE.get("predicted_segment_cache_hits", 0) or 0) + 1
+            return cached
+        STATE["predicted_segment_cache_misses"] = int(STATE.get("predicted_segment_cache_misses", 0) or 0) + 1
+    segments = predicted_obstacle_check_segments(q, reference_q=reference_q)
+    if key is not None and isinstance(cache, dict):
+        lru_cache_put(cache, key, segments, PREDICTED_SEGMENT_CACHE_MAX)
+    return segments
+
+
 def format_obstacle_report(mode, report, reason):
     point = report.get("point") if isinstance(report, dict) else None
     segment = report.get("segment") if isinstance(report, dict) else None
@@ -15451,7 +16012,7 @@ def path_obstacle_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadl
     cache_key = path_obstacle_check_cache_key(q_start, q_goal, mode, samples)
     cache = STATE.setdefault("path_obstacle_check_cache", {})
     if cache_key is not None and isinstance(cache, dict):
-        cached = cache.get(cache_key)
+        cached = lru_cache_get(cache, cache_key)
         if cached is not None:
             STATE["path_obstacle_check_cache_hits"] = int(STATE.get("path_obstacle_check_cache_hits", 0) or 0) + 1
             return cached
@@ -15459,38 +16020,36 @@ def path_obstacle_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadl
 
     def finish(result):
         if cache_key is not None and isinstance(cache, dict) and path_obstacle_result_cacheable(result):
-            if len(cache) >= int(PLANNING_PATH_PENALTY_CACHE_MAX):
-                try:
-                    cache.pop(next(iter(cache)))
-                except Exception:
-                    cache.clear()
-            cache[cache_key] = result
+            lru_cache_put(cache, cache_key, result, PLANNING_PATH_PENALTY_CACHE_MAX)
         return result
 
     try:
         if not obstacles:
             return finish((True, "ok", samples, None))
+        obstacle_np = rigid_obstacle_numpy_cache(obstacles)
 
         for i in range(1, samples + 1):
             if planning_deadline_exceeded(deadline):
                 return finish((False, "planning budget exceeded", i, None))
             s = float(i) / float(samples)
             q = interpolate_q_shortest(q_start, q_goal, s)
-            segments = predicted_obstacle_check_segments(q, reference_q=q_start)
+            segments = predicted_obstacle_check_segments_cached(q, reference_q=q_start)
             for link_name, pa, pb in segments:
-                for obstacle in obstacles:
+                candidate_indices = obstacle_aabb_candidate_indices(
+                    pa,
+                    pb,
+                    obstacle_np,
+                    margin_xy=PATH_OBSTACLE_MARGIN_XY,
+                    margin_z=PATH_OBSTACLE_MARGIN_Z,
+                    radius=PATH_LINK_COLLISION_RADIUS_M,
+                )
+                if candidate_indices is None:
+                    candidate_indices = range(len(obstacles))
+                for obstacle_index in candidate_indices:
+                    obstacle = obstacles[int(obstacle_index)]
                     if planning_deadline_exceeded(deadline):
                         return False, "planning budget exceeded", i, None
                     if unload_bin_wall_overpass_allowed(mode, obstacle, pa, pb):
-                        continue
-                    if not obstacle_aabb_overlaps_segment(
-                        pa,
-                        pb,
-                        obstacle,
-                        margin_xy=PATH_OBSTACLE_MARGIN_XY,
-                        margin_z=PATH_OBSTACLE_MARGIN_Z,
-                        radius=PATH_LINK_COLLISION_RADIUS_M,
-                    ):
                         continue
                     hit, hit_point = segment_intersects_obstacle_proxy(
                         pa,
@@ -15522,19 +16081,21 @@ def path_obstacle_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadl
             if not segments:
                 points = predicted_obstacle_check_points(q, reference_q=q_start)
                 for p in points:
-                    for obstacle in obstacles:
+                    candidate_indices = obstacle_aabb_candidate_indices(
+                        p,
+                        p,
+                        obstacle_np,
+                        margin_xy=PATH_OBSTACLE_MARGIN_XY,
+                        margin_z=PATH_OBSTACLE_MARGIN_Z,
+                        radius=0.0,
+                    )
+                    if candidate_indices is None:
+                        candidate_indices = range(len(obstacles))
+                    for obstacle_index in candidate_indices:
+                        obstacle = obstacles[int(obstacle_index)]
                         if planning_deadline_exceeded(deadline):
                             return finish((False, "planning budget exceeded", i, None))
                         if unload_bin_wall_overpass_allowed(mode, obstacle, p):
-                            continue
-                        if not obstacle_aabb_overlaps_segment(
-                            p,
-                            p,
-                            obstacle,
-                            margin_xy=PATH_OBSTACLE_MARGIN_XY,
-                            margin_z=PATH_OBSTACLE_MARGIN_Z,
-                            radius=0.0,
-                        ):
                             continue
                         if point_inside_obstacle_proxy(
                             p,
@@ -19947,6 +20508,77 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
     }
 
 
+def clone_candidate_plan_result(seq, points, detail):
+    seq_copy = []
+    for item in seq or []:
+        try:
+            label, q, duration = item
+            seq_copy.append((str(label), np.array(q, dtype=np.float32).copy(), float(duration)))
+        except Exception:
+            seq_copy.append(copy.deepcopy(item))
+    points_copy = []
+    for p in points or []:
+        try:
+            points_copy.append(np.array(p, dtype=np.float32).copy())
+        except Exception:
+            points_copy.append(copy.deepcopy(p))
+    return seq_copy, points_copy, copy.deepcopy(detail)
+
+
+def dig_candidate_result_cache_key(target_xyz, candidate):
+    try:
+        q_start = tuple(float(x) for x in np.round(np.array(CTRL.q_cmd, dtype=np.float32).reshape(-1)[:4], 4))
+        target_key = tuple(float(x) for x in np.round(np.array(target_xyz, dtype=np.float32).reshape(-1)[:3], 4))
+        candidate_hash = stable_json_hash(candidate)
+        ik_hash = stable_json_hash(STATE.get("ik_calibration_report", {}) or {})
+        unload_landing = vec_list(STATE.get("active_unload_landing_point"), 3)
+        unload_release = vec_list(STATE.get("active_unload_release_point"), 3)
+        return (
+            target_key,
+            candidate_hash,
+            q_start,
+            ik_hash,
+            int(STATE.get("rigid_obstacle_cache_version", 0) or 0),
+            tuple(unload_landing or []),
+            tuple(unload_release or []),
+            PLANNER_VERSION,
+        )
+    except Exception:
+        return None
+
+
+def dig_candidate_result_cache_get(target_xyz, candidate):
+    key = dig_candidate_result_cache_key(target_xyz, candidate)
+    cache = STATE.setdefault("dig_candidate_result_cache", {})
+    cached = lru_cache_get(cache, key) if key is not None else None
+    if cached is None:
+        STATE["dig_candidate_result_cache_misses"] = int(STATE.get("dig_candidate_result_cache_misses", 0) or 0) + 1
+        return None
+    STATE["dig_candidate_result_cache_hits"] = int(STATE.get("dig_candidate_result_cache_hits", 0) or 0) + 1
+    seq, points, detail = clone_candidate_plan_result(cached.get("seq"), cached.get("points"), cached.get("detail"))
+    if isinstance(detail, dict):
+        detail["candidate_result_cache_hit"] = True
+    return seq, points, detail
+
+
+def dig_candidate_result_cache_put(target_xyz, candidate, seq, points, detail):
+    if not seq or not isinstance(detail, dict) or not bool(detail.get("planned", False)):
+        return
+    key = dig_candidate_result_cache_key(target_xyz, candidate)
+    if key is None:
+        return
+    seq_copy, points_copy, detail_copy = clone_candidate_plan_result(seq, points, detail)
+    if isinstance(detail_copy, dict):
+        detail_copy["candidate_result_cache_hit"] = False
+    cache = STATE.setdefault("dig_candidate_result_cache", {})
+    lru_cache_put(
+        cache,
+        key,
+        {"seq": seq_copy, "points": points_copy, "detail": detail_copy},
+        DIG_CANDIDATE_RESULT_CACHE_MAX,
+    )
+
+
 def evaluate_dig_plan_candidate(seq, points, candidate, stages=None):
     if not seq:
         return -1.0e9, "no_sequence", []
@@ -22406,7 +23038,12 @@ def plan_dig_sequence_from_target(target_xyz, max_seconds=None):
                 )
                 break
             candidate_t0 = time.perf_counter()
-            seq, points, detail = plan_dig_sequence_candidate(target_xyz, candidate, deadline=deadline)
+            cached_result = dig_candidate_result_cache_get(target_xyz, candidate)
+            if cached_result is not None:
+                seq, points, detail = cached_result
+            else:
+                seq, points, detail = plan_dig_sequence_candidate(target_xyz, candidate, deadline=deadline)
+                dig_candidate_result_cache_put(target_xyz, candidate, seq, points, detail)
             candidate_ms = 1000.0 * max(0.0, time.perf_counter() - candidate_t0)
             perf_block_record(
                 f"plan_candidate:{candidate.get('id', 'candidate')}",

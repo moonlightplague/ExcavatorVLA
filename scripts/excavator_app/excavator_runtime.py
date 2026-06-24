@@ -33,6 +33,16 @@ except Exception:
 from isaacsim.core.api.world import World
 from isaacsim.core.prims import SingleArticulation
 from isaacsim.core.utils.types import ArticulationAction
+try:
+    from isaacsim.sensors.camera import Camera as IsaacCamera
+    HAS_ISAAC_CAMERA = True
+except Exception:
+    IsaacCamera = None
+    HAS_ISAAC_CAMERA = False
+try:
+    from PIL import Image
+except Exception:
+    Image = None
 
 from . import auto_dataset_collect
 from . import ik_calculation
@@ -265,6 +275,17 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_last_dq_real": None,
     "dataset_last_ddq_real": None,
     "dataset_current_q_goal": None,
+    "dataset_camera_enabled": True,
+    "dataset_camera_objects": {},
+    "dataset_camera_initialized": False,
+    "dataset_camera_init_attempted": False,
+    "dataset_camera_last_error_time": 0.0,
+    "dataset_camera_last_status": {},
+    "dataset_camera_resolution": [320, 240],
+    "dataset_camera_frequency": 10,
+    "dataset_camera_sample_stride": 1,
+    "dataset_image_dir": "",
+    "dataset_camera_frame_count": 0,
     "last_execution_failure_reason": "",
     "dataset_samples": 0,
     "dataset_last_error_time": 0.0,
@@ -467,8 +488,11 @@ AUTO_COLLECT_TARGET_RADIUS_Y = 0.82
 AUTO_COLLECT_TARGET_DEPTHS = [0.24, 0.32, 0.40, 0.46]
 AUTO_COLLECT_TARGET_MIN_Z = GROUND_TOP_Z + 0.04
 AUTO_COLLECT_TARGET_MAX_Z = 5.00
-AUTO_COLLECT_SCHEMA = "excavator_auto_state_action_v3"
-DATASET_TRAJECTORY_FORMAT = "compact_jsonl_v4"
+AUTO_COLLECT_SCHEMA = "excavator_auto_state_action_v4"
+DATASET_TRAJECTORY_FORMAT = "compact_jsonl_v5"
+DATASET_CAMERA_SCHEMA = "excavator_camera_observation_v1"
+DATASET_CAMERA_NAMES = ["front", "bucket", "side"]
+DATASET_CAMERA_DEFAULT_RESOLUTION = [320, 240]
 DATASET_DEBUG_PLAN_FILE = "plan_debug.json"
 DATASET_DEBUG_TIMELINE_FILE = "debug_timeline.jsonl"
 AUTO_COLLECT_MAX_ATTEMPT_MULTIPLIER = 5
@@ -4782,6 +4806,340 @@ def append_jsonl(path, data):
         f.write(json.dumps(json_sanitize(data), ensure_ascii=True) + "\n")
 
 
+def ensure_xform_path(stage_obj, path):
+    if stage_obj is None:
+        return None
+    path = str(path)
+    if not path or path == "/":
+        return None
+    parts = [part for part in path.split("/") if part]
+    current = ""
+    prim = None
+    for part in parts:
+        current += "/" + part
+        prim = stage_obj.GetPrimAtPath(current)
+        if not prim or not prim.IsValid():
+            prim = UsdGeom.Xform.Define(stage_obj, current).GetPrim()
+    return prim
+
+
+def dataset_camera_image_extension():
+    return "png" if Image is not None else "ppm"
+
+
+def dataset_camera_resolution():
+    value = STATE.get("dataset_camera_resolution", DATASET_CAMERA_DEFAULT_RESOLUTION)
+    try:
+        width = int(value[0])
+        height = int(value[1])
+    except Exception:
+        width, height = DATASET_CAMERA_DEFAULT_RESOLUTION
+    return [max(32, width), max(32, height)]
+
+
+def dataset_camera_specs():
+    swing_parent = LINK_PATHS.get("swing_link") or (f"{ROBOT_BASE}/swing_link" if ROBOT_BASE else "")
+    bucket_parent = LINK_PATHS.get("bucket_link") or BUCKET_LINK or (f"{ROBOT_BASE}/bucket_link" if ROBOT_BASE else "")
+    side_parent = f"{CONTROL_ROOT}/DatasetCameras" if CONTROL_ROOT else "/World/ControlRig/DatasetCameras"
+    return [
+        {
+            "name": "front",
+            "meaning": "front / cabin / scene camera image from the simulator",
+            "parent": swing_parent,
+            "path": f"{swing_parent}/dataset_front_camera" if swing_parent else "",
+            "translate": [1.5, 0.0, 1.2],
+            "rotate_xyz_deg": [90.0, 0.0, -90.0],
+            "focal_length": 18.0,
+            "horizontal_aperture": 20.955,
+        },
+        {
+            "name": "bucket",
+            "meaning": "camera focused near bucket / digging area",
+            "parent": bucket_parent,
+            "path": f"{bucket_parent}/dataset_bucket_camera" if bucket_parent else "",
+            "translate": [0.35, 0.0, 0.35],
+            "rotate_xyz_deg": [75.0, 0.0, -90.0],
+            "focal_length": 16.0,
+            "horizontal_aperture": 20.955,
+        },
+        {
+            "name": "side",
+            "meaning": "side-view or third-person camera",
+            "parent": side_parent,
+            "path": f"{side_parent}/side_camera",
+            "translate": [-3.5, 8.5, 5.2],
+            "rotate_xyz_deg": [62.0, 0.0, -155.0],
+            "focal_length": 18.0,
+            "horizontal_aperture": 20.955,
+            "world_space": True,
+        },
+    ]
+
+
+def set_dataset_camera_xform(camera_prim, translate, rotate_xyz_deg):
+    xform = UsdGeom.Xformable(camera_prim)
+    xform.ClearXformOpOrder()
+    xform.AddTranslateOp().Set(Gf.Vec3d(float(translate[0]), float(translate[1]), float(translate[2])))
+    xform.AddRotateXYZOp().Set(Gf.Vec3f(float(rotate_xyz_deg[0]), float(rotate_xyz_deg[1]), float(rotate_xyz_deg[2])))
+
+
+def ensure_dataset_camera_prim(stage_obj, spec):
+    path = str(spec.get("path", ""))
+    parent = str(spec.get("parent", ""))
+    if not path or not parent:
+        return None, "missing_camera_path_or_parent"
+    if bool(spec.get("world_space", False)):
+        ensure_xform_path(stage_obj, parent)
+    else:
+        parent_prim = stage_obj.GetPrimAtPath(parent)
+        if not parent_prim or not parent_prim.IsValid():
+            return None, f"missing_parent:{parent}"
+    camera = UsdGeom.Camera.Define(stage_obj, path)
+    prim = camera.GetPrim()
+    try:
+        camera.CreateFocalLengthAttr().Set(float(spec.get("focal_length", 18.0)))
+        camera.CreateHorizontalApertureAttr().Set(float(spec.get("horizontal_aperture", 20.955)))
+        camera.CreateClippingRangeAttr().Set(Gf.Vec2f(0.02, 1000.0))
+    except Exception:
+        pass
+    set_dataset_camera_xform(
+        prim,
+        spec.get("translate", [0.0, 0.0, 0.0]),
+        spec.get("rotate_xyz_deg", [0.0, 0.0, 0.0]),
+    )
+    return prim, "ok"
+
+
+def dataset_camera_prim_metadata(path):
+    prim = get_prim(path)
+    if not prim or not prim.IsValid():
+        return {"available": False, "prim_path": str(path)}
+    meta = {"available": True, "prim_path": str(path)}
+    try:
+        cam = UsdGeom.Camera(prim)
+        for key, attr_name in [
+            ("focal_length", "focalLength"),
+            ("horizontal_aperture", "horizontalAperture"),
+            ("vertical_aperture", "verticalAperture"),
+        ]:
+            attr = cam.GetPrim().GetAttribute(attr_name)
+            value = attr.Get() if attr else None
+            if value is not None:
+                meta[key] = float(value)
+        clip_attr = cam.GetPrim().GetAttribute("clippingRange")
+        clip = clip_attr.Get() if clip_attr else None
+        if clip is not None:
+            meta["clipping_range"] = [float(clip[0]), float(clip[1])]
+    except Exception as exc:
+        meta["metadata_error"] = f"{type(exc).__name__}:{exc}"
+    return meta
+
+
+def dataset_camera_world_pose(path):
+    prim = get_prim(path)
+    if not prim or not prim.IsValid():
+        return {"available": False, "prim_path": str(path)}
+    try:
+        mat = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+        translation = mat.ExtractTranslation()
+        rows = []
+        for r in range(4):
+            rows.append([float(mat[r][c]) for c in range(4)])
+        return {
+            "available": True,
+            "prim_path": str(path),
+            "position": [float(translation[0]), float(translation[1]), float(translation[2])],
+            "world_transform": rows,
+        }
+    except Exception as exc:
+        return {"available": False, "prim_path": str(path), "reason": f"{type(exc).__name__}:{exc}"}
+
+
+def save_rgb_image(path, rgb):
+    ensure_parent_dir(path)
+    rgb = np.asarray(rgb)
+    if rgb.ndim == 3 and rgb.shape[-1] == 4:
+        rgb = rgb[:, :, :3]
+    if rgb.dtype != np.uint8:
+        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+    if Image is not None and str(path).lower().endswith(".png"):
+        Image.fromarray(rgb).save(str(path))
+        return "png"
+    with open(str(path), "wb") as f:
+        h, w = int(rgb.shape[0]), int(rgb.shape[1])
+        f.write(f"P6\n{w} {h}\n255\n".encode("ascii"))
+        f.write(np.ascontiguousarray(rgb[:, :, :3]).tobytes())
+    return "ppm"
+
+
+def dataset_camera_initialize(force=False):
+    if not bool(STATE.get("dataset_camera_enabled", True)):
+        STATE["dataset_camera_last_status"] = {"enabled": False, "reason": "disabled"}
+        return False
+    if not HAS_ISAAC_CAMERA or IsaacCamera is None:
+        STATE["dataset_camera_last_status"] = {"enabled": True, "available": False, "reason": "isaac_camera_api_unavailable"}
+        return False
+    if bool(STATE.get("dataset_camera_initialized", False)) and not force:
+        objects = STATE.get("dataset_camera_objects")
+        if isinstance(objects, dict) and objects:
+            return True
+
+    stage_obj = omni.usd.get_context().get_stage()
+    resolution = dataset_camera_resolution()
+    frequency = int(STATE.get("dataset_camera_frequency", 10) or 10)
+    objects = {}
+    status = {
+        "enabled": True,
+        "schema": DATASET_CAMERA_SCHEMA,
+        "resolution": resolution,
+        "image_format": dataset_camera_image_extension(),
+        "views": {},
+    }
+    for spec in dataset_camera_specs():
+        name = str(spec.get("name", ""))
+        path = str(spec.get("path", ""))
+        view_status = dict(spec)
+        view_status.pop("translate", None)
+        view_status.pop("rotate_xyz_deg", None)
+        try:
+            prim, reason = ensure_dataset_camera_prim(stage_obj, spec)
+            if prim is None:
+                view_status.update({"available": False, "reason": reason})
+                status["views"][name] = view_status
+                continue
+            cam = IsaacCamera(prim_path=path, resolution=(int(resolution[0]), int(resolution[1])), frequency=frequency)
+            cam.initialize()
+            objects[name] = cam
+            view_status.update(dataset_camera_prim_metadata(path))
+            view_status.update({"available": True, "reason": "ok"})
+        except Exception as exc:
+            view_status.update({"available": False, "reason": f"{type(exc).__name__}:{exc}", "prim_path": path})
+        status["views"][name] = view_status
+
+    STATE["dataset_camera_objects"] = objects
+    STATE["dataset_camera_initialized"] = bool(objects)
+    STATE["dataset_camera_init_attempted"] = True
+    STATE["dataset_camera_last_status"] = status
+    if objects:
+        info_print(
+            "[DATASET CAMERA]",
+            f"views={list(objects.keys())}",
+            f"resolution={resolution}",
+            f"format={dataset_camera_image_extension()}",
+        )
+    else:
+        info_print("[WARN] [DATASET CAMERA] no usable camera views", status)
+    return bool(objects)
+
+
+def dataset_camera_episode_metadata():
+    status = STATE.get("dataset_camera_last_status")
+    if not isinstance(status, dict) or not status:
+        status = {
+            "enabled": bool(STATE.get("dataset_camera_enabled", True)),
+            "schema": DATASET_CAMERA_SCHEMA,
+            "resolution": dataset_camera_resolution(),
+            "image_format": dataset_camera_image_extension(),
+            "views": {},
+        }
+        for spec in dataset_camera_specs():
+            name = str(spec.get("name", ""))
+            path = str(spec.get("path", ""))
+            view = dict(spec)
+            view.update(dataset_camera_prim_metadata(path))
+            status["views"][name] = view
+    return status
+
+
+def dataset_capture_camera_observations(sample_index):
+    payload = {
+        "observation.images.front": None,
+        "observation.images.bucket": None,
+        "observation.images.side": None,
+        "observation.camera": {
+            "schema": DATASET_CAMERA_SCHEMA,
+            "available": False,
+            "frame_index": int(sample_index),
+            "views": {},
+        },
+    }
+    if not bool(STATE.get("dataset_camera_enabled", True)):
+        payload["observation.camera"]["reason"] = "disabled"
+        return payload
+    stride = max(1, int(STATE.get("dataset_camera_sample_stride", 1) or 1))
+    if int(sample_index) % stride != 0:
+        payload["observation.camera"]["reason"] = "stride_skipped"
+        return payload
+    if not dataset_camera_initialize(force=False):
+        status = STATE.get("dataset_camera_last_status", {})
+        payload["observation.camera"]["reason"] = status.get("reason", "camera_unavailable") if isinstance(status, dict) else "camera_unavailable"
+        return payload
+
+    episode_dir = str(STATE.get("dataset_episode_dir", "") or "")
+    image_dir = str(STATE.get("dataset_image_dir", "") or "")
+    if not episode_dir or not image_dir:
+        payload["observation.camera"]["reason"] = "missing_episode_image_dir"
+        return payload
+
+    objects = STATE.get("dataset_camera_objects")
+    if not isinstance(objects, dict):
+        objects = {}
+    extension = dataset_camera_image_extension()
+    any_available = False
+    for name in DATASET_CAMERA_NAMES:
+        cam = objects.get(name)
+        view_payload = {
+            "available": False,
+            "name": name,
+            "path": None,
+            "shape": None,
+            "dtype": None,
+        }
+        spec = next((item for item in dataset_camera_specs() if str(item.get("name", "")) == name), {})
+        prim_path = str(spec.get("path", ""))
+        view_payload["prim_path"] = prim_path
+        view_payload["pose"] = dataset_camera_world_pose(prim_path)
+        try:
+            if cam is None:
+                view_payload["reason"] = "camera_object_missing"
+            else:
+                rgb = cam.get_rgb()
+                if rgb is None:
+                    view_payload["reason"] = "rgb_none"
+                else:
+                    rgb = np.asarray(rgb)
+                    if rgb.ndim == 3 and rgb.shape[-1] == 4:
+                        rgb = rgb[:, :, :3]
+                    if rgb.dtype != np.uint8:
+                        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+                    filename = f"{int(sample_index):06d}.{extension}"
+                    abs_path = os.path.join(image_dir, name, filename)
+                    fmt = save_rgb_image(abs_path, rgb)
+                    rel_path = os.path.relpath(abs_path, episode_dir).replace(os.sep, "/")
+                    payload[f"observation.images.{name}"] = rel_path
+                    view_payload.update(
+                        {
+                            "available": True,
+                            "path": rel_path,
+                            "shape": [int(x) for x in rgb.shape],
+                            "dtype": str(rgb.dtype),
+                            "format": fmt,
+                        }
+                    )
+                    any_available = True
+        except Exception as exc:
+            view_payload["reason"] = f"{type(exc).__name__}:{exc}"
+            now = time.time()
+            if now - float(STATE.get("dataset_camera_last_error_time", 0.0)) > 2.0:
+                STATE["dataset_camera_last_error_time"] = now
+                info_print("[WARN] dataset camera capture failed:", name, type(exc).__name__, exc)
+        payload["observation.camera"]["views"][name] = view_payload
+    payload["observation.camera"]["available"] = any_available
+    payload["observation.camera"]["image_format"] = extension
+    payload["observation.camera"]["resolution"] = dataset_camera_resolution()
+    return payload
+
+
 def jsonl_line_count(path):
     try:
         with open(str(path), "r", encoding="utf-8") as f:
@@ -5008,6 +5366,22 @@ def auto_dataset_config_snapshot():
         "initial_pose_family": AUTO_COLLECT_INITIAL_POSES_DEG,
         "sand_reset_policy": AUTO_COLLECT_SAND_RESET_POLICY,
         "preflight_min_particles": AUTO_PREFLIGHT_MIN_PARTICLES,
+        "camera": camera_config_snapshot(),
+    }
+
+
+def camera_config_snapshot():
+    return {
+        "schema": DATASET_CAMERA_SCHEMA,
+        "enabled": bool(STATE.get("dataset_camera_enabled", True)),
+        "available": bool(HAS_ISAAC_CAMERA),
+        "resolution": dataset_camera_resolution(),
+        "frequency": int(STATE.get("dataset_camera_frequency", 10) or 10),
+        "sample_stride": max(1, int(STATE.get("dataset_camera_sample_stride", 1) or 1)),
+        "image_format": dataset_camera_image_extension(),
+        "views": dataset_camera_specs(),
+        "pil_available": bool(Image is not None),
+        "effort_available": False,
     }
 
 
@@ -5031,6 +5405,7 @@ def full_config_snapshot():
         "auto_dataset": auto_dataset_config_snapshot(),
         "planner": planner_config_snapshot(),
         "quality_gate": quality_gate_config_snapshot(),
+        "camera": camera_config_snapshot(),
     }
 
 
@@ -7008,18 +7383,21 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False)
         cost_summary = dataset_cost_summary(q_cmd, q_real, action, sand_metrics, rigid_clearance, dynamics=dynamics)
         constraint_flags = dataset_constraint_flags(cost_summary, contact_flags, phase_features)
         sample_index = int(STATE.get("dataset_samples", 0)) - int(STATE.get("dataset_episode_sample_start", 0))
+        obs_state = dataset_observation_state(q_real=q_real)
         sample = {
             "v": DATASET_TRAJECTORY_FORMAT,
             "ep": int(STATE.get("dataset_episode_id", 0)),
             "id": str(STATE.get("dataset_episode_uid", "")),
             "i": int(sample_index),
             "t": float(now) - float(STATE.get("dataset_episode_start_time", now)),
+            "task": str(STATE.get("dataset_task_text", "Dig soil from the marked area and dump it into the target container.")),
             "phase": str(phase),
             "phase.index": phase_features["index"],
             "phase.one_hot": phase_features["one_hot"],
             "phase.context": phase_features["context"],
             "label": str(label),
-            "obs.state": dataset_observation_state(q_real=q_real),
+            "observation.state": obs_state,
+            "obs.state": obs_state,
             "obs.q": vec_list(q_real, 4),
             "obs.dq": joint_velocity,
             "obs.ddq": joint_acceleration,
@@ -7038,6 +7416,7 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False)
             "cost": cost_summary,
             "label.flags": constraint_flags,
         }
+        sample.update(dataset_capture_camera_observations(sample_index))
 
         path = str(STATE.get("dataset_path", "excavator_dataset.jsonl"))
         append_jsonl(path, sample)
@@ -7128,6 +7507,7 @@ def ensure_auto_collect_run_dir():
     write_json_file(os.path.join(run_dir, "auto_dataset_config.json"), config_snapshot["auto_dataset"])
     write_json_file(os.path.join(run_dir, "planner_config.json"), config_snapshot["planner"])
     write_json_file(os.path.join(run_dir, "quality_gate_config.json"), config_snapshot["quality_gate"])
+    write_json_file(os.path.join(run_dir, "camera_config.json"), config_snapshot["camera"])
     write_json_file(
         os.path.join(run_dir, "run_meta.json"),
         {
@@ -7141,7 +7521,29 @@ def ensure_auto_collect_run_dir():
             "state_names": DATASET_STATE_NAMES,
             "action_names": DATASET_ACTION_NAMES,
             "phase_names": DATASET_PHASE_NAMES,
+            "camera_observations": dataset_camera_episode_metadata(),
+            "lerobot_schema_notes": {
+                "observation.images.front": "relative image path in each trajectory row; convert to torch.Tensor [3,H,W] during export",
+                "observation.images.bucket": "relative image path in each trajectory row; optional bucket-focused view",
+                "observation.images.side": "relative image path in each trajectory row; optional side/third-person view",
+                "observation.state": DATASET_STATE_NAMES,
+                "observation.effort": "unavailable in this runtime unless articulation effort sensing is added",
+                "action": DATASET_ACTION_NAMES,
+                "task": "episode-level and per-sample natural language task string",
+            },
             "trajectory_fields": {
+                "task": "natural language task string",
+                "observation.state": DATASET_STATE_NAMES,
+                "observation.images.front": "relative path to RGB image",
+                "observation.images.bucket": "relative path to RGB image",
+                "observation.images.side": "relative path to RGB image",
+                "observation.camera": [
+                    "schema",
+                    "frame_index",
+                    "views.{front,bucket,side}.path",
+                    "views.{front,bucket,side}.shape",
+                    "views.{front,bucket,side}.pose",
+                ],
                 "obs.state": DATASET_STATE_NAMES,
                 "obs.q": DOF_ORDER,
                 "obs.dq": DOF_ORDER,
@@ -7228,6 +7630,7 @@ def ensure_auto_collect_run_dir():
             "failed_index": "failed_episodes.jsonl",
             "diagnostic_index": "diagnostic_episodes.jsonl",
             "planning_diagnostics_index": "planning_diagnostics.jsonl",
+            "camera_config": "camera_config.json",
             "segment_indices": {
                 "dig": "segment_dig.jsonl",
                 "dig_secure": "segment_dig_secure.jsonl",
@@ -8125,6 +8528,7 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
     STATE["dataset_event_path"] = os.path.join(episode_dir, "events.jsonl")
     STATE["dataset_meta_path"] = os.path.join(episode_dir, "meta.json")
     STATE["dataset_sand_metrics_path"] = os.path.join(episode_dir, "sand_metrics.jsonl")
+    STATE["dataset_image_dir"] = os.path.join(episode_dir, "images")
     STATE["dataset_episode_start_time"] = time.time()
     STATE["dataset_episode_freezes"] = 0
     STATE["dataset_last_sample_time"] = 0.0
@@ -8134,6 +8538,8 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
     STATE["dataset_last_dq_real"] = None
     STATE["dataset_last_ddq_real"] = None
     STATE["dataset_current_q_goal"] = None
+    STATE["dataset_camera_frame_count"] = 0
+    STATE["dataset_task_text"] = "Dig soil from the marked area and dump it into the target container."
     STATE["last_execution_failure_reason"] = ""
     STATE["sand_metrics_last_time"] = 0.0
     STATE["sand_metrics_last"] = None
@@ -8148,6 +8554,9 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
     STATE["dataset_max_joint_error_deg"] = 0.0
     STATE["dataset_max_action_speed"] = 0.0
     STATE["dataset_phase_metrics"] = {}
+    if bool(STATE.get("dataset_camera_enabled", True)):
+        os.makedirs(STATE["dataset_image_dir"], exist_ok=True)
+        dataset_camera_initialize(force=False)
     initial_ids = capture_initial_pile_particle_ids()
     STATE["dataset_episode_sample_start"] = int(STATE.get("dataset_samples", 0))
     STATE["dataset_recording"] = True
@@ -8233,6 +8642,15 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
         "candidate_sampling_seed": candidate_sampling_seed,
         "task": "Dig soil from the marked area and dump it into the target container.",
         "trajectory_format": DATASET_TRAJECTORY_FORMAT,
+        "camera_observations": dataset_camera_episode_metadata(),
+        "lerobot_schema_notes": {
+            "observation.images.front": "relative image path; export loader should read as torch.Tensor [3,H,W]",
+            "observation.images.bucket": "relative image path; optional bucket-focused view",
+            "observation.images.side": "relative image path; optional side/third-person view",
+            "observation.state": DATASET_STATE_NAMES,
+            "observation.effort": "unavailable in this runtime unless articulation effort sensing is added",
+            "action": DATASET_ACTION_NAMES,
+        },
         "target_xyz": vec_list(target, 3),
         "unload_point_xyz": vec_list(unload_point, 3),
         "unload_landing_xyz": vec_list(unload_landing, 3),
@@ -8265,10 +8683,19 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
                 "obs.ddq",
                 "action.ddq",
             ],
+        "trajectory_fields_added_v4": [
+            "task",
+            "observation.state",
+            "observation.images.front",
+            "observation.images.bucket",
+            "observation.images.side",
+            "observation.camera",
+        ],
         "paths": {
             "trajectory": STATE["dataset_path"],
             "events": STATE["dataset_event_path"],
             "sand_metrics": STATE["dataset_sand_metrics_path"],
+            "images": STATE["dataset_image_dir"],
             "meta": STATE["dataset_meta_path"],
             "plan_debug": plan_debug_path,
             "debug_timeline": debug_timeline_path(create=False),

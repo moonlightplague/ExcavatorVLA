@@ -142,6 +142,8 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "trace_no_plan_notice_time": 0.0,
     "trace_no_plan_notice_shown": False,
     "excavator_render_mode": True,
+    "debug_visuals_visible": True,
+    "debug_visuals_last_hide_time": 0.0,
     "request_calibrate": False,
     "request_home": False,
     "request_print": False,
@@ -494,7 +496,7 @@ AUTO_COLLECT_TARGET_MAX_Z = 5.00
 AUTO_COLLECT_SCHEMA = "excavator_auto_state_action_v4"
 DATASET_TRAJECTORY_FORMAT = "compact_jsonl_v5"
 DATASET_CAMERA_SCHEMA = "excavator_camera_observation_v1"
-DATASET_CAMERA_NAMES = ["camera", "cameraleft", "cameraright"]
+DATASET_CAMERA_NAMES = ["0", "1", "2"]
 DATASET_CAMERA_DEFAULT_RESOLUTION = [256, 256]
 DATASET_DEBUG_PLAN_FILE = "plan_debug.json"
 DATASET_DEBUG_TIMELINE_FILE = "debug_timeline.jsonl"
@@ -1225,6 +1227,52 @@ def format_action_ready_detail(detail):
     )
 
 
+async def recover_articulation_action_channel(label="action_channel_recover"):
+    detail_before = articulation_action_ready_detail()
+    if bool(detail_before.get("ready", False)):
+        return True, "already_ready", detail_before
+
+    info_print("[ACTION CHANNEL RECOVER START]", f"label={label}", format_action_ready_detail(detail_before))
+    if not bool(detail_before.get("timeline_playing", False)):
+        ensure_timeline_playing(f"{label}_timeline")
+        await step_updates(12)
+
+    world = None
+    try:
+        world = World.instance()
+    except Exception:
+        world = None
+
+    if world is not None:
+        try:
+            await world.initialize_simulation_context_async()
+        except Exception as e:
+            info_print("[ACTION CHANNEL RECOVER]", f"label={label}", f"world_init={type(e).__name__}:{e}")
+        try:
+            await world.play_async()
+        except Exception as e:
+            info_print("[ACTION CHANNEL RECOVER]", f"label={label}", f"world_play={type(e).__name__}:{e}")
+
+    await step_updates(24)
+
+    if ROBOT is not None:
+        try:
+            ROBOT.initialize()
+        except Exception as e:
+            info_print("[ACTION CHANNEL RECOVER]", f"label={label}", f"robot_initialize={type(e).__name__}:{e}")
+
+    await step_updates(24)
+    detail_after = articulation_action_ready_detail()
+    ok = bool(detail_after.get("ready", False))
+    info_print(
+        "[ACTION CHANNEL RECOVER DONE]",
+        f"label={label}",
+        f"ok={ok}",
+        format_action_ready_detail(detail_after),
+    )
+    return ok, "ok" if ok else "still_not_ready", detail_after
+
+
 async def wait_for_articulation_action_ready(
     label="action",
     min_stable_frames=ACTION_READY_MIN_STABLE_FRAMES,
@@ -1652,6 +1700,71 @@ def apply_excavator_render_mode(render_on=None, force_status=True):
 
 def toggle_excavator_render_mode():
     return apply_excavator_render_mode(not bool(STATE.get("excavator_render_mode", False)))
+
+
+def debug_visuals_enabled():
+    return bool(STATE.get("debug_visuals_visible", True))
+
+
+def debug_visual_root_paths():
+    roots = []
+    control_roots = []
+    if CONTROL_ROOT:
+        control_roots.append(str(CONTROL_ROOT))
+    if "/World/ControlRig" not in control_roots:
+        control_roots.append("/World/ControlRig")
+    for root in control_roots:
+        roots.extend(
+            [
+                f"{root}/TracePath",
+                f"{root}/LoadedRouteDebug",
+                f"{root}/UnloadPointBall",
+                f"{root}/UnloadSelectedRangeBox",
+                f"{root}/UnloadSelectedRangeCylinder",
+            ]
+        )
+    for sand_root in ["/World/SandSite", "/SandSite"]:
+        roots.extend(
+            [
+                f"{sand_root}/SandGenerationRangeGuide",
+                f"{sand_root}/SandGenerationRangeColumn",
+                f"{sand_root}/SandGenerationRangeBox",
+            ]
+        )
+    out = []
+    for path in roots:
+        if path and path not in out:
+            out.append(path)
+    return out
+
+
+def apply_debug_visuals_visibility(visible=None, force_status=True):
+    if visible is None:
+        visible = bool(STATE.get("debug_visuals_visible", True))
+    visible = bool(visible)
+    STATE["debug_visuals_visible"] = visible
+    touched = 0
+    for path in debug_visual_root_paths():
+        if set_prim_visibility(path, visible):
+            touched += 1
+    if visible:
+        try:
+            show_trace_prims(current_trace_mode())
+        except Exception:
+            pass
+    else:
+        try:
+            hide_trace_prims()
+        except Exception:
+            pass
+    info_print("[DEBUG VISUALS]", f"visible={visible}", f"roots={touched}")
+    if force_status:
+        update_status(f"Calc Viz {'ON' if visible else 'OFF'}; roots={touched}", force=True)
+    return visible
+
+
+def toggle_debug_visuals_from_ui():
+    return apply_debug_visuals_visibility(not debug_visuals_enabled())
 
 
 def set_prim_attr(prim, name, value, type_name=None):
@@ -3034,11 +3147,15 @@ def ensure_unload_marker(point=None, label=""):
             f"path={UNLOAD_MARKER_PATH} pos={vec_list(p, 3)}"
         )
     ensure_unload_range_column(p, label=label)
+    set_prim_visibility(prim, debug_visuals_enabled())
     return prim
 
 
 def update_sphere_marker(path, point, radius, color):
     if point is None:
+        hide_debug_prim(path)
+        return None
+    if not debug_visuals_enabled():
         hide_debug_prim(path)
         return None
     p = np.array(point, dtype=np.float32).reshape(-1)[:3]
@@ -3074,6 +3191,9 @@ def hide_debug_prim(path):
 
 
 def update_debug_line(path, points, color, width=0.035):
+    if not debug_visuals_enabled():
+        hide_debug_prim(path)
+        return None
     pts = []
     for point in points or []:
         if point is None:
@@ -3147,8 +3267,12 @@ def draw_unload_dump_debug(
     if CONTROL_ROOT is None:
         return
     root = f"{CONTROL_ROOT}/LoadedRouteDebug"
+    if not debug_visuals_enabled():
+        hide_debug_prim(root)
+        return
     if not get_prim(root).IsValid():
         UsdGeom.Xform.Define(stage, root)
+    set_prim_visibility(root, True)
     ctx = None
     wall_z = None
     overpass_z = None
@@ -3360,6 +3484,7 @@ def ensure_unload_range_column(point=None, label=""):
                 f"visual_vertices={0 if poly is None else len(visual_polygon_xy(poly, UNLOAD_RANGE_VISUAL_MAX_VERTICES))} z_range=({z_min:.3f},{z_max:.3f}) height={height:.3f} "
                 f"mesh_shrink_d={manual_unload_mesh_shrink_d():.3f}"
             )
+        set_prim_visibility(prim, debug_visuals_enabled())
         return prim
 
     try:
@@ -3385,6 +3510,7 @@ def ensure_unload_range_column(point=None, label=""):
             f"[UNLOAD RANGE] {label}: "
             f"shape=circle path={cyl_path} center={vec_list(center, 3)} radius={radius:.3f} z_range=({z_min:.3f},{z_max:.3f}) height={height:.3f}"
         )
+    set_prim_visibility(prim, debug_visuals_enabled())
     return prim
 
 
@@ -4842,48 +4968,36 @@ def dataset_camera_resolution():
 
 def dataset_camera_specs():
     swing_parent = LINK_PATHS.get("swing_link") or (f"{ROBOT_BASE}/swing_link" if ROBOT_BASE else "")
-    bucket_parent = LINK_PATHS.get("bucket_link") or BUCKET_LINK or (f"{ROBOT_BASE}/bucket_link" if ROBOT_BASE else "")
-    side_parent = f"{CONTROL_ROOT}/DatasetCameras" if CONTROL_ROOT else "/World/ControlRig/DatasetCameras"
+    arm_parent = LINK_PATHS.get("arm_link") or (f"{ROBOT_BASE}/arm_link" if ROBOT_BASE else "")
     return [
         {
-            "name": "camera",
-            "meaning": "main excavator camera image from the simulator",
+            "name": "0",
+            "meaning": "arm-tip top-down camera",
+            "parent": arm_parent,
+            "path": f"{arm_parent}/Camera_0" if arm_parent else "",
+        },
+        {
+            "name": "1",
+            "meaning": "original main camera on swing",
             "parent": swing_parent,
-            "path": f"{swing_parent}/dataset_camera" if swing_parent else "",
-            "translate": [1.5, 0.0, 1.2],
-            "rotate_xyz_deg": [90.0, 0.0, -90.0],
-            "focal_length": 18.0,
-            "horizontal_aperture": 20.955,
+            "path": f"{swing_parent}/Camera_1" if swing_parent else "",
         },
         {
-            "name": "cameraleft",
-            "meaning": "left / bucket-focused camera image from the simulator",
-            "parent": bucket_parent,
-            "path": f"{bucket_parent}/dataset_cameraleft" if bucket_parent else "",
-            "translate": [0.35, 0.0, 0.35],
-            "rotate_xyz_deg": [75.0, 0.0, -90.0],
-            "focal_length": 16.0,
-            "horizontal_aperture": 20.955,
-        },
-        {
-            "name": "cameraright",
-            "meaning": "right / third-person camera image from the simulator",
-            "parent": side_parent,
-            "path": f"{side_parent}/dataset_cameraright",
-            "translate": [-3.5, 8.5, 5.2],
-            "rotate_xyz_deg": [62.0, 0.0, -155.0],
-            "focal_length": 18.0,
-            "horizontal_aperture": 20.955,
-            "world_space": True,
+            "name": "2",
+            "meaning": "swing-mounted overhead panorama camera",
+            "parent": swing_parent,
+            "path": f"{swing_parent}/Camera_2" if swing_parent else "",
         },
     ]
 
 
-def set_dataset_camera_xform(camera_prim, translate, rotate_xyz_deg):
-    xform = UsdGeom.Xformable(camera_prim)
-    xform.ClearXformOpOrder()
-    xform.AddTranslateOp().Set(Gf.Vec3d(float(translate[0]), float(translate[1]), float(translate[2])))
-    xform.AddRotateXYZOp().Set(Gf.Vec3f(float(rotate_xyz_deg[0]), float(rotate_xyz_deg[1]), float(rotate_xyz_deg[2])))
+def is_camera_prim(prim):
+    if not prim or not prim.IsValid():
+        return False
+    try:
+        return bool(prim.IsA(UsdGeom.Camera))
+    except Exception:
+        return str(prim.GetTypeName()) == "Camera"
 
 
 def ensure_dataset_camera_prim(stage_obj, spec):
@@ -4891,25 +5005,12 @@ def ensure_dataset_camera_prim(stage_obj, spec):
     parent = str(spec.get("parent", ""))
     if not path or not parent:
         return None, "missing_camera_path_or_parent"
-    if bool(spec.get("world_space", False)):
-        ensure_xform_path(stage_obj, parent)
-    else:
-        parent_prim = stage_obj.GetPrimAtPath(parent)
-        if not parent_prim or not parent_prim.IsValid():
-            return None, f"missing_parent:{parent}"
-    camera = UsdGeom.Camera.Define(stage_obj, path)
-    prim = camera.GetPrim()
-    try:
-        camera.CreateFocalLengthAttr().Set(float(spec.get("focal_length", 18.0)))
-        camera.CreateHorizontalApertureAttr().Set(float(spec.get("horizontal_aperture", 20.955)))
-        camera.CreateClippingRangeAttr().Set(Gf.Vec2f(0.02, 1000.0))
-    except Exception:
-        pass
-    set_dataset_camera_xform(
-        prim,
-        spec.get("translate", [0.0, 0.0, 0.0]),
-        spec.get("rotate_xyz_deg", [0.0, 0.0, 0.0]),
-    )
+    parent_prim = stage_obj.GetPrimAtPath(parent)
+    if not parent_prim or not parent_prim.IsValid():
+        return None, f"missing_parent:{parent}"
+    prim = stage_obj.GetPrimAtPath(path)
+    if not is_camera_prim(prim):
+        return None, f"configured_camera_missing:{path}"
     return prim, "ok"
 
 
@@ -5006,6 +5107,28 @@ def dataset_camera_runtime_ready():
     return True, "ok"
 
 
+def dataset_camera_shutdown(reason="shutdown"):
+    objects = STATE.get("dataset_camera_objects")
+    closed = 0
+    if isinstance(objects, dict):
+        for name, cam in list(objects.items()):
+            for method_name in ("destroy", "cleanup", "stop", "pause"):
+                method = getattr(cam, method_name, None)
+                if not callable(method):
+                    continue
+                try:
+                    method()
+                    closed += 1
+                    break
+                except Exception:
+                    continue
+    STATE["dataset_camera_objects"] = {}
+    STATE["dataset_camera_initialized"] = False
+    STATE["dataset_camera_init_attempted"] = False
+    STATE["dataset_camera_last_status"] = {"enabled": bool(STATE.get("dataset_camera_enabled", True)), "available": False, "reason": reason, "closed": closed}
+    return closed
+
+
 def dataset_camera_initialize(force=False):
     if not bool(STATE.get("dataset_camera_enabled", True)):
         STATE["dataset_camera_last_status"] = {"enabled": False, "reason": "disabled"}
@@ -5098,9 +5221,9 @@ def dataset_camera_episode_metadata():
 
 def dataset_capture_camera_observations(sample_index):
     payload = {
-        "observation.images.camera": None,
-        "observation.images.cameraleft": None,
-        "observation.images.cameraright": None,
+        "observation.images.0": None,
+        "observation.images.1": None,
+        "observation.images.2": None,
         "observation.camera": {
             "schema": DATASET_CAMERA_SCHEMA,
             "available": False,
@@ -7573,9 +7696,9 @@ def ensure_auto_collect_run_dir():
             "phase_names": DATASET_PHASE_NAMES,
             "camera_observations": dataset_camera_episode_metadata(),
             "lerobot_schema_notes": {
-                "observation.images.camera": "relative image path in each trajectory row; convert to torch.Tensor [3,H,W] during export",
-                "observation.images.cameraleft": "relative image path in each trajectory row; optional left / bucket-focused view",
-                "observation.images.cameraright": "relative image path in each trajectory row; optional right / third-person view",
+                "observation.images.0": "relative image path in each trajectory row; arm-tip top-down view, convert to torch.Tensor [3,H,W] during export",
+                "observation.images.1": "relative image path in each trajectory row; original main swing-mounted view",
+                "observation.images.2": "relative image path in each trajectory row; swing-mounted overhead panorama view",
                 "observation.state": DATASET_STATE_NAMES,
                 "observation.effort": "unavailable in this runtime unless articulation effort sensing is added",
                 "action": DATASET_ACTION_NAMES,
@@ -7584,15 +7707,15 @@ def ensure_auto_collect_run_dir():
             "trajectory_fields": {
                 "task": "natural language task string",
                 "observation.state": DATASET_STATE_NAMES,
-                "observation.images.camera": "relative path to RGB image",
-                "observation.images.cameraleft": "relative path to RGB image",
-                "observation.images.cameraright": "relative path to RGB image",
+                "observation.images.0": "relative path to RGB image",
+                "observation.images.1": "relative path to RGB image",
+                "observation.images.2": "relative path to RGB image",
                 "observation.camera": [
                     "schema",
                     "frame_index",
-                    "views.{camera,cameraleft,cameraright}.path",
-                    "views.{camera,cameraleft,cameraright}.shape",
-                    "views.{camera,cameraleft,cameraright}.pose",
+                    "views.{0,1,2}.path",
+                    "views.{0,1,2}.shape",
+                    "views.{0,1,2}.pose",
                 ],
                 "obs.state": DATASET_STATE_NAMES,
                 "obs.q": DOF_ORDER,
@@ -8693,9 +8816,9 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
         "trajectory_format": DATASET_TRAJECTORY_FORMAT,
         "camera_observations": dataset_camera_episode_metadata(),
         "lerobot_schema_notes": {
-            "observation.images.camera": "relative image path; export loader should read as torch.Tensor [3,H,W]",
-            "observation.images.cameraleft": "relative image path; optional left / bucket-focused view",
-            "observation.images.cameraright": "relative image path; optional right / third-person view",
+            "observation.images.0": "relative image path; arm-tip top-down view, export loader should read as torch.Tensor [3,H,W]",
+            "observation.images.1": "relative image path; original main swing-mounted view",
+            "observation.images.2": "relative image path; swing-mounted overhead panorama view",
             "observation.state": DATASET_STATE_NAMES,
             "observation.effort": "unavailable in this runtime unless articulation effort sensing is added",
             "action": DATASET_ACTION_NAMES,
@@ -8735,9 +8858,9 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
         "trajectory_fields_added_v4": [
             "task",
             "observation.state",
-            "observation.images.camera",
-            "observation.images.cameraleft",
-            "observation.images.cameraright",
+            "observation.images.0",
+            "observation.images.1",
+            "observation.images.2",
             "observation.camera",
         ],
         "paths": {
@@ -9417,11 +9540,28 @@ async def auto_collect_prepare_environment():
         max_frames=ACTION_READY_MAX_WAIT_FRAMES,
         record_failure=False,
     )
+    recovery_detail = None
+    if not action_ready:
+        recovered, recovery_reason, recovery_detail = await recover_articulation_action_channel(
+            "auto_collect_prepare_action_channel"
+        )
+        action_ready, action_reason, action_detail = await wait_for_articulation_action_ready(
+            "auto_collect_prepare_action_channel_after_recover",
+            min_stable_frames=ACTION_READY_MIN_STABLE_FRAMES,
+            max_frames=ACTION_READY_MAX_WAIT_FRAMES,
+            record_failure=False,
+        )
+        if not action_ready and recovery_reason:
+            action_reason = f"{action_reason}; recovery={recovery_reason}"
     record_gate(
         "action_channel",
         action_ready,
         "ok" if action_ready else "prepare_failed/action_channel_not_ready",
-        detail={"reason": action_reason, "action_detail": action_detail},
+        detail={
+            "reason": action_reason,
+            "action_detail": action_detail,
+            "recovery_detail": recovery_detail,
+        },
     )
     if not action_ready:
         return fail_prepare(
@@ -12153,6 +12293,7 @@ def ensure_trace_prims():
 
 
 def set_trace_visibility(paths, visible):
+    visible = bool(visible) and debug_visuals_enabled()
     token = UsdGeom.Tokens.inherited if visible else UsdGeom.Tokens.invisible
     for p in paths:
         if p is None:
@@ -12181,6 +12322,9 @@ def hide_trace_prims():
 
 
 def show_trace_prims(mode=None):
+    if not debug_visuals_enabled():
+        hide_trace_prims()
+        return
     mode = current_trace_mode() if mode is None else int(mode)
     if mode == 1:
         set_trace_visibility([TRACE_CURVE_PATH, TRACE_BUCKET_PATH, TRACE_TARGET_PATH], True)
@@ -12361,6 +12505,9 @@ def trace_points_signature(trace_points):
 
 
 def draw_trace(force=False):
+    if not debug_visuals_enabled():
+        hide_trace_prims()
+        return
     mode = current_trace_mode()
     if mode == 0:
         hide_trace_prims()
@@ -24253,6 +24400,9 @@ def build_ui():
     def toggle_render_mode_from_ui():
         toggle_excavator_render_mode()
 
+    def toggle_calc_viz_from_ui():
+        toggle_debug_visuals_from_ui()
+
     def set_log_normal_from_ui():
         set_log_mode("normal")
 
@@ -24427,6 +24577,7 @@ def build_ui():
                         ui.Button("Home", width=82, clicked_fn=home)
                         ui.Button("Print State", width=104, clicked_fn=print_state)
                         ui.Button("Render Mode", width=112, clicked_fn=toggle_render_mode_from_ui)
+                        ui.Button("Calc Viz", width=92, clicked_fn=toggle_calc_viz_from_ui)
 
                     ui.Separator()
                     ui.Label("Auto Dataset (primary pipeline)")
@@ -24735,6 +24886,12 @@ async def main():
         if current_trace_mode() != 0:
             draw_trace(force=False)
 
+        if not debug_visuals_enabled():
+            now = time.time()
+            if now - float(STATE.get("debug_visuals_last_hide_time", 0.0) or 0.0) > 0.5:
+                STATE["debug_visuals_last_hide_time"] = now
+                apply_debug_visuals_visibility(False, force_status=False)
+
         check_freeze_state("main_loop")
 
         await step_updates(max(1, int(60 / CONTROL_HZ)))
@@ -24742,6 +24899,7 @@ async def main():
     STATE["follow"] = False
     STATE["manual_joint_active"] = False
     STATE["manual_joint_target"] = None
+    dataset_camera_shutdown("main_loop_exit")
     STATE["robot_state_reads_enabled"] = False
     STATE["robot_state_shutdown"] = True
     cancel_registered_tasks(reason="main_loop_exit", keep={"main_loop"})

@@ -28,14 +28,14 @@ SEGMENT_FILES = {
 
 LEROBOT_EXPORT_SCHEMA = "excavator_lerobot_export_v1"
 LEROBOT_IMAGE_KEYS = [
-    "observation.images.camera",
-    "observation.images.cameraleft",
-    "observation.images.cameraright",
+    "observation.images.0",
+    "observation.images.1",
+    "observation.images.2",
 ]
 LEROBOT_IMAGE_KEY_ALIASES = {
-    "observation.images.camera": ["observation.images.camera", "observation.images.front"],
-    "observation.images.cameraleft": ["observation.images.cameraleft", "observation.images.bucket"],
-    "observation.images.cameraright": ["observation.images.cameraright", "observation.images.side"],
+    "observation.images.0": ["observation.images.0", "observation.images.camera", "observation.images.front"],
+    "observation.images.1": ["observation.images.1", "observation.images.cameraleft", "observation.images.bucket"],
+    "observation.images.2": ["observation.images.2", "observation.images.cameraright", "observation.images.side"],
 }
 
 
@@ -336,9 +336,9 @@ def inspect_trajectory_schema(run_dir: Union[str, os.PathLike], max_episodes: in
                         "has_action": "action" in sample,
                         "has_task": "task" in sample,
                         "images": {
-                            "camera": sample_image_value(sample, "observation.images.camera"),
-                            "cameraleft": sample_image_value(sample, "observation.images.cameraleft"),
-                            "cameraright": sample_image_value(sample, "observation.images.cameraright"),
+                            "0": sample_image_value(sample, "observation.images.0"),
+                            "1": sample_image_value(sample, "observation.images.1"),
+                            "2": sample_image_value(sample, "observation.images.2"),
                         },
                     }
                 )
@@ -349,9 +349,9 @@ def inspect_trajectory_schema(run_dir: Union[str, os.PathLike], max_episodes: in
         "action",
         "sand",
         "env",
-        "observation.images.camera",
-        "observation.images.cameraleft",
-        "observation.images.cameraright",
+        "observation.images.0",
+        "observation.images.1",
+        "observation.images.2",
         "observation.camera",
     ]
     required_present = {key: field_counter.get(key, 0) > 0 for key in required}
@@ -902,9 +902,9 @@ def trajectory_columns(trajectory: List[dict]) -> Dict[str, list]:
         "phase": [],
         "task": [],
         "observation.state": [],
-        "observation.images.camera": [],
-        "observation.images.cameraleft": [],
-        "observation.images.cameraright": [],
+        "observation.images.0": [],
+        "observation.images.1": [],
+        "observation.images.2": [],
         "observation.camera": [],
         "obs.state": [],
         "obs.q": [],

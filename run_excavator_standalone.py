@@ -25,15 +25,16 @@ PROJECT_DIR = SCRIPT_DIR
 SCENE_USD_PATH = os.path.join(PROJECT_DIR, "assets/usd/excavator_scene.usd")
 ROBOT_PRIM_PATH = "/World/URDF_real3"
 
-# Use the existing working camera prim in the USD scene.
-# Do NOT use /front_camera here unless you really created that camera yourself.
-CAMERA_PARENT_PATH = "/World/URDF_real3/swing_link"
+# Use the three existing robot-mounted dataset cameras in the USD scene.
+# These names intentionally match the VLA dataset keys: observation.images.0/1/2.
+CAMERA_SWING_PARENT_PATH = "/World/URDF_real3/swing_link"
+CAMERA_ARM_PARENT_PATH = "/World/URDF_real3/arm_link"
 CAMERA_PRIM_PATHS = {
-    "front": CAMERA_PARENT_PATH + "/Camera",
-    "left": CAMERA_PARENT_PATH + "/Camera_left",
-    "right": CAMERA_PARENT_PATH + "/Camera_right",
+    "0": CAMERA_ARM_PARENT_PATH + "/Camera_0",
+    "1": CAMERA_SWING_PARENT_PATH + "/Camera_1",
+    "2": CAMERA_SWING_PARENT_PATH + "/Camera_2",
 }
-CAMERA_PRIM_PATH = CAMERA_PRIM_PATHS["front"]
+CAMERA_PRIM_PATH = CAMERA_PRIM_PATHS["1"]
 
 # TCP Bridge settings
 HOST = "0.0.0.0"
@@ -43,6 +44,7 @@ PORT = 5555
 CAPTURE_WIDTH = 800
 CAPTURE_HEIGHT = 600
 CAPTURE_WAIT_FRAMES = 5
+PENDING_VIEWPORT_CAPTURE_HELPERS = []
 
 
 # ---------------------------------------------------------------------
@@ -84,6 +86,16 @@ def capsule_to_numpy_rgba(capsule, buffer_size, width, height, np_module):
     return arr.copy()
 
 
+def cleanup_viewport_capture_helpers(force=False):
+    kept = []
+    for holder in PENDING_VIEWPORT_CAPTURE_HELPERS:
+        if not holder.get("done") and not force:
+            kept.append(holder)
+            continue
+        holder.clear()
+    PENDING_VIEWPORT_CAPTURE_HELPERS[:] = kept
+
+
 def capture_rgb_from_viewport(viewport, world, simulation_app, capture_viewport_to_buffer, np_module,
                               width=CAPTURE_WIDTH, height=CAPTURE_HEIGHT,
                               wait_frames=CAPTURE_WAIT_FRAMES):
@@ -97,6 +109,8 @@ def capture_rgb_from_viewport(viewport, world, simulation_app, capture_viewport_
     It avoids Isaac Sim Camera RGB annotator / syntheticdata bug.
     """
     result = {"done": False, "rgb": None}
+
+    helper_holder = {"done": False, "helper": None}
 
     def on_capture(capsule, buffer_size, w, h, fmt):
         try:
@@ -113,9 +127,11 @@ def capture_rgb_from_viewport(viewport, world, simulation_app, capture_viewport_
 
         finally:
             result["done"] = True
+            helper_holder["done"] = True
 
     # Request one viewport capture.
-    _helper = capture_viewport_to_buffer(viewport, on_capture)
+    helper_holder["helper"] = capture_viewport_to_buffer(viewport, on_capture)
+    PENDING_VIEWPORT_CAPTURE_HELPERS.append(helper_holder)
 
     # Pump frames until callback finishes.
     for _ in range(wait_frames):
@@ -124,6 +140,8 @@ def capture_rgb_from_viewport(viewport, world, simulation_app, capture_viewport_
 
         if result["done"]:
             break
+
+    cleanup_viewport_capture_helpers(force=False)
 
     if result["rgb"] is None:
         print("[WARN] viewport capture returned None, using black image", flush=True)
@@ -273,19 +291,6 @@ def main():
         dome.CreateColorAttr(Gf.Vec3f(1.0, 1.0, 1.0))
         print(f"[INFO] Added dome light at: {dome_light_path}")
 
-    # Create a fallback external view camera.
-    view_camera_path = "/World/ViewCamera"
-    if not stage.GetPrimAtPath(view_camera_path).IsValid():
-        view_cam = UsdGeom.Camera.Define(stage, view_camera_path)
-        view_cam.CreateFocalLengthAttr(24.0)
-
-        xform = UsdGeom.Xformable(view_cam.GetPrim())
-        xform.ClearXformOpOrder()
-        xform.AddTranslateOp().Set(Gf.Vec3d(8.0, 8.0, 5.0))
-        xform.AddRotateXYZOp().Set(Gf.Vec3f(-30.0, -45.0, 0.0))
-
-        print(f"[INFO] Created fallback view camera: {view_camera_path}")
-
     # Initialize robot articulation.
     robot = SingleArticulation(
         prim_path=ROBOT_PRIM_PATH,
@@ -371,7 +376,7 @@ def main():
         simulation_app.close()
         return
 
-    # Prefer excavator-mounted cameras. If none are valid, fall back to ViewCamera.
+    # Use only the three excavator-mounted USD cameras.
     active_camera_paths = {}
     for camera_name, camera_path in CAMERA_PRIM_PATHS.items():
         if stage.GetPrimAtPath(camera_path).IsValid():
@@ -380,8 +385,9 @@ def main():
             print(f"[WARN] Camera prim not found: {camera_path}")
 
     if not active_camera_paths:
-        print(f"[WARN] Falling back to: {view_camera_path}")
-        active_camera_paths["fallback"] = view_camera_path
+        print("[ERROR] No configured Camera_0/1/2 prims found. Viewport capture cannot run.")
+        simulation_app.close()
+        return
 
     active_capture_camera_name = next(iter(active_camera_paths))
     active_capture_camera_path = active_camera_paths[active_capture_camera_name]
@@ -583,6 +589,7 @@ def main():
             world.step(render=True)
             simulation_app.update()
 
+    cleanup_viewport_capture_helpers(force=True)
     simulation_app.close()
 
 

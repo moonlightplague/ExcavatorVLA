@@ -5,6 +5,7 @@ import importlib.util
 import json
 import math
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -264,6 +265,13 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_meta_path": "",
     "debug_timeline_path": "",
     "debug_timeline_last_error_time": 0.0,
+    "debug_profile_summary": {},
+    "debug_profile_recent": [],
+    "debug_profile_count": 0,
+    "debug_profile_last": None,
+    "stage_timing_active": {},
+    "stage_timing_summary": {},
+    "stage_timing_recent": [],
     "dataset_episode_id": int(time.time()),
     "dataset_episode_uid": "",
     "dataset_episode_dir": "",
@@ -288,8 +296,9 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_camera_sample_stride": 1,
     "dataset_camera_keep_invisible": True,
     "dataset_camera_last_hide_time": 0.0,
-    "dataset_camera_png_compress_level": 9,
-    "dataset_camera_png_optimize": True,
+    "dataset_camera_png_compress_level": int(os.environ.get("EXCAVATOR_DATASET_CAMERA_PNG_COMPRESS", "3") or 3),
+    "dataset_camera_png_optimize": str(os.environ.get("EXCAVATOR_DATASET_CAMERA_PNG_OPTIMIZE", "0") or "0").strip().lower()
+    not in ("0", "false", "no", "off"),
     "dataset_camera_retry_after_time": 0.0,
     "dataset_image_dir": "",
     "dataset_camera_frame_count": 0,
@@ -325,11 +334,17 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_final_spill_from_pile_particles": 0,
     "dataset_max_joint_error_deg": 0.0,
     "dataset_max_action_speed": 0.0,
+    "dataset_effort_available": False,
+    "dataset_effort_sample_count": 0,
+    "dataset_effort_missing_samples": 0,
+    "dataset_max_abs_effort": 0.0,
     "dataset_phase_metrics": {},
     "sand_metrics_last_time": 0.0,
     "sand_metrics_last": None,
     "sand_snapshot_last_time": 0.0,
     "sand_snapshot_last": None,
+    "bucket_load_fast_last_time": 0.0,
+    "bucket_load_fast_last": None,
     "auto_collect_episode_sand_snapshot": None,
     "auto_collect_episode_sand_snapshot_time": 0.0,
     "planning_sand_snapshot": None,
@@ -341,6 +356,10 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "rigid_obstacle_cache": None,
     "rigid_obstacle_cache_hits": 0,
     "rigid_obstacle_cache_misses": 0,
+    "rigid_obstacle_cache_version": 0,
+    "path_obstacle_check_cache": {},
+    "path_obstacle_check_cache_hits": 0,
+    "path_obstacle_check_cache_misses": 0,
     "sand_site_stable_reset_done": False,
     "sand_site_reset_active": False,
     "sand_site_last_reset_label": "",
@@ -509,6 +528,13 @@ AUTO_COLLECT_EXPORT_LEROBOT_V3_ON_FINISH = str(
 ).strip().lower() not in ("0", "false", "no", "off")
 AUTO_COLLECT_LEROBOT_V3_SPLIT = str(os.environ.get("EXCAVATOR_LEROBOT_V3_SPLIT", "trainable") or "trainable")
 AUTO_COLLECT_LEROBOT_V3_DIRNAME = str(os.environ.get("EXCAVATOR_LEROBOT_V3_DIRNAME", "lerobot_v3") or "lerobot_v3")
+AUTO_COLLECT_LEROBOT_V3_EXPORT_PYTHON = str(
+    os.environ.get("EXCAVATOR_LEROBOT_V3_EXPORT_PYTHON", r"D:\450\conda\envs\isaaclab_py311\python.exe")
+    or ""
+).strip()
+AUTO_COLLECT_LEROBOT_V3_EXPORT_TIMEOUT_S = float(
+    os.environ.get("EXCAVATOR_LEROBOT_V3_EXPORT_TIMEOUT_S", "1200") or 1200.0
+)
 PLANNER_VERSION = "dig_plan_v4_joint_space_world_debug"
 QUALITY_GATE_VERSION = "quality_gate_v2_particles_no_freeze"
 AUTO_PREFLIGHT_MIN_PARTICLES = 1000
@@ -552,6 +578,8 @@ AUTO_COLLECT_INITIAL_POSES_DEG = [
 SAND_PARTICLE_PATH_SUFFIX = "RealSandParticles"
 SAND_PARTICLE_MASS_DEFAULT = 0.535
 SAND_METRICS_INTERVAL = 0.45
+BUCKET_LOAD_FAST_AABB_MARGIN = 0.06
+BUCKET_LOAD_FAST_CACHE_INTERVAL = 0.02
 SAND_SNAPSHOT_MAX_AGE = 0.35
 SAND_SNAPSHOT_GRID_RES = 64
 SAND_SNAPSHOT_GRID_MAX_RES = 96
@@ -712,7 +740,7 @@ UNLOAD_FINAL_LOAD_XY_TOL = 0.42
 UNLOAD_FINAL_LOAD_Z_CLEARANCE = 0.05
 UNLOAD_POINT_DEFAULT_RADIUS = 0.45
 UNLOAD_SELECTED_EDGE_MARGIN = 0.12
-DEFAULT_UNLOAD_SOURCE_MESH_PATH = "/World/SandSite/UnloadBin"
+DEFAULT_UNLOAD_SOURCE_MESH_PATH = "/World/truck/DumpBedCollision/dump_bed_collision"
 
 DIG_PLAN_CANDIDATES = [
     {
@@ -883,13 +911,25 @@ def safe_float(x, default=0.0):
     return default
 
 
-LOG_MODES = ["quiet", "normal", "debug", "trace"]
+LOG_MODES = ["quiet", "normal", "debug", "profile", "trace"]
+LOG_CYCLE_MODES = ["normal", "quiet", "debug", "profile"]
+DEBUG_PROFILE_RECENT_LIMIT = 128
+DEBUG_PROFILE_TIMELINE_THRESHOLD_MS = 2.0
 LOG_IMPORTANT_TOKENS = [
     "[ERROR]",
     "[WARN]",
     "[GROUND WARN]",
     "[GUARD]",
     "[FREEZE]",
+    "[DIG]",
+    "[DIG STEP",
+    "[DIG FINISHED]",
+    "[AUTO DATASET]",
+    "[AUTO DATASET ATTEMPT]",
+    "[AUTO DATASET SCORE]",
+    "[UNLOAD ARRIVAL]",
+    "[UNLOAD DUMP]",
+    "[LOADED ROUTE TEST FINISHED]",
     "[AUTO FREEZE STOP]",
     "[MANUAL FREEZE STOP]",
     "[MOVE VERIFY FAILED]",
@@ -958,7 +998,26 @@ LOG_DEBUG_TOKENS = [
     "[UNLOAD READY]",
     "[UNLOAD ROUTE]",
     "[UNLOAD DUMP PLAN]",
+    "[UNLOAD DUMP DEBUG]",
+    "[UNLOAD DEBUG LEGEND]",
     "[UNLOAD PRE-DUMP ALIGN]",
+    "[UNLOAD GOAL RETRY HIGH]",
+    "[UNLOAD EXEC GOAL]",
+    "[SWING CORRIDOR]",
+    "[CLEARANCE ROUTE",
+    "[PLAN EXEC TRACE]",
+    "[PLAN EXEC DIRECT]",
+    "[DIG GUARD",
+    "[BUCKET SAND DIAG]",
+    "[DEBUG VISUALS]",
+    "[LOADED ROUTE TEST OBSERVE]",
+    "[LOADED ROUTE TEST SNAPSHOT]",
+    "[LOADED ROUTE TEST CACHE]",
+    "[LOADED ROUTE TEST PLAN]",
+    "[LOADED ROUTE GROUP]",
+    "[LOADED ROUTE GROUP SEGMENT]",
+    "[LOADED ROUTE ACCEL LIMIT]",
+    "[LOADED ROUTE ADAPTIVE]",
     "ROBOT dof_names",
     "DOF_NAME_TO_REAL_IDX",
     "JOINT_INDICES",
@@ -974,6 +1033,18 @@ def current_log_mode():
     mode = normalize_log_mode(STATE.get("log_mode", "normal"))
     STATE["log_mode"] = mode
     return mode
+
+
+def debug_diagnostics_enabled():
+    return current_log_mode() in ("debug", "profile", "trace")
+
+
+def debug_profile_enabled():
+    return current_log_mode() in ("profile", "trace")
+
+
+def non_quiet_diagnostics_enabled():
+    return current_log_mode() != "quiet"
 
 
 def log_text_from_args(args, kwargs=None):
@@ -1001,22 +1072,6 @@ def should_emit_log(text, force=False):
     important = log_matches_any(text, LOG_IMPORTANT_TOKENS)
     if mode == "quiet" and not important:
         return False
-
-    debug_like = log_matches_any(text, LOG_DEBUG_TOKENS)
-    if mode == "normal" and debug_like and not important and not log_matches_any(text, LOG_NORMAL_TOKENS):
-        return False
-
-    if mode in ("normal", "quiet") and not important:
-        now = time.time()
-        signature = log_signature(text)
-        last = STATE.setdefault("log_last_print_time", {})
-        suppressed = STATE.setdefault("log_suppressed_count", {})
-        interval = float(STATE.get("log_repeat_interval", 0.35))
-        last_time = float(last.get(signature, 0.0))
-        if now - last_time < interval:
-            suppressed[signature] = int(suppressed.get(signature, 0)) + 1
-            return False
-        last[signature] = now
 
     return True
 
@@ -1049,16 +1104,33 @@ def toggle_quiet_log():
     return set_log_mode("normal" if mode == "quiet" else "quiet")
 
 
+def cycle_log_mode():
+    mode = current_log_mode()
+    try:
+        idx = LOG_CYCLE_MODES.index(mode)
+    except ValueError:
+        idx = 0
+    return set_log_mode(LOG_CYCLE_MODES[(idx + 1) % len(LOG_CYCLE_MODES)])
+
+
 def print_log_state():
     suppressed = STATE.get("log_suppressed_count", {}) or {}
     total_suppressed = sum(int(v) for v in suppressed.values())
     top = sorted(suppressed.items(), key=lambda item: -int(item[1]))[:5]
+    profile = STATE.get("debug_profile_summary", {}) or {}
+    profile_top = []
+    if isinstance(profile, dict):
+        profile_top = sorted(
+            profile.items(),
+            key=lambda item: -float(item[1].get("total_ms", 0.0) if isinstance(item[1], dict) else 0.0),
+        )[:8]
     info_print(
         "[LOG STATE]",
         f"mode={current_log_mode()}",
         f"repeat_interval={float(STATE.get('log_repeat_interval', 0.35)):.2f}",
         f"suppressed_total={total_suppressed}",
         f"suppressed_top={[(k[:72], int(v)) for k, v in top]}",
+        f"profile_top={[(k, round(float(v.get('total_ms', 0.0)), 1), int(v.get('count', 0))) for k, v in profile_top if isinstance(v, dict)]}",
         force_log=True,
     )
 
@@ -1707,12 +1779,136 @@ def apply_excavator_render_mode(render_on=None, force_status=True):
     return render_on
 
 
+def debug_profile_record(label, elapsed_ms, data=None, threshold_ms=None, error=""):
+    if not debug_profile_enabled():
+        return
+    label = str(label or "unknown")
+    elapsed_ms = safe_float(elapsed_ms, 0.0)
+    summary = STATE.get("debug_profile_summary")
+    if not isinstance(summary, dict):
+        summary = {}
+    row = summary.get(label)
+    if not isinstance(row, dict):
+        row = {
+            "count": 0,
+            "total_ms": 0.0,
+            "min_ms": elapsed_ms,
+            "max_ms": 0.0,
+            "avg_ms": 0.0,
+            "slow_count": 0,
+            "error_count": 0,
+        }
+    row["count"] = int(row.get("count", 0)) + 1
+    row["total_ms"] = float(row.get("total_ms", 0.0)) + elapsed_ms
+    row["min_ms"] = min(float(row.get("min_ms", elapsed_ms)), elapsed_ms)
+    row["max_ms"] = max(float(row.get("max_ms", 0.0)), elapsed_ms)
+    row["avg_ms"] = row["total_ms"] / max(1, row["count"])
+    threshold = DEBUG_PROFILE_TIMELINE_THRESHOLD_MS if threshold_ms is None else safe_float(threshold_ms, 0.0)
+    if elapsed_ms >= threshold:
+        row["slow_count"] = int(row.get("slow_count", 0)) + 1
+    if error:
+        row["error_count"] = int(row.get("error_count", 0)) + 1
+    summary[label] = row
+    STATE["debug_profile_summary"] = summary
+
+    entry = {
+        "t": time.time(),
+        "label": label,
+        "elapsed_ms": elapsed_ms,
+        "threshold_ms": threshold,
+        "error": str(error or ""),
+    }
+    if isinstance(data, dict) and data:
+        entry["data"] = data
+    recent = STATE.get("debug_profile_recent")
+    if not isinstance(recent, list):
+        recent = []
+    recent.append(entry)
+    STATE["debug_profile_recent"] = recent[-DEBUG_PROFILE_RECENT_LIMIT:]
+    STATE["debug_profile_count"] = int(STATE.get("debug_profile_count", 0) or 0) + 1
+    STATE["debug_profile_last"] = entry
+
+    if elapsed_ms >= threshold or error:
+        info_print(
+            "[PROFILE]",
+            f"label={label}",
+            f"elapsed_ms={elapsed_ms:.2f}",
+            f"threshold_ms={threshold:.2f}",
+            f"count={row['count']}",
+            f"avg_ms={row['avg_ms']:.2f}",
+            f"max_ms={row['max_ms']:.2f}",
+            f"error={str(error or '')}",
+            force_log=True,
+        )
+        try:
+            recorder = globals().get("debug_timeline_record")
+            if callable(recorder):
+                recorder(
+                    "PROFILE",
+                    stage=label,
+                    result="error" if error else "slow",
+                    reason=str(error or label),
+                    data=entry,
+                    include_sand=False,
+                )
+        except Exception:
+            pass
+
+
+def debug_profiled(label=None, threshold_ms=None):
+    def decorate(fn):
+        profile_label = str(label or getattr(fn, "__name__", "profiled"))
+        if asyncio.iscoroutinefunction(fn):
+            async def async_wrapper(*args, **kwargs):
+                if not debug_profile_enabled():
+                    return await fn(*args, **kwargs)
+                t0 = time.perf_counter()
+                error = ""
+                try:
+                    return await fn(*args, **kwargs)
+                except Exception as exc:
+                    error = f"{type(exc).__name__}:{exc}"
+                    raise
+                finally:
+                    debug_profile_record(
+                        profile_label,
+                        (time.perf_counter() - t0) * 1000.0,
+                        threshold_ms=threshold_ms,
+                        error=error,
+                    )
+            async_wrapper.__name__ = getattr(fn, "__name__", "async_wrapper")
+            async_wrapper.__doc__ = getattr(fn, "__doc__", None)
+            return async_wrapper
+
+        def wrapper(*args, **kwargs):
+            if not debug_profile_enabled():
+                return fn(*args, **kwargs)
+            t0 = time.perf_counter()
+            error = ""
+            try:
+                return fn(*args, **kwargs)
+            except Exception as exc:
+                error = f"{type(exc).__name__}:{exc}"
+                raise
+            finally:
+                debug_profile_record(
+                    profile_label,
+                    (time.perf_counter() - t0) * 1000.0,
+                    threshold_ms=threshold_ms,
+                    error=error,
+                )
+        wrapper.__name__ = getattr(fn, "__name__", "wrapper")
+        wrapper.__doc__ = getattr(fn, "__doc__", None)
+        return wrapper
+    return decorate
+
+
 def toggle_excavator_render_mode():
     return apply_excavator_render_mode(not bool(STATE.get("excavator_render_mode", False)))
 
 
 def debug_visuals_enabled():
-    return bool(STATE.get("debug_visuals_visible", True))
+    return bool(STATE.get("debug_visuals_visible", True)) and debug_diagnostics_enabled()
 
 
 def debug_visual_root_paths():
@@ -1754,10 +1950,11 @@ def apply_debug_visuals_visibility(visible=None, force_status=True):
     previous = bool(STATE.get("debug_visuals_visible", True))
     STATE["debug_visuals_visible"] = visible
     touched = 0
+    effective_visible = bool(visible) and debug_diagnostics_enabled()
     for path in debug_visual_root_paths():
-        if set_prim_visibility(path, visible):
+        if set_prim_visibility(path, effective_visible):
             touched += 1
-    if visible:
+    if effective_visible:
         try:
             show_trace_prims(current_trace_mode())
         except Exception:
@@ -1768,9 +1965,10 @@ def apply_debug_visuals_visibility(visible=None, force_status=True):
         except Exception:
             pass
     if force_status or previous != visible:
-        info_print("[DEBUG VISUALS]", f"visible={visible}", f"roots={touched}")
+        info_print("[DEBUG VISUALS]", f"visible={visible}", f"effective={effective_visible}", f"roots={touched}")
     if force_status:
-        update_status(f"Calc Viz {'ON' if visible else 'OFF'}; roots={touched}", force=True)
+        suffix = "" if debug_diagnostics_enabled() else " (Debug OFF)"
+        update_status(f"Calc Viz {'ON' if visible else 'OFF'}{suffix}; roots={touched}", force=True)
     return visible
 
 
@@ -3275,6 +3473,8 @@ def draw_unload_dump_debug(
     best_reachable_point=None,
     rejected_segment=None,
 ):
+    if not debug_diagnostics_enabled():
+        return
     if CONTROL_ROOT is None:
         return
     root = f"{CONTROL_ROOT}/LoadedRouteDebug"
@@ -4382,6 +4582,28 @@ def compact_sand_metrics(metrics):
     }
 
 
+def compact_bucket_load_metrics(metrics):
+    if not isinstance(metrics, dict) or not bool(metrics.get("available", False)):
+        return {
+            "available": False,
+            "metrics_scope": "bucket_fast",
+            "reason": "" if not isinstance(metrics, dict) else str(metrics.get("reason", "")),
+        }
+    return {
+        "available": True,
+        "metrics_scope": str(metrics.get("metrics_scope", "bucket_fast")),
+        "n": int(metrics.get("particle_count", 0)),
+        "candidate": int(metrics.get("candidate_count", 0)),
+        "bucket": int(metrics.get("bucket_count", 0)),
+        "bucket_from_pile": int(metrics.get("bucket_from_pile_count", 0)),
+        "bucket_from_initial": int(metrics.get("bucket_from_initial_count", metrics.get("bucket_from_pile_count", 0))),
+        "bucket_from_pile_mass": float(metrics.get("bucket_from_pile_mass", 0.0)),
+        "source_tracking": str(metrics.get("source_tracking", "unknown")),
+        "source_tracking_notes": str(metrics.get("source_tracking_notes", "")),
+        "metrics_ms": float(metrics.get("metrics_ms", 0.0)),
+    }
+
+
 def compact_scene_context(ctx=None):
     ctx = task_scene_context() if ctx is None else ctx
     if not isinstance(ctx, dict):
@@ -4892,6 +5114,15 @@ DATASET_ACTION_NAMES = [
     "bucket_cmd_velocity",
 ]
 
+DATASET_RECORD_DIAGNOSTIC_FIELDS = True
+
+DATASET_EFFORT_NAMES = [
+    "swing_measured_effort",
+    "boom_measured_effort",
+    "arm_measured_effort",
+    "bucket_measured_effort",
+]
+
 DATASET_PHASE_NAMES = [
     "pre_dig",
     "approach_contact",
@@ -5070,6 +5301,7 @@ def dataset_camera_world_pose(path):
         return {"available": False, "prim_path": str(path), "reason": f"{type(exc).__name__}:{exc}"}
 
 
+@debug_profiled("dataset_save_rgb_image", threshold_ms=2.0)
 def save_rgb_image(path, rgb):
     ensure_parent_dir(path)
     rgb = np.asarray(rgb)
@@ -5078,12 +5310,12 @@ def save_rgb_image(path, rgb):
     if rgb.dtype != np.uint8:
         rgb = np.clip(rgb, 0, 255).astype(np.uint8)
     if Image is not None and str(path).lower().endswith(".png"):
-        compress_level = int(STATE.get("dataset_camera_png_compress_level", 9) or 9)
+        compress_level = int(STATE.get("dataset_camera_png_compress_level", 3) or 3)
         compress_level = max(0, min(9, compress_level))
         Image.fromarray(np.ascontiguousarray(rgb[:, :, :3])).save(
             str(path),
             format="PNG",
-            optimize=bool(STATE.get("dataset_camera_png_optimize", True)),
+            optimize=bool(STATE.get("dataset_camera_png_optimize", False)),
             compress_level=compress_level,
         )
         return "png"
@@ -5230,6 +5462,7 @@ def dataset_camera_episode_metadata():
     return status
 
 
+@debug_profiled("dataset_capture_camera_observations", threshold_ms=5.0)
 def dataset_capture_camera_observations(sample_index):
     payload = {
         "observation.images.0": None,
@@ -5265,6 +5498,7 @@ def dataset_capture_camera_observations(sample_index):
         objects = {}
     extension = dataset_camera_image_extension()
     any_available = False
+    spec_by_name = {str(item.get("name", "")): item for item in dataset_camera_specs()}
     for name in DATASET_CAMERA_NAMES:
         cam = objects.get(name)
         view_payload = {
@@ -5274,7 +5508,7 @@ def dataset_capture_camera_observations(sample_index):
             "shape": None,
             "dtype": None,
         }
-        spec = next((item for item in dataset_camera_specs() if str(item.get("name", "")) == name), {})
+        spec = spec_by_name.get(str(name), {})
         prim_path = str(spec.get("path", ""))
         view_payload["prim_path"] = prim_path
         view_payload["pose"] = dataset_camera_world_pose(prim_path)
@@ -5422,6 +5656,8 @@ def debug_timeline_path(create=False):
 
 
 def debug_timeline_record(tag, stage="", result="", reason="", data=None, q_cmd=None, q_real=None, include_sand=False):
+    if not debug_diagnostics_enabled():
+        return
     path = debug_timeline_path(create=False)
     if not path:
         return
@@ -5562,13 +5798,12 @@ def camera_config_snapshot():
         "sample_stride": max(1, int(STATE.get("dataset_camera_sample_stride", 1) or 1)),
         "image_format": dataset_camera_image_extension(),
         "png_compression": {
-            "compress_level": int(STATE.get("dataset_camera_png_compress_level", 9) or 9),
-            "optimize": bool(STATE.get("dataset_camera_png_optimize", True)),
+            "compress_level": int(STATE.get("dataset_camera_png_compress_level", 3) or 3),
+            "optimize": bool(STATE.get("dataset_camera_png_optimize", False)),
             "lossless": True,
         },
         "views": dataset_camera_specs(),
         "pil_available": bool(Image is not None),
-        "effort_available": False,
     }
 
 
@@ -5615,7 +5850,6 @@ def dataset_sand_status():
                     "real_sand_enabled",
                     "real_sand_particle_count",
                     "real_sand_error",
-                    "excavated_volume",
                     "status",
                 ]
                 return {k: status.get(k) for k in keep if k in status}
@@ -5624,16 +5858,16 @@ def dataset_sand_status():
     return {"sand_site_active": bool(sand_site_active())}
 
 
-def dataset_bucket_load_estimate():
-    api = get_sand_site_api()
-    if api is not None and callable(api.get("get_status")):
-        try:
-            status = api.get("get_status")()
-            for key in ["bucket_load", "scripted_bucket_load", "excavated_volume"]:
-                if key in status:
-                    return safe_float(status.get(key), 0.0)
-        except Exception:
-            pass
+def dataset_bucket_load_estimate(metrics=None):
+    """Measured bucket load used by dataset state, as bucket_from_pile particle count."""
+    if isinstance(metrics, dict):
+        if "bucket_from_pile_count" in metrics:
+            return safe_float(metrics.get("bucket_from_pile_count"), 0.0)
+        if "bucket_from_pile" in metrics:
+            return safe_float(metrics.get("bucket_from_pile"), 0.0)
+    fast = bucket_load_fast_current(force=False)
+    if isinstance(fast, dict) and bool(fast.get("available", False)):
+        return safe_float(fast.get("bucket_from_pile_count"), 0.0)
     return 0.0
 
 
@@ -5706,6 +5940,8 @@ def invalidate_sand_runtime_caches(reason=""):
     STATE["sand_snapshot_last_time"] = 0.0
     STATE["sand_metrics_last"] = None
     STATE["sand_metrics_last_time"] = 0.0
+    STATE["bucket_load_fast_last"] = None
+    STATE["bucket_load_fast_last_time"] = 0.0
     if reason:
         STATE["sand_cache_invalidated_reason"] = str(reason)
 
@@ -6181,6 +6417,8 @@ def initial_pile_mask_for_points(points, fallback_pile_mask=None):
 
 
 def bucket_particle_diagnostic(label, points=None, force_log=True):
+    if not debug_diagnostics_enabled():
+        return {"available": False, "reason": "debug_disabled", "label": str(label)}
     points = sand_particle_positions() if points is None else points
     if points is None or len(points) == 0:
         row = {"available": False, "reason": "missing_particle_points", "label": str(label)}
@@ -6422,6 +6660,165 @@ def sand_region_masks(points):
     return pile_mask, bucket_mask, bin_mask
 
 
+def bucket_local_box_world_aabb(expand=0.0):
+    if not BUCKET_LINK:
+        return None, None
+    local_min = np.array(SAND_BUCKET_LOCAL_MIN, dtype=np.float32) - float(expand)
+    local_max = np.array(SAND_BUCKET_LOCAL_MAX, dtype=np.float32) + float(expand)
+    corners = []
+    for x in [local_min[0], local_max[0]]:
+        for y in [local_min[1], local_max[1]]:
+            for z in [local_min[2], local_max[2]]:
+                p = transform_local_point_to_world(BUCKET_LINK, np.array([x, y, z], dtype=np.float32))
+                if p is None:
+                    return None, None
+                corners.append(np.array(p, dtype=np.float32).reshape(3))
+    arr = np.vstack(corners)
+    return np.min(arr, axis=0), np.max(arr, axis=0)
+
+
+@debug_profiled("bucket_load_fast_current", threshold_ms=1.0)
+def bucket_load_fast_current(force=False, points=None):
+    now = time.time()
+    if (
+        not force
+        and points is None
+        and isinstance(STATE.get("bucket_load_fast_last"), dict)
+        and now - float(STATE.get("bucket_load_fast_last_time", 0.0) or 0.0) < float(BUCKET_LOAD_FAST_CACHE_INTERVAL)
+    ):
+        return dict(STATE["bucket_load_fast_last"])
+
+    t0 = time.perf_counter()
+    if points is None:
+        points = sand_particle_positions()
+    if points is None:
+        metrics = {
+            "available": False,
+            "metrics_scope": "bucket_fast",
+            "reason": "missing_particle_points",
+            "particle_count": 0,
+            "candidate_count": 0,
+            "bucket_count": 0,
+            "bucket_from_pile_count": 0,
+            "bucket_from_initial_count": 0,
+            "bucket_from_pile_mass": 0.0,
+        }
+        STATE["bucket_load_fast_last"] = metrics
+        STATE["bucket_load_fast_last_time"] = now
+        return dict(metrics)
+
+    pts = np.asarray(points, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] < 3 or len(pts) == 0:
+        metrics = {
+            "available": False,
+            "metrics_scope": "bucket_fast",
+            "reason": f"invalid_particle_shape:{list(pts.shape)}",
+            "particle_count": int(0 if pts.ndim == 0 else len(pts)),
+            "candidate_count": 0,
+            "bucket_count": 0,
+            "bucket_from_pile_count": 0,
+            "bucket_from_initial_count": 0,
+            "bucket_from_pile_mass": 0.0,
+        }
+        STATE["bucket_load_fast_last"] = metrics
+        STATE["bucket_load_fast_last_time"] = now
+        return dict(metrics)
+    pts = np.ascontiguousarray(pts[:, :3], dtype=np.float32)
+
+    aabb_min, aabb_max = bucket_local_box_world_aabb(expand=BUCKET_LOAD_FAST_AABB_MARGIN)
+    if aabb_min is None or aabb_max is None:
+        candidate_idx = np.arange(len(pts), dtype=np.int64)
+        candidate_pts = pts
+        source_detail = "full_projection_fallback"
+    else:
+        candidate_mask = np.all(pts >= aabb_min.reshape(1, 3), axis=1) & np.all(pts <= aabb_max.reshape(1, 3), axis=1)
+        candidate_idx = np.nonzero(candidate_mask)[0].astype(np.int64, copy=False)
+        candidate_pts = pts[candidate_idx]
+        source_detail = "bucket_world_aabb"
+
+    if len(candidate_pts) == 0:
+        mass = sand_particle_mass()
+        metrics = {
+            "available": True,
+            "metrics_scope": "bucket_fast",
+            "particle_count": int(len(pts)),
+            "candidate_count": 0,
+            "bucket_count": 0,
+            "bucket_from_pile_count": 0,
+            "bucket_from_initial_count": 0,
+            "bucket_from_pile_mass": 0.0,
+            "particle_mass": float(mass),
+            "source_tracking": "empty_candidate",
+            "source_tracking_notes": source_detail,
+            "metrics_ms": float((time.perf_counter() - t0) * 1000.0),
+        }
+        STATE["bucket_load_fast_last"] = metrics
+        STATE["bucket_load_fast_last_time"] = now
+        return dict(metrics)
+
+    local = project_points_to_link_local(candidate_pts, BUCKET_LINK)
+    if local is None or len(local) != len(candidate_pts):
+        metrics = {
+            "available": False,
+            "metrics_scope": "bucket_fast",
+            "reason": "bucket_local_projection_failed",
+            "particle_count": int(len(pts)),
+            "candidate_count": int(len(candidate_pts)),
+            "bucket_count": 0,
+            "bucket_from_pile_count": 0,
+            "bucket_from_initial_count": 0,
+            "bucket_from_pile_mass": 0.0,
+            "metrics_ms": float((time.perf_counter() - t0) * 1000.0),
+        }
+        STATE["bucket_load_fast_last"] = metrics
+        STATE["bucket_load_fast_last_time"] = now
+        return dict(metrics)
+
+    strict = np.all(local >= SAND_BUCKET_LOCAL_MIN.reshape(1, 3), axis=1) & np.all(
+        local <= SAND_BUCKET_LOCAL_MAX.reshape(1, 3),
+        axis=1,
+    )
+    bucket_idx = candidate_idx[np.nonzero(strict)[0]]
+    bucket_count = int(len(bucket_idx))
+    ctx = task_scene_context()
+    _, _, _, _, z_min, z_expected_max = sand_pile_geometry_from_context(ctx)
+    pile_mask = sand_pile_xy_mask(pts, ctx) & (pts[:, 2] >= z_min) & (pts[:, 2] <= z_expected_max)
+    initial_mask = initial_pile_mask_for_points(pts, fallback_pile_mask=pile_mask)
+    raw_from_pile_bucket_count = int(np.count_nonzero(initial_mask[bucket_idx])) if bucket_count > 0 else 0
+    source_tracking = "initial_mask"
+    notes = [source_detail]
+    from_pile_bucket_count = raw_from_pile_bucket_count
+    if bucket_count >= int(SAND_SOURCE_FALLBACK_MIN_REGION_COUNT):
+        ratio = float(raw_from_pile_bucket_count) / max(1.0, float(bucket_count))
+        if ratio < float(SAND_SOURCE_FALLBACK_MIN_RATIO):
+            source_tracking = "bucket_region_fallback"
+            notes.append(f"bucket:raw={raw_from_pile_bucket_count}/region={bucket_count}/ratio={ratio:.2f}")
+            from_pile_bucket_count = bucket_count
+    mass = sand_particle_mass()
+    metrics = {
+        "available": True,
+        "metrics_scope": "bucket_fast",
+        "particle_count": int(len(pts)),
+        "candidate_count": int(len(candidate_pts)),
+        "bucket_count": int(bucket_count),
+        "bucket_from_pile_count": int(from_pile_bucket_count),
+        "bucket_from_initial_count": int(raw_from_pile_bucket_count),
+        "bucket_from_pile_mass": float(from_pile_bucket_count * mass),
+        "particle_mass": float(mass),
+        "source_tracking": source_tracking,
+        "source_tracking_notes": "; ".join(notes),
+        "metrics_ms": float((time.perf_counter() - t0) * 1000.0),
+    }
+    STATE["bucket_load_fast_last"] = metrics
+    STATE["bucket_load_fast_last_time"] = now
+    perf = dict(STATE.get("sand_perf_last", {}) or {})
+    perf["bucket_fast_ms"] = float(metrics["metrics_ms"])
+    perf["bucket_fast_particles"] = int(len(pts))
+    perf["bucket_fast_candidates"] = int(len(candidate_pts))
+    STATE["sand_perf_last"] = perf
+    return dict(metrics)
+
+
 def particle_ids_from_mask(mask):
     if mask is None:
         return set()
@@ -6439,6 +6836,7 @@ def capture_initial_pile_particle_ids():
     return ids
 
 
+@debug_profiled("sand_metrics_current", threshold_ms=2.0)
 def sand_metrics_current(force=False, snapshot=None):
     now = time.time()
     t0 = time.perf_counter()
@@ -7150,8 +7548,10 @@ def update_episode_quality_trackers(metrics, phase, q_cmd=None, q_real=None, act
             int(STATE.get("dataset_lift_bucket_from_pile_particles", 0)),
             bucket_from_pile,
         )
-    STATE["dataset_final_bin_from_pile_particles"] = int(metrics.get("bin_from_pile_count", 0))
-    STATE["dataset_final_spill_from_pile_particles"] = int(metrics.get("spill_from_pile_count", 0))
+    if "bin_from_pile_count" in metrics:
+        STATE["dataset_final_bin_from_pile_particles"] = int(metrics.get("bin_from_pile_count", 0))
+    if "spill_from_pile_count" in metrics:
+        STATE["dataset_final_spill_from_pile_particles"] = int(metrics.get("spill_from_pile_count", 0))
     if q_cmd is not None and q_real is not None:
         err_deg = [abs(rad_to_deg(x)) for x in dataset_joint_error(q_cmd, q_real)]
         STATE["dataset_max_joint_error_deg"] = max(float(STATE.get("dataset_max_joint_error_deg", 0.0)), max(err_deg))
@@ -7163,36 +7563,6 @@ def update_episode_quality_trackers(metrics, phase, q_cmd=None, q_real=None, act
             )
         except Exception:
             pass
-
-
-def dataset_action_from_q(q_cmd, now):
-    q_cmd = np.array(q_cmd, dtype=np.float32)
-    q_prev = STATE.get("dataset_last_q_cmd")
-    t_prev = float(STATE.get("dataset_last_sample_time", 0.0))
-    if q_prev is None or t_prev <= 0.0:
-        STATE["dataset_last_q_cmd"] = q_cmd.copy()
-        return [0.0, 0.0, 0.0, 0.0]
-
-    q_prev = np.array(q_prev, dtype=np.float32)
-    dt = max(1e-4, float(now) - t_prev)
-    dq = dataset_q_delta(q_cmd, q_prev)
-    STATE["dataset_last_q_cmd"] = q_cmd.copy()
-    return [float(x) for x in (dq / dt)]
-
-
-def dataset_joint_velocity_from_real(q_real, now):
-    q_real = np.array(q_real, dtype=np.float32)
-    q_prev = STATE.get("dataset_last_q_real")
-    t_prev = float(STATE.get("dataset_last_sample_time", 0.0))
-    if q_prev is None or t_prev <= 0.0:
-        STATE["dataset_last_q_real"] = q_real.copy()
-        return [0.0, 0.0, 0.0, 0.0]
-
-    q_prev = np.array(q_prev, dtype=np.float32)
-    dt = max(1e-4, float(now) - t_prev)
-    dq = dataset_q_delta(q_real, q_prev)
-    STATE["dataset_last_q_real"] = q_real.copy()
-    return [float(x) for x in (dq / dt)]
 
 
 def dataset_motion_derivatives(q_cmd, q_real, now):
@@ -7263,6 +7633,91 @@ def dataset_joint_error(q_cmd, q_real):
     except Exception:
         pass
     return [float(x) for x in err]
+
+
+def dataset_joint_effort_observation():
+    result = {
+        "available": False,
+        "names": list(DATASET_EFFORT_NAMES),
+        "source": "robot.get_measured_joint_efforts",
+        "reason": "",
+    }
+    if ROBOT is None:
+        result["reason"] = "robot_missing"
+        return result
+    if JOINT_INDICES is None:
+        result["reason"] = "joint_indices_missing"
+        return result
+    reader = getattr(ROBOT, "get_measured_joint_efforts", None)
+    if not callable(reader):
+        result["reason"] = "get_measured_joint_efforts_unavailable"
+        return result
+    try:
+        values = reader(joint_indices=JOINT_INDICES)
+        arr = np.array(values, dtype=np.float32).reshape(-1)
+        if arr.size < len(DOF_ORDER):
+            result["reason"] = f"effort_shape_short:{arr.size}"
+            return result
+        arr = arr[: len(DOF_ORDER)]
+        if not np.all(np.isfinite(arr)):
+            result["reason"] = "effort_non_finite"
+            return result
+        effort = [float(x) for x in arr]
+        result.update(
+            {
+                "available": True,
+                "reason": "ok",
+                "value": effort,
+                "observation.effort": effort,
+            }
+        )
+        return result
+    except Exception as exc:
+        result["reason"] = f"{type(exc).__name__}:{exc}"
+        return result
+
+
+def dataset_joint_force_torque_observation():
+    result = {
+        "available": False,
+        "source": "robot.get_measured_joint_forces",
+        "reason": "",
+    }
+    if ROBOT is None:
+        result["reason"] = "robot_missing"
+        return result
+    if JOINT_INDICES is None:
+        result["reason"] = "joint_indices_missing"
+        return result
+    reader = getattr(ROBOT, "get_measured_joint_forces", None)
+    if not callable(reader):
+        result["reason"] = "get_measured_joint_forces_unavailable"
+        return result
+    try:
+        values = reader(joint_indices=JOINT_INDICES)
+        arr = np.array(values, dtype=np.float32)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        if arr.shape[0] < len(DOF_ORDER) or arr.shape[-1] < 6:
+            result["reason"] = f"joint_force_shape_unexpected:{list(arr.shape)}"
+            return result
+        arr = arr[: len(DOF_ORDER), :6]
+        if not np.all(np.isfinite(arr)):
+            result["reason"] = "joint_force_non_finite"
+            return result
+        result.update(
+            {
+                "available": True,
+                "reason": "ok",
+                "names": list(DOF_ORDER),
+                "components": ["force_x", "force_y", "force_z", "torque_x", "torque_y", "torque_z"],
+                "value": [[float(v) for v in row] for row in arr],
+            }
+        )
+        return result
+    except Exception as exc:
+        result["reason"] = f"{type(exc).__name__}:{exc}"
+        return result
 
 
 def dataset_phase_index(phase):
@@ -7507,14 +7962,14 @@ def dataset_constraint_flags(cost, contact, phase_features):
     return flags
 
 
-def dataset_observation_state(q_real=None):
+def dataset_observation_state(q_real=None, bucket_load_metrics=None):
     if q_real is None:
         q_real = get_real_joint_positions()
     q_real = np.array(q_real, dtype=np.float32)
     base = get_prim_translation(ROBOT_BASE) if ROBOT_BASE else np.zeros(3, dtype=np.float32)
     tip = bucket_tip_pos()
     load = bucket_load_pos()
-    bucket_load = dataset_bucket_load_estimate()
+    bucket_load = dataset_bucket_load_estimate(bucket_load_metrics)
     state = [
         float(base[0]),
         float(base[1]),
@@ -7536,6 +7991,7 @@ def dataset_observation_state(q_real=None):
     return state
 
 
+@debug_profiled("dataset_record_sample", threshold_ms=2.0)
 def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False):
     if not bool(STATE.get("dataset_recording", False)):
         return
@@ -7559,18 +8015,38 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False)
         action = dynamics["action"]
         joint_velocity = dynamics["dq_real"]
         joint_acceleration = dynamics["ddq_real"]
-        sand_metrics = sand_metrics_current(force=force)
-        update_episode_quality_trackers(sand_metrics, phase, q_cmd=q_cmd, q_real=q_real, action=action)
+        bucket_metrics = bucket_load_fast_current(force=True)
+        update_episode_quality_trackers(bucket_metrics, phase, q_cmd=q_cmd, q_real=q_real, action=action)
         q_goal = STATE.get("dataset_current_q_goal")
         target = get_target_pos() if TARGET_PATH else None
         phase_features = dataset_phase_features(phase)
-        rigid_clearance = dataset_rigid_clearance_summary()
-        contact_flags = dataset_contact_flags(phase, sand_metrics, rigid_clearance)
-        env_summary = dataset_environment_summary(target)
-        cost_summary = dataset_cost_summary(q_cmd, q_real, action, sand_metrics, rigid_clearance, dynamics=dynamics)
-        constraint_flags = dataset_constraint_flags(cost_summary, contact_flags, phase_features)
+        debug_extra = bool(DATASET_RECORD_DIAGNOSTIC_FIELDS)
+        rigid_clearance = dataset_rigid_clearance_summary() if debug_extra else {}
+        contact_flags = dataset_contact_flags(phase, bucket_metrics, rigid_clearance) if debug_extra else {}
+        env_summary = dataset_environment_summary(target) if debug_extra else {}
+        cost_summary = (
+            dataset_cost_summary(q_cmd, q_real, action, bucket_metrics, rigid_clearance, dynamics=dynamics)
+            if debug_extra
+            else {}
+        )
+        constraint_flags = dataset_constraint_flags(cost_summary, contact_flags, phase_features) if debug_extra else []
         sample_index = int(STATE.get("dataset_samples", 0)) - int(STATE.get("dataset_episode_sample_start", 0))
-        obs_state = dataset_observation_state(q_real=q_real)
+        obs_state = dataset_observation_state(q_real=q_real, bucket_load_metrics=bucket_metrics)
+        effort_obs = dataset_joint_effort_observation()
+        joint_force_obs = dataset_joint_force_torque_observation() if debug_extra else None
+        observation_effort = effort_obs.get("observation.effort") if isinstance(effort_obs, dict) else None
+        STATE["dataset_effort_sample_count"] = int(STATE.get("dataset_effort_sample_count", 0) or 0) + 1
+        if observation_effort is None:
+            STATE["dataset_effort_missing_samples"] = int(STATE.get("dataset_effort_missing_samples", 0) or 0) + 1
+        if observation_effort is not None:
+            STATE["dataset_effort_available"] = True
+            try:
+                STATE["dataset_max_abs_effort"] = max(
+                    float(STATE.get("dataset_max_abs_effort", 0.0) or 0.0),
+                    float(np.max(np.abs(np.array(observation_effort, dtype=np.float32)))),
+                )
+            except Exception:
+                pass
         sample = {
             "v": DATASET_TRAJECTORY_FORMAT,
             "ep": int(STATE.get("dataset_episode_id", 0)),
@@ -7584,6 +8060,8 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False)
             "phase.context": phase_features["context"],
             "label": str(label),
             "observation.state": obs_state,
+            "observation.effort": observation_effort,
+            "observation.effort_meta": effort_obs,
             "obs.state": obs_state,
             "obs.q": vec_list(q_real, 4),
             "obs.dq": joint_velocity,
@@ -7597,12 +8075,18 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False)
             "bucket.tip": vec_list(bucket_tip_pos(), 3),
             "bucket.load": vec_list(bucket_load_pos(), 3),
             "bucket.pour": vec_list(bucket_pour_pos(), 3),
-            "sand": compact_sand_metrics(sand_metrics),
-            "contact": contact_flags,
-            "env": env_summary,
-            "cost": cost_summary,
-            "label.flags": constraint_flags,
+            "sand": compact_bucket_load_metrics(bucket_metrics),
         }
+        if debug_extra:
+            sample.update(
+                {
+                    "obs.joint_force_torque": joint_force_obs,
+                    "contact": contact_flags,
+                    "env": env_summary,
+                    "cost": cost_summary,
+                    "label.flags": constraint_flags,
+                }
+            )
         sample.update(dataset_capture_camera_observations(sample_index))
 
         path = str(STATE.get("dataset_path", "excavator_dataset.jsonl"))
@@ -7617,7 +8101,7 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False)
                     "t_episode": float(now) - float(STATE.get("dataset_episode_start_time", now)),
                     "phase": str(phase),
                     "label": str(label),
-                    "sand": compact_sand_metrics(sand_metrics),
+                    "sand": compact_bucket_load_metrics(bucket_metrics),
                 },
             )
 
@@ -7707,6 +8191,7 @@ def ensure_auto_collect_run_dir():
             "dataset_root": AUTO_COLLECT_DATASET_ROOT,
             "state_names": DATASET_STATE_NAMES,
             "action_names": DATASET_ACTION_NAMES,
+            "effort_names": DATASET_EFFORT_NAMES,
             "phase_names": DATASET_PHASE_NAMES,
             "camera_observations": dataset_camera_episode_metadata(),
             "lerobot_schema_notes": {
@@ -7714,13 +8199,17 @@ def ensure_auto_collect_run_dir():
                 "observation.images.1": "relative image path in each trajectory row; original main swing-mounted view",
                 "observation.images.2": "relative image path in each trajectory row; swing-mounted overhead panorama view",
                 "observation.state": DATASET_STATE_NAMES,
-                "observation.effort": "unavailable in this runtime unless articulation effort sensing is added",
+                "observation.state.bucket_load_estimate": "bucket_from_pile particle count from the per-sample bucket-fast metric",
+                "observation.effort": DATASET_EFFORT_NAMES,
+                "obs.joint_force_torque": "optional measured per-joint [Fx,Fy,Fz,Tx,Ty,Tz] diagnostics",
                 "action": DATASET_ACTION_NAMES,
                 "task": "episode-level and per-sample natural language task string",
             },
             "trajectory_fields": {
                 "task": "natural language task string",
                 "observation.state": DATASET_STATE_NAMES,
+                "observation.effort": DATASET_EFFORT_NAMES,
+                "observation.effort_meta": "availability/source/reason for measured joint efforts",
                 "observation.images.0": "relative path to RGB image",
                 "observation.images.1": "relative path to RGB image",
                 "observation.images.2": "relative path to RGB image",
@@ -7735,6 +8224,7 @@ def ensure_auto_collect_run_dir():
                 "obs.q": DOF_ORDER,
                 "obs.dq": DOF_ORDER,
                 "obs.ddq": DOF_ORDER,
+                "obs.joint_force_torque": "optional measured per-joint [Fx,Fy,Fz,Tx,Ty,Tz]",
                 "obs.q_cmd": DOF_ORDER,
                 "obs.q_err": DOF_ORDER,
                 "action": DATASET_ACTION_NAMES,
@@ -7748,16 +8238,14 @@ def ensure_auto_collect_run_dir():
                 "bucket.load": ["x", "y", "z"],
                 "bucket.pour": ["x", "y", "z"],
                 "sand": [
+                    "metrics_scope=bucket_fast for trajectory samples",
                     "n",
-                    "pile",
+                    "candidate",
                     "bucket",
                     "bucket_from_pile",
-                    "bin",
-                    "bin_from_pile",
-                    "spill_from_pile",
                     "bucket_from_pile_mass",
-                    "bin_from_pile_mass",
-                    "spill_from_pile_mass",
+                    "metrics_ms",
+                    "source_tracking",
                 ],
                 "contact": [
                     "bucket_soil_phase",
@@ -7947,6 +8435,10 @@ def auto_collect_write_run_summary():
                 "unload": os.path.join(run_dir, "segment_unload.jsonl"),
             },
             "debug_timeline_index": os.path.join(run_dir, DATASET_DEBUG_TIMELINE_FILE),
+            "debug_diagnostics_enabled": bool(debug_diagnostics_enabled()),
+            "debug_profile_enabled": bool(debug_profile_enabled()),
+            "debug_profile_summary": dict(STATE.get("debug_profile_summary", {}) or {}),
+            "debug_profile_recent": list(STATE.get("debug_profile_recent", []) or [])[-64:],
             "scene_context": compact_scene_context(),
             "sand_reset_policy": AUTO_COLLECT_SAND_RESET_POLICY,
             "sand_reset_done": bool(STATE.get("auto_collect_sand_reset_done", False)),
@@ -7954,9 +8446,86 @@ def auto_collect_write_run_summary():
             "sand_site_last_reset_label": STATE.get("sand_site_last_reset_label", ""),
             "auto_reset_sand_after_ui_ready": AUTO_RESET_SAND_AFTER_UI_READY,
             "perf_last": dict(STATE.get("sand_perf_last", {}) or {}),
+            "stage_timing_summary": dict(STATE.get("stage_timing_summary", {}) or {}),
+            "stage_timing_recent": list(STATE.get("stage_timing_recent", []) or [])[-32:],
             "lerobot_v3_export": STATE.get("auto_collect_lerobot_v3_export", {}),
         },
     )
+
+
+def lerobot_v3_external_export_python():
+    python_exe = str(AUTO_COLLECT_LEROBOT_V3_EXPORT_PYTHON or "").strip().strip('"')
+    if not python_exe or python_exe.lower() in ("0", "false", "no", "off", "none"):
+        return ""
+    if os.path.isfile(python_exe):
+        return python_exe
+    return ""
+
+
+def text_tail(value, limit=6000):
+    text = str(value or "")
+    limit = max(0, int(limit or 0))
+    if limit and len(text) > limit:
+        return text[-limit:]
+    return text
+
+
+def auto_collect_export_lerobot_v3_subprocess(run_dir, tool_path, export_record):
+    python_exe = lerobot_v3_external_export_python()
+    if not python_exe:
+        return None
+    export_dir = str(export_record.get("export_dir", "") or "")
+    cmd = [
+        python_exe,
+        str(tool_path),
+        str(run_dir),
+        "--export-lerobot",
+        "--export-split",
+        str(AUTO_COLLECT_LEROBOT_V3_SPLIT),
+        "--export-dir",
+        export_dir,
+        "--export-overwrite",
+    ]
+    record = dict(export_record)
+    record["export_mode"] = "subprocess"
+    record["export_python"] = python_exe
+    record["export_tool"] = str(tool_path)
+    started = time.time()
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=os.path.dirname(os.path.abspath(str(tool_path))) or None,
+            capture_output=True,
+            text=True,
+            timeout=max(30.0, float(AUTO_COLLECT_LEROBOT_V3_EXPORT_TIMEOUT_S or 1200.0)),
+        )
+        record["subprocess"] = {
+            "returncode": int(proc.returncode),
+            "elapsed_ms": round((time.time() - started) * 1000.0, 1),
+            "stdout_tail": text_tail(proc.stdout, 6000),
+            "stderr_tail": text_tail(proc.stderr, 6000),
+        }
+    except Exception as exc:
+        record["ok"] = False
+        record["reason"] = f"external_export_failed:{type(exc).__name__}:{exc}"
+        record["subprocess"] = {
+            "elapsed_ms": round((time.time() - started) * 1000.0, 1),
+            "exception": f"{type(exc).__name__}:{exc}",
+        }
+        return record
+
+    manifest_path = os.path.join(export_dir, "manifest.json") if export_dir else ""
+    manifest = read_json_file_or_none(manifest_path) if manifest_path else None
+    if isinstance(manifest, dict):
+        record["manifest"] = manifest
+        record["ok"] = bool(manifest.get("vla_training_ready", False))
+        record["reason"] = "ok" if record["ok"] else "export_incomplete"
+        return record
+
+    returncode = int(record.get("subprocess", {}).get("returncode", -1))
+    record["ok"] = False
+    record["reason"] = f"external_export_failed:returncode={returncode};manifest_missing"
+    return record
 
 
 def auto_collect_export_lerobot_v3_sync(run_dir):
@@ -7974,6 +8543,36 @@ def auto_collect_export_lerobot_v3_sync(run_dir):
         "elapsed_ms": None,
         "reason": "not_started",
     }
+    def write_failure_marker(record):
+        export_dir = str(record.get("export_dir", "") if isinstance(record, dict) else "")
+        if not export_dir:
+            return
+        try:
+            os.makedirs(export_dir, exist_ok=True)
+            marker_path = os.path.join(export_dir, "EXPORT_FAILED.txt")
+            reason = str(record.get("reason", "unknown") if isinstance(record, dict) else "unknown")
+            with open(marker_path, "w", encoding="utf-8") as f:
+                f.write("LeRobot v3 export failed.\n")
+                f.write(f"reason: {reason}\n")
+                f.write("\nFull status is in ../lerobot_v3_export.json and run summary.json.\n")
+                if "pandas is required" in reason or "No module named 'pandas'" in reason:
+                    f.write(
+                        "\nInstall pandas plus a parquet engine such as pyarrow, or set "
+                        "EXCAVATOR_LEROBOT_V3_EXPORT_PYTHON to a Python that has them.\n"
+                    )
+                export_python = str(record.get("export_python", "") if isinstance(record, dict) else "")
+                if export_python:
+                    f.write(f"\nexport_python: {export_python}\n")
+                subprocess_info = record.get("subprocess", {}) if isinstance(record, dict) else {}
+                if isinstance(subprocess_info, dict):
+                    stderr_tail = str(subprocess_info.get("stderr_tail", "") or "")
+                    if stderr_tail:
+                        f.write("\nstderr_tail:\n")
+                        f.write(text_tail(stderr_tail, 4000))
+                        f.write("\n")
+        except Exception:
+            pass
+
     try:
         if not run_dir or not os.path.isdir(run_dir):
             export_record["reason"] = "run_dir_missing"
@@ -7981,6 +8580,10 @@ def auto_collect_export_lerobot_v3_sync(run_dir):
         tool_path = project_path("excavator_dataset_tools.py")
         if not os.path.isfile(tool_path):
             export_record["reason"] = f"export_tool_missing:{tool_path}"
+            return export_record
+        external_record = auto_collect_export_lerobot_v3_subprocess(run_dir, tool_path, export_record)
+        if isinstance(external_record, dict):
+            export_record.update(external_record)
             return export_record
         spec = importlib.util.spec_from_file_location("excavator_dataset_tools_runtime_export", tool_path)
         if spec is None or spec.loader is None:
@@ -8006,6 +8609,8 @@ def auto_collect_export_lerobot_v3_sync(run_dir):
     finally:
         export_record["finished_at"] = time.time()
         export_record["elapsed_ms"] = round((float(export_record["finished_at"]) - started) * 1000.0, 1)
+        if not bool(export_record.get("ok", False)):
+            write_failure_marker(export_record)
         if result_path:
             try:
                 write_json_file(result_path, export_record)
@@ -8128,6 +8733,7 @@ def auto_collect_episode_metrics():
     q_real = get_real_joint_positions()
     q_cmd = CTRL.q_cmd.copy()
     sand_metrics = sand_metrics_current(force=True)
+    update_episode_quality_trackers(sand_metrics, "episode_metrics", q_cmd=q_cmd, q_real=q_real, action=None)
     return {
         "q_real_rad": vec_list(q_real, 4),
         "q_cmd_rad": vec_list(q_cmd, 4),
@@ -8139,7 +8745,7 @@ def auto_collect_episode_metrics():
         "bucket_load_xyz": vec_list(bucket_load_pos(), 3),
         "bucket_pour_xyz": vec_list(bucket_pour_pos(), 3),
         "unload_drop": compact_unload_drop(),
-        "bucket_load_estimate": dataset_bucket_load_estimate(),
+        "bucket_load_estimate": dataset_bucket_load_estimate(sand_metrics),
         "sand": compact_sand_metrics(sand_metrics),
         "support_clearance": support_clearance_detail(),
         "freeze_count": int(STATE.get("dataset_episode_freezes", 0)),
@@ -8151,6 +8757,13 @@ def auto_collect_episode_metrics():
         "final_spill_from_pile_particles": int(STATE.get("dataset_final_spill_from_pile_particles", 0)),
         "max_joint_error_deg": float(STATE.get("dataset_max_joint_error_deg", 0.0)),
         "max_action_speed": float(STATE.get("dataset_max_action_speed", 0.0)),
+        "effort_available": bool(
+            int(STATE.get("dataset_effort_sample_count", 0) or 0) > 0
+            and int(STATE.get("dataset_effort_missing_samples", 0) or 0) == 0
+        ),
+        "effort_sample_count": int(STATE.get("dataset_effort_sample_count", 0) or 0),
+        "effort_missing_samples": int(STATE.get("dataset_effort_missing_samples", 0) or 0),
+        "max_abs_effort": float(STATE.get("dataset_max_abs_effort", 0.0)),
     }
 
 
@@ -8248,10 +8861,132 @@ def stage_contract_summary(stage_name, stage_index=None, q_goal=None, duration=N
     return out
 
 
+def stage_timing_key(stage_name, stage_index):
+    ep = str(STATE.get("dataset_episode_uid", "") or STATE.get("active_task_name", "") or "manual")
+    return f"{ep}:{int(stage_index) if stage_index is not None else -1}:{str(stage_name)}"
+
+
+def update_stage_timing_summary(stage_name, result, elapsed_s=None, planned_s=None):
+    if elapsed_s is None:
+        return
+    try:
+        elapsed_ms = float(elapsed_s) * 1000.0
+        stage = str(stage_name)
+        summary = STATE.get("stage_timing_summary")
+        if not isinstance(summary, dict):
+            summary = {}
+        row = summary.get(stage)
+        if not isinstance(row, dict):
+            row = {
+                "count": 0,
+                "done": 0,
+                "failed": 0,
+                "cancelled": 0,
+                "stopped": 0,
+                "total_ms": 0.0,
+                "min_ms": None,
+                "max_ms": 0.0,
+                "planned_total_ms": 0.0,
+            }
+        row["count"] = int(row.get("count", 0) or 0) + 1
+        if str(result) == "done":
+            row["done"] = int(row.get("done", 0) or 0) + 1
+        elif str(result) == "failed":
+            row["failed"] = int(row.get("failed", 0) or 0) + 1
+        elif str(result) == "cancelled":
+            row["cancelled"] = int(row.get("cancelled", 0) or 0) + 1
+        elif str(result) == "stopped":
+            row["stopped"] = int(row.get("stopped", 0) or 0) + 1
+        row["total_ms"] = float(row.get("total_ms", 0.0) or 0.0) + elapsed_ms
+        row["max_ms"] = max(float(row.get("max_ms", 0.0) or 0.0), elapsed_ms)
+        old_min = row.get("min_ms")
+        row["min_ms"] = elapsed_ms if old_min is None else min(float(old_min), elapsed_ms)
+        if planned_s is not None:
+            row["planned_total_ms"] = float(row.get("planned_total_ms", 0.0) or 0.0) + float(planned_s) * 1000.0
+        row["avg_ms"] = float(row["total_ms"]) / max(1, int(row["count"]))
+        row["avg_planned_ms"] = float(row.get("planned_total_ms", 0.0) or 0.0) / max(1, int(row["count"]))
+        summary[stage] = row
+        STATE["stage_timing_summary"] = summary
+
+        recent = STATE.get("stage_timing_recent")
+        if not isinstance(recent, list):
+            recent = []
+        recent.append(
+            {
+                "stage": stage,
+                "result": str(result),
+                "elapsed_ms": round(elapsed_ms, 1),
+                "planned_ms": None if planned_s is None else round(float(planned_s) * 1000.0, 1),
+                "episode": str(STATE.get("dataset_episode_uid", "")),
+                "t": round(time.time(), 3),
+            }
+        )
+        STATE["stage_timing_recent"] = recent[-64:]
+    except Exception:
+        pass
+
+
+def stage_timing_attach(row, stage_name, stage_index, result, duration=None):
+    key = stage_timing_key(stage_name, stage_index)
+    active = STATE.get("stage_timing_active")
+    if not isinstance(active, dict):
+        active = {}
+    now_perf = time.perf_counter()
+    now_wall = time.time()
+    planned_s = None if duration is None else float(duration)
+    if str(result) == "start":
+        active[key] = {
+            "perf": float(now_perf),
+            "wall": float(now_wall),
+            "planned_s": planned_s,
+        }
+        STATE["stage_timing_active"] = active
+        row["timing"] = {
+            "planned_duration_s": planned_s,
+            "started_at": round(now_wall, 3),
+        }
+        return row
+
+    terminal_result = str(result) in {"done", "failed", "cancelled", "stopped"}
+    if not terminal_result:
+        start = active.get(key)
+        elapsed_s = None
+        if isinstance(start, dict):
+            elapsed_s = max(0.0, float(now_perf) - float(start.get("perf", now_perf)))
+            planned_s = start.get("planned_s", planned_s)
+        row["timing"] = {
+            "planned_duration_s": planned_s,
+            "elapsed_so_far_s": elapsed_s,
+            "elapsed_so_far_ms": None if elapsed_s is None else round(float(elapsed_s) * 1000.0, 1),
+            "observed_at": round(now_wall, 3),
+        }
+        return row
+
+    start = active.pop(key, None)
+    STATE["stage_timing_active"] = active
+    if isinstance(start, dict):
+        elapsed_s = max(0.0, float(now_perf) - float(start.get("perf", now_perf)))
+        planned_s = start.get("planned_s", planned_s)
+    else:
+        elapsed_s = None
+    row["timing"] = {
+        "planned_duration_s": planned_s,
+        "wall_duration_s": elapsed_s,
+        "wall_elapsed_ms": None if elapsed_s is None else round(float(elapsed_s) * 1000.0, 1),
+        "finished_at": round(now_wall, 3),
+    }
+    if elapsed_s is not None:
+        row["wall_duration_s"] = float(elapsed_s)
+        row["wall_elapsed_ms"] = round(float(elapsed_s) * 1000.0, 1)
+        update_stage_timing_summary(stage_name, result, elapsed_s=elapsed_s, planned_s=planned_s)
+    return row
+
+
 def record_stage_audit(stage_name, stage_index, result, reason="", q_goal=None, duration=None, data=None, include_sand=False):
     try:
         row = stage_contract_summary(stage_name, stage_index=stage_index, q_goal=q_goal, duration=duration)
         row["result"] = str(result)
+        stage_timing_attach(row, stage_name, stage_index, str(result), duration=duration)
         if reason:
             row["reason"] = debug_short_string(reason, 360)
         try:
@@ -8850,7 +9585,14 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
     STATE["dataset_final_spill_from_pile_particles"] = 0
     STATE["dataset_max_joint_error_deg"] = 0.0
     STATE["dataset_max_action_speed"] = 0.0
+    STATE["bucket_load_fast_last"] = None
+    STATE["bucket_load_fast_last_time"] = 0.0
+    STATE["dataset_effort_available"] = False
+    STATE["dataset_effort_sample_count"] = 0
+    STATE["dataset_effort_missing_samples"] = 0
+    STATE["dataset_max_abs_effort"] = 0.0
     STATE["dataset_phase_metrics"] = {}
+    STATE["stage_timing_active"] = {}
     if bool(STATE.get("dataset_camera_enabled", True)):
         os.makedirs(STATE["dataset_image_dir"], exist_ok=True)
     initial_ids = capture_initial_pile_particle_ids()
@@ -8944,7 +9686,9 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
             "observation.images.1": "relative image path; original main swing-mounted view",
             "observation.images.2": "relative image path; swing-mounted overhead panorama view",
             "observation.state": DATASET_STATE_NAMES,
-            "observation.effort": "unavailable in this runtime unless articulation effort sensing is added",
+            "observation.state.bucket_load_estimate": "bucket_from_pile particle count from the per-sample bucket-fast metric",
+            "observation.effort": DATASET_EFFORT_NAMES,
+            "obs.joint_force_torque": "optional measured per-joint [Fx,Fy,Fz,Tx,Ty,Tz] diagnostics",
             "action": DATASET_ACTION_NAMES,
         },
         "target_xyz": vec_list(target, 3),
@@ -8967,6 +9711,7 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
         "trainable_rule": "full_dig_lift_dump_only",
         "state_names": DATASET_STATE_NAMES,
         "action_names": DATASET_ACTION_NAMES,
+        "effort_names": DATASET_EFFORT_NAMES,
         "phase_names": DATASET_PHASE_NAMES,
         "trajectory_fields_added_v3": [
             "phase.index",
@@ -8982,6 +9727,8 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
         "trajectory_fields_added_v4": [
             "task",
             "observation.state",
+            "observation.effort",
+            "observation.effort_meta",
             "observation.images.0",
             "observation.images.1",
             "observation.images.2",
@@ -9110,6 +9857,10 @@ def auto_collect_finish_episode(meta, success, reason):
         "lift_bucket_from_pile_particles": metrics.get("lift_bucket_from_pile_particles"),
         "final_bin_from_pile_particles": metrics.get("final_bin_from_pile_particles"),
         "final_spill_from_pile_particles": metrics.get("final_spill_from_pile_particles"),
+        "effort_available": metrics.get("effort_available"),
+        "effort_sample_count": metrics.get("effort_sample_count"),
+        "effort_missing_samples": metrics.get("effort_missing_samples"),
+        "max_abs_effort": metrics.get("max_abs_effort"),
     }
     append_jsonl(os.path.join(run_dir, "episodes.jsonl"), index_row)
     auto_collect_write_segment_indices(run_dir, meta, index_row, score_report)
@@ -9166,6 +9917,47 @@ def auto_collect_finish_episode(meta, success, reason):
     auto_collect_write_run_summary()
     STATE["dataset_recording"] = False
     return success
+
+
+def auto_collect_finalize_active_episode_if_needed(reason):
+    if not bool(STATE.get("dataset_recording", False)):
+        return False
+    meta_path = str(STATE.get("dataset_meta_path", "") or "")
+    episode_dir = str(STATE.get("dataset_episode_dir", "") or "")
+    if not meta_path or not episode_dir:
+        return False
+    score_path = os.path.join(episode_dir, "score.json")
+    if os.path.exists(score_path):
+        STATE["dataset_recording"] = False
+        return False
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except Exception:
+        meta = {}
+    if not isinstance(meta, dict) or not meta:
+        return False
+    status = str(meta.get("status", "") or "").lower()
+    if status and status != "running":
+        STATE["dataset_recording"] = False
+        return False
+
+    phase_metrics = STATE.get("dataset_phase_metrics", {})
+    has_dump_settle = isinstance(phase_metrics, dict) and "after_dump_settle" in phase_metrics
+    final_bin = int(STATE.get("dataset_final_bin_from_pile_particles", 0) or 0)
+    freezes = int(STATE.get("dataset_episode_freezes", 0) or 0)
+    execution_success = bool(has_dump_settle and final_bin >= int(QUALITY_MIN_DUMP_PARTICLES) and freezes <= 0)
+    finish_reason = "ok" if execution_success else f"execution_failed/{reason}"
+    info_print(
+        "[AUTO DATASET FINALIZE]",
+        f"episode={meta.get('episode_id', '')}",
+        f"reason={reason}",
+        f"execution_success={execution_success}",
+        f"after_dump_settle={has_dump_settle}",
+        f"final_bin={final_bin}",
+        f"freezes={freezes}",
+    )
+    return auto_collect_finish_episode(meta, execution_success, finish_reason)
 
 
 def auto_collect_sample_target(attempt_index, retry_index=0):
@@ -10115,6 +10907,13 @@ async def auto_collect_loop(count, max_attempts=None):
     STATE["auto_collect_run_dir"] = ""
     STATE["auto_collect_run_id"] = ""
     STATE["auto_collect_lerobot_v3_export"] = {}
+    STATE["stage_timing_active"] = {}
+    STATE["stage_timing_summary"] = {}
+    STATE["stage_timing_recent"] = []
+    STATE["debug_profile_summary"] = {}
+    STATE["debug_profile_recent"] = []
+    STATE["debug_profile_count"] = 0
+    STATE["debug_profile_last"] = None
     STATE["debug_timeline_path"] = ""
     STATE["auto_collect_sand_reset_done"] = False
     ensure_auto_collect_run_dir()
@@ -10166,6 +10965,10 @@ async def auto_collect_loop(count, max_attempts=None):
         info_print("[ERROR] [AUTO DATASET] loop failed:", type(e).__name__, e)
         STATE["auto_collect_last_result"] = f"loop_failed={type(e).__name__}: {e}"
     finally:
+        try:
+            auto_collect_finalize_active_episode_if_needed("auto_collect_loop_interrupted_before_finish")
+        except Exception as e:
+            info_print("[WARN] [AUTO DATASET FINALIZE] failed:", type(e).__name__, e)
         debug_timeline_record(
             "RUN_END",
             result=str(STATE.get("auto_collect_last_result", "")),
@@ -10219,12 +11022,16 @@ def request_auto_collect(count, max_attempts=None):
 
 def stop_auto_collect():
     STATE["auto_collect_stop_requested"] = True
+    recording_auto_episode = bool(STATE.get("auto_collect_active", False)) and bool(STATE.get("dataset_recording", False))
     STATE["trace_active_motion"] = None
     STATE["trace_no_plan_notice_shown"] = True
     STATE["trace_no_plan_notice_time"] = time.time()
     cancel_active_task("auto dataset stop requested")
     invalidate_active_task("auto_collect_stop_requested")
-    cancel_registered_task("auto_collect", reason="stop_auto_collect")
+    if recording_auto_episode:
+        info_print("[AUTO DATASET STOP]", "current episode will finalize before export")
+    else:
+        cancel_registered_task("auto_collect", reason="stop_auto_collect")
     auto_collect_write_run_summary()
     update_status("[AUTO DATASET] stop requested", force=True)
 
@@ -11656,7 +12463,7 @@ class ArticulationActionController:
                     "[UNLOAD DUMP ACTION CLIP]",
                     f"cmd={rad_to_deg(bucket_cmd):.2f}deg",
                     f"action={rad_to_deg(bucket_action):.2f}deg",
-                    force_log=True,
+                    force_log=debug_diagnostics_enabled(),
                 )
         swing_idx = self.name_to_idx["swing"]
         lo, hi = FINAL_LIMITS_RAD["swing"]
@@ -12968,7 +13775,7 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
             f"bucket_start={rad_to_deg(float(q0[bucket_idx])):.2f}deg",
             f"bucket_target={rad_to_deg(float(q1[bucket_idx])):.2f}deg",
             f"bucket_delta={rad_to_deg(float(q1[bucket_idx] - q0[bucket_idx])):.2f}deg",
-            force_log=True,
+            force_log=debug_diagnostics_enabled(),
         )
     if "lift_carry" in str(label or mode).lower():
         bucket_idx = CTRL.name_to_idx.get("bucket", 3)
@@ -13856,11 +14663,15 @@ def format_ground_report(mode, report, reason):
 
 
 def log_phase_ground(prefix, mode):
+    if not non_quiet_diagnostics_enabled():
+        return
     report = phase_ground_report(mode)
     info_print(f"{prefix} " + format_ground_report(mode, report, "check"))
 
 
 def log_predicted_phase_ground(prefix, mode, q, reference_q=None):
+    if not non_quiet_diagnostics_enabled():
+        return True, "quiet_disabled", {"quiet_disabled": True}
     report = predicted_phase_ground_report(q, mode, reference_q=reference_q)
     if report.get("tip_z") is None:
         ok, reason = False, "missing predicted phase report"
@@ -14109,6 +14920,8 @@ def rigid_obstacle_bboxes(force=False):
             )
     STATE["rigid_obstacle_cache"] = bboxes
     STATE["rigid_obstacle_cache_time"] = now
+    STATE["rigid_obstacle_cache_version"] = int(STATE.get("rigid_obstacle_cache_version", 0) or 0) + 1
+    STATE["path_obstacle_check_cache"] = {}
     return bboxes
 
 
@@ -14117,6 +14930,10 @@ def clear_rigid_obstacle_cache(reason=""):
     STATE["rigid_obstacle_cache_time"] = 0.0
     STATE["rigid_obstacle_cache_hits"] = 0
     STATE["rigid_obstacle_cache_misses"] = 0
+    STATE["rigid_obstacle_cache_version"] = int(STATE.get("rigid_obstacle_cache_version", 0) or 0) + 1
+    STATE["path_obstacle_check_cache"] = {}
+    STATE["path_obstacle_check_cache_hits"] = 0
+    STATE["path_obstacle_check_cache_misses"] = 0
     if reason:
         info_print("[OBSTACLE CACHE CLEAR]", f"reason={reason}")
 
@@ -14601,17 +15418,62 @@ def unload_bin_wall_overpass_allowed(mode, obstacle, *points):
     return float(min_z) >= wall_top + float(UNLOAD_BIN_WALL_OVERPASS_CLEARANCE_Z)
 
 
+def path_obstacle_check_cache_key(q_start, q_goal, mode, samples):
+    try:
+        qa = np.round(np.array(q_start, dtype=np.float32).reshape(-1)[:4], 4)
+        qb = np.round(np.array(q_goal, dtype=np.float32).reshape(-1)[:4], 4)
+        return (
+            int(STATE.get("rigid_obstacle_cache_version", 0) or 0),
+            str(mode),
+            int(max(2, int(samples))),
+            tuple(float(x) for x in qa),
+            tuple(float(x) for x in qb),
+            float(PATH_OBSTACLE_MARGIN_XY),
+            float(PATH_OBSTACLE_MARGIN_Z),
+            float(PATH_LINK_COLLISION_RADIUS_M),
+        )
+    except Exception:
+        return None
+
+
+def path_obstacle_result_cacheable(result):
+    if not isinstance(result, tuple) or len(result) < 2:
+        return False
+    reason = str(result[1]).lower()
+    return "planning budget exceeded" not in reason and "deadline" not in reason
+
+
+@debug_profiled("path_obstacle_check", threshold_ms=5.0)
 def path_obstacle_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadline=None):
     t0 = time.perf_counter()
     obstacles = rigid_obstacle_bboxes()
+    samples = max(2, int(samples))
+    cache_key = path_obstacle_check_cache_key(q_start, q_goal, mode, samples)
+    cache = STATE.setdefault("path_obstacle_check_cache", {})
+    if cache_key is not None and isinstance(cache, dict):
+        cached = cache.get(cache_key)
+        if cached is not None:
+            STATE["path_obstacle_check_cache_hits"] = int(STATE.get("path_obstacle_check_cache_hits", 0) or 0) + 1
+            return cached
+        STATE["path_obstacle_check_cache_misses"] = int(STATE.get("path_obstacle_check_cache_misses", 0) or 0) + 1
+
+    def finish(result):
+        if cache_key is not None and isinstance(cache, dict) and path_obstacle_result_cacheable(result):
+            if len(cache) >= int(PLANNING_PATH_PENALTY_CACHE_MAX):
+                try:
+                    cache.pop(next(iter(cache)))
+                except Exception:
+                    cache.clear()
+            cache[cache_key] = result
+        return result
+
     try:
         if not obstacles:
-            return True, "ok", samples, None
+            return finish((True, "ok", samples, None))
 
-        samples = max(2, int(samples))
         for i in range(1, samples + 1):
             if planning_deadline_exceeded(deadline):
-                return False, "planning budget exceeded", i, None
+                return finish((False, "planning budget exceeded", i, None))
             s = float(i) / float(samples)
             q = interpolate_q_shortest(q_start, q_goal, s)
             segments = predicted_obstacle_check_segments(q, reference_q=q_start)
@@ -14652,7 +15514,7 @@ def path_obstacle_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadl
                             "bbox_min": obstacle["min"],
                             "bbox_max": obstacle["max"],
                         }
-                        return False, "predicted rigid link sweep contact", i, report
+                        return finish((False, "predicted rigid link sweep contact", i, report))
 
             # Segment sweeps already include all chain endpoints. Keep point-only
             # checks as a fallback for unusual missing-segment predictions instead
@@ -14662,7 +15524,7 @@ def path_obstacle_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadl
                 for p in points:
                     for obstacle in obstacles:
                         if planning_deadline_exceeded(deadline):
-                            return False, "planning budget exceeded", i, None
+                            return finish((False, "planning budget exceeded", i, None))
                         if unload_bin_wall_overpass_allowed(mode, obstacle, p):
                             continue
                         if not obstacle_aabb_overlaps_segment(
@@ -14691,9 +15553,9 @@ def path_obstacle_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadl
                                 "bbox_min": obstacle["min"],
                                 "bbox_max": obstacle["max"],
                             }
-                            return False, "predicted rigid obstacle contact", i, report
+                            return finish((False, "predicted rigid obstacle contact", i, report))
 
-        return True, "ok", samples, None
+        return finish((True, "ok", samples, None))
     finally:
         perf = dict(STATE.get("sand_perf_last", {}) or {})
         perf["obstacle_check_ms"] = float(perf.get("obstacle_check_ms", 0.0) or 0.0) + (
@@ -14703,6 +15565,7 @@ def path_obstacle_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadl
         STATE["sand_perf_last"] = perf
 
 
+@debug_profiled("path_segment_check", threshold_ms=5.0)
 def path_segment_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadline=None):
     ok, reason, sample, report = path_phase_check(q_start, q_goal, mode, samples=samples, deadline=deadline)
     if not ok:
@@ -15035,6 +15898,7 @@ def unload_pose_bucket_clearance_report(q_pose, reference_q=None):
     }
 
 
+@debug_profiled("validate_unload_goal", threshold_ms=5.0)
 def validate_unload_goal(q_start, q_pre_dump, q_dump=None, dump_info=None, label="unload_goal", deadline=None):
     ctx = task_scene_context()
     landing = unload_bin_landing_point(ctx=ctx)
@@ -15093,7 +15957,7 @@ def validate_unload_goal(q_start, q_pre_dump, q_dump=None, dump_info=None, label
         f"wall_top={fmt_optional((collision or {}).get('wall_top_z') if isinstance(collision, dict) else None)}",
         f"required_z={fmt_optional((collision or {}).get('required_clearance_z') if isinstance(collision, dict) else reach.get('required_clearance_z'))}",
         f"reach_margin={fmt_optional(reach.get('reach_margin'))}",
-        force_log=True,
+        force_log=bool((not ok) or debug_diagnostics_enabled()),
     )
     if not ok:
         info_print(
@@ -17041,11 +17905,13 @@ def swing_corridor_summary(q_start, q_goal, mode, samples=25, deadline=None):
     return summary
 
 
+@debug_profiled("find_clearance_route", threshold_ms=10.0)
 def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=None):
     end_effector = path_end_effector_for_mode(mode)
     route_verbose = "staged_unload" in str(label).lower() or "unload_to_bin" in str(mode).lower()
+    route_debug_log = bool(route_verbose and non_quiet_diagnostics_enabled())
     if planning_deadline_exceeded(deadline):
-        if route_verbose:
+        if route_debug_log:
             info_print(
                 "[CLEARANCE ROUTE SKIP]",
                 f"label={label}",
@@ -17081,7 +17947,7 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
         deadline=corridor_deadline,
     )
     corridor_intervals = list((corridor or {}).get("free_intervals_deg", []) or [])
-    if route_verbose:
+    if route_debug_log:
         info_print(
             "[CLEARANCE ROUTE START]",
             f"label={label}",
@@ -17166,7 +18032,7 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
 
     def try_joint_rrt_route():
         nonlocal last_reason
-        if route_verbose:
+        if route_debug_log:
             info_print(
                 "[CLEARANCE ROUTE RRT START]",
                 f"label={label}",
@@ -17175,12 +18041,12 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
             )
         if joint_space_planner is None:
             last_reason = "joint_space_planner unavailable; deterministic routes only"
-            if route_verbose:
+            if route_debug_log:
                 info_print("[CLEARANCE ROUTE RRT SKIP]", f"label={label}", last_reason, force_log=True)
             return
         if budget_expired():
             last_reason = "planning budget exceeded"
-            if route_verbose:
+            if route_debug_log:
                 info_print("[CLEARANCE ROUTE RRT SKIP]", f"label={label}", last_reason, force_log=True)
             return
         rrt_deadline = None
@@ -17224,7 +18090,7 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
                 f"trapped={rrt_stats.get('trapped', 0)} advanced={rrt_stats.get('advanced', 0)} "
                 f"last={rrt_stats.get('last_reason', '')}"
             )
-            if route_verbose:
+            if route_debug_log:
                 info_print("[CLEARANCE ROUTE RRT FAILED]", f"label={label}", last_reason, force_log=True)
 
     def add_deterministic_joint_routes():
@@ -17245,7 +18111,7 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
 
         tried = 0
         detours = PATH_DETERMINISTIC_SWING_DETOURS_DEG if deadline is None else PATH_DETERMINISTIC_SWING_DETOURS_DEG[:7]
-        if route_verbose:
+        if route_debug_log:
             info_print(
                 "[CLEARANCE ROUTE DETERMINISTIC START]",
                 f"label={label}",
@@ -17333,7 +18199,7 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
 
         if not candidates and tried > 0:
             last_reason = f"deterministic joint clearance tried={tried} last={last_reason}"
-        if route_verbose:
+        if route_debug_log:
             info_print(
                 "[CLEARANCE ROUTE DETERMINISTIC DONE]",
                 f"label={label}",
@@ -17434,7 +18300,7 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
     fast_heights = PATH_FAST_SIDE_HEIGHTS if deadline is None else PATH_FAST_SIDE_HEIGHTS[:2]
     fast_blocker_limit = int(PATH_FAST_SIDE_MAX_BLOCKERS) if deadline is None else 1
     fast_corner_limit = 10 if deadline is None else 4
-    if route_verbose:
+    if route_debug_log:
         info_print(
             "[CLEARANCE ROUTE CORNER START]",
             f"label={label}",
@@ -17482,7 +18348,7 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
     fallback_heights = PATH_CLEARANCE_HEIGHTS if deadline is None else PATH_CLEARANCE_HEIGHTS[:3]
     fallback_fractions = PATH_CLEARANCE_FRACTIONS if deadline is None else [0.50]
     fallback_side_offsets = PATH_ROUTE_SIDE_OFFSETS if deadline is None else PATH_ROUTE_SIDE_OFFSETS[:1]
-    if route_verbose:
+    if route_debug_log:
         info_print(
             "[CLEARANCE ROUTE FALLBACK START]",
             f"label={label}",
@@ -17573,7 +18439,7 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
         )
         return best["route"], str(best["type"])
 
-    if route_verbose:
+    if route_debug_log:
         info_print("[CLEARANCE ROUTE FAILED]", f"label={label}", f"reason={last_reason}", force_log=True)
     return None, last_reason
 
@@ -21021,7 +21887,7 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
             "mode=finite_search_with_debug",
             "reason=avoid_main_thread_candidate_explosion",
             f"cleared_stale_cancel={bool(STATE.get('loaded_route_test_cleared_stale_cancel', False))}",
-            force_log=True,
+            force_log=debug_diagnostics_enabled(),
         )
     info_print(
         "[POST SECURE PLAN START]",
@@ -21029,7 +21895,7 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
         f"q_start={q_deg_values(q_lift, wrap_swing_for_display=True)}",
         f"landing={vec_list(unload_bin_landing_point(), 3)}",
         f"dump_deg={fmt_optional(unload_dump_target_deg())}",
-        force_log=loaded_route_test,
+        force_log=bool(loaded_route_test and debug_diagnostics_enabled()),
     )
     dump_deadline = child_planning_deadline(deadline, 6.0, min_seconds=2.0) if loaded_route_test else deadline
     if loaded_route_test:
@@ -21037,7 +21903,7 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
             "[POST SECURE PLAN DUMP BUDGET]",
             f"dump_budget={fmt_optional(max(0.0, float(dump_deadline) - time.time()))}s",
             f"route_reserved={fmt_optional(max(0.0, float(deadline) - float(dump_deadline)))}s",
-            force_log=True,
+            force_log=debug_diagnostics_enabled(),
         )
     q_release_align, dump_info = plan_dump_pose_to_bin(
         q_seed=q_lift,
@@ -21116,7 +21982,7 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
             f"min_bucket_z={fmt_optional(unload_exec_clearance.get('min_bucket_z'))}",
             f"required_exec_z={fmt_optional(unload_exec_clearance.get('exec_required_clearance_z'))}",
             f"exec_margin={fmt_optional(unload_exec_clearance.get('exec_margin'))}",
-            force_log=True,
+            force_log=debug_diagnostics_enabled(),
         )
     if (
         (not bool(unload_goal_validation.get("ok", False)) and bool(unload_goal_validation.get("can_retry_high", False)))
@@ -21162,7 +22028,7 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
                 f"attempt={retry_idx + 1}/{len(retry_zs)}",
                 f"release_z={retry_z:.3f}",
                 f"required_z={required_z:.3f}",
-                force_log=loaded_route_test,
+                force_log=bool(loaded_route_test and debug_diagnostics_enabled()),
             )
             q_retry_align, retry_info = plan_dump_pose_to_bin(
                 q_seed=q_lift,
@@ -21213,7 +22079,7 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
                         f"required_exec_z={fmt_optional(retry_exec_clearance.get('exec_required_clearance_z'))}",
                         f"exec_margin={fmt_optional(retry_exec_clearance.get('exec_margin'))}",
                         f"q_pre_dump={q_deg_values(q_pre_retry, wrap_swing_for_display=True)}",
-                        force_log=loaded_route_test,
+                        force_log=bool(loaded_route_test and debug_diagnostics_enabled()),
                     )
                     continue
                 q_release_align = q_retry_align
@@ -21229,7 +22095,7 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
                     "[UNLOAD GOAL RETRY HIGH OK]",
                     f"release_z={retry_z:.3f}",
                     f"q_pre_dump={q_deg_values(q_pre_dump, wrap_swing_for_display=True)}",
-                    force_log=True,
+                    force_log=debug_diagnostics_enabled(),
             )
             break
         if not retry_ok and best_retry_ok is not None:
@@ -21246,7 +22112,7 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
                 f"release_z={fmt_optional(best_retry_ok.get('release_z'))}",
                 f"exec_margin={fmt_optional(unload_exec_clearance.get('exec_margin'))}",
                 f"q_pre_dump={q_deg_values(q_pre_dump, wrap_swing_for_display=True)}",
-                force_log=True,
+                force_log=debug_diagnostics_enabled(),
             )
         if not retry_ok:
             candidate["unload_goal_validation"] = unload_goal_validation
@@ -21307,7 +22173,7 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
         f"exec_required_z={fmt_optional(unload_exec_clearance.get('exec_required_clearance_z'))}",
         f"exec_margin={fmt_optional(unload_exec_clearance.get('exec_margin'))}",
         "dump_policy=bucket_only_after_arrival",
-        force_log=True,
+        force_log=debug_diagnostics_enabled(),
     )
 
     direct_samples = 8 if loaded_route_test else DIG_PLAN_PATH_CHECK_SAMPLES
@@ -21323,7 +22189,7 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
         f"kind={kind}",
         f"reason={reason}",
         f"q_pre_dump={q_deg_values(q_pre_dump, wrap_swing_for_display=True)}",
-        force_log=loaded_route_test,
+        force_log=bool(loaded_route_test and debug_diagnostics_enabled()),
     )
     route_seq = []
     route_points = []
@@ -21638,6 +22504,7 @@ def plan_dig_sequence_from_target(target_xyz, max_seconds=None):
     return best["sequence"]
 
 
+@debug_profiled("build_dig_plan_from_current_target", threshold_ms=20.0)
 def build_dig_plan_from_current_target(force_status=True, max_seconds=None):
     if bool(STATE.get("dig_plan_planning_active", False)):
         seq_existing = STATE.get("dig_plan_sequence", None)
@@ -21880,7 +22747,7 @@ def install_loaded_unload_route_test_plan_from_current():
             f"obstacle_snapshot_ms={(time.perf_counter() - t_obstacles) * 1000.0:.1f}",
             f"cache_hit={bool(hit_delta > 0)}",
             f"cache_miss={bool(miss_delta > 0)}",
-            force_log=True,
+            force_log=debug_diagnostics_enabled(),
         )
         ok = append_staged_post_secure_load_plan(task_label="loaded_unload_route_test")
     finally:
@@ -21890,7 +22757,7 @@ def install_loaded_unload_route_test_plan_from_current():
             f"path_misses={int(STATE.get('planning_path_penalty_cache_misses', 0))}",
             f"swing_hits={int(STATE.get('planning_swing_corridor_cache_hits', 0))}",
             f"swing_misses={int(STATE.get('planning_swing_corridor_cache_misses', 0))}",
-            force_log=True,
+            force_log=debug_diagnostics_enabled(),
         )
         STATE["dig_plan_planning_active"] = previous_active
         STATE["dig_plan_planning_source"] = previous_source
@@ -22022,6 +22889,7 @@ def unload_release_alignment_bucket_deg(dump_deg=None):
     return float(align_deg)
 
 
+@debug_profiled("plan_dump_pose_to_bin", threshold_ms=10.0)
 def plan_dump_pose_to_bin(
     q_seed=None,
     dump_deg=None,
@@ -22198,7 +23066,7 @@ def plan_dump_pose_to_bin(
             f"drift={fmt_optional(seed_drop.get('drift_distance'))} "
             f"q_seed={q_deg_values(q_seed, wrap_swing_for_display=True)} "
             f"q_seed_dump={q_deg_values(q_seed_dump, wrap_swing_for_display=True)}",
-            force_log=True,
+            force_log=debug_diagnostics_enabled(),
         )
     draw_unload_dump_debug(
         label,
@@ -22233,7 +23101,7 @@ def plan_dump_pose_to_bin(
                 f"release_target={vec_list(release_target, 3)} "
                 f"ik_pour_target={vec_list(pour_target, 3)} "
                 f"remaining={'none' if deadline is None else fmt_optional(max(0.0, float(deadline) - time.time())) + 's'}",
-                force_log=True,
+                force_log=debug_diagnostics_enabled(),
             )
         q_dump, info = solve_priority_ik_to_target(
             pour_target,
@@ -22265,7 +23133,7 @@ def plan_dump_pose_to_bin(
                 info_print(
                     f"[UNLOAD DUMP PLAN TRY FAILED] {label}: "
                     f"attempt={attempt + 1}/{correction_iters} reason={last_reason}",
-                    force_log=True,
+                    force_log=debug_diagnostics_enabled(),
                 )
             break
 
@@ -22348,7 +23216,7 @@ def plan_dump_pose_to_bin(
                 f"bucket_err={bucket_err:.2f}deg "
                 f"cost={cost:.2f} "
                 f"q={q_deg_values(q_dump, wrap_swing_for_display=True)}",
-                force_log=True,
+                force_log=debug_diagnostics_enabled(),
             )
 
         if drop_ready and center_soft_ready:
@@ -22591,7 +23459,7 @@ async def execute_unload_sequence(stage_name, q_goal, duration, task_id=None):
             f"q_edge={q_deg_values(q_edge, wrap_swing_for_display=True)}",
             f"q_goal_raw={q_deg_values(q_goal_raw, wrap_swing_for_display=True)}",
             f"seconds={edge_seconds:.2f}",
-            force_log=True,
+            force_log=debug_diagnostics_enabled(),
         )
         edge_ok = await move_to_profile(
             q_edge,
@@ -22636,7 +23504,7 @@ async def execute_unload_sequence(stage_name, q_goal, duration, task_id=None):
             "source=planned_loaded_route",
             "trace_redraw=False",
             "precheck=skipped",
-            force_log=True,
+            force_log=debug_diagnostics_enabled(),
         )
     else:
         try:
@@ -22848,7 +23716,7 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
         f"bucket_start_particles={start_bucket_count}",
         f"bin_start_particles={start_bin_count}",
         f"metric_stride={metric_stride}",
-        force_log=True,
+        force_log=debug_diagnostics_enabled(),
     )
 
     q_final = q0.copy()
@@ -22889,7 +23757,7 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
                 f"bucket_real={rad_to_deg(real_bucket):.2f}deg",
                 f"bucket_delta={bucket_now - start_bucket_count}",
                 f"bin_delta={bin_now - start_bin_count}",
-                force_log=True,
+                force_log=debug_diagnostics_enabled(),
             )
         stop_bucket_count = max(0, int(start_bucket_count * float(UNLOAD_DUMP_STOP_BUCKET_FRACTION)))
         if (
@@ -22924,7 +23792,7 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
             f"bucket_err={err_deg:.2f}deg",
             f"bucket_delta={bucket_end - start_bucket_count}",
             f"bin_delta={bin_end - start_bin_count}",
-            force_log=True,
+            force_log=debug_diagnostics_enabled(),
         )
     except Exception as e:
         info_print("[WARN] [UNLOAD DUMP DIRECT DONE] cannot read real bucket:", type(e).__name__, e)
@@ -23463,20 +24331,39 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
             include_sand="unload" in seg["name"],
         )
 
+    def close_loaded_group_audits(result, reason_text=""):
+        active = STATE.get("stage_timing_active")
+        if not isinstance(active, dict):
+            active = {}
+        for seg in segments:
+            key = stage_timing_key(seg["name"], seg["index"])
+            if key not in active:
+                continue
+            record_stage_audit(
+                seg["name"],
+                int(seg["index"]),
+                result,
+                reason=str(reason_text),
+                q_goal=seg["q1"],
+                duration=seg["seconds"],
+                data={"continuous_group": True, "closed_by_group": True},
+                include_sand="unload" in seg["name"],
+            )
+
     names = [seg["name"] for seg in segments]
     update_status(
         f"[LOADED ROUTE GROUP] continuous waypoints={len(segments)} duration={total_seconds:.2f}s",
         force=True,
     )
-    info_print(
-        "[LOADED ROUTE GROUP]",
-        f"stages={names}",
-        f"duration={total_seconds:.2f}s",
-        f"q_start={q_deg_values(q_start, wrap_swing_for_display=True)}",
-        f"q_final={q_deg_values(segments[-1]['q1'], wrap_swing_for_display=True)}",
-        "profile=global_smoothstep_piecewise_linear_adaptive",
-        force_log=True,
-    )
+    if non_quiet_diagnostics_enabled():
+        info_print(
+            "[LOADED ROUTE GROUP]",
+            f"stages={names}",
+            f"duration={total_seconds:.2f}s",
+            f"q_start={q_deg_values(q_start, wrap_swing_for_display=True)}",
+            f"q_final={q_deg_values(segments[-1]['q1'], wrap_swing_for_display=True)}",
+            "profile=global_smoothstep_piecewise_linear_adaptive",
+        )
 
     cumulative = []
     acc = 0.0
@@ -23519,6 +24406,7 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
     while profile_time < total_seconds - 1.0e-6:
         if motion_cancel_requested(task_id):
             update_status("[MOVE STOPPED] loaded_route_group", force=True)
+            close_loaded_group_audits("cancelled", "motion_cancel_requested")
             return False, int(start_index)
         if time.time() - wall_start > max_wall_seconds:
             reason_text = (
@@ -23527,6 +24415,7 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
             )
             set_execution_failure_reason(reason_text)
             update_status(f"[DIG EXEC FAILED] loaded_route_group: adaptive timeout", force=True)
+            close_loaded_group_audits("failed", reason_text)
             return False, int(start_index)
 
         corner_scale = loaded_route_corner_scale(path_time, cumulative)
@@ -23553,7 +24442,9 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
             candidate_path_time = min(total_seconds, max(0.0, eased * total_seconds))
             seg, q = loaded_route_sample_q_at_path_time(candidate_path_time, total_seconds, cumulative)
             if q is None or seg is None:
-                set_execution_failure_reason("execution_failed/loaded_route_group_sample_failed")
+                reason_text = "execution_failed/loaded_route_group_sample_failed"
+                set_execution_failure_reason(reason_text)
+                close_loaded_group_audits("failed", reason_text)
                 return False, int(start_index)
             accel_scale, accel_report = loaded_route_accel_limit_scale(
                 q_sent_prev,
@@ -23572,12 +24463,13 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
         stage_name = seg["name"]
         if stage_name != last_seg_name:
             last_seg_name = stage_name
-            info_print(
-                "[LOADED ROUTE GROUP SEGMENT]",
-                f"stage={stage_name}",
-                f"profile_time={profile_time:.2f}/{total_seconds:.2f}",
-                f"frame={frame}",
-            )
+            if non_quiet_diagnostics_enabled():
+                info_print(
+                    "[LOADED ROUTE GROUP SEGMENT]",
+                    f"stage={stage_name}",
+                    f"profile_time={profile_time:.2f}/{total_seconds:.2f}",
+                    f"frame={frame}",
+                )
         STATE["active_plan_stage_index"] = int(seg["index"])
 
         q_final_cmd = q.copy()
@@ -23595,11 +24487,13 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
                 data={"continuous_group": True},
                 include_sand="unload" in stage_name,
             )
+            close_loaded_group_audits("failed", str(STATE.get("last_execution_failure_reason", "") or send_reason))
             return False, int(start_index)
 
         await step_updates(step_frames)
         if motion_cancel_requested(task_id):
             update_status("[MOVE STOPPED] loaded_route_group", force=True)
+            close_loaded_group_audits("cancelled", "motion_cancel_requested")
             return False, int(start_index)
         if bool((accel_report or {}).get("ok", False)):
             try:
@@ -23619,20 +24513,20 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
             and now - float(last_accel_log_time) >= float(LOADED_ROUTE_ACCEL_LOG_INTERVAL)
         ):
             last_accel_log_time = now
-            info_print(
-                "[LOADED ROUTE ACCEL LIMIT]",
-                f"stage={stage_name}",
-                f"scale={accel_scale:.2f}",
-                f"base_scale={base_advance_scale:.2f}",
-                f"applied_scale={attempt_scale:.2f}",
-                f"profile_time={profile_time:.2f}/{total_seconds:.2f}",
-                f"load_acc={float(accel_report.get('load_acc_mps2', 0.0)):.2f}mps2",
-                f"swing_acc={float(accel_report.get('swing_acc_deg_s2', 0.0)):.1f}deg/s2",
-                f"joint_acc={float(accel_report.get('joint_acc_deg_s2', 0.0)):.1f}deg/s2",
-                f"bucket_acc={float(accel_report.get('bucket_acc_deg_s2', 0.0)):.1f}deg/s2",
-                f"limiting={accel_report.get('limiting')}",
-                force_log=True,
-            )
+            if non_quiet_diagnostics_enabled():
+                info_print(
+                    "[LOADED ROUTE ACCEL LIMIT]",
+                    f"stage={stage_name}",
+                    f"scale={accel_scale:.2f}",
+                    f"base_scale={base_advance_scale:.2f}",
+                    f"applied_scale={attempt_scale:.2f}",
+                    f"profile_time={profile_time:.2f}/{total_seconds:.2f}",
+                    f"load_acc={float(accel_report.get('load_acc_mps2', 0.0)):.2f}mps2",
+                    f"swing_acc={float(accel_report.get('swing_acc_deg_s2', 0.0)):.1f}deg/s2",
+                    f"joint_acc={float(accel_report.get('joint_acc_deg_s2', 0.0)):.1f}deg/s2",
+                    f"bucket_acc={float(accel_report.get('bucket_acc_deg_s2', 0.0)):.1f}deg/s2",
+                    f"limiting={accel_report.get('limiting')}",
+                )
         adaptive_scale, lag_report = loaded_route_adaptive_scale(q_final_cmd)
         now = time.time()
         if (
@@ -23641,18 +24535,18 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
             and now - float(last_adaptive_log_time) >= float(LOADED_ROUTE_ADAPTIVE_LOG_INTERVAL)
         ):
             last_adaptive_log_time = now
-            info_print(
-                "[LOADED ROUTE ADAPTIVE]",
-                f"stage={stage_name}",
-                f"scale={adaptive_scale:.2f}",
-                f"corner_scale={corner_scale:.2f}",
-                f"profile_time={profile_time:.2f}/{total_seconds:.2f}",
-                f"swing_err={float(lag_report.get('swing_err_deg', 0.0)):.2f}deg",
-                f"joint_err={float(lag_report.get('non_bucket_err_deg', 0.0)):.2f}deg",
-                f"bucket_err={float(lag_report.get('bucket_err_deg', 0.0)):.2f}deg",
-                f"critical_swing={bool(lag_report.get('critical_swing', False))}",
-                force_log=True,
-            )
+            if non_quiet_diagnostics_enabled():
+                info_print(
+                    "[LOADED ROUTE ADAPTIVE]",
+                    f"stage={stage_name}",
+                    f"scale={adaptive_scale:.2f}",
+                    f"corner_scale={corner_scale:.2f}",
+                    f"profile_time={profile_time:.2f}/{total_seconds:.2f}",
+                    f"swing_err={float(lag_report.get('swing_err_deg', 0.0)):.2f}deg",
+                    f"joint_err={float(lag_report.get('non_bucket_err_deg', 0.0)):.2f}deg",
+                    f"bucket_err={float(lag_report.get('bucket_err_deg', 0.0)):.2f}deg",
+                    f"critical_swing={bool(lag_report.get('critical_swing', False))}",
+                )
         if frame % freeze_stride == 0:
             check_freeze_state(f"loaded_route_group:{stage_name}")
 
@@ -23669,6 +24563,7 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
             data={"continuous_group": True},
             include_sand=True,
         )
+        close_loaded_group_audits("failed", str(STATE.get("last_execution_failure_reason", "") or "loaded_route_group_not_reached"))
         return False, int(start_index)
 
     if not verify_unload_arrival(final_seg["name"], q_final_cmd):
@@ -23682,6 +24577,7 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
             data={"continuous_group": True},
             include_sand=True,
         )
+        close_loaded_group_audits("failed", str(STATE.get("last_execution_failure_reason", "") or "unload_arrival_failed"))
         return False, int(start_index)
 
     STATE["dig_plan_step_index"] = int(STATE.get("dig_plan_step_index", 0)) + len(segments)
@@ -23704,6 +24600,7 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
             data={"continuous_group": True},
             include_sand=True,
         )
+        close_loaded_group_audits("failed", str(STATE.get("last_execution_failure_reason", "") or "dump_failed"))
         return False, int(start_index)
 
     log_phase_ground("[DIG GUARD AFTER]", final_seg["name"])
@@ -23717,13 +24614,13 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
             data={"continuous_group": True},
             include_sand="unload" in seg["name"],
         )
-    info_print(
-        "[LOADED ROUTE GROUP DONE]",
-        f"stages={names}",
-        f"next_index={next_index}",
-        "dump_executed=True",
-        force_log=True,
-    )
+    if non_quiet_diagnostics_enabled():
+        info_print(
+            "[LOADED ROUTE GROUP DONE]",
+            f"stages={names}",
+            f"next_index={next_index}",
+            "dump_executed=True",
+        )
     return True, int(next_index)
 
 
@@ -24535,14 +25432,8 @@ def build_ui():
     def toggle_calc_viz_from_ui():
         toggle_debug_visuals_from_ui()
 
-    def set_log_normal_from_ui():
-        set_log_mode("normal")
-
-    def toggle_debug_from_ui():
-        toggle_debug_log()
-
-    def toggle_quiet_from_ui():
-        toggle_quiet_log()
+    def cycle_log_mode_from_ui():
+        cycle_log_mode()
 
     def print_log_state_from_ui():
         print_log_state()
@@ -24668,9 +25559,7 @@ def build_ui():
                 with ui.VStack(spacing=8):
                     with ui.HStack(spacing=6, height=26):
                         ui.Label("Log", width=80)
-                        ui.Button("Normal", width=82, clicked_fn=set_log_normal_from_ui)
-                        ui.Button("Debug ON/OFF", width=118, clicked_fn=toggle_debug_from_ui)
-                        ui.Button("Quiet ON/OFF", width=118, clicked_fn=toggle_quiet_from_ui)
+                        ui.Button("Log Mode", width=118, clicked_fn=cycle_log_mode_from_ui)
                         ui.Button("State", width=70, clicked_fn=print_log_state_from_ui)
 
                     ui.Separator()

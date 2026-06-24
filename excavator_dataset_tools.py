@@ -253,8 +253,13 @@ def analyze_events_for_rows(rows: Sequence[dict], limit_rows: Optional[int] = No
                 if result == "failed":
                     failed_stage_counter[stage] += 1
                 try:
-                    if result == "done" and data.get("duration") is not None:
-                        stage_durations[stage].append(float(data.get("duration")))
+                    duration_value = data.get("wall_duration_s")
+                    if duration_value is None and isinstance(data.get("timing"), dict):
+                        duration_value = data["timing"].get("wall_duration_s")
+                    if duration_value is None:
+                        duration_value = data.get("duration")
+                    if result == "done" and duration_value is not None:
+                        stage_durations[stage].append(float(duration_value))
                 except Exception:
                     pass
     return {
@@ -1223,11 +1228,19 @@ def vector_stats_for_rows(rows: Sequence[dict], key: str, dim: int) -> Dict[str,
     }
 
 
-def build_lerobot_v3_stats(rows: Sequence[dict], state_dim: int, action_dim: int) -> Dict[str, object]:
-    return {
+def build_lerobot_v3_stats(
+    rows: Sequence[dict],
+    state_dim: int,
+    action_dim: int,
+    effort_dim: Optional[int] = None,
+) -> Dict[str, object]:
+    stats = {
         "observation.state": vector_stats_for_rows(rows, "observation.state", state_dim),
         "action": vector_stats_for_rows(rows, "action", action_dim),
     }
+    if effort_dim is not None and effort_dim > 0:
+        stats["observation.effort"] = vector_stats_for_rows(rows, "observation.effort", effort_dim)
+    return stats
 
 
 def lerobot_v3_required_paths(export_dir: str, image_keys: Sequence[str]) -> List[str]:
@@ -1318,6 +1331,12 @@ def collect_lerobot_rows(
         "arm_cmd_velocity",
         "bucket_cmd_velocity",
     ]
+    effort_names = run_meta.get("effort_names") or [
+        "swing_measured_effort",
+        "boom_measured_effort",
+        "arm_measured_effort",
+        "bucket_measured_effort",
+    ]
     rows = []
     episodes = []
     episode_stats = []
@@ -1345,6 +1364,7 @@ def collect_lerobot_rows(
             if state is None or action is None:
                 skipped_frames += 1
                 continue
+            effort = vector_or_none(sample.get("observation.effort"), len(effort_names))
             task_text = lerobot_task_text(sample, meta)
             if task_text not in tasks_by_text:
                 tasks_by_text[task_text] = len(tasks_by_text)
@@ -1359,6 +1379,7 @@ def collect_lerobot_rows(
                 "task": task_text,
                 "observation.state": state,
                 "action": action,
+                "observation.effort": effort,
                 "phase": str(sample.get("phase", "")),
                 "raw_episode_index": episode.get("episode_index"),
                 "raw_episode_id": episode.get("episode_id", sample.get("id", "")),
@@ -1414,6 +1435,7 @@ def collect_lerobot_rows(
         "image_paths": image_paths,
         "state_names": state_names,
         "action_names": action_names,
+        "effort_names": effort_names,
         "run_meta": run_meta,
         "skipped_frames": skipped_frames,
         "source_episode_count": len(episode_rows),
@@ -1493,22 +1515,30 @@ def export_lerobot_dataset(
     episodes = collected["episodes"]
     state_names = list(collected["state_names"])  # type: ignore[arg-type]
     action_names = list(collected["action_names"])  # type: ignore[arg-type]
+    effort_names = list(collected.get("effort_names", []))  # type: ignore[arg-type]
+    effort_dim = len(effort_names)
+    effort_available = bool(
+        effort_dim > 0
+        and rows
+        and all(vector_or_none(row.get("observation.effort"), effort_dim) is not None for row in rows)
+    )
     task_text_by_index = {int(task["task_index"]): str(task["task"]) for task in tasks}  # type: ignore[index]
 
     data_rows = []
     for row in rows:
         frame_index = int(row["frame_index"])
-        data_rows.append(
-            {
-                "index": int(row["index"]),
-                "episode_index": int(row["episode_index"]),
-                "frame_index": frame_index,
-                "timestamp": float(frame_index) / float(export_fps),
-                "task_index": int(row["task_index"]),
-                "observation.state": row["observation.state"],
-                "action": row["action"],
-            }
-        )
+        data_row = {
+            "index": int(row["index"]),
+            "episode_index": int(row["episode_index"]),
+            "frame_index": frame_index,
+            "timestamp": float(frame_index) / float(export_fps),
+            "task_index": int(row["task_index"]),
+            "observation.state": row["observation.state"],
+            "action": row["action"],
+        }
+        if effort_available:
+            data_row["observation.effort"] = row["observation.effort"]
+        data_rows.append(data_row)
     parquet_path = os.path.join(data_dir, "file-000.parquet")
     data_df = pd.DataFrame(data_rows)
     parquet_ok, parquet_reason = try_write_dataframe_parquet(data_df, parquet_path, index=False)
@@ -1564,6 +1594,12 @@ def export_lerobot_dataset(
         "index": {"dtype": "int64", "shape": [1], "names": None},
         "task_index": {"dtype": "int64", "shape": [1], "names": None},
     }
+    if effort_available:
+        features["observation.effort"] = {
+            "dtype": "float32",
+            "shape": [effort_dim],
+            "names": effort_names,
+        }
     for key in image_features:
         features[key] = {
             "dtype": "video",
@@ -1588,7 +1624,12 @@ def export_lerobot_dataset(
     }
     write_json(os.path.join(meta_dir, "info.json"), info)
 
-    stats = build_lerobot_v3_stats(data_rows, len(state_names), len(action_names))
+    stats = build_lerobot_v3_stats(
+        data_rows,
+        len(state_names),
+        len(action_names),
+        effort_dim if effort_available else None,
+    )
     write_json(os.path.join(meta_dir, "stats.json"), stats)
 
     video_ready = all(video_results.get(key, {}).get("available") is True for key in image_features)
@@ -1604,6 +1645,7 @@ def export_lerobot_dataset(
         "created_at": time.time(),
         "standard_lerobot_ready": vla_training_ready,
         "state_action_ready": bool(parquet_ok),
+        "effort_available": bool(effort_available),
         "vla_training_ready": vla_training_ready,
         "parquet": {
             "data_available": parquet_ok,
@@ -1647,6 +1689,7 @@ def export_lerobot_dataset(
         "- `meta/episodes/chunk-000/file-000.parquet`: episode metadata and video/data chunk indices",
         "- `meta/stats.json`: state/action statistics",
         "- `data/chunk-000/file-000.parquet`: frame table",
+        "- `observation.effort` is included in the frame table only when Isaac measured joint efforts were available for every exported frame.",
         "- `videos/observation.images.0/chunk-000/file-000.mp4`: camera 0 stream",
         "- `videos/observation.images.1/chunk-000/file-000.mp4`: camera 1 stream",
         "- `videos/observation.images.2/chunk-000/file-000.mp4`: camera 2 stream",

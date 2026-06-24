@@ -299,7 +299,7 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_camera_sample_stride": 1,
     "dataset_camera_keep_invisible": True,
     "dataset_camera_last_hide_time": 0.0,
-    "dataset_camera_image_format": str(os.environ.get("EXCAVATOR_DATASET_CAMERA_FORMAT", "png") or "png").strip().lower(),
+    "dataset_camera_image_format": str(os.environ.get("EXCAVATOR_DATASET_CAMERA_FORMAT", "ppm") or "ppm").strip().lower(),
     "dataset_camera_png_compress_level": int(os.environ.get("EXCAVATOR_DATASET_CAMERA_PNG_COMPRESS", "3") or 3),
     "dataset_camera_png_optimize": str(os.environ.get("EXCAVATOR_DATASET_CAMERA_PNG_OPTIMIZE", "0") or "0").strip().lower()
     not in ("0", "false", "no", "off"),
@@ -5401,7 +5401,7 @@ def ensure_xform_path(stage_obj, path):
 
 
 def dataset_camera_image_extension():
-    requested = str(STATE.get("dataset_camera_image_format", "png") or "png").strip().lower()
+    requested = str(STATE.get("dataset_camera_image_format", "ppm") or "ppm").strip().lower()
     if requested in ("ppm", "raw", "raw_ppm"):
         return "ppm"
     return "png" if Image is not None else "ppm"
@@ -6077,8 +6077,9 @@ def camera_config_snapshot():
         "resolution": dataset_camera_resolution(),
         "frequency": int(STATE.get("dataset_camera_frequency", 10) or 10),
         "sample_stride": max(1, int(STATE.get("dataset_camera_sample_stride", 1) or 1)),
-        "requested_image_format": str(STATE.get("dataset_camera_image_format", "png") or "png"),
+        "requested_image_format": str(STATE.get("dataset_camera_image_format", "ppm") or "ppm"),
         "image_format": dataset_camera_image_extension(),
+        "image_format_note": "Default PPM keeps RGB frame content uncompressed during collection; LeRobot export converts images/videos after the run.",
         "png_compression": {
             "compress_level": int(STATE.get("dataset_camera_png_compress_level", 3) or 3),
             "optimize": bool(STATE.get("dataset_camera_png_optimize", False)),

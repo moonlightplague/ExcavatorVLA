@@ -270,6 +270,7 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "debug_timeline_last_error_time": 0.0,
     "debug_profile_summary": {},
     "debug_profile_recent": [],
+    "plan_build_summary": {},
     "debug_profile_count": 0,
     "debug_profile_last": None,
     "stage_timing_active": {},
@@ -362,6 +363,10 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "bucket_load_spatial_hits": 0,
     "bucket_load_spatial_misses": 0,
     "bucket_load_spatial_fallbacks": 0,
+    "dataset_metrics_frame_cache": None,
+    "dataset_metrics_frame_hits": 0,
+    "dataset_metrics_frame_misses": 0,
+    "dataset_record_sample_spans": {},
     "auto_collect_episode_sand_snapshot": None,
     "auto_collect_episode_sand_snapshot_time": 0.0,
     "planning_sand_snapshot": None,
@@ -377,12 +382,45 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "path_obstacle_check_cache": {},
     "path_obstacle_check_cache_hits": 0,
     "path_obstacle_check_cache_misses": 0,
+    "path_obstacle_check_invocations": 0,
+    "path_obstacle_check_get_attempts": 0,
+    "path_obstacle_check_put_attempts": 0,
+    "path_obstacle_check_puts": 0,
+    "path_obstacle_check_key_none": 0,
+    "path_obstacle_check_invocations_total": 0,
+    "path_obstacle_check_get_attempts_total": 0,
+    "path_obstacle_check_put_attempts_total": 0,
+    "path_obstacle_check_puts_total": 0,
+    "path_obstacle_check_hits_total": 0,
+    "path_obstacle_check_misses_total": 0,
+    "path_obstacle_check_key_none_total": 0,
+    "path_obstacle_batch_broadphase_calls": 0,
+    "path_obstacle_batch_broadphase_segments": 0,
+    "path_segment_check_cache": {},
+    "path_segment_check_cache_hits": 0,
+    "path_segment_check_cache_misses": 0,
+    "path_segment_check_invocations": 0,
+    "path_segment_check_get_attempts": 0,
+    "path_segment_check_put_attempts": 0,
+    "path_segment_check_puts": 0,
+    "path_segment_check_key_none": 0,
+    "path_segment_check_invocations_total": 0,
+    "path_segment_check_get_attempts_total": 0,
+    "path_segment_check_put_attempts_total": 0,
+    "path_segment_check_puts_total": 0,
+    "path_segment_check_hits_total": 0,
+    "path_segment_check_misses_total": 0,
+    "path_segment_check_key_none_total": 0,
     "predicted_segment_cache": {},
     "predicted_segment_cache_hits": 0,
     "predicted_segment_cache_misses": 0,
+    "predicted_segment_cache_get_attempts": 0,
+    "predicted_segment_cache_puts": 0,
     "dig_candidate_result_cache": {},
     "dig_candidate_result_cache_hits": 0,
     "dig_candidate_result_cache_misses": 0,
+    "dig_candidate_result_cache_get_attempts": 0,
+    "dig_candidate_result_cache_puts": 0,
     "rigid_obstacle_numpy_cache": None,
     "sand_site_stable_reset_done": False,
     "sand_site_reset_active": False,
@@ -604,6 +642,7 @@ SAND_PARTICLE_MASS_DEFAULT = 0.535
 SAND_METRICS_INTERVAL = 0.45
 BUCKET_LOAD_FAST_AABB_MARGIN = 0.06
 BUCKET_LOAD_FAST_CACHE_INTERVAL = 0.02
+DATASET_METRICS_FRAME_CACHE_SECONDS = float(os.environ.get("EXCAVATOR_DATASET_METRICS_FRAME_CACHE_SECONDS", "0.045") or 0.045)
 BUCKET_LOAD_SPATIAL_INDEX_ENABLED = str(os.environ.get("EXCAVATOR_BUCKET_LOAD_SPATIAL_INDEX", "1") or "1").strip().lower() not in (
     "0",
     "false",
@@ -1907,6 +1946,25 @@ def debug_profile_record(label, elapsed_ms, data=None, threshold_ms=None, error=
                 )
         except Exception:
             pass
+
+
+def increment_runtime_counter(name, amount=1, total_name=None):
+    try:
+        amount_i = int(amount)
+    except Exception:
+        amount_i = 1
+    STATE[name] = int(STATE.get(name, 0) or 0) + amount_i
+    if total_name:
+        STATE[total_name] = int(STATE.get(total_name, 0) or 0) + amount_i
+    return STATE.get(name, 0)
+
+
+def debug_profile_span(label, start_time, threshold_ms=5.0, data=None):
+    if not debug_profile_enabled():
+        return 0.0
+    elapsed_ms = (time.perf_counter() - float(start_time)) * 1000.0
+    debug_profile_record(label, elapsed_ms, data=data, threshold_ms=threshold_ms)
+    return elapsed_ms
 
 
 def debug_profiled(label=None, threshold_ms=None):
@@ -4611,6 +4669,25 @@ def vec_list(v, n=None):
     if n is not None:
         arr = arr[:int(n)]
     return [float(x) for x in arr]
+
+
+def quantized_q_tuple(q, quantum_deg=None, n=4):
+    if q is None:
+        return None
+    quantum = float(PATH_CACHE_Q_QUANT_DEG if quantum_deg is None else quantum_deg)
+    quantum_rad = max(1.0e-7, deg_to_rad(abs(quantum)))
+    arr = np.array(q, dtype=np.float64).reshape(-1)[: int(n)]
+    arr = np.round(arr / quantum_rad) * quantum_rad
+    return tuple(round(float(x), 7) for x in arr)
+
+
+def quantized_xyz_tuple(v, quantum=0.005, n=3):
+    if v is None:
+        return None
+    quantum_f = max(1.0e-7, float(quantum))
+    arr = np.array(v, dtype=np.float64).reshape(-1)[: int(n)]
+    arr = np.round(arr / quantum_f) * quantum_f
+    return tuple(round(float(x), 5) for x in arr)
 
 
 def compact_sand_metrics(metrics):
@@ -7394,6 +7471,69 @@ def sand_metrics_current(force=False, snapshot=None):
     return dict(metrics)
 
 
+def dataset_metrics_frame_bundle(label="", q_real=None, need_full=False, force=False):
+    now = time.time()
+    try:
+        q_sig = quantized_q_tuple(q_real if q_real is not None else CTRL.q_cmd, quantum_deg=0.05)
+    except Exception:
+        q_sig = None
+    cache = STATE.get("dataset_metrics_frame_cache")
+    same_frame_cache = (
+        not force
+        and isinstance(cache, dict)
+        and now - float(cache.get("time", 0.0) or 0.0) <= float(DATASET_METRICS_FRAME_CACHE_SECONDS)
+        and cache.get("q_sig") == q_sig
+    )
+    if same_frame_cache:
+        increment_runtime_counter("dataset_metrics_frame_hits", 1)
+        if need_full and not isinstance(cache.get("full_metrics"), dict):
+            span_t = time.perf_counter()
+            snapshot = cache.get("snapshot")
+            cache["full_metrics"] = sand_metrics_current(force=True, snapshot=snapshot if isinstance(snapshot, dict) else None)
+            debug_profile_span("dataset_metrics_frame.full_sand_metrics", span_t, threshold_ms=8.0)
+            STATE["dataset_metrics_frame_cache"] = cache
+        return cache
+
+    increment_runtime_counter("dataset_metrics_frame_misses", 1)
+    span_t = time.perf_counter()
+    snapshot = dataset_particle_snapshot(label=label or "dataset_metrics_frame", build_bucket_index=True)
+    debug_profile_span("dataset_metrics_frame.snapshot", span_t, threshold_ms=4.0)
+
+    span_t = time.perf_counter()
+    bucket_metrics = bucket_load_fast_current(force=False, points=snapshot)
+    debug_profile_span("dataset_metrics_frame.bucket_load", span_t, threshold_ms=4.0)
+
+    full_metrics = None
+    if need_full:
+        span_t = time.perf_counter()
+        full_metrics = sand_metrics_current(force=True, snapshot=snapshot)
+        debug_profile_span("dataset_metrics_frame.full_sand_metrics", span_t, threshold_ms=8.0)
+
+    bundle = {
+        "time": now,
+        "q_sig": q_sig,
+        "label": str(label or ""),
+        "snapshot": snapshot,
+        "bucket_metrics": dict(bucket_metrics or {}),
+        "full_metrics": dict(full_metrics or {}) if isinstance(full_metrics, dict) else None,
+    }
+    STATE["dataset_metrics_frame_cache"] = bundle
+    return bundle
+
+
+def dataset_metrics_frame_full(label="", q_real=None, force=False):
+    bundle = dataset_metrics_frame_bundle(label=label, q_real=q_real, need_full=True, force=force)
+    full = bundle.get("full_metrics") if isinstance(bundle, dict) else None
+    if isinstance(full, dict):
+        return dict(full)
+    snapshot = bundle.get("snapshot") if isinstance(bundle, dict) else None
+    metrics = sand_metrics_current(force=True, snapshot=snapshot if isinstance(snapshot, dict) else None)
+    if isinstance(bundle, dict):
+        bundle["full_metrics"] = dict(metrics or {})
+        STATE["dataset_metrics_frame_cache"] = bundle
+    return dict(metrics or {})
+
+
 def is_sand_contact_phase(mode):
     m = str(mode).lower()
     return any(phase in m for phase in SAND_CONTACT_PHASES)
@@ -8443,21 +8583,51 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False)
         return
 
     try:
+        sample_spans = {}
+
+        def mark_span(span_label, started, threshold_ms=5.0, data=None):
+            elapsed = debug_profile_span(span_label, started, threshold_ms=threshold_ms, data=data)
+            if elapsed:
+                sample_spans[span_label] = float(elapsed)
+
         if q_cmd is None:
             q_cmd = CTRL.q_cmd.copy()
         if q_real is None:
             q_real = get_real_joint_positions()
 
+        span_t = time.perf_counter()
         dynamics = dataset_motion_derivatives(q_cmd, q_real, now)
         action = dynamics["action"]
         joint_velocity = dynamics["dq_real"]
         joint_acceleration = dynamics["ddq_real"]
+        mark_span("dataset_record_sample.motion", span_t, threshold_ms=1.0)
+
         sample_index = int(STATE.get("dataset_samples", 0)) - int(STATE.get("dataset_episode_sample_start", 0))
-        particle_snapshot = dataset_particle_snapshot(label=f"sample:{sample_index}")
-        bucket_metrics = bucket_load_fast_current(force=True, points=particle_snapshot)
+        span_t = time.perf_counter()
+        metrics_bundle = dataset_metrics_frame_bundle(label=f"sample:{sample_index}", q_real=q_real, need_full=False)
+        particle_snapshot = metrics_bundle.get("snapshot") if isinstance(metrics_bundle, dict) else None
+        bucket_metrics = metrics_bundle.get("bucket_metrics") if isinstance(metrics_bundle, dict) else None
+        if not isinstance(bucket_metrics, dict):
+            bucket_metrics = bucket_load_fast_current(force=True, points=particle_snapshot if isinstance(particle_snapshot, dict) else None)
+        mark_span(
+            "dataset_record_sample.particle_bucket",
+            span_t,
+            threshold_ms=4.0,
+            data={
+                "cache_hit_ratio": (
+                    float(STATE.get("dataset_metrics_frame_hits", 0) or 0)
+                    / max(1.0, float(int(STATE.get("dataset_metrics_frame_hits", 0) or 0) + int(STATE.get("dataset_metrics_frame_misses", 0) or 0)))
+                )
+            },
+        )
+
+        span_t = time.perf_counter()
         update_episode_quality_trackers(bucket_metrics, phase, q_cmd=q_cmd, q_real=q_real, action=action)
+        mark_span("dataset_record_sample.quality", span_t, threshold_ms=1.5)
+
         q_goal = STATE.get("dataset_current_q_goal")
         target = get_target_pos() if TARGET_PATH else None
+        span_t = time.perf_counter()
         phase_features = dataset_phase_features(phase)
         debug_extra = bool(DATASET_RECORD_DIAGNOSTIC_FIELDS)
         rigid_clearance = dataset_rigid_clearance_summary() if debug_extra else {}
@@ -8473,6 +8643,8 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False)
         effort_obs = dataset_joint_effort_observation()
         joint_force_obs = dataset_joint_force_torque_observation() if debug_extra else None
         observation_effort = effort_obs.get("observation.effort") if isinstance(effort_obs, dict) else None
+        mark_span("dataset_record_sample.features", span_t, threshold_ms=4.0)
+
         STATE["dataset_effort_sample_count"] = int(STATE.get("dataset_effort_sample_count", 0) or 0) + 1
         if observation_effort is None:
             STATE["dataset_effort_missing_samples"] = int(STATE.get("dataset_effort_missing_samples", 0) or 0) + 1
@@ -8525,12 +8697,17 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False)
                     "label.flags": constraint_flags,
                 }
             )
+        span_t = time.perf_counter()
         sample.update(dataset_capture_camera_observations(sample_index))
+        mark_span("dataset_record_sample.camera", span_t, threshold_ms=4.0)
 
         path = str(STATE.get("dataset_path", "excavator_dataset.jsonl"))
+        span_t = time.perf_counter()
         append_jsonl_dataset(path, sample)
+        mark_span("dataset_record_sample.trajectory_write", span_t, threshold_ms=2.0)
         sand_path = str(STATE.get("dataset_sand_metrics_path", ""))
         if sand_path:
+            span_t = time.perf_counter()
             append_jsonl_dataset(
                 sand_path,
                 {
@@ -8542,9 +8719,12 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False)
                     "sand": compact_bucket_load_metrics(bucket_metrics),
                 },
             )
+            mark_span("dataset_record_sample.sand_write", span_t, threshold_ms=2.0)
 
         STATE["dataset_last_sample_time"] = now
         STATE["dataset_samples"] = int(STATE.get("dataset_samples", 0)) + 1
+        if sample_spans:
+            STATE["dataset_record_sample_spans"] = sample_spans
     except Exception as e:
         if now - float(STATE.get("dataset_last_error_time", 0.0)) > 2.0:
             STATE["dataset_last_error_time"] = now
@@ -8877,6 +9057,8 @@ def auto_collect_write_run_summary():
             "debug_profile_enabled": bool(debug_profile_enabled()),
             "debug_profile_summary": dict(STATE.get("debug_profile_summary", {}) or {}),
             "debug_profile_recent": list(STATE.get("debug_profile_recent", []) or [])[-64:],
+            "plan_build_summary": dict(STATE.get("plan_build_summary", {}) or {}),
+            "dataset_record_sample_spans": dict(STATE.get("dataset_record_sample_spans", {}) or {}),
             "scene_context": compact_scene_context(),
             "sand_reset_policy": AUTO_COLLECT_SAND_RESET_POLICY,
             "sand_reset_done": bool(STATE.get("auto_collect_sand_reset_done", False)),
@@ -8896,12 +9078,45 @@ def auto_collect_write_run_summary():
                 "path_obstacle_entries": len(STATE.get("path_obstacle_check_cache", {}) or {}),
                 "path_obstacle_hits": int(STATE.get("path_obstacle_check_cache_hits", 0) or 0),
                 "path_obstacle_misses": int(STATE.get("path_obstacle_check_cache_misses", 0) or 0),
+                "path_obstacle_invocations": int(STATE.get("path_obstacle_check_invocations", 0) or 0),
+                "path_obstacle_get_attempts": int(STATE.get("path_obstacle_check_get_attempts", 0) or 0),
+                "path_obstacle_put_attempts": int(STATE.get("path_obstacle_check_put_attempts", 0) or 0),
+                "path_obstacle_puts": int(STATE.get("path_obstacle_check_puts", 0) or 0),
+                "path_obstacle_key_none": int(STATE.get("path_obstacle_check_key_none", 0) or 0),
+                "path_obstacle_invocations_total": int(STATE.get("path_obstacle_check_invocations_total", 0) or 0),
+                "path_obstacle_get_attempts_total": int(STATE.get("path_obstacle_check_get_attempts_total", 0) or 0),
+                "path_obstacle_put_attempts_total": int(STATE.get("path_obstacle_check_put_attempts_total", 0) or 0),
+                "path_obstacle_puts_total": int(STATE.get("path_obstacle_check_puts_total", 0) or 0),
+                "path_obstacle_hits_total": int(STATE.get("path_obstacle_check_hits_total", 0) or 0),
+                "path_obstacle_misses_total": int(STATE.get("path_obstacle_check_misses_total", 0) or 0),
+                "path_obstacle_key_none_total": int(STATE.get("path_obstacle_check_key_none_total", 0) or 0),
+                "path_obstacle_batch_broadphase_calls": int(STATE.get("path_obstacle_batch_broadphase_calls", 0) or 0),
+                "path_obstacle_batch_broadphase_segments": int(STATE.get("path_obstacle_batch_broadphase_segments", 0) or 0),
+                "path_segment_entries": len(STATE.get("path_segment_check_cache", {}) or {}),
+                "path_segment_hits": int(STATE.get("path_segment_check_cache_hits", 0) or 0),
+                "path_segment_misses": int(STATE.get("path_segment_check_cache_misses", 0) or 0),
+                "path_segment_invocations": int(STATE.get("path_segment_check_invocations", 0) or 0),
+                "path_segment_get_attempts": int(STATE.get("path_segment_check_get_attempts", 0) or 0),
+                "path_segment_put_attempts": int(STATE.get("path_segment_check_put_attempts", 0) or 0),
+                "path_segment_puts": int(STATE.get("path_segment_check_puts", 0) or 0),
+                "path_segment_key_none": int(STATE.get("path_segment_check_key_none", 0) or 0),
+                "path_segment_invocations_total": int(STATE.get("path_segment_check_invocations_total", 0) or 0),
+                "path_segment_get_attempts_total": int(STATE.get("path_segment_check_get_attempts_total", 0) or 0),
+                "path_segment_put_attempts_total": int(STATE.get("path_segment_check_put_attempts_total", 0) or 0),
+                "path_segment_puts_total": int(STATE.get("path_segment_check_puts_total", 0) or 0),
+                "path_segment_hits_total": int(STATE.get("path_segment_check_hits_total", 0) or 0),
+                "path_segment_misses_total": int(STATE.get("path_segment_check_misses_total", 0) or 0),
+                "path_segment_key_none_total": int(STATE.get("path_segment_check_key_none_total", 0) or 0),
                 "predicted_segment_entries": len(STATE.get("predicted_segment_cache", {}) or {}),
                 "predicted_segment_hits": int(STATE.get("predicted_segment_cache_hits", 0) or 0),
                 "predicted_segment_misses": int(STATE.get("predicted_segment_cache_misses", 0) or 0),
+                "predicted_segment_get_attempts": int(STATE.get("predicted_segment_cache_get_attempts", 0) or 0),
+                "predicted_segment_puts": int(STATE.get("predicted_segment_cache_puts", 0) or 0),
                 "dig_candidate_entries": len(STATE.get("dig_candidate_result_cache", {}) or {}),
                 "dig_candidate_hits": int(STATE.get("dig_candidate_result_cache_hits", 0) or 0),
                 "dig_candidate_misses": int(STATE.get("dig_candidate_result_cache_misses", 0) or 0),
+                "dig_candidate_get_attempts": int(STATE.get("dig_candidate_result_cache_get_attempts", 0) or 0),
+                "dig_candidate_puts": int(STATE.get("dig_candidate_result_cache_puts", 0) or 0),
                 "rigid_obstacle_cache_version": int(STATE.get("rigid_obstacle_cache_version", 0) or 0),
                 "rigid_obstacle_numpy_cached": isinstance(STATE.get("rigid_obstacle_numpy_cache"), dict),
             },
@@ -8910,6 +9125,8 @@ def auto_collect_write_run_summary():
                 "hits": int(STATE.get("bucket_load_spatial_hits", 0) or 0),
                 "misses": int(STATE.get("bucket_load_spatial_misses", 0) or 0),
                 "fallbacks": int(STATE.get("bucket_load_spatial_fallbacks", 0) or 0),
+                "dataset_metrics_frame_hits": int(STATE.get("dataset_metrics_frame_hits", 0) or 0),
+                "dataset_metrics_frame_misses": int(STATE.get("dataset_metrics_frame_misses", 0) or 0),
                 "grid_xy": int(BUCKET_LOAD_SPATIAL_GRID_RES_XY),
                 "grid_z": int(BUCKET_LOAD_SPATIAL_GRID_RES_Z),
             },
@@ -9236,9 +9453,9 @@ def auto_collect_episode_metrics():
 
 def record_phase_metrics(label, q_cmd=None, q_real=None, action=None):
     label = str(label)
-    metrics = sand_metrics_current(force=True)
     q_cmd_now = CTRL.q_cmd.copy() if q_cmd is None else np.array(q_cmd, dtype=np.float32).copy()
     q_real_now = get_real_joint_positions() if q_real is None else np.array(q_real, dtype=np.float32).copy()
+    metrics = dataset_metrics_frame_full(label=f"phase:{label}", q_real=q_real_now, force=False)
     update_episode_quality_trackers(metrics, label, q_cmd=q_cmd_now, q_real=q_real_now, action=action)
 
     phase_metrics = STATE.get("dataset_phase_metrics")
@@ -11384,6 +11601,53 @@ async def auto_collect_loop(count, max_attempts=None):
     STATE["debug_profile_recent"] = []
     STATE["debug_profile_count"] = 0
     STATE["debug_profile_last"] = None
+    STATE["plan_build_summary"] = {}
+    STATE["dataset_record_sample_spans"] = {}
+    for key in [
+        "path_obstacle_check_cache_hits",
+        "path_obstacle_check_cache_misses",
+        "path_obstacle_check_invocations",
+        "path_obstacle_check_get_attempts",
+        "path_obstacle_check_put_attempts",
+        "path_obstacle_check_puts",
+        "path_obstacle_check_key_none",
+        "path_obstacle_check_invocations_total",
+        "path_obstacle_check_get_attempts_total",
+        "path_obstacle_check_put_attempts_total",
+        "path_obstacle_check_puts_total",
+        "path_obstacle_check_hits_total",
+        "path_obstacle_check_misses_total",
+        "path_obstacle_check_key_none_total",
+        "path_obstacle_batch_broadphase_calls",
+        "path_obstacle_batch_broadphase_segments",
+        "path_segment_check_cache_hits",
+        "path_segment_check_cache_misses",
+        "path_segment_check_invocations",
+        "path_segment_check_get_attempts",
+        "path_segment_check_put_attempts",
+        "path_segment_check_puts",
+        "path_segment_check_key_none",
+        "path_segment_check_invocations_total",
+        "path_segment_check_get_attempts_total",
+        "path_segment_check_put_attempts_total",
+        "path_segment_check_puts_total",
+        "path_segment_check_hits_total",
+        "path_segment_check_misses_total",
+        "path_segment_check_key_none_total",
+        "predicted_segment_cache_hits",
+        "predicted_segment_cache_misses",
+        "predicted_segment_cache_get_attempts",
+        "predicted_segment_cache_puts",
+        "dig_candidate_result_cache_hits",
+        "dig_candidate_result_cache_misses",
+        "dig_candidate_result_cache_get_attempts",
+        "dig_candidate_result_cache_puts",
+        "dataset_metrics_frame_hits",
+        "dataset_metrics_frame_misses",
+    ]:
+        STATE[key] = 0
+    STATE["dataset_metrics_frame_cache"] = None
+    clear_planning_runtime_caches("auto_collect_loop_start")
     STATE["debug_timeline_path"] = ""
     STATE["auto_collect_sand_reset_done"] = False
     ensure_auto_collect_run_dir()
@@ -11847,20 +12111,11 @@ def perf_block_record(label, elapsed_ms, data=None, threshold_ms=None):
 
 def clear_planning_runtime_caches(reason=""):
     STATE["planning_path_penalty_cache"] = {}
-    STATE["planning_path_penalty_cache_hits"] = 0
-    STATE["planning_path_penalty_cache_misses"] = 0
     STATE["path_obstacle_check_cache"] = {}
-    STATE["path_obstacle_check_cache_hits"] = 0
-    STATE["path_obstacle_check_cache_misses"] = 0
+    STATE["path_segment_check_cache"] = {}
     STATE["predicted_segment_cache"] = {}
-    STATE["predicted_segment_cache_hits"] = 0
-    STATE["predicted_segment_cache_misses"] = 0
     STATE["dig_candidate_result_cache"] = {}
-    STATE["dig_candidate_result_cache_hits"] = 0
-    STATE["dig_candidate_result_cache_misses"] = 0
     STATE["planning_swing_corridor_cache"] = {}
-    STATE["planning_swing_corridor_cache_hits"] = 0
-    STATE["planning_swing_corridor_cache_misses"] = 0
     STATE["planning_sand_snapshot"] = None
     STATE["planning_sand_snapshot_active"] = False
     if reason:
@@ -14561,6 +14816,14 @@ DIG_PLAN_TOPK_IK = 2
 DIG_PLAN_MAX_CANDIDATES = 10
 DIG_PLAN_PATH_CHECK_SAMPLES = 6
 DIG_PLAN_MAX_BUILD_SECONDS = 10.0
+DIG_PLAN_EARLY_ACCEPT_ENABLED = str(os.environ.get("EXCAVATOR_DIG_PLAN_EARLY_ACCEPT", "1") or "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+DIG_PLAN_EARLY_ACCEPT_MAX_COST = float(os.environ.get("EXCAVATOR_DIG_PLAN_EARLY_ACCEPT_MAX_COST", "950.0") or 950.0)
+DIG_PLAN_EARLY_ACCEPT_AFTER_CANDIDATES = int(os.environ.get("EXCAVATOR_DIG_PLAN_EARLY_ACCEPT_AFTER", "1") or 1)
 PLANNER_SYNC_BLOCK_WARN_MS = 250.0
 AUTO_COLLECT_FIND_PLAN_MAX_SECONDS = 30.0
 AUTO_COLLECT_CANDIDATE_PLAN_SECONDS = 10.0
@@ -14608,6 +14871,8 @@ PATH_OBSTACLE_OVER_CLEARANCE_Z = 0.45
 UNLOAD_BIN_WALL_OVERPASS_CLEARANCE_Z = 0.055
 UNLOAD_BIN_WALL_EXEC_EXTRA_CLEARANCE_Z = 0.28
 PATH_OBSTACLE_CACHE_SECONDS = 2.50
+PATH_CACHE_Q_QUANT_DEG = float(os.environ.get("EXCAVATOR_PATH_CACHE_Q_QUANT_DEG", "0.05") or 0.05)
+DIG_CANDIDATE_CACHE_Q_QUANT_DEG = float(os.environ.get("EXCAVATOR_DIG_CANDIDATE_CACHE_Q_QUANT_DEG", "0.10") or 0.10)
 PATH_OBSTACLE_MESH_PROXY_MIN_AREA = 1.0e-4
 PATH_OBSTACLE_MESH_PROXY_MAX_FACES = 32
 PATH_ROUTE_SIDE_OFFSETS = [0.65, 1.10, 1.65, 2.25]
@@ -15400,25 +15665,19 @@ def rigid_obstacle_bboxes(force=False):
     STATE["rigid_obstacle_cache_version"] = int(STATE.get("rigid_obstacle_cache_version", 0) or 0) + 1
     STATE["rigid_obstacle_numpy_cache"] = None
     STATE["path_obstacle_check_cache"] = {}
+    STATE["path_segment_check_cache"] = {}
     return bboxes
 
 
 def clear_rigid_obstacle_cache(reason=""):
     STATE["rigid_obstacle_cache"] = None
     STATE["rigid_obstacle_cache_time"] = 0.0
-    STATE["rigid_obstacle_cache_hits"] = 0
-    STATE["rigid_obstacle_cache_misses"] = 0
     STATE["rigid_obstacle_cache_version"] = int(STATE.get("rigid_obstacle_cache_version", 0) or 0) + 1
     STATE["rigid_obstacle_numpy_cache"] = None
     STATE["path_obstacle_check_cache"] = {}
-    STATE["path_obstacle_check_cache_hits"] = 0
-    STATE["path_obstacle_check_cache_misses"] = 0
+    STATE["path_segment_check_cache"] = {}
     STATE["predicted_segment_cache"] = {}
-    STATE["predicted_segment_cache_hits"] = 0
-    STATE["predicted_segment_cache_misses"] = 0
     STATE["dig_candidate_result_cache"] = {}
-    STATE["dig_candidate_result_cache_hits"] = 0
-    STATE["dig_candidate_result_cache_misses"] = 0
     if reason:
         info_print("[OBSTACLE CACHE CLEAR]", f"reason={reason}")
 
@@ -15488,6 +15747,37 @@ def obstacle_aabb_candidate_indices(pa, pb, obstacle_np, margin_xy=0.0, margin_z
             & (seg_min[2] <= maxs[:, 2])
         )
         return indices[mask]
+    except Exception:
+        return None
+
+
+def obstacle_aabb_candidate_indices_many(segments, obstacle_np, margin_xy=0.0, margin_z=0.0, radius=0.0):
+    try:
+        mins = obstacle_np.get("min")
+        maxs = obstacle_np.get("max")
+        indices = obstacle_np.get("indices")
+        if mins is None or maxs is None or indices is None or len(indices) == 0:
+            return [np.zeros(0, dtype=np.int32) for _ in segments]
+        if not segments:
+            return []
+        a = np.array([np.array(seg[1], dtype=np.float32).reshape(-1)[:3] for seg in segments], dtype=np.float32)
+        b = np.array([np.array(seg[2], dtype=np.float32).reshape(-1)[:3] for seg in segments], dtype=np.float32)
+        pad_xy = max(0.0, float(margin_xy) + float(radius))
+        pad_z = max(0.0, float(margin_z) + float(radius))
+        pad = np.array([pad_xy, pad_xy, pad_z], dtype=np.float32)
+        seg_min = np.minimum(a, b) - pad
+        seg_max = np.maximum(a, b) + pad
+        mask = (
+            (seg_max[:, None, 0] >= mins[None, :, 0])
+            & (seg_min[:, None, 0] <= maxs[None, :, 0])
+            & (seg_max[:, None, 1] >= mins[None, :, 1])
+            & (seg_min[:, None, 1] <= maxs[None, :, 1])
+            & (seg_max[:, None, 2] >= mins[None, :, 2])
+            & (seg_min[:, None, 2] <= maxs[None, :, 2])
+        )
+        increment_runtime_counter("path_obstacle_batch_broadphase_calls", 1)
+        increment_runtime_counter("path_obstacle_batch_broadphase_segments", len(segments))
+        return [indices[mask_i] for mask_i in mask]
     except Exception:
         return None
 
@@ -15854,11 +16144,8 @@ def predicted_obstacle_check_segments(q, reference_q=None):
 
 def predicted_segment_cache_key(q, reference_q=None):
     try:
-        q_key = tuple(float(x) for x in np.round(np.array(q, dtype=np.float32).reshape(-1)[:4], 4))
-        if reference_q is None:
-            ref_key = None
-        else:
-            ref_key = tuple(float(x) for x in np.round(np.array(reference_q, dtype=np.float32).reshape(-1)[:4], 4))
+        q_key = quantized_q_tuple(q, quantum_deg=PATH_CACHE_Q_QUANT_DEG)
+        ref_key = None if reference_q is None else quantized_q_tuple(reference_q, quantum_deg=PATH_CACHE_Q_QUANT_DEG)
         ik_key = stable_json_hash(STATE.get("ik_calibration_report", {}) or {})
         return (ik_key, q_key, ref_key)
     except Exception:
@@ -15869,6 +16156,7 @@ def predicted_obstacle_check_segments_cached(q, reference_q=None):
     key = predicted_segment_cache_key(q, reference_q=reference_q)
     cache = STATE.setdefault("predicted_segment_cache", {})
     if key is not None and isinstance(cache, dict):
+        increment_runtime_counter("predicted_segment_cache_get_attempts", 1)
         cached = lru_cache_get(cache, key)
         if cached is not None:
             STATE["predicted_segment_cache_hits"] = int(STATE.get("predicted_segment_cache_hits", 0) or 0) + 1
@@ -15877,6 +16165,7 @@ def predicted_obstacle_check_segments_cached(q, reference_q=None):
     segments = predicted_obstacle_check_segments(q, reference_q=reference_q)
     if key is not None and isinstance(cache, dict):
         lru_cache_put(cache, key, segments, PREDICTED_SEGMENT_CACHE_MAX)
+        increment_runtime_counter("predicted_segment_cache_puts", 1)
     return segments
 
 
@@ -16002,14 +16291,12 @@ def unload_bin_wall_overpass_allowed(mode, obstacle, *points):
 
 def path_obstacle_check_cache_key(q_start, q_goal, mode, samples):
     try:
-        qa = np.round(np.array(q_start, dtype=np.float32).reshape(-1)[:4], 4)
-        qb = np.round(np.array(q_goal, dtype=np.float32).reshape(-1)[:4], 4)
         return (
             int(STATE.get("rigid_obstacle_cache_version", 0) or 0),
             str(mode),
             int(max(2, int(samples))),
-            tuple(float(x) for x in qa),
-            tuple(float(x) for x in qb),
+            quantized_q_tuple(q_start, quantum_deg=PATH_CACHE_Q_QUANT_DEG),
+            quantized_q_tuple(q_goal, quantum_deg=PATH_CACHE_Q_QUANT_DEG),
             float(PATH_OBSTACLE_MARGIN_XY),
             float(PATH_OBSTACLE_MARGIN_Z),
             float(PATH_LINK_COLLISION_RADIUS_M),
@@ -16028,20 +16315,48 @@ def path_obstacle_result_cacheable(result):
 @debug_profiled("path_obstacle_check", threshold_ms=5.0)
 def path_obstacle_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadline=None):
     t0 = time.perf_counter()
+    increment_runtime_counter(
+        "path_obstacle_check_invocations",
+        1,
+        total_name="path_obstacle_check_invocations_total",
+    )
     obstacles = rigid_obstacle_bboxes()
     samples = max(2, int(samples))
     cache_key = path_obstacle_check_cache_key(q_start, q_goal, mode, samples)
     cache = STATE.setdefault("path_obstacle_check_cache", {})
     if cache_key is not None and isinstance(cache, dict):
+        increment_runtime_counter(
+            "path_obstacle_check_get_attempts",
+            1,
+            total_name="path_obstacle_check_get_attempts_total",
+        )
         cached = lru_cache_get(cache, cache_key)
         if cached is not None:
             STATE["path_obstacle_check_cache_hits"] = int(STATE.get("path_obstacle_check_cache_hits", 0) or 0) + 1
+            increment_runtime_counter("path_obstacle_check_hits_total", 1)
             return cached
         STATE["path_obstacle_check_cache_misses"] = int(STATE.get("path_obstacle_check_cache_misses", 0) or 0) + 1
+        increment_runtime_counter("path_obstacle_check_misses_total", 1)
+    else:
+        increment_runtime_counter(
+            "path_obstacle_check_key_none",
+            1,
+            total_name="path_obstacle_check_key_none_total",
+        )
 
     def finish(result):
         if cache_key is not None and isinstance(cache, dict) and path_obstacle_result_cacheable(result):
+            increment_runtime_counter(
+                "path_obstacle_check_put_attempts",
+                1,
+                total_name="path_obstacle_check_put_attempts_total",
+            )
             lru_cache_put(cache, cache_key, result, PLANNING_PATH_PENALTY_CACHE_MAX)
+            increment_runtime_counter(
+                "path_obstacle_check_puts",
+                1,
+                total_name="path_obstacle_check_puts_total",
+            )
         return result
 
     try:
@@ -16055,21 +16370,22 @@ def path_obstacle_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadl
             s = float(i) / float(samples)
             q = interpolate_q_shortest(q_start, q_goal, s)
             segments = predicted_obstacle_check_segments_cached(q, reference_q=q_start)
-            for link_name, pa, pb in segments:
-                candidate_indices = obstacle_aabb_candidate_indices(
-                    pa,
-                    pb,
-                    obstacle_np,
-                    margin_xy=PATH_OBSTACLE_MARGIN_XY,
-                    margin_z=PATH_OBSTACLE_MARGIN_Z,
-                    radius=PATH_LINK_COLLISION_RADIUS_M,
-                )
+            candidate_lists = obstacle_aabb_candidate_indices_many(
+                segments,
+                obstacle_np,
+                margin_xy=PATH_OBSTACLE_MARGIN_XY,
+                margin_z=PATH_OBSTACLE_MARGIN_Z,
+                radius=PATH_LINK_COLLISION_RADIUS_M,
+            )
+            if candidate_lists is None:
+                candidate_lists = [None for _ in segments]
+            for (link_name, pa, pb), candidate_indices in zip(segments, candidate_lists):
                 if candidate_indices is None:
                     candidate_indices = range(len(obstacles))
                 for obstacle_index in candidate_indices:
                     obstacle = obstacles[int(obstacle_index)]
                     if planning_deadline_exceeded(deadline):
-                        return False, "planning budget exceeded", i, None
+                        return finish((False, "planning budget exceeded", i, None))
                     if unload_bin_wall_overpass_allowed(mode, obstacle, pa, pb):
                         continue
                     hit, hit_point = segment_intersects_obstacle_proxy(
@@ -16147,17 +16463,83 @@ def path_obstacle_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadl
         STATE["sand_perf_last"] = perf
 
 
+def path_segment_check_cache_key(q_start, q_goal, mode, samples):
+    try:
+        return (
+            int(STATE.get("rigid_obstacle_cache_version", 0) or 0),
+            str(mode),
+            int(max(2, int(samples))),
+            quantized_q_tuple(q_start, quantum_deg=PATH_CACHE_Q_QUANT_DEG),
+            quantized_q_tuple(q_goal, quantum_deg=PATH_CACHE_Q_QUANT_DEG),
+            float(PATH_OBSTACLE_MARGIN_XY),
+            float(PATH_OBSTACLE_MARGIN_Z),
+            float(PATH_LINK_COLLISION_RADIUS_M),
+        )
+    except Exception:
+        return None
+
+
+def path_segment_result_cacheable(result):
+    if not isinstance(result, tuple) or len(result) < 3:
+        return False
+    reason_text = " ".join(str(x).lower() for x in result[1:3])
+    return "planning budget exceeded" not in reason_text and "deadline" not in reason_text
+
+
 @debug_profiled("path_segment_check", threshold_ms=5.0)
 def path_segment_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadline=None):
+    increment_runtime_counter(
+        "path_segment_check_invocations",
+        1,
+        total_name="path_segment_check_invocations_total",
+    )
+    samples = max(2, int(samples))
+    cache_key = path_segment_check_cache_key(q_start, q_goal, mode, samples)
+    cache = STATE.setdefault("path_segment_check_cache", {})
+    if cache_key is not None and isinstance(cache, dict):
+        increment_runtime_counter(
+            "path_segment_check_get_attempts",
+            1,
+            total_name="path_segment_check_get_attempts_total",
+        )
+        cached = lru_cache_get(cache, cache_key)
+        if cached is not None:
+            STATE["path_segment_check_cache_hits"] = int(STATE.get("path_segment_check_cache_hits", 0) or 0) + 1
+            increment_runtime_counter("path_segment_check_hits_total", 1)
+            return cached
+        STATE["path_segment_check_cache_misses"] = int(STATE.get("path_segment_check_cache_misses", 0) or 0) + 1
+        increment_runtime_counter("path_segment_check_misses_total", 1)
+    else:
+        increment_runtime_counter(
+            "path_segment_check_key_none",
+            1,
+            total_name="path_segment_check_key_none_total",
+        )
+
+    def finish(result):
+        if cache_key is not None and isinstance(cache, dict) and path_segment_result_cacheable(result):
+            increment_runtime_counter(
+                "path_segment_check_put_attempts",
+                1,
+                total_name="path_segment_check_put_attempts_total",
+            )
+            lru_cache_put(cache, cache_key, result, PLANNING_PATH_PENALTY_CACHE_MAX)
+            increment_runtime_counter(
+                "path_segment_check_puts",
+                1,
+                total_name="path_segment_check_puts_total",
+            )
+        return result
+
     ok, reason, sample, report = path_phase_check(q_start, q_goal, mode, samples=samples, deadline=deadline)
     if not ok:
-        return False, "phase", reason, sample, report
+        return finish((False, "phase", reason, sample, report))
 
     ok, reason, sample, report = path_obstacle_check(q_start, q_goal, mode, samples=samples, deadline=deadline)
     if not ok:
-        return False, "obstacle", reason, sample, report
+        return finish((False, "obstacle", reason, sample, report))
 
-    return True, "ok", "ok", samples, report
+    return finish((True, "ok", "ok", samples, report))
 
 
 def unload_bin_wall_clearance_required_z(ctx=None):
@@ -20578,13 +20960,13 @@ def planning_sand_snapshot_cache_key():
 
 def dig_candidate_result_cache_key(target_xyz, candidate):
     try:
-        q_start = tuple(float(x) for x in np.round(np.array(CTRL.q_cmd, dtype=np.float32).reshape(-1)[:4], 4))
-        target_key = tuple(float(x) for x in np.round(np.array(target_xyz, dtype=np.float32).reshape(-1)[:3], 4))
+        q_start = quantized_q_tuple(CTRL.q_cmd, quantum_deg=DIG_CANDIDATE_CACHE_Q_QUANT_DEG)
+        target_key = quantized_xyz_tuple(target_xyz, quantum=0.005)
         candidate_hash = stable_json_hash(candidate)
         ik_hash = stable_json_hash(STATE.get("ik_calibration_report", {}) or {})
         sand_snapshot_hash = planning_sand_snapshot_cache_key()
-        unload_landing = vec_list(STATE.get("active_unload_landing_point"), 3)
-        unload_release = vec_list(STATE.get("active_unload_release_point"), 3)
+        unload_landing = quantized_xyz_tuple(STATE.get("active_unload_landing_point"), quantum=0.005)
+        unload_release = quantized_xyz_tuple(STATE.get("active_unload_release_point"), quantum=0.005)
         return (
             target_key,
             candidate_hash,
@@ -20603,6 +20985,8 @@ def dig_candidate_result_cache_key(target_xyz, candidate):
 def dig_candidate_result_cache_get(target_xyz, candidate):
     key = dig_candidate_result_cache_key(target_xyz, candidate)
     cache = STATE.setdefault("dig_candidate_result_cache", {})
+    if key is not None:
+        increment_runtime_counter("dig_candidate_result_cache_get_attempts", 1)
     cached = lru_cache_get(cache, key) if key is not None else None
     if cached is None:
         STATE["dig_candidate_result_cache_misses"] = int(STATE.get("dig_candidate_result_cache_misses", 0) or 0) + 1
@@ -20630,6 +21014,7 @@ def dig_candidate_result_cache_put(target_xyz, candidate, seq, points, detail):
         {"seq": seq_copy, "points": points_copy, "detail": detail_copy},
         DIG_CANDIDATE_RESULT_CACHE_MAX,
     )
+    increment_runtime_counter("dig_candidate_result_cache_puts", 1)
 
 
 def evaluate_dig_plan_candidate(seq, points, candidate, stages=None):
@@ -23067,22 +23452,56 @@ def should_append_staged_post_secure_load_after_stage(stage_name):
     return False
 
 
+def dig_plan_candidate_early_accept_ok(row, evaluated_count):
+    if not bool(DIG_PLAN_EARLY_ACCEPT_ENABLED):
+        return False, "disabled"
+    if int(evaluated_count) < max(1, int(DIG_PLAN_EARLY_ACCEPT_AFTER_CANDIDATES)):
+        return False, "min_candidates_not_reached"
+    if not isinstance(row, dict) or not bool(row.get("planned", True)):
+        return False, "candidate_not_planned"
+    contract = row.get("fsm_contract")
+    if isinstance(contract, dict) and contract.get("ok") is False:
+        return False, "contract_failed"
+    planner_cost = float(row.get("planner_cost", row.get("rank_cost", 1.0e9)) or 1.0e9)
+    if planner_cost > float(DIG_PLAN_EARLY_ACCEPT_MAX_COST):
+        return False, f"cost>{float(DIG_PLAN_EARLY_ACCEPT_MAX_COST):.1f}"
+    return True, f"cost<={float(DIG_PLAN_EARLY_ACCEPT_MAX_COST):.1f}"
+
+
 def plan_dig_sequence_from_target(target_xyz, max_seconds=None):
     STATE["last_dig_plan_candidates"] = []
     STATE["dig_plan_candidate"] = None
     STATE["dig_plan_best_failure"] = None
     best = None
     best_failure = None
+    plan_t0 = time.perf_counter()
+    plan_summary = {
+        "target": vec_list(target_xyz, 3),
+        "budget_seconds": 0.0,
+        "candidate_count": 0,
+        "evaluated": 0,
+        "first_plan_ms": None,
+        "accepted_plan_ms": None,
+        "early_accept": False,
+        "early_accept_reason": "",
+        "best_ready": False,
+        "best_cost": None,
+        "best_candidate": "",
+        "timeout": False,
+    }
 
     candidates = adaptive_dig_plan_candidates(target_xyz)
     budget_source = max_seconds if max_seconds is not None else STATE.get("dig_plan_build_budget_seconds", DIG_PLAN_MAX_BUILD_SECONDS)
     budget_seconds = float(budget_source or DIG_PLAN_MAX_BUILD_SECONDS)
+    plan_summary["budget_seconds"] = float(budget_seconds)
+    plan_summary["candidate_count"] = int(len(candidates))
     deadline = time.time() + budget_seconds
     previous_perf_deadline = STATE.get("dig_plan_active_perf_deadline")
     STATE["dig_plan_active_perf_deadline"] = time.perf_counter() + budget_seconds
     try:
         for candidate in candidates:
             if planning_deadline_exceeded(deadline):
+                plan_summary["timeout"] = True
                 info_print(
                     "[DIG PLAN TIMEOUT]",
                     f"budget={budget_seconds:.2f}s",
@@ -23109,9 +23528,12 @@ def plan_dig_sequence_from_target(target_xyz, max_seconds=None):
                     "budget_seconds": float(budget_seconds),
                 },
             )
-            row = dict(detail)
+            row = dict(detail or {})
             row["candidate"] = dict(candidate)
+            early_accept_this = False
             if seq:
+                if plan_summary.get("first_plan_ms") is None:
+                    plan_summary["first_plan_ms"] = float((time.perf_counter() - plan_t0) * 1000.0)
                 if planning_deadline_exceeded(deadline):
                     legacy_score = 0.0
                     score_reason = "post_plan_eval_skipped_due_budget"
@@ -23138,6 +23560,13 @@ def plan_dig_sequence_from_target(target_xyz, max_seconds=None):
                         "candidate": dict(candidate),
                         "row": row,
                     }
+                evaluated_count = len(STATE.get("last_dig_plan_candidates", [])) + 1
+                early_ok, early_reason = dig_plan_candidate_early_accept_ok(row, evaluated_count)
+                if early_ok:
+                    plan_summary["early_accept"] = True
+                    plan_summary["early_accept_reason"] = early_reason
+                    plan_summary["accepted_plan_ms"] = float((time.perf_counter() - plan_t0) * 1000.0)
+                    early_accept_this = True
             else:
                 row["score"] = -1.0e9
                 row["score_reason"] = row.get("failure_reason", "planning_failed")
@@ -23156,8 +23585,33 @@ def plan_dig_sequence_from_target(target_xyz, max_seconds=None):
                     elif new_prefix == old_prefix and float(row.get("best_partial_cost", 1.0e9)) < float(best_failure.get("best_partial_cost", 1.0e9)):
                         best_failure = row
             STATE["last_dig_plan_candidates"].append(row)
+            plan_summary["evaluated"] = int(len(STATE.get("last_dig_plan_candidates", [])))
+            if early_accept_this:
+                break
     finally:
         STATE["dig_plan_active_perf_deadline"] = previous_perf_deadline
+
+    plan_summary["elapsed_ms"] = float((time.perf_counter() - plan_t0) * 1000.0)
+    plan_summary["evaluated"] = int(len(STATE.get("last_dig_plan_candidates", [])))
+    plan_summary["best_ready"] = bool(best is not None)
+    if best is not None:
+        plan_summary["best_cost"] = float(best.get("rank_cost", 0.0) or 0.0)
+        plan_summary["best_candidate"] = str((best.get("candidate") or {}).get("id", ""))
+        if plan_summary.get("accepted_plan_ms") is None:
+            plan_summary["accepted_plan_ms"] = plan_summary["elapsed_ms"]
+    STATE["plan_build_summary"] = plan_summary
+    info_print(
+        "[PLAN_BUILD_SUMMARY]",
+        f"evaluated={plan_summary.get('evaluated')}/{plan_summary.get('candidate_count')}",
+        f"first_plan_ms={fmt_optional(plan_summary.get('first_plan_ms'))}",
+        f"accepted_ms={fmt_optional(plan_summary.get('accepted_plan_ms'))}",
+        f"elapsed_ms={fmt_optional(plan_summary.get('elapsed_ms'))}",
+        f"best_ready={plan_summary.get('best_ready')}",
+        f"best_cost={fmt_optional(plan_summary.get('best_cost'))}",
+        f"early_accept={plan_summary.get('early_accept')}",
+        f"reason={plan_summary.get('early_accept_reason')}",
+        force_log=debug_diagnostics_enabled(),
+    )
 
     if best is None:
         STATE["dig_plan_best_failure"] = best_failure

@@ -217,6 +217,7 @@ __marimo__/
 # Local Isaac/runtime outputs
 backup/
 excavator_auto_dataset/
+/DATA/
 logs/
 log/
 *.log

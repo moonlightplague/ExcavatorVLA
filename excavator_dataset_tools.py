@@ -1343,13 +1343,18 @@ def collect_lerobot_rows(
     tasks_by_text: Dict[str, int] = {}
     image_paths = {key: [] for key in LEROBOT_IMAGE_KEYS}
     skipped_frames = 0
+    skipped_state_action_frames = 0
+    skipped_missing_camera_frames = 0
+    missing_camera_by_key: Counter = Counter()
+    missing_camera_examples: List[dict] = []
     global_frame = 0
-    for export_episode_index, episode in enumerate(episode_rows):
+    for source_episode_index, episode in enumerate(episode_rows):
         trajectory = load_trajectory(episode)
         episode_dir = episode_dir_from_row(episode)
         meta = read_json(row_path_value(episode, "meta"), default={}) or {}
         if not trajectory:
             continue
+        export_episode_index = len(episodes)
         first_t = safe_float_value(trajectory[0].get("t"), 0.0) or 0.0
         episode_start_frame = global_frame
         episode_length = 0
@@ -1363,6 +1368,32 @@ def collect_lerobot_rows(
             action = vector_or_none(sample.get("action"), len(action_names))
             if state is None or action is None:
                 skipped_frames += 1
+                skipped_state_action_frames += 1
+                continue
+            resolved_images: Dict[str, Tuple[object, str]] = {}
+            missing_image_keys: List[str] = []
+            for key in LEROBOT_IMAGE_KEYS:
+                image_value = sample_image_value(sample, key)
+                abs_image = resolve_episode_file(episode_dir, image_value)
+                if abs_image and os.path.isfile(abs_image):
+                    resolved_images[key] = (image_value, abs_image)
+                else:
+                    missing_image_keys.append(key)
+                    missing_camera_by_key[key] += 1
+            if missing_image_keys:
+                skipped_frames += 1
+                skipped_missing_camera_frames += 1
+                if len(missing_camera_examples) < 20:
+                    missing_camera_examples.append(
+                        {
+                            "source_episode_index": int(source_episode_index),
+                            "raw_episode_index": episode.get("episode_index"),
+                            "raw_episode_id": episode.get("episode_id", ""),
+                            "raw_sample_index": sample.get("i"),
+                            "phase": str(sample.get("phase", "")),
+                            "missing": list(missing_image_keys),
+                        }
+                    )
                 continue
             effort = vector_or_none(sample.get("observation.effort"), len(effort_names))
             task_text = lerobot_task_text(sample, meta)
@@ -1386,16 +1417,10 @@ def collect_lerobot_rows(
                 "raw_sample_index": sample.get("i"),
             }
             for key in LEROBOT_IMAGE_KEYS:
-                image_value = sample_image_value(sample, key)
-                abs_image = resolve_episode_file(episode_dir, image_value)
-                if abs_image and os.path.isfile(abs_image):
-                    image_paths[key].append(abs_image)
-                    row[key] = image_value
-                    row[f"{key}.available"] = True
-                else:
-                    image_paths[key].append("")
-                    row[key] = None
-                    row[f"{key}.available"] = False
+                image_value, abs_image = resolved_images[key]
+                image_paths[key].append(abs_image)
+                row[key] = image_value
+                row[f"{key}.available"] = True
             rows.append(row)
             episode_length += 1
             global_frame += 1
@@ -1438,6 +1463,10 @@ def collect_lerobot_rows(
         "effort_names": effort_names,
         "run_meta": run_meta,
         "skipped_frames": skipped_frames,
+        "skipped_state_action_frames": skipped_state_action_frames,
+        "skipped_missing_camera_frames": skipped_missing_camera_frames,
+        "missing_camera_by_key": dict(missing_camera_by_key),
+        "missing_camera_examples": missing_camera_examples,
         "source_episode_count": len(episode_rows),
     }
 
@@ -1663,10 +1692,15 @@ def export_lerobot_dataset(
         "total_episodes": len(episodes),
         "total_tasks": len(tasks),
         "skipped_frames": collected["skipped_frames"],
+        "skipped_state_action_frames": collected.get("skipped_state_action_frames", 0),
+        "skipped_missing_camera_frames": collected.get("skipped_missing_camera_frames", 0),
+        "missing_camera_by_key": collected.get("missing_camera_by_key", {}),
+        "missing_camera_examples": collected.get("missing_camera_examples", []),
         "notes": [
             "Original auto-collection debug data remains outside this subfolder.",
             "This folder follows the LeRobot v3.0 offline layout for VLA/SmolVLA training.",
             "Camera streams are observation.images.0, observation.images.1, observation.images.2.",
+            "Rows missing any camera frame are skipped during export so state/action/video stay aligned.",
             "If vla_training_ready is false, install pandas/pyarrow plus a video encoder, then rerun the exporter.",
         ],
     }
@@ -1723,6 +1757,10 @@ def print_lerobot_export(
         require_standard=require_standard,
         require_vla=require_vla,
     )
+    try:
+        write_json(os.path.join(os.path.abspath(str(run_dir)), "lerobot_v3_export.json"), result)
+    except Exception:
+        pass
     print("[LEROBOT EXPORT]", json.dumps(result, ensure_ascii=True, indent=2))
 
 

@@ -218,6 +218,7 @@ __marimo__/
 backup/
 excavator_auto_dataset/
 /DATA/
+/qa/
 logs/
 log/
 *.log

@@ -24319,6 +24319,23 @@ def current_real_q_near(reference_q=None):
     return q_real_near_command(get_real_joint_positions(), q_ref)
 
 
+def record_unload_trajectory_sample(stage_name, label, q_cmd=None, force=True):
+    """Capture camera/state rows during direct unload motions that bypass move_to_profile."""
+    if not bool(STATE.get("dataset_recording", False)):
+        return
+    try:
+        q_cmd_now = CTRL.q_cmd.copy() if q_cmd is None else np.array(q_cmd, dtype=np.float32).reshape(-1)[:4].copy()
+        try:
+            q_real_now = current_real_q_near(q_cmd_now)
+        except Exception:
+            q_real_now = None
+        dataset_record_sample(stage_name, q_cmd=q_cmd_now, q_real=q_real_now, label=label, force=force)
+    except Exception as e:
+        if time.time() - float(STATE.get("dataset_last_error_time", 0.0)) > 2.0:
+            STATE["dataset_last_error_time"] = time.time()
+            info_print("[WARN] unload trajectory sample failed:", type(e).__name__, e)
+
+
 def bucket_only_dump_ready(stage_name, dump_deg, label="before_dump"):
     try:
         q_real = current_real_q_near()
@@ -24356,6 +24373,7 @@ async def wait_for_dump_settle(stage_name, task_id=None):
         if (frame + 1) % sample_frames != 0 and (frame + 1) < max_frames:
             continue
         metrics = record_phase_metrics("after_dump_settle_probe")
+        record_unload_trajectory_sample(stage_name, "after_dump_settle_probe")
         bin_count = int(metrics.get("bin_from_pile_count", 0)) if isinstance(metrics, dict) else 0
         if last_bin_count is not None and abs(bin_count - int(last_bin_count)) <= 1:
             stable_samples += 1
@@ -24366,6 +24384,7 @@ async def wait_for_dump_settle(stage_name, task_id=None):
             break
 
     record_phase_metrics("after_dump_settle")
+    record_unload_trajectory_sample(stage_name, "after_dump_settle")
     return True
 
 
@@ -24391,6 +24410,7 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
     loaded_route_dump = str(STATE.get("active_task_name", "")) == "loaded_unload_route_test"
     metric_stride = max(1, int(UNLOAD_DUMP_METRIC_SAMPLE_STRIDE_LOADED if loaded_route_dump else 1))
     start_metrics = record_phase_metrics("before_dump_direct")
+    record_unload_trajectory_sample(stage_name, "before_dump_direct", q_cmd=q0)
     start_bucket_count = int(start_metrics.get("bucket_from_pile_count", 0)) if isinstance(start_metrics, dict) else 0
     start_bin_count = int(start_metrics.get("bin_from_pile_count", 0)) if isinstance(start_metrics, dict) else 0
     if loaded_route_dump and bool(LOADED_ROUTE_STAGE_PARTICLE_DIAGNOSTICS):
@@ -24433,6 +24453,7 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
             set_execution_failure_reason(f"execution_failed/unload_dump_action_failed:{stage_name}:{send_reason}")
             return False
         await step_updates(wait_frames)
+        record_unload_trajectory_sample(stage_name, "during_dump_direct", q_cmd=q)
         do_metric_sample = (i == 0) or ((i + 1) >= max_steps) or ((i + 1) % metric_stride == 0)
         if do_metric_sample:
             last_metrics = record_phase_metrics("during_dump_direct")
@@ -24470,6 +24491,7 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
         q_real = q_real_near_command(get_real_joint_positions(), q_final)
         err_deg = abs(rad_to_deg(float(q_final[bucket_idx] - q_real[bucket_idx])))
         end_metrics = record_phase_metrics("after_dump_direct")
+        record_unload_trajectory_sample(stage_name, "after_dump_direct", q_cmd=q_final)
         bucket_end = int(end_metrics.get("bucket_from_pile_count", 0)) if isinstance(end_metrics, dict) else 0
         bin_end = int(end_metrics.get("bin_from_pile_count", 0)) if isinstance(end_metrics, dict) else 0
         if loaded_route_dump and bool(LOADED_ROUTE_STAGE_PARTICLE_DIAGNOSTICS):

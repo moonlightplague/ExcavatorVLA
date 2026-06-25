@@ -14824,6 +14824,17 @@ DIG_PLAN_EARLY_ACCEPT_ENABLED = str(os.environ.get("EXCAVATOR_DIG_PLAN_EARLY_ACC
 )
 DIG_PLAN_EARLY_ACCEPT_MAX_COST = float(os.environ.get("EXCAVATOR_DIG_PLAN_EARLY_ACCEPT_MAX_COST", "950.0") or 950.0)
 DIG_PLAN_EARLY_ACCEPT_AFTER_CANDIDATES = int(os.environ.get("EXCAVATOR_DIG_PLAN_EARLY_ACCEPT_AFTER", "1") or 1)
+DIG_PLAN_STAGED_PREFIX_EARLY_ACCEPT_ENABLED = str(
+    os.environ.get("EXCAVATOR_DIG_PLAN_STAGED_PREFIX_EARLY_ACCEPT", "1") or "1"
+).strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+DIG_PLAN_STAGED_PREFIX_EARLY_ACCEPT_AFTER_CANDIDATES = int(
+    os.environ.get("EXCAVATOR_DIG_PLAN_STAGED_PREFIX_EARLY_ACCEPT_AFTER", "1") or 1
+)
 PLANNER_SYNC_BLOCK_WARN_MS = 250.0
 AUTO_COLLECT_FIND_PLAN_MAX_SECONDS = 30.0
 AUTO_COLLECT_CANDIDATE_PLAN_SECONDS = 10.0
@@ -23468,6 +23479,21 @@ def dig_plan_candidate_early_accept_ok(row, evaluated_count):
     return True, f"cost<={float(DIG_PLAN_EARLY_ACCEPT_MAX_COST):.1f}"
 
 
+def dig_plan_staged_prefix_early_accept_ok(row, evaluated_count):
+    if not bool(DIG_PLAN_STAGED_PREFIX_EARLY_ACCEPT_ENABLED):
+        return False, "staged_prefix_disabled", ""
+    if int(evaluated_count) < max(1, int(DIG_PLAN_STAGED_PREFIX_EARLY_ACCEPT_AFTER_CANDIDATES)):
+        return False, "staged_prefix_min_candidates_not_reached", ""
+    prefix_stages, reason = staged_prefix_stages_from_failure(row)
+    if not prefix_stages:
+        return False, reason, ""
+    semantic = [dig_plan_semantic_phase_name(str(stage.get("phase", ""))) for stage in prefix_stages if isinstance(stage, dict)]
+    terminal = str(next((phase for phase in reversed(semantic) if phase != "clearance_route"), ""))
+    if terminal != "pull_exit_cut" and terminal != "secure_load":
+        return False, f"staged_prefix_terminal_not_ready:{terminal}", terminal
+    return True, f"staged_prefix_ready:{terminal}", terminal
+
+
 def plan_dig_sequence_from_target(target_xyz, max_seconds=None):
     STATE["last_dig_plan_candidates"] = []
     STATE["dig_plan_candidate"] = None
@@ -23484,6 +23510,8 @@ def plan_dig_sequence_from_target(target_xyz, max_seconds=None):
         "accepted_plan_ms": None,
         "early_accept": False,
         "early_accept_reason": "",
+        "staged_prefix_early_accept": False,
+        "staged_prefix_terminal_phase": "",
         "best_ready": False,
         "best_cost": None,
         "best_candidate": "",
@@ -23584,6 +23612,16 @@ def plan_dig_sequence_from_target(target_xyz, max_seconds=None):
                         best_failure = row
                     elif new_prefix == old_prefix and float(row.get("best_partial_cost", 1.0e9)) < float(best_failure.get("best_partial_cost", 1.0e9)):
                         best_failure = row
+                evaluated_count = len(STATE.get("last_dig_plan_candidates", [])) + 1
+                staged_ok, staged_reason, staged_terminal = dig_plan_staged_prefix_early_accept_ok(row, evaluated_count)
+                if staged_ok:
+                    best_failure = row
+                    plan_summary["early_accept"] = True
+                    plan_summary["early_accept_reason"] = staged_reason
+                    plan_summary["staged_prefix_early_accept"] = True
+                    plan_summary["staged_prefix_terminal_phase"] = staged_terminal
+                    plan_summary["accepted_plan_ms"] = float((time.perf_counter() - plan_t0) * 1000.0)
+                    early_accept_this = True
             STATE["last_dig_plan_candidates"].append(row)
             plan_summary["evaluated"] = int(len(STATE.get("last_dig_plan_candidates", [])))
             if early_accept_this:
@@ -23600,6 +23638,16 @@ def plan_dig_sequence_from_target(target_xyz, max_seconds=None):
         if plan_summary.get("accepted_plan_ms") is None:
             plan_summary["accepted_plan_ms"] = plan_summary["elapsed_ms"]
     STATE["plan_build_summary"] = plan_summary
+    try:
+        debug_timeline_record(
+            "PLAN_BUILD_SUMMARY",
+            result="early_accept" if bool(plan_summary.get("early_accept")) else ("timeout" if bool(plan_summary.get("timeout")) else "complete"),
+            reason=str(plan_summary.get("early_accept_reason", "")),
+            data=dict(plan_summary),
+            include_sand=False,
+        )
+    except Exception:
+        pass
     info_print(
         "[PLAN_BUILD_SUMMARY]",
         f"evaluated={plan_summary.get('evaluated')}/{plan_summary.get('candidate_count')}",
@@ -23609,6 +23657,8 @@ def plan_dig_sequence_from_target(target_xyz, max_seconds=None):
         f"best_ready={plan_summary.get('best_ready')}",
         f"best_cost={fmt_optional(plan_summary.get('best_cost'))}",
         f"early_accept={plan_summary.get('early_accept')}",
+        f"staged_prefix={plan_summary.get('staged_prefix_early_accept')}",
+        f"terminal={plan_summary.get('staged_prefix_terminal_phase')}",
         f"reason={plan_summary.get('early_accept_reason')}",
         force_log=debug_diagnostics_enabled(),
     )
@@ -23621,6 +23671,9 @@ def plan_dig_sequence_from_target(target_xyz, max_seconds=None):
             terminal = ""
             if isinstance(plan, dict):
                 terminal = str(plan.get("staged_prefix_terminal_phase", "") or "")
+            plan_summary["staged_prefix_selected"] = True
+            plan_summary["staged_prefix_terminal_phase"] = terminal or str(plan_summary.get("staged_prefix_terminal_phase", ""))
+            STATE["plan_build_summary"] = plan_summary
             update_status(
                 f"[DIG PLAN STAGED] executable prefix ready through {terminal or 'partial dig'}",
                 force=True,

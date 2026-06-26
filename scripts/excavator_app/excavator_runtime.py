@@ -147,8 +147,6 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "trace_no_plan_notice_shown": False,
     "excavator_render_mode": True,
     "debug_visuals_visible": True,
-    "bucket_load_volume_selected_source_path": "/World/URDF_real3/bucket_link/bucket_cut/node_/mesh_",
-    "bucket_load_volume_selected_used_paths": [],
     "debug_visuals_last_hide_time": 0.0,
     "request_calibrate": False,
     "request_home": False,
@@ -6401,8 +6399,7 @@ def sand_config_snapshot():
         "sand_particle_path_suffix": SAND_PARTICLE_PATH_SUFFIX,
         "sand_bucket_load_volume": {
             "enabled": bool(SAND_BUCKET_LOAD_VOLUME_ENABLED),
-            "mesh_path": SAND_BUCKET_LOAD_VOLUME_MESH_PATH,
-            "selected_source_path": bucket_load_volume_selected_source_path(),
+            "mesh_path": bucket_load_volume_source_path(),
             "mode": "mesh_boundary_capped_closed_cavity",
             "mesh_backed_inside_test": True,
             "bucket_vol_ui": "closed_count_volume_calc_viz",
@@ -7266,21 +7263,10 @@ def sand_region_masks(points):
     return pile_mask, bucket_mask, bin_mask
 
 
-def bucket_load_volume_selected_source_path():
-    return str(STATE.get("bucket_load_volume_selected_source_path", "") or "").strip()
-
-
-def bucket_load_volume_explicit_source_path():
-    selected = bucket_load_volume_selected_source_path()
+def bucket_load_volume_source_path():
     configured = str(SAND_BUCKET_LOAD_VOLUME_MESH_PATH or "").strip()
     default_path = str(DEFAULT_BUCKET_LOAD_VOLUME_MESH_PATH or "").strip()
-    if selected and (selected != default_path or not configured or configured == default_path):
-        return selected
-    return configured or selected
-
-
-def bucket_load_volume_has_explicit_source():
-    return bool(bucket_load_volume_explicit_source_path())
+    return configured or default_path
 
 
 def clear_bucket_load_volume_caches():
@@ -7292,60 +7278,6 @@ def clear_bucket_load_volume_caches():
     ]:
         STATE[key] = None
     STATE["bucket_load_fast_last_time"] = 0.0
-
-
-def selected_bucket_load_volume_source_is_valid(path):
-    prim = get_prim(path)
-    if not prim or not prim.IsValid():
-        return False, "missing_prim", []
-    mesh_paths = []
-    try:
-        if prim.IsA(UsdGeom.Mesh):
-            mesh_paths.append(str(prim.GetPath()))
-        else:
-            for child in iter_prim_subtree(prim):
-                if child and child.IsValid() and child.IsA(UsdGeom.Mesh):
-                    mesh_paths.append(str(child.GetPath()))
-    except Exception as e:
-        return False, f"scan_failed:{type(e).__name__}", []
-    if not mesh_paths:
-        return False, "no_mesh_under_selection", []
-    return True, "ok", mesh_paths[:8]
-
-
-def set_bucket_load_volume_source_from_selected():
-    path = first_selected_prim_path()
-    if not path:
-        update_status("[BUCKET LOAD VIZ] select bucket_link, node_STL_BINARY_, or mesh first", force=True)
-        info_print("[BUCKET LOAD VIZ]", "select_failed=no_selection")
-        return False
-    ok, reason, mesh_paths = selected_bucket_load_volume_source_is_valid(path)
-    if not ok:
-        STATE["bucket_load_volume_selected_source_path"] = ""
-        STATE["bucket_load_volume_selected_used_paths"] = []
-        clear_bucket_load_volume_caches()
-        hide_debug_prim(bucket_sand_debug_root_path())
-        update_status(f"[BUCKET LOAD VIZ] selected source invalid: {reason}", force=True)
-        info_print("[BUCKET LOAD VIZ]", f"select_failed={reason}", f"path={path}")
-        return False
-
-    STATE["bucket_load_volume_selected_source_path"] = str(path)
-    STATE["bucket_load_volume_selected_used_paths"] = list(mesh_paths)
-    clear_bucket_load_volume_caches()
-    info_print(
-        "[BUCKET LOAD VIZ]",
-        "selected_source",
-        f"path={path}",
-        f"mesh_count={len(mesh_paths)}",
-        f"mesh_paths={mesh_paths[:4]}",
-    )
-    update_status(f"[BUCKET LOAD VIZ] selected source: {path}", force=True)
-    if debug_visuals_enabled():
-        maybe_draw_bucket_sand_count_debug(force=True)
-    else:
-        hide_debug_prim(bucket_sand_debug_root_path())
-    return True
-
 
 def point_in_polygon_2d(points_xy, polygon_xy):
     pts = np.asarray(points_xy, dtype=np.float32)
@@ -7406,12 +7338,7 @@ def default_bucket_load_volume_mesh_local():
 
 
 def bucket_load_volume_candidate_mesh_paths():
-    paths = []
-    explicit_path = bucket_load_volume_explicit_source_path()
-    if explicit_path:
-        paths.append(explicit_path)
-    if SAND_BUCKET_LOAD_VOLUME_MESH_PATH:
-        paths.append(SAND_BUCKET_LOAD_VOLUME_MESH_PATH)
+    paths = [bucket_load_volume_source_path()]
     out = []
     for path in paths:
         if path and path not in out:
@@ -7608,7 +7535,7 @@ def bucket_load_volume_authored_mesh_local():
         isinstance(cache, dict)
         and float(now - float(cache.get("time", 0.0) or 0.0)) < 5.0
         and cache.get("bucket_link") == BUCKET_LINK
-        and cache.get("source_path") == bucket_load_volume_explicit_source_path()
+        and cache.get("source_path") == bucket_load_volume_source_path()
     ):
         return cache.get("value")
 
@@ -7622,14 +7549,13 @@ def bucket_load_volume_authored_mesh_local():
         closed = close_mesh_boundary_faces(vertices, faces, source_path=path, used_paths=used_paths)
         if closed is not None:
             value = closed
-            STATE["bucket_load_volume_selected_used_paths"] = list(used_paths or [])[:8]
             STATE["bucket_load_volume_mesh_last_failures"] = list(failures or [])[:8]
             break
 
     STATE["bucket_load_volume_mesh_cache"] = {
         "time": now,
         "bucket_link": BUCKET_LINK,
-        "source_path": bucket_load_volume_explicit_source_path(),
+        "source_path": bucket_load_volume_source_path(),
         "value": value,
     }
     return value
@@ -7639,7 +7565,7 @@ def bucket_load_volume_mesh_local():
     authored = bucket_load_volume_authored_mesh_local()
     if authored is not None:
         return authored
-    source_path = bucket_load_volume_explicit_source_path()
+    source_path = bucket_load_volume_source_path()
     if source_path:
         return (
             np.zeros((0, 3), dtype=np.float32),
@@ -7827,18 +7753,6 @@ def draw_bucket_sand_count_debug(force=False):
     if not visible or not BUCKET_LINK:
         hide_debug_prim(root)
         return False
-    if not bucket_load_volume_has_explicit_source():
-        hide_debug_prim(root)
-        now = time.time()
-        if force and now - float(STATE.get("bucket_load_volume_no_source_warn_time", 0.0) or 0.0) > 2.0:
-            STATE["bucket_load_volume_no_source_warn_time"] = now
-            info_print(
-                "[WARN] [BUCKET LOAD VIZ]",
-                "no_selected_mesh_source",
-                "select a bucket mesh or node_STL_BINARY_ first",
-            )
-            update_status("[BUCKET LOAD VIZ] select bucket_link/node_STL_BINARY_/mesh first", force=False)
-        return False
     root_prim = get_prim(root)
     if not root_prim.IsValid():
         root_prim = UsdGeom.Xform.Define(stage, root).GetPrim()
@@ -7876,7 +7790,7 @@ def draw_bucket_sand_count_debug(force=False):
             f"volume_enabled={bool(SAND_BUCKET_LOAD_VOLUME_ENABLED)}",
             f"volume_source={volume_source}",
             f"volume_segments={0 if not volume_segments else len(volume_segments)}",
-            f"selected_source={bucket_load_volume_selected_source_path()}",
+            f"source={bucket_load_volume_source_path()}",
         )
     return True
 
@@ -27797,9 +27711,6 @@ def build_ui():
     def toggle_calc_viz_from_ui():
         toggle_debug_visuals_from_ui()
 
-    def select_bucket_vol_source_from_ui():
-        set_bucket_load_volume_source_from_selected()
-
     def cycle_log_mode_from_ui():
         cycle_log_mode()
 
@@ -27967,11 +27878,6 @@ def build_ui():
                         ui.Button("Print State", width=92, clicked_fn=print_state)
                         ui.Button("Render Mode", width=100, clicked_fn=toggle_render_mode_from_ui)
                         ui.Button("Calc Viz", width=76, clicked_fn=toggle_calc_viz_from_ui)
-
-                    with ui.HStack(spacing=6, height=24):
-                        ui.Label("Bucket volume", width=126)
-                        ui.Button("Select Mesh", width=104, clicked_fn=select_bucket_vol_source_from_ui)
-                        ui.Label("Calc Viz shows closed count volume only.", width=260)
 
                     ui.Separator()
                     ui.Label("Auto Dataset (primary pipeline)")

@@ -204,8 +204,12 @@ def ensure_project_root():
     for root in _candidate_roots():
         if _looks_like_project_root(root):
             for import_root in reversed(_import_roots(root)):
-                if import_root not in sys.path:
-                    sys.path.insert(0, import_root)
+                while import_root in sys.path:
+                    try:
+                        sys.path.remove(import_root)
+                    except ValueError:
+                        break
+                sys.path.insert(0, import_root)
             return root
     raise RuntimeError(
         "Cannot find scripts/excavator_app/bootstrap.py. Script Editor may be running a temp copy; "
@@ -341,6 +345,9 @@ def _open_selected_stage(project_root):
 
 PROJECT_ROOT = ensure_project_root()
 print(f"[INFO] Excavator model source: {_selected_model_label()}")
+print(f"[INFO] Excavator project root: {PROJECT_ROOT}")
+print(f"[INFO] Excavator entry script: {os.path.abspath(__file__)}")
+print(f"[INFO] Excavator config project_root: {_config_text('project_root', '')}")
 _ensure_zsp_configuration_aliases(PROJECT_ROOT)
 _normalize_zsp_layer_paths(PROJECT_ROOT)
 _open_selected_stage(PROJECT_ROOT)

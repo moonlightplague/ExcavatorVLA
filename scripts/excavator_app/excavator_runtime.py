@@ -431,6 +431,12 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
 
 STATE = builtins._EXCAVATOR_MOUSE_SLIDER_STATE
 
+try:
+    _runtime_mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(__file__)))
+    print("[INFO]", "[RUNTIME SOURCE]", f"file={__file__}", f"mtime={_runtime_mtime}")
+except Exception:
+    pass
+
 
 def runtime_module():
     return sys.modules[__name__]

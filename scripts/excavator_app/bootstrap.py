@@ -19,19 +19,28 @@ def ensure_project_root(extra_root=None):
         if not root:
             continue
         root = os.path.abspath(root)
-        if os.path.isfile(os.path.join(root, "excavator_app", "bootstrap.py")) and root not in sys.path:
+        if os.path.isfile(os.path.join(root, "excavator_app", "bootstrap.py")):
+            while root in sys.path:
+                try:
+                    sys.path.remove(root)
+                except ValueError:
+                    break
             sys.path.insert(0, root)
+            return root
+    return ""
 
 
 def reload_runtime(module_name):
     ensure_project_root()
+    importlib.invalidate_caches()
     if module_name in sys.modules:
         return importlib.reload(sys.modules[module_name])
     return importlib.import_module(module_name)
 
 
 def run_excavator_with_sand():
-    ensure_project_root()
+    root = ensure_project_root()
+    print(f"[INFO] [BOOTSTRAP ROOT] root={root} bootstrap={__file__}")
     for module_name in [
         "excavator_app.ik_calculation",
         "excavator_app.auto_dataset_collect",

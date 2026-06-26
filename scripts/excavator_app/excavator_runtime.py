@@ -147,6 +147,8 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "trace_no_plan_notice_shown": False,
     "excavator_render_mode": True,
     "debug_visuals_visible": True,
+    "bucket_load_volume_selected_source_path": "/World/URDF_real3/bucket_link/visuals/bucket_link/node_STL_BINARY_/mesh",
+    "bucket_load_volume_selected_used_paths": [],
     "debug_visuals_last_hide_time": 0.0,
     "request_calibrate": False,
     "request_home": False,
@@ -163,7 +165,7 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "manual_unload_inner_size": None,
     "manual_unload_z_range": None,
     "manual_unload_radius": 0.45,
-    "manual_unload_mesh_shrink_d": 0.12,
+    "manual_unload_mesh_shrink_d": 0.20,
     "manual_unload_range_shape": "circle",
     "manual_unload_selected_size_xy": None,
     "manual_unload_polygon_xy": None,
@@ -173,7 +175,7 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "last_unload_model_xyz": None,
     "last_unload_model_z_range": None,
     "last_unload_model_radius": 0.45,
-    "last_unload_model_shrink_d": 0.12,
+    "last_unload_model_shrink_d": 0.20,
     "last_unload_sync_time": 0.0,
     "speed_multiplier": 1.0,
     "last_status_time": 0.0,
@@ -568,6 +570,12 @@ AUTO_COLLECT_PRE_RESET_SETTLE_FRAMES = 45
 AUTO_COLLECT_RESET_SETTLE_FRAMES = 180
 AUTO_COLLECT_HOME_SECONDS = 1.40
 DIRECT_HOME_SETTLE_FRAMES = 10
+AUTO_COLLECT_HOME_BEFORE_EACH_ATTEMPT = False
+AUTO_COLLECT_HOME_BEFORE_SAND_RESET = True
+AUTO_COLLECT_HOME_ONLY_IF_UNSAFE = True
+AUTO_COLLECT_UNSAFE_BUCKET_BELOW_GROUND_Z = 0.08
+AUTO_COLLECT_HOME_BUCKET_RELAXED_TOL_DEG = 28.0
+AUTO_COLLECT_HOME_NON_BUCKET_RELAXED_SCALE = 1.5
 DIRECT_INITIAL_POSE_SETTLE_FRAMES = 18
 DIRECT_PLAN_END_HOME_SETTLE_FRAMES = 8
 AUTO_COLLECT_TARGET_CENTER = np.array([0.0, -6.7, 0.0], dtype=np.float32)
@@ -668,9 +676,63 @@ SAND_RESET_STABLE_P95_DISPLACEMENT = 0.020
 SAND_RESET_ESCAPE_Z = -1.0
 SAND_RESET_ESCAPE_CHECK_FRAMES = 150
 SAND_RESET_MAX_NATIVE_ATTEMPTS = 2
-SAND_BUCKET_LOCAL_MIN = np.array([-0.12, -0.58, -0.30], dtype=np.float32)
-SAND_BUCKET_LOCAL_MAX = np.array([0.90, 0.58, 0.55], dtype=np.float32)
 SAND_BUCKET_DIAG_EXPAND_LOCAL = np.array([0.40, 0.30, 0.45], dtype=np.float32)
+DEFAULT_BUCKET_LOAD_VOLUME_MESH_PATH = "/World/URDF_real3/bucket_link/visuals/bucket_link/node_STL_BINARY_/mesh"
+SAND_BUCKET_LOAD_VOLUME_ENABLED = str(os.environ.get("EXCAVATOR_BUCKET_LOAD_VOLUME", "1") or "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+SAND_BUCKET_LOAD_VOLUME_MESH_PATH = str(
+    os.environ.get("EXCAVATOR_BUCKET_LOAD_VOLUME_MESH_PATH", DEFAULT_BUCKET_LOAD_VOLUME_MESH_PATH) or ""
+).strip()
+BUCKET_SAND_DEBUG_DRAW_INTERVAL = float(os.environ.get("EXCAVATOR_BUCKET_SAND_DEBUG_DRAW_INTERVAL", "0.75") or 0.75)
+BUCKET_SAND_DEBUG_PROFILE_POINTS = int(os.environ.get("EXCAVATOR_BUCKET_SAND_DEBUG_PROFILE_POINTS", "67") or 67)
+BUCKET_LOAD_VOLUME_MAX_SOURCE_VERTICES = int(os.environ.get("EXCAVATOR_BUCKET_LOAD_VOLUME_MAX_SOURCE_VERTICES", "200000") or 200000)
+SAND_BUCKET_LOAD_VOLUME_Y_MIN = -0.50
+SAND_BUCKET_LOAD_VOLUME_Y_MAX = 0.50
+
+
+def _resample_closed_profile_2d(control_points, target_count):
+    pts = np.asarray(control_points, dtype=np.float32).reshape(-1, 2)
+    count = max(3, int(target_count))
+    if len(pts) < 3 or count <= len(pts):
+        return pts
+    next_pts = np.roll(pts, -1, axis=0)
+    edge_vecs = next_pts - pts
+    edge_lengths = np.linalg.norm(edge_vecs, axis=1).astype(np.float32)
+    perimeter = float(np.sum(edge_lengths))
+    if not math.isfinite(perimeter) or perimeter <= 1.0e-6:
+        return pts
+    cumulative = np.concatenate([np.array([0.0], dtype=np.float32), np.cumsum(edge_lengths)])
+    samples = []
+    edge_index = 0
+    for d in np.linspace(0.0, perimeter, count, endpoint=False):
+        while edge_index < len(edge_lengths) - 1 and float(d) >= float(cumulative[edge_index + 1]):
+            edge_index += 1
+        seg_len = max(1.0e-6, float(edge_lengths[edge_index]))
+        t = (float(d) - float(cumulative[edge_index])) / seg_len
+        a = pts[edge_index]
+        b = pts[(edge_index + 1) % len(pts)]
+        samples.append((a * (1.0 - t) + b * t).astype(np.float32))
+    return np.asarray(samples, dtype=np.float32).reshape(-1, 2)
+
+
+SAND_BUCKET_LOAD_PROFILE_XZ = _resample_closed_profile_2d(
+    np.array(
+        [
+            [-0.08, 0.43],
+            [-0.08, -0.08],
+            [0.18, -0.30],
+            [0.78, -0.24],
+            [0.90, 0.12],
+            [0.54, 0.50],
+        ],
+        dtype=np.float32,
+    ),
+    BUCKET_SAND_DEBUG_PROFILE_POINTS,
+)
 SAND_SOURCE_FALLBACK_MIN_REGION_COUNT = 32
 SAND_SOURCE_FALLBACK_MIN_RATIO = 0.60
 SAND_PILE_CENTER = AUTO_COLLECT_TARGET_CENTER.copy()
@@ -812,7 +874,7 @@ UNLOAD_FINAL_JOINT_TOL_DEG = 2.50
 UNLOAD_FINAL_LOAD_XY_TOL = 0.42
 UNLOAD_FINAL_LOAD_Z_CLEARANCE = 0.05
 UNLOAD_POINT_DEFAULT_RADIUS = 0.45
-UNLOAD_SELECTED_EDGE_MARGIN = 0.12
+UNLOAD_SELECTED_EDGE_MARGIN = 0.20
 DEFAULT_UNLOAD_SOURCE_MESH_PATH = "/World/truck/DumpBedCollision/dump_bed_collision"
 
 DIG_PLAN_CANDIDATES = [
@@ -1970,6 +2032,7 @@ def debug_profile_span(label, start_time, threshold_ms=5.0, data=None):
 def debug_profiled(label=None, threshold_ms=None):
     def decorate(fn):
         profile_label = str(label or getattr(fn, "__name__", "profiled"))
+        profile_data_provider_name = f"{getattr(fn, '__name__', '')}_debug_profile_data"
         if asyncio.iscoroutinefunction(fn):
             async def async_wrapper(*args, **kwargs):
                 if not debug_profile_enabled():
@@ -1982,9 +2045,17 @@ def debug_profiled(label=None, threshold_ms=None):
                     error = f"{type(exc).__name__}:{exc}"
                     raise
                 finally:
+                    profile_data = None
+                    try:
+                        provider = globals().get(profile_data_provider_name)
+                        if callable(provider):
+                            profile_data = provider(*args, **kwargs)
+                    except Exception:
+                        profile_data = None
                     debug_profile_record(
                         profile_label,
                         (time.perf_counter() - t0) * 1000.0,
+                        data=profile_data,
                         threshold_ms=threshold_ms,
                         error=error,
                     )
@@ -2003,9 +2074,17 @@ def debug_profiled(label=None, threshold_ms=None):
                 error = f"{type(exc).__name__}:{exc}"
                 raise
             finally:
+                profile_data = None
+                try:
+                    provider = globals().get(profile_data_provider_name)
+                    if callable(provider):
+                        profile_data = provider(*args, **kwargs)
+                except Exception:
+                    profile_data = None
                 debug_profile_record(
                     profile_label,
                     (time.perf_counter() - t0) * 1000.0,
+                    data=profile_data,
                     threshold_ms=threshold_ms,
                     error=error,
                 )
@@ -2038,6 +2117,7 @@ def debug_visual_root_paths():
                 f"{root}/UnloadPointBall",
                 f"{root}/UnloadSelectedRangeBox",
                 f"{root}/UnloadSelectedRangeCylinder",
+                f"{root}/BucketSandDebug",
             ]
         )
     for sand_root in ["/World/SandSite", "/SandSite"]:
@@ -2069,6 +2149,10 @@ def apply_debug_visuals_visibility(visible=None, force_status=True):
     if effective_visible:
         try:
             show_trace_prims(current_trace_mode())
+        except Exception:
+            pass
+        try:
+            maybe_draw_bucket_sand_count_debug(force=True)
         except Exception:
             pass
     else:
@@ -2631,7 +2715,7 @@ def prim_collision_enabled(prim):
         return False
 
 
-def disable_collision(prim, label=""):
+def disable_collision(prim, label="", log=True):
     if prim is None or not prim.IsValid():
         return
     try:
@@ -2640,7 +2724,7 @@ def disable_collision(prim, label=""):
     except Exception:
         pass
     set_prim_attr(prim, "physics:collisionEnabled", False, Sdf.ValueTypeNames.Bool)
-    if label:
+    if label and bool(log):
         info_print("[COLLISION OFF]", label, prim.GetPath())
 
 
@@ -3492,7 +3576,7 @@ def update_sphere_marker(path, point, radius, color):
     else:
         set_xform(prim, translate=(float(p[0]), float(p[1]), float(p[2])))
         set_color(prim, color)
-        disable_collision(prim, "debug_marker")
+        disable_collision(prim, "debug_marker", log=False)
     try:
         UsdGeom.Imageable(prim).GetVisibilityAttr().Set(UsdGeom.Tokens.inherited)
     except Exception:
@@ -3548,12 +3632,72 @@ def update_debug_line(path, points, color, width=0.035):
         pass
     prim = curve.GetPrim()
     set_color(prim, color)
-    disable_collision(prim, "debug_line")
+    disable_collision(prim, "debug_line", log=False)
     try:
         UsdGeom.Imageable(prim).GetVisibilityAttr().Set(UsdGeom.Tokens.inherited)
     except Exception:
         pass
     return prim
+
+
+def box_corners_from_min_max(mn, mx):
+    lo = np.array(mn, dtype=np.float32).reshape(-1)[:3]
+    hi = np.array(mx, dtype=np.float32).reshape(-1)[:3]
+    return [
+        np.array([x, y, z], dtype=np.float32)
+        for x in [lo[0], hi[0]]
+        for y in [lo[1], hi[1]]
+        for z in [lo[2], hi[2]]
+    ]
+
+
+def update_debug_segments(path, segments, color, width=0.025, visible=None):
+    if not (debug_visuals_enabled() if visible is None else bool(visible)):
+        hide_debug_prim(path)
+        return None
+    try:
+        pts = []
+        counts = []
+        for seg in segments or []:
+            if seg is None or len(seg) < 2:
+                continue
+            a = np.array(seg[0], dtype=np.float32).reshape(-1)[:3]
+            b = np.array(seg[1], dtype=np.float32).reshape(-1)[:3]
+            pts.append(Gf.Vec3f(float(a[0]), float(a[1]), float(a[2])))
+            pts.append(Gf.Vec3f(float(b[0]), float(b[1]), float(b[2])))
+            counts.append(2)
+        if len(pts) < 2:
+            hide_debug_prim(path)
+            return None
+        prim = get_prim(path)
+        if not prim.IsValid() or not prim.IsA(UsdGeom.BasisCurves):
+            try:
+                stage.RemovePrim(Sdf.Path(path))
+            except Exception:
+                pass
+            curve = UsdGeom.BasisCurves.Define(stage, path)
+        else:
+            curve = UsdGeom.BasisCurves(prim)
+        curve.GetPointsAttr().Set(pts) if curve.GetPointsAttr().IsValid() else curve.CreatePointsAttr(pts)
+        curve.GetCurveVertexCountsAttr().Set(counts) if curve.GetCurveVertexCountsAttr().IsValid() else curve.CreateCurveVertexCountsAttr(counts)
+        curve.CreateTypeAttr(UsdGeom.Tokens.linear)
+        try:
+            curve.GetBasisAttr().Clear()
+        except Exception:
+            pass
+        curve.CreateWrapAttr(UsdGeom.Tokens.nonperiodic)
+        curve.CreateWidthsAttr([float(width)] * len(pts))
+        prim = curve.GetPrim()
+        set_color(prim, color)
+        disable_collision(prim, "debug_segments", log=False)
+        try:
+            UsdGeom.Imageable(prim).GetVisibilityAttr().Set(UsdGeom.Tokens.inherited)
+        except Exception:
+            pass
+        return prim
+    except Exception:
+        hide_debug_prim(path)
+        return None
 
 
 def update_debug_rect_loop(path, center_xy, half_xy, z, color, width=0.025):
@@ -4728,6 +4872,8 @@ def compact_bucket_load_metrics(metrics):
         "bucket": int(metrics.get("bucket_count", 0)),
         "bucket_from_pile": int(metrics.get("bucket_from_pile_count", 0)),
         "bucket_from_initial": int(metrics.get("bucket_from_initial_count", metrics.get("bucket_from_pile_count", 0))),
+        "load_volume_enabled": bool(metrics.get("load_volume_enabled", SAND_BUCKET_LOAD_VOLUME_ENABLED)),
+        "load_volume_source": str(metrics.get("load_volume_source", "")),
         "bucket_from_pile_mass": float(metrics.get("bucket_from_pile_mass", 0.0)),
         "source_tracking": str(metrics.get("source_tracking", "unknown")),
         "source_tracking_notes": str(metrics.get("source_tracking_notes", "")),
@@ -6023,11 +6169,12 @@ def debug_timeline_path(create=False):
     path = str(STATE.get("debug_timeline_path", "") or "")
     if path:
         return path
+    if not create:
+        return ""
     run_dir = str(STATE.get("auto_collect_run_dir", "") or "")
     if not run_dir:
         return ""
-    if create:
-        os.makedirs(run_dir, exist_ok=True)
+    os.makedirs(run_dir, exist_ok=True)
     path = os.path.join(run_dir, DATASET_DEBUG_TIMELINE_FILE)
     STATE["debug_timeline_path"] = path
     return path
@@ -6200,8 +6347,14 @@ def sand_config_snapshot():
         "status": status,
         "particle_mass": sand_particle_mass(),
         "sand_particle_path_suffix": SAND_PARTICLE_PATH_SUFFIX,
-        "sand_bucket_local_min": vec_list(SAND_BUCKET_LOCAL_MIN, 3),
-        "sand_bucket_local_max": vec_list(SAND_BUCKET_LOCAL_MAX, 3),
+        "sand_bucket_load_volume": {
+            "enabled": bool(SAND_BUCKET_LOAD_VOLUME_ENABLED),
+            "mesh_path": SAND_BUCKET_LOAD_VOLUME_MESH_PATH,
+            "selected_source_path": bucket_load_volume_selected_source_path(),
+            "mode": "mesh_boundary_capped_closed_cavity",
+            "mesh_backed_inside_test": True,
+            "bucket_vol_ui": "closed_count_volume_calc_viz",
+        },
         "sand_metrics_interval": SAND_METRICS_INTERVAL,
         "bucket_load_spatial_index": {
             "enabled": bool(BUCKET_LOAD_SPATIAL_INDEX_ENABLED),
@@ -6836,17 +6989,17 @@ def bucket_particle_diagnostic(label, points=None, force_log=True):
     _, _, _, _, z_min, z_expected_max = sand_pile_geometry_from_context(ctx)
     pile_mask = sand_pile_xy_mask(points, ctx) & (points[:, 2] >= z_min) & (points[:, 2] <= z_expected_max)
     initial_mask = initial_pile_mask_for_points(points, fallback_pile_mask=pile_mask)
-    strict_mask = np.all(local >= SAND_BUCKET_LOCAL_MIN.reshape(1, 3), axis=1) & np.all(
-        local <= SAND_BUCKET_LOCAL_MAX.reshape(1, 3),
-        axis=1,
-    )
-    expand = SAND_BUCKET_DIAG_EXPAND_LOCAL.reshape(3)
-    expanded_min = SAND_BUCKET_LOCAL_MIN - expand
-    expanded_max = SAND_BUCKET_LOCAL_MAX + expand
-    expanded_mask = np.all(local >= expanded_min.reshape(1, 3), axis=1) & np.all(
-        local <= expanded_max.reshape(1, 3),
-        axis=1,
-    )
+    volume_vertices, volume_faces, volume_source = bucket_load_volume_mesh_local()
+    volume_mask = bucket_load_volume_mask_from_local(local) if bool(SAND_BUCKET_LOAD_VOLUME_ENABLED) else np.zeros(len(local), dtype=bool)
+    strict_mask = volume_mask
+    volume_bounds_min, volume_bounds_max = bucket_load_volume_local_bounds(expand=float(np.max(SAND_BUCKET_DIAG_EXPAND_LOCAL)))
+    if volume_bounds_min is not None and volume_bounds_max is not None:
+        expanded_mask = np.all(local >= volume_bounds_min.reshape(1, 3), axis=1) & np.all(
+            local <= volume_bounds_max.reshape(1, 3),
+            axis=1,
+        )
+    else:
+        expanded_mask = np.zeros(len(local), dtype=bool)
 
     strict_from_pile = initial_mask & strict_mask
     expanded_from_pile = initial_mask & expanded_mask
@@ -6883,6 +7036,10 @@ def bucket_particle_diagnostic(label, points=None, force_log=True):
         "particles": int(len(points)),
         "strict_total": int(np.count_nonzero(strict_mask)),
         "strict_from_pile": int(np.count_nonzero(strict_from_pile)),
+        "load_volume_enabled": bool(SAND_BUCKET_LOAD_VOLUME_ENABLED),
+        "load_volume_source": str(volume_source),
+        "load_volume_vertex_count": int(len(volume_vertices) if volume_vertices is not None else 0),
+        "load_volume_face_count": int(len(volume_faces) if volume_faces is not None else 0),
         "expanded_total": int(np.count_nonzero(expanded_mask)),
         "expanded_from_pile": int(np.count_nonzero(expanded_from_pile)),
         "expanded_local_min": expanded_local_min,
@@ -6893,10 +7050,8 @@ def bucket_particle_diagnostic(label, points=None, force_log=True):
         "strict_world_center": strict_world_center,
         "expanded_all_world_center": expanded_all_world_center,
         "strict_all_world_center": strict_all_world_center,
-        "strict_box_min": vec_list(SAND_BUCKET_LOCAL_MIN, 3),
-        "strict_box_max": vec_list(SAND_BUCKET_LOCAL_MAX, 3),
-        "expanded_box_min": vec_list(expanded_min, 3),
-        "expanded_box_max": vec_list(expanded_max, 3),
+        "load_volume_bounds_min": None if volume_bounds_min is None else vec_list(volume_bounds_min, 3),
+        "load_volume_bounds_max": None if volume_bounds_max is None else vec_list(volume_bounds_max, 3),
         "q_real_deg": q_deg_values(get_real_joint_positions(), wrap_swing_for_display=True),
     }
     info_print(
@@ -6905,6 +7060,11 @@ def bucket_particle_diagnostic(label, points=None, force_log=True):
         f"particles={row['particles']}",
         f"strict_total={row['strict_total']}",
         f"strict_from_pile={row['strict_from_pile']}",
+        f"load_volume={row['load_volume_enabled']}",
+        f"load_volume_source={row['load_volume_source']}",
+        f"load_volume_mesh={row['load_volume_vertex_count']}v/{row['load_volume_face_count']}f",
+        f"load_volume_bounds_min={row['load_volume_bounds_min']}",
+        f"load_volume_bounds_max={row['load_volume_bounds_max']}",
         f"expanded_total={row['expanded_total']}",
         f"expanded_from_pile={row['expanded_from_pile']}",
         f"expanded_local_min={row['expanded_local_min']}",
@@ -7035,9 +7195,10 @@ def sand_region_masks(points):
     if bucket_local is None:
         bucket_mask = empty.copy()
     else:
-        bucket_mask = np.all(bucket_local >= SAND_BUCKET_LOCAL_MIN.reshape(1, 3), axis=1) & np.all(
-            bucket_local <= SAND_BUCKET_LOCAL_MAX.reshape(1, 3), axis=1
-        )
+        if bool(SAND_BUCKET_LOAD_VOLUME_ENABLED):
+            bucket_mask = bucket_load_volume_mask_from_local(bucket_local)
+        else:
+            bucket_mask = empty.copy()
 
     bin_center_3 = np.array(ctx["unload_bin_center"], dtype=np.float32)
     bin_center = np.array([float(bin_center_3[0]), float(bin_center_3[1]), 0.0], dtype=np.float32)
@@ -7053,21 +7214,643 @@ def sand_region_masks(points):
     return pile_mask, bucket_mask, bin_mask
 
 
-def bucket_local_box_world_aabb(expand=0.0):
+def bucket_load_volume_selected_source_path():
+    return str(STATE.get("bucket_load_volume_selected_source_path", "") or "").strip()
+
+
+def bucket_load_volume_explicit_source_path():
+    selected = bucket_load_volume_selected_source_path()
+    configured = str(SAND_BUCKET_LOAD_VOLUME_MESH_PATH or "").strip()
+    default_path = str(DEFAULT_BUCKET_LOAD_VOLUME_MESH_PATH or "").strip()
+    if selected and (selected != default_path or not configured or configured == default_path):
+        return selected
+    return configured or selected
+
+
+def bucket_load_volume_has_explicit_source():
+    return bool(bucket_load_volume_explicit_source_path())
+
+
+def clear_bucket_load_volume_caches():
+    for key in [
+        "bucket_load_volume_default_mesh_cache",
+        "bucket_load_volume_mesh_cache",
+        "bucket_load_volume_segment_edge_cache",
+        "bucket_load_fast_last",
+    ]:
+        STATE[key] = None
+    STATE["bucket_load_fast_last_time"] = 0.0
+
+
+def selected_bucket_load_volume_source_is_valid(path):
+    prim = get_prim(path)
+    if not prim or not prim.IsValid():
+        return False, "missing_prim", []
+    mesh_paths = []
+    try:
+        if prim.IsA(UsdGeom.Mesh):
+            mesh_paths.append(str(prim.GetPath()))
+        else:
+            for child in iter_prim_subtree(prim):
+                if child and child.IsValid() and child.IsA(UsdGeom.Mesh):
+                    mesh_paths.append(str(child.GetPath()))
+    except Exception as e:
+        return False, f"scan_failed:{type(e).__name__}", []
+    if not mesh_paths:
+        return False, "no_mesh_under_selection", []
+    return True, "ok", mesh_paths[:8]
+
+
+def set_bucket_load_volume_source_from_selected():
+    path = first_selected_prim_path()
+    if not path:
+        update_status("[BUCKET LOAD VIZ] select bucket_link, node_STL_BINARY_, or mesh first", force=True)
+        info_print("[BUCKET LOAD VIZ]", "select_failed=no_selection")
+        return False
+    ok, reason, mesh_paths = selected_bucket_load_volume_source_is_valid(path)
+    if not ok:
+        STATE["bucket_load_volume_selected_source_path"] = ""
+        STATE["bucket_load_volume_selected_used_paths"] = []
+        clear_bucket_load_volume_caches()
+        hide_debug_prim(bucket_sand_debug_root_path())
+        update_status(f"[BUCKET LOAD VIZ] selected source invalid: {reason}", force=True)
+        info_print("[BUCKET LOAD VIZ]", f"select_failed={reason}", f"path={path}")
+        return False
+
+    STATE["bucket_load_volume_selected_source_path"] = str(path)
+    STATE["bucket_load_volume_selected_used_paths"] = list(mesh_paths)
+    clear_bucket_load_volume_caches()
+    info_print(
+        "[BUCKET LOAD VIZ]",
+        "selected_source",
+        f"path={path}",
+        f"mesh_count={len(mesh_paths)}",
+        f"mesh_paths={mesh_paths[:4]}",
+    )
+    update_status(f"[BUCKET LOAD VIZ] selected source: {path}", force=True)
+    if debug_visuals_enabled():
+        maybe_draw_bucket_sand_count_debug(force=True)
+    else:
+        hide_debug_prim(bucket_sand_debug_root_path())
+    return True
+
+
+def point_in_polygon_2d(points_xy, polygon_xy):
+    pts = np.asarray(points_xy, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] < 2:
+        return np.zeros(0, dtype=bool)
+    poly = np.asarray(polygon_xy, dtype=np.float32)
+    if poly.ndim != 2 or poly.shape[0] < 3 or poly.shape[1] < 2:
+        return np.zeros(len(pts), dtype=bool)
+    x = pts[:, 0]
+    y = pts[:, 1]
+    inside = np.zeros(len(pts), dtype=bool)
+    xj = float(poly[-1, 0])
+    yj = float(poly[-1, 1])
+    eps = 1.0e-9
+    for i in range(poly.shape[0]):
+        xi = float(poly[i, 0])
+        yi = float(poly[i, 1])
+        crosses = ((yi > y) != (yj > y)) & (x < (xj - xi) * (y - yi) / (yj - yi + eps) + xi)
+        inside ^= crosses
+        xj, yj = xi, yi
+    return inside
+
+
+def default_bucket_load_volume_mesh_local():
+    now = time.time()
+    cache = STATE.get("bucket_load_volume_default_mesh_cache")
+    if (
+        isinstance(cache, dict)
+        and cache.get("bucket_link") == BUCKET_LINK
+        and float(now - float(cache.get("time", 0.0) or 0.0)) < 3.0
+    ):
+        value = cache.get("value")
+        if value is not None:
+            return value
+
+    profile = np.asarray(SAND_BUCKET_LOAD_PROFILE_XZ, dtype=np.float32).reshape(-1, 2)
+    source = "default_closed_proxy_mesh"
+    y_min = float(SAND_BUCKET_LOAD_VOLUME_Y_MIN)
+    y_max = float(SAND_BUCKET_LOAD_VOLUME_Y_MAX)
+    if profile.shape[0] < 3:
+        return np.zeros((0, 3), dtype=np.float32), [], "default_closed_proxy_invalid"
+
+    left = [[float(x), y_min, float(z)] for x, z in profile]
+    right = [[float(x), y_max, float(z)] for x, z in profile]
+    verts = np.asarray(left + right, dtype=np.float32)
+    n = int(profile.shape[0])
+    faces = [list(range(n - 1, -1, -1)), list(range(n, 2 * n))]
+    for i in range(n):
+        j = (i + 1) % n
+        faces.append([i, j, n + j, n + i])
+    value = (verts, faces, source)
+    STATE["bucket_load_volume_default_mesh_cache"] = {
+        "time": now,
+        "bucket_link": BUCKET_LINK,
+        "value": value,
+    }
+    return value
+
+
+def bucket_load_volume_candidate_mesh_paths():
+    paths = []
+    explicit_path = bucket_load_volume_explicit_source_path()
+    if explicit_path:
+        paths.append(explicit_path)
+    if SAND_BUCKET_LOAD_VOLUME_MESH_PATH:
+        paths.append(SAND_BUCKET_LOAD_VOLUME_MESH_PATH)
+    out = []
+    for path in paths:
+        if path and path not in out:
+            out.append(path)
+    return out
+
+
+def mesh_faces_from_usd(mesh):
+    try:
+        counts = list(mesh.GetFaceVertexCountsAttr().Get() or [])
+        indices = list(mesh.GetFaceVertexIndicesAttr().Get() or [])
+    except Exception:
+        return []
+    faces = []
+    offset = 0
+    for count in counts:
+        c = int(count)
+        if c >= 3 and offset + c <= len(indices):
+            faces.append([int(indices[offset + k]) for k in range(c)])
+        offset += max(0, c)
+    return faces
+
+
+def mesh_edge_pairs_from_faces(faces):
+    pairs = set()
+    for face in faces or []:
+        try:
+            ids = [int(i) for i in face]
+        except Exception:
+            continue
+        if len(ids) < 2:
+            continue
+        for idx, a in enumerate(ids):
+            b = ids[(idx + 1) % len(ids)]
+            if a == b:
+                continue
+            pairs.add((min(a, b), max(a, b)))
+    return sorted(pairs)
+
+
+def bucket_load_source_mesh_local(path):
+    if not path or not BUCKET_LINK:
+        return None, [], ["missing_path_or_bucket_link"]
+    root = get_prim(path)
+    if not root or not root.IsValid():
+        return None, [], [f"missing_prim:{path}"]
+    vertices_chunks = []
+    faces = []
+    used_paths = []
+    failures = []
+    max_vertices = max(256, int(BUCKET_LOAD_VOLUME_MAX_SOURCE_VERTICES))
+
+    def read_one_mesh(prim):
+        if not prim or not prim.IsValid() or not prim.IsA(UsdGeom.Mesh):
+            return
+        low = str(prim.GetPath()).lower()
+        if "/bucketloadvolum" in low or "/bucketsanddebug" in low:
+            return
+        try:
+            mesh = UsdGeom.Mesh(prim)
+            raw_pts = mesh.GetPointsAttr().Get()
+            raw_faces = mesh_faces_from_usd(mesh)
+            if raw_pts is None or len(raw_pts) < 4:
+                failures.append((str(prim.GetPath()), f"invalid_points:{0 if raw_pts is None else len(raw_pts)}"))
+                return
+            if not raw_faces:
+                failures.append((str(prim.GetPath()), "no_faces"))
+                return
+            if sum(len(chunk) for chunk in vertices_chunks) + len(raw_pts) > max_vertices:
+                failures.append((str(prim.GetPath()), f"vertex_limit:{len(raw_pts)}/{max_vertices}"))
+                return
+            mat = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+            world = []
+            for p in raw_pts:
+                wp = mat.Transform(Gf.Vec3d(float(p[0]), float(p[1]), float(p[2])))
+                world.append([float(wp[0]), float(wp[1]), float(wp[2])])
+            local = project_points_to_link_local(np.asarray(world, dtype=np.float32), BUCKET_LINK)
+            if local is None or len(local) < 4:
+                failures.append((str(prim.GetPath()), "bucket_local_projection_failed"))
+                return
+            base = sum(len(chunk) for chunk in vertices_chunks)
+            local = np.asarray(local, dtype=np.float32).reshape(-1, 3)
+            vertices_chunks.append(local)
+            for face in raw_faces:
+                remapped = [int(i) + base for i in face if 0 <= int(i) < len(local)]
+                if len(remapped) >= 3:
+                    faces.append(remapped)
+            used_paths.append(str(prim.GetPath()))
+        except Exception as e:
+            failures.append((str(prim.GetPath()), f"{type(e).__name__}:{e}"))
+
+    if root.IsA(UsdGeom.Mesh):
+        read_one_mesh(root)
+    else:
+        try:
+            for child in iter_prim_subtree(root):
+                read_one_mesh(child)
+        except Exception as e:
+            failures.append((path, f"scan_failed:{type(e).__name__}:{e}"))
+    if not vertices_chunks:
+        return None, used_paths, failures
+    vertices = np.vstack(vertices_chunks).astype(np.float32, copy=False)
+    if len(vertices) < 4 or not faces:
+        failures.append((path, "empty_mesh_after_read"))
+        return None, used_paths, failures
+    return (vertices, faces), used_paths, failures
+
+
+def boundary_edges_from_faces(faces):
+    edge_counts = {}
+    for face in faces or []:
+        try:
+            ids = [int(i) for i in face]
+        except Exception:
+            continue
+        if len(ids) < 3:
+            continue
+        for idx, a in enumerate(ids):
+            b = ids[(idx + 1) % len(ids)]
+            if a == b:
+                continue
+            key = (min(int(a), int(b)), max(int(a), int(b)))
+            edge_counts[key] = int(edge_counts.get(key, 0)) + 1
+    return [edge for edge, count in edge_counts.items() if int(count) == 1]
+
+
+def connected_components_from_edges(edges):
+    adjacency = {}
+    for a, b in edges or []:
+        adjacency.setdefault(int(a), set()).add(int(b))
+        adjacency.setdefault(int(b), set()).add(int(a))
+    components = []
+    seen = set()
+    for start in list(adjacency.keys()):
+        if start in seen:
+            continue
+        stack = [start]
+        seen.add(start)
+        component = []
+        while stack:
+            node = stack.pop()
+            component.append(node)
+            for nxt in adjacency.get(node, []):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        if len(component) >= 3:
+            components.append(component)
+    return components
+
+
+def close_mesh_boundary_faces(vertices, faces, source_path="", used_paths=None):
+    verts = np.asarray(vertices, dtype=np.float32)
+    if verts.ndim != 2 or verts.shape[1] < 3 or len(verts) < 4 or not faces:
+        return None
+    verts = verts[:, :3].astype(np.float32, copy=False)
+    out_faces = [[int(i) for i in face] for face in faces if len(face) >= 3]
+    base_face_count = len(out_faces)
+    boundary_edges = boundary_edges_from_faces(out_faces)
+    try:
+        cap_vertices = []
+        cap_faces = []
+        for component in connected_components_from_edges(boundary_edges):
+            comp = [idx for idx in component if 0 <= int(idx) < len(verts)]
+            if len(comp) < 3:
+                continue
+            centroid = np.mean(verts[np.asarray(comp, dtype=np.int32)], axis=0).astype(np.float32)
+            centroid_idx = len(verts) + len(cap_vertices)
+            cap_vertices.append(centroid)
+            comp_set = set(int(i) for i in comp)
+            for a, b in boundary_edges:
+                if int(a) in comp_set and int(b) in comp_set:
+                    cap_faces.append([int(a), int(b), int(centroid_idx)])
+        if cap_vertices:
+            verts = np.vstack([verts, np.asarray(cap_vertices, dtype=np.float32).reshape(-1, 3)])
+            out_faces.extend(cap_faces)
+        used = ",".join(list(used_paths or [])[:3])
+        source = (
+            f"mesh_boundary_capped_closed_cavity:{source_path};"
+            f"meshes={len(used_paths or [])};boundary_edges={len(boundary_edges)};"
+            f"cap_faces={len(out_faces) - base_face_count};used={used}"
+        )
+        return verts, out_faces, source
+    except Exception:
+        return None
+
+
+def bucket_load_volume_authored_mesh_local():
+    if not BUCKET_LINK:
+        return None
+    now = time.time()
+    cache = STATE.get("bucket_load_volume_mesh_cache")
+    if (
+        isinstance(cache, dict)
+        and float(now - float(cache.get("time", 0.0) or 0.0)) < 5.0
+        and cache.get("bucket_link") == BUCKET_LINK
+        and cache.get("source_path") == bucket_load_volume_explicit_source_path()
+    ):
+        return cache.get("value")
+
+    value = None
+    for path in bucket_load_volume_candidate_mesh_paths():
+        source_mesh, used_paths, failures = bucket_load_source_mesh_local(path)
+        if source_mesh is None:
+            STATE["bucket_load_volume_mesh_last_failures"] = list(failures or [])[:8]
+            continue
+        vertices, faces = source_mesh
+        closed = close_mesh_boundary_faces(vertices, faces, source_path=path, used_paths=used_paths)
+        if closed is not None:
+            value = closed
+            STATE["bucket_load_volume_selected_used_paths"] = list(used_paths or [])[:8]
+            STATE["bucket_load_volume_mesh_last_failures"] = list(failures or [])[:8]
+            break
+
+    STATE["bucket_load_volume_mesh_cache"] = {
+        "time": now,
+        "bucket_link": BUCKET_LINK,
+        "source_path": bucket_load_volume_explicit_source_path(),
+        "value": value,
+    }
+    return value
+
+
+def bucket_load_volume_mesh_local():
+    authored = bucket_load_volume_authored_mesh_local()
+    if authored is not None:
+        return authored
+    source_path = bucket_load_volume_explicit_source_path()
+    if source_path:
+        return (
+            np.zeros((0, 3), dtype=np.float32),
+            [],
+            f"mesh_boundary_capped_closed_cavity_unavailable:{source_path}",
+        )
+    return default_bucket_load_volume_mesh_local()
+
+
+def triangulate_mesh_faces(faces):
+    triangles = []
+    for face in faces or []:
+        idx = [int(i) for i in face]
+        if len(idx) < 3:
+            continue
+        for k in range(1, len(idx) - 1):
+            triangles.append([idx[0], idx[k], idx[k + 1]])
+    return np.asarray(triangles, dtype=np.int32) if triangles else np.zeros((0, 3), dtype=np.int32)
+
+
+def point_in_closed_mesh(points, vertices, faces):
+    pts = np.asarray(points, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] < 3:
+        return np.zeros(0, dtype=bool)
+    if len(pts) == 0:
+        return np.zeros(0, dtype=bool)
+    verts = np.asarray(vertices, dtype=np.float32).reshape(-1, 3)
+    triangles = triangulate_mesh_faces(faces)
+    if len(verts) < 4 or len(triangles) == 0:
+        return np.zeros(len(pts), dtype=bool)
+
+    # Ray-cast along local +Y. The load-volume mesh is expected to be closed,
+    # including a virtual rim plane; this represents capacity, not steel.
+    direction = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    eps = 1.0e-6
+    counts = np.zeros(len(pts), dtype=np.int32)
+    for tri in triangles:
+        v0 = verts[int(tri[0])]
+        v1 = verts[int(tri[1])]
+        v2 = verts[int(tri[2])]
+        e1 = v1 - v0
+        e2 = v2 - v0
+        h = np.cross(direction, e2)
+        a = float(np.dot(e1, h))
+        if abs(a) < eps:
+            continue
+        inv_a = 1.0 / a
+        s = pts - v0.reshape(1, 3)
+        u = inv_a * np.einsum("ij,j->i", s, h)
+        mask = (u >= -eps) & (u <= 1.0 + eps)
+        if not np.any(mask):
+            continue
+        q = np.cross(s, e1.reshape(1, 3))
+        v = inv_a * np.einsum("ij,j->i", q, direction)
+        t = inv_a * np.einsum("j,ij->i", e2, q)
+        hit = mask & (v >= -eps) & ((u + v) <= 1.0 + eps) & (t > eps)
+        counts[hit] += 1
+    return (counts % 2) == 1
+
+
+def bucket_load_volume_mask_from_local(local):
+    pts = np.asarray(local, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] < 3 or len(pts) == 0:
+        return np.zeros(0, dtype=bool)
+    vertices, faces, source = bucket_load_volume_mesh_local()
+    try:
+        verts = np.asarray(vertices, dtype=np.float32).reshape(-1, 3)
+        if len(verts) >= 4 and len(triangulate_mesh_faces(faces)) > 0:
+            return point_in_closed_mesh(pts, verts, faces)
+    except Exception:
+        pass
+    return np.zeros(len(pts), dtype=bool)
+
+
+def bucket_load_volume_local_bounds(expand=0.0):
+    try:
+        vertices, _, _ = bucket_load_volume_mesh_local()
+        verts = np.asarray(vertices, dtype=np.float32).reshape(-1, 3)
+    except Exception:
+        verts = np.zeros((0, 3), dtype=np.float32)
+    if len(verts) < 3:
+        return None, None
+    expand = float(expand)
+    mn = np.min(verts, axis=0).astype(np.float32) - expand
+    mx = np.max(verts, axis=0).astype(np.float32) + expand
+    return mn, mx
+
+
+def bucket_load_volume_world_aabb(expand=0.0):
     if not BUCKET_LINK:
         return None, None
-    local_min = np.array(SAND_BUCKET_LOCAL_MIN, dtype=np.float32) - float(expand)
-    local_max = np.array(SAND_BUCKET_LOCAL_MAX, dtype=np.float32) + float(expand)
-    corners = []
-    for x in [local_min[0], local_max[0]]:
-        for y in [local_min[1], local_max[1]]:
-            for z in [local_min[2], local_max[2]]:
-                p = transform_local_point_to_world(BUCKET_LINK, np.array([x, y, z], dtype=np.float32))
-                if p is None:
-                    return None, None
-                corners.append(np.array(p, dtype=np.float32).reshape(3))
+    local_min, local_max = bucket_load_volume_local_bounds(expand=expand)
+    if local_min is None or local_max is None:
+        return None, None
+    corners = bucket_local_box_world_corners(local_min, local_max)
+    if corners is None:
+        return None, None
     arr = np.vstack(corners)
     return np.min(arr, axis=0), np.max(arr, axis=0)
+
+
+def bucket_local_box_world_corners(local_min, local_max):
+    if not BUCKET_LINK:
+        return None
+    corners = []
+    for local in box_corners_from_min_max(local_min, local_max):
+        p = transform_local_point_to_world(BUCKET_LINK, local)
+        if p is None:
+            return None
+        corners.append(np.array(p, dtype=np.float32).reshape(3))
+    return corners
+
+
+def bucket_load_volume_world_segments():
+    if not BUCKET_LINK:
+        return None
+    vertices, faces, source = bucket_load_volume_mesh_local()
+    world_vertices = bucket_load_volume_world_vertices(vertices)
+    if world_vertices is None:
+        return None
+    edge_cache_key = (str(source), int(len(world_vertices)), int(len(faces or [])))
+    cache = STATE.get("bucket_load_volume_segment_edge_cache")
+    if isinstance(cache, dict) and cache.get("key") == edge_cache_key:
+        edge_pairs = cache.get("edge_pairs")
+    else:
+        pairs = []
+        seen = set()
+        for face in faces or []:
+            idx = [int(i) for i in face]
+            if len(idx) < 2:
+                continue
+            for k, i in enumerate(idx):
+                j = idx[(k + 1) % len(idx)]
+                key = tuple(sorted((int(i), int(j))))
+                if key in seen or i < 0 or j < 0 or i >= len(world_vertices) or j >= len(world_vertices):
+                    continue
+                seen.add(key)
+                pairs.append([int(i), int(j)])
+        edge_pairs = np.asarray(pairs, dtype=np.int32).reshape(-1, 2) if pairs else np.zeros((0, 2), dtype=np.int32)
+        STATE["bucket_load_volume_segment_edge_cache"] = {
+            "key": edge_cache_key,
+            "edge_pairs": edge_pairs,
+        }
+    if edge_pairs is None or len(edge_pairs) == 0:
+        return []
+    segments = [
+        (world_vertices[int(i)], world_vertices[int(j)])
+        for i, j in np.asarray(edge_pairs, dtype=np.int32).reshape(-1, 2)
+        if 0 <= int(i) < len(world_vertices) and 0 <= int(j) < len(world_vertices)
+    ]
+    return segments
+
+
+def bucket_load_volume_world_vertices(vertices=None):
+    if not BUCKET_LINK:
+        return None
+    verts = np.asarray(vertices if vertices is not None else bucket_load_volume_mesh_local()[0], dtype=np.float32).reshape(-1, 3)
+    world = []
+    for local in verts:
+        p = transform_local_point_to_world(BUCKET_LINK, local)
+        if p is None:
+            return None
+        world.append(np.array(p, dtype=np.float32).reshape(3))
+    return np.asarray(world, dtype=np.float32)
+
+
+def bucket_load_volume_world_mesh():
+    if not BUCKET_LINK:
+        return None, None, "missing_bucket_link"
+    vertices, faces, source = bucket_load_volume_mesh_local()
+    world_vertices = bucket_load_volume_world_vertices(vertices)
+    if world_vertices is None:
+        return None, None, source
+    return world_vertices, faces, source
+
+
+def bucket_sand_debug_root_path():
+    root = CONTROL_ROOT or "/World/ControlRig"
+    return f"{root}/BucketSandDebug"
+
+
+def draw_bucket_sand_count_debug(force=False):
+    root = bucket_sand_debug_root_path()
+    visible = debug_visuals_enabled()
+    if not visible or not BUCKET_LINK:
+        hide_debug_prim(root)
+        return False
+    if not bucket_load_volume_has_explicit_source():
+        hide_debug_prim(root)
+        now = time.time()
+        if force and now - float(STATE.get("bucket_load_volume_no_source_warn_time", 0.0) or 0.0) > 2.0:
+            STATE["bucket_load_volume_no_source_warn_time"] = now
+            info_print(
+                "[WARN] [BUCKET LOAD VIZ]",
+                "no_selected_mesh_source",
+                "select a bucket mesh or node_STL_BINARY_ first",
+            )
+            update_status("[BUCKET LOAD VIZ] select bucket_link/node_STL_BINARY_/mesh first", force=False)
+        return False
+    root_prim = get_prim(root)
+    if not root_prim.IsValid():
+        root_prim = UsdGeom.Xform.Define(stage, root).GetPrim()
+    set_prim_visibility(root_prim, True)
+
+    volume_source = "mesh_boundary_capped_closed_cavity"
+    hide_debug_prim(f"{root}/LoadVolumeMeshProxy")
+    hide_debug_prim(f"{root}/LoadVolumeMeshEdges")
+    volume_segments = bucket_load_volume_world_segments()
+    if volume_segments:
+        update_debug_segments(
+            f"{root}/LoadVolumeProfileProxy",
+            volume_segments,
+            (0.0, 0.85, 1.0),
+            width=0.030,
+            visible=visible,
+        )
+    else:
+        hide_debug_prim(f"{root}/LoadVolumeProfileProxy")
+
+    hide_debug_prim(f"{root}/LegacyCubeCountBox")
+    hide_debug_prim(f"{root}/FastCandidateWorldAABB")
+
+    bucket_load_point_marker = update_sphere_marker(
+        f"{root}/BucketLoadPoint",
+        bucket_load_pos(),
+        0.075,
+        (1.0, 0.25, 1.0),
+    )
+    disable_collision(bucket_load_point_marker, "bucket_load_point_debug", log=False)
+    if force:
+        info_print(
+            "[BUCKET SAND VIZ]",
+            f"root={root}",
+            f"volume_enabled={bool(SAND_BUCKET_LOAD_VOLUME_ENABLED)}",
+            f"volume_source={volume_source}",
+            f"volume_segments={0 if not volume_segments else len(volume_segments)}",
+            f"selected_source={bucket_load_volume_selected_source_path()}",
+        )
+    return True
+
+
+def maybe_draw_bucket_sand_count_debug(force=False):
+    root = bucket_sand_debug_root_path()
+    if not debug_visuals_enabled():
+        return False
+
+    now = time.time()
+    interval = max(0.02, float(BUCKET_SAND_DEBUG_DRAW_INTERVAL))
+    if not force and now - float(STATE.get("bucket_sand_debug_last_draw_time", 0.0) or 0.0) < interval:
+        return True
+    STATE["bucket_sand_debug_last_draw_time"] = now
+
+    try:
+        return draw_bucket_sand_count_debug(force=force)
+    except Exception as e:
+        if now - float(STATE.get("bucket_sand_debug_last_error_time", 0.0) or 0.0) > 2.0:
+            STATE["bucket_sand_debug_last_error_time"] = now
+            info_print("[WARN] [BUCKET SAND VIZ] draw skipped:", type(e).__name__, e)
+        try:
+            hide_debug_prim(root)
+        except Exception:
+            pass
+        return False
 
 
 def dataset_particle_snapshot(label="", build_bucket_index=False):
@@ -7214,7 +7997,10 @@ def bucket_load_fast_current(force=False, points=None):
     pts = np.ascontiguousarray(pts[:, :3], dtype=np.float32)
 
     spatial_index = None
-    aabb_min, aabb_max = bucket_local_box_world_aabb(expand=BUCKET_LOAD_FAST_AABB_MARGIN)
+    if bool(SAND_BUCKET_LOAD_VOLUME_ENABLED):
+        aabb_min, aabb_max = bucket_load_volume_world_aabb(expand=BUCKET_LOAD_FAST_AABB_MARGIN)
+    else:
+        aabb_min, aabb_max = None, None
     if aabb_min is None or aabb_max is None:
         candidate_idx = np.arange(len(pts), dtype=np.int64)
         candidate_pts = pts
@@ -7284,10 +8070,8 @@ def bucket_load_fast_current(force=False, points=None):
         STATE["bucket_load_fast_last_time"] = now
         return dict(metrics)
 
-    strict = np.all(local >= SAND_BUCKET_LOCAL_MIN.reshape(1, 3), axis=1) & np.all(
-        local <= SAND_BUCKET_LOCAL_MAX.reshape(1, 3),
-        axis=1,
-    )
+    _, _, load_volume_source = bucket_load_volume_mesh_local()
+    strict = bucket_load_volume_mask_from_local(local) if bool(SAND_BUCKET_LOAD_VOLUME_ENABLED) else np.zeros(len(local), dtype=bool)
     bucket_idx = candidate_idx[np.nonzero(strict)[0]]
     bucket_count = int(len(bucket_idx))
     initial_mask = initial_pile_mask_for_points(pts, fallback_pile_mask=None)
@@ -7299,6 +8083,11 @@ def bucket_load_fast_current(force=False, points=None):
     raw_from_pile_bucket_count = int(np.count_nonzero(initial_mask[bucket_idx])) if bucket_count > 0 else 0
     source_tracking = "initial_mask"
     notes = [source_detail]
+    if bool(SAND_BUCKET_LOAD_VOLUME_ENABLED):
+        notes.append("narrow=load_volume_mesh")
+        notes.append(f"volume_source={load_volume_source}")
+    else:
+        notes.append("narrow=disabled_no_bucket_volume")
     if isinstance(spatial_index, dict):
         notes.append(f"spatial_build_ms={float(spatial_index.get('build_ms', 0.0) or 0.0):.3f}")
     from_pile_bucket_count = raw_from_pile_bucket_count
@@ -7317,6 +8106,8 @@ def bucket_load_fast_current(force=False, points=None):
         "bucket_count": int(bucket_count),
         "bucket_from_pile_count": int(from_pile_bucket_count),
         "bucket_from_initial_count": int(raw_from_pile_bucket_count),
+        "load_volume_enabled": bool(SAND_BUCKET_LOAD_VOLUME_ENABLED),
+        "load_volume_source": str(load_volume_source),
         "bucket_from_pile_mass": float(from_pile_bucket_count * mass),
         "particle_mass": float(mass),
         "source_tracking": source_tracking,
@@ -8627,23 +9418,47 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False)
 
         q_goal = STATE.get("dataset_current_q_goal")
         target = get_target_pos() if TARGET_PATH else None
+        features_t = time.perf_counter()
         span_t = time.perf_counter()
         phase_features = dataset_phase_features(phase)
+        mark_span("dataset_record_sample.features.phase", span_t, threshold_ms=1.0)
         debug_extra = bool(DATASET_RECORD_DIAGNOSTIC_FIELDS)
-        rigid_clearance = dataset_rigid_clearance_summary() if debug_extra else {}
-        contact_flags = dataset_contact_flags(phase, bucket_metrics, rigid_clearance) if debug_extra else {}
-        env_summary = dataset_environment_summary(target) if debug_extra else {}
-        cost_summary = (
-            dataset_cost_summary(q_cmd, q_real, action, bucket_metrics, rigid_clearance, dynamics=dynamics)
-            if debug_extra
-            else {}
-        )
-        constraint_flags = dataset_constraint_flags(cost_summary, contact_flags, phase_features) if debug_extra else []
+        if debug_extra:
+            span_t = time.perf_counter()
+            rigid_clearance = dataset_rigid_clearance_summary()
+            mark_span("dataset_record_sample.features.rigid_clearance", span_t, threshold_ms=2.0)
+            span_t = time.perf_counter()
+            contact_flags = dataset_contact_flags(phase, bucket_metrics, rigid_clearance)
+            mark_span("dataset_record_sample.features.contact", span_t, threshold_ms=1.0)
+            span_t = time.perf_counter()
+            env_summary = dataset_environment_summary(target)
+            mark_span("dataset_record_sample.features.env", span_t, threshold_ms=2.0)
+            span_t = time.perf_counter()
+            cost_summary = dataset_cost_summary(q_cmd, q_real, action, bucket_metrics, rigid_clearance, dynamics=dynamics)
+            mark_span("dataset_record_sample.features.cost", span_t, threshold_ms=1.0)
+            span_t = time.perf_counter()
+            constraint_flags = dataset_constraint_flags(cost_summary, contact_flags, phase_features)
+            mark_span("dataset_record_sample.features.flags", span_t, threshold_ms=1.0)
+        else:
+            rigid_clearance = {}
+            contact_flags = {}
+            env_summary = {}
+            cost_summary = {}
+            constraint_flags = []
+        span_t = time.perf_counter()
         obs_state = dataset_observation_state(q_real=q_real, bucket_load_metrics=bucket_metrics)
+        mark_span("dataset_record_sample.features.obs_state", span_t, threshold_ms=2.0)
+        span_t = time.perf_counter()
         effort_obs = dataset_joint_effort_observation()
-        joint_force_obs = dataset_joint_force_torque_observation() if debug_extra else None
+        mark_span("dataset_record_sample.features.effort", span_t, threshold_ms=2.0)
+        if debug_extra:
+            span_t = time.perf_counter()
+            joint_force_obs = dataset_joint_force_torque_observation()
+            mark_span("dataset_record_sample.features.force_torque", span_t, threshold_ms=2.0)
+        else:
+            joint_force_obs = None
         observation_effort = effort_obs.get("observation.effort") if isinstance(effort_obs, dict) else None
-        mark_span("dataset_record_sample.features", span_t, threshold_ms=4.0)
+        mark_span("dataset_record_sample.features", features_t, threshold_ms=4.0)
 
         STATE["dataset_effort_sample_count"] = int(STATE.get("dataset_effort_sample_count", 0) or 0) + 1
         if observation_effort is None:
@@ -11087,6 +11902,54 @@ def update_unload_models_only(p):
     STATE["last_unload_sync_time"] = time.time()
 
 
+def auto_collect_prepare_home_needed(policy=None, ready_reset_done=None):
+    if bool(AUTO_COLLECT_HOME_BEFORE_EACH_ATTEMPT):
+        return True, "home_before_each_attempt"
+
+    if policy is None:
+        policy = str(AUTO_COLLECT_SAND_RESET_POLICY).lower()
+    else:
+        policy = str(policy).lower()
+    if ready_reset_done is None:
+        ready_reset_done = bool(STATE.get("sand_site_stable_reset_done", False))
+    else:
+        ready_reset_done = bool(ready_reset_done)
+
+    reset_api_ready = callable((get_sand_site_api() or {}).get("reset"))
+    reset_would_run = (
+        bool(AUTO_COLLECT_HOME_BEFORE_SAND_RESET)
+        and reset_api_ready
+        and policy in ["once_per_run_after_home", "per_episode_after_home"]
+        and (policy == "per_episode_after_home" or not bool(STATE.get("auto_collect_sand_reset_done", False)))
+        and not (
+            AUTO_COLLECT_REUSE_READY_SAND_RESET
+            and ready_reset_done
+            and policy == "once_per_run_after_home"
+        )
+    )
+    if reset_would_run:
+        return True, "home_before_sand_reset"
+
+    if not bool(AUTO_COLLECT_HOME_ONLY_IF_UNSAFE):
+        return False, "home_optional_disabled"
+
+    try:
+        bucket_min = bbox_min_z(BUCKET_LINK)
+        if bucket_min is not None and float(bucket_min) < GROUND_TOP_Z - float(AUTO_COLLECT_UNSAFE_BUCKET_BELOW_GROUND_Z):
+            return True, f"bucket_below_ground:{float(bucket_min):.3f}"
+    except Exception as e:
+        return True, f"bucket_ground_check_failed:{type(e).__name__}"
+
+    try:
+        full_min, _full_max, full_source = robot_full_collision_bbox()
+        if full_min is not None and float(full_min[2]) < GROUND_TOP_Z - float(AUTO_COLLECT_UNSAFE_BUCKET_BELOW_GROUND_Z):
+            return True, f"robot_collision_below_ground:{float(full_min[2]):.3f}:{full_source}"
+    except Exception:
+        pass
+
+    return False, "safe_for_direct_initial_pose"
+
+
 async def auto_collect_prepare_environment():
     was_recording = bool(STATE.get("dataset_recording", False))
     STATE["dataset_recording"] = False
@@ -11210,35 +12073,62 @@ async def auto_collect_prepare_environment():
             gate="task_state",
             detail={"task_id": task_id, "active_task": STATE.get("active_task_name", "")},
         )
-    q_home = safe_home_q()
-    ok = await set_joint_pose_direct_and_settle(
-        q_home,
-        label="auto_collect_home",
-        mode="auto_collect_home_direct",
-        settle_frames=DIRECT_HOME_SETTLE_FRAMES,
-        task_id=None,
-    )
-    if not ok:
-        action_ready = robot_articulation_action_ready()
-        reason = (
-            "prepare_failed/home_direct_failed:"
-            f"action_ready={action_ready}; "
-            f"timeline={simulation_timeline_is_playing()}; "
-            f"running={STATE.get('running', False)}; "
-            f"active_task={STATE.get('active_task_name', '')}; "
-            f"task_alive={task_alive(task_id)}; "
-            f"q_home_deg={q_deg_values(q_home, wrap_swing_for_display=True)}"
+    policy = str(AUTO_COLLECT_SAND_RESET_POLICY).lower()
+    ready_reset_done = bool(STATE.get("sand_site_stable_reset_done", False))
+    home_needed, home_need_reason = auto_collect_prepare_home_needed(policy=policy, ready_reset_done=ready_reset_done)
+    home_ok = True
+    q_home = None
+    if home_needed:
+        sync_motion_start_q("auto_collect_prepare_home")
+        q_home = safe_home_q()
+        home_ok, home_detail = await auto_collect_home_direct_with_recovery(
+            q_home,
+            task_id=task_id,
         )
-        return fail_prepare(reason, gate="home_pose", q_cmd=q_home)
-    record_gate("home_pose", True, "ok", detail={"q_home_deg": q_deg_values(q_home, wrap_swing_for_display=True)})
+        if not home_ok:
+            action_ready = robot_articulation_action_ready()
+            if isinstance(home_detail, dict) and home_detail:
+                home_detail_text = f"; detail={home_detail.get('reason', '')}; err={home_detail.get('err_deg', {})}"
+            else:
+                home_detail_text = ""
+            reason = (
+                "prepare_failed/home_direct_failed:"
+                f"action_ready={action_ready}; "
+                f"timeline={simulation_timeline_is_playing()}; "
+                f"running={STATE.get('running', False)}; "
+                f"active_task={STATE.get('active_task_name', '')}; "
+                f"task_alive={task_alive(task_id)}; "
+                f"home_needed_reason={home_need_reason}; "
+                f"q_home_deg={q_deg_values(q_home, wrap_swing_for_display=True)}"
+                f"{home_detail_text}"
+            )
+            return fail_prepare(reason, gate="home_pose", detail=home_detail, q_cmd=q_home)
+        home_gate_reason = "ok"
+        if isinstance(home_detail, dict) and home_detail.get("recovered"):
+            home_gate_reason = "ok_recovered"
+        record_gate(
+            "home_pose",
+            True,
+            home_gate_reason,
+            detail={
+                "home_needed_reason": home_need_reason,
+                "q_home_deg": q_deg_values(q_home, wrap_swing_for_display=True),
+                "recovery": home_detail,
+            },
+        )
+    else:
+        record_gate(
+            "home_pose",
+            True,
+            "skipped_not_required",
+            detail={"home_needed_reason": home_need_reason},
+        )
     await step_updates(AUTO_COLLECT_PRE_RESET_SETTLE_FRAMES)
     if handle_timeline_stop_if_needed("auto_collect_prepare_after_home"):
         return fail_prepare("prepare_failed/timeline_stopped_after_home", gate="timeline")
 
-    policy = str(AUTO_COLLECT_SAND_RESET_POLICY).lower()
-    ready_reset_done = bool(STATE.get("sand_site_stable_reset_done", False))
     should_reset_sand = (
-        ok
+        home_ok
         and callable((get_sand_site_api() or {}).get("reset"))
         and policy in ["once_per_run_after_home", "per_episode_after_home"]
         and (policy == "per_episode_after_home" or not bool(STATE.get("auto_collect_sand_reset_done", False)))
@@ -11289,7 +12179,9 @@ async def auto_collect_prepare_environment():
             f"policy={AUTO_COLLECT_SAND_RESET_POLICY}",
             f"reset_done={STATE.get('auto_collect_sand_reset_done')}",
             f"ready_stable_reset_done={ready_reset_done}",
-            f"home_ok={ok}",
+            f"home_ok={home_ok}",
+            f"home_needed={home_needed}",
+            f"home_reason={home_need_reason}",
             "action=skip",
         )
         await step_updates(20)
@@ -11528,7 +12420,11 @@ async def auto_collect_one_episode():
         f"unload_point={vec_list(unload_bin_dump_point(), 3)}",
         f"unload_landing={vec_list(unload_bin_landing_point(), 3)}",
     )
-    result = await execute_dig_target_ball(rebuild_plan=False, task_name=f"auto_collect_episode_{attempt:06d}")
+    result = await execute_dig_target_ball(
+        rebuild_plan=False,
+        task_name=f"auto_collect_episode_{attempt:06d}",
+        return_home=False,
+    )
     freezes = int(STATE.get("dataset_episode_freezes", 0))
     if not result:
         failure_reason = str(STATE.get("last_execution_failure_reason", "") or "execution_failed/stage_failed")
@@ -11729,9 +12625,10 @@ async def auto_collect_loop(count, max_attempts=None):
         STATE["dataset_sand_metrics_path"] = previous_dataset["dataset_sand_metrics_path"]
         STATE["auto_collect_episode_sand_snapshot"] = None
         STATE["auto_collect_episode_sand_snapshot_time"] = 0.0
-        clear_planning_runtime_caches("auto_collect_loop_end")
         dataset_writer_flush("auto_collect_loop_end")
         auto_collect_write_run_summary()
+        clear_planning_runtime_caches("auto_collect_loop_end")
+        STATE["debug_timeline_path"] = ""
         finished_run_dir = str(STATE.get("auto_collect_run_dir", "") or "")
         if finished_run_dir:
             register_async_task(
@@ -13348,6 +14245,8 @@ def set_manual_joint_target(q_target, reason="slider"):
     STATE["manual_joint_target"] = np.array(q, dtype=np.float32)
     STATE["manual_joint_active"] = True
     STATE["manual_override"] = True
+    STATE["freeze_candidate_since"] = 0.0
+    STATE["freeze_last_real_q"] = None
     hold_manual_ui_sync()
 
     now = time.time()
@@ -13810,7 +14709,8 @@ def sync_unload_from_sliders_live(force=False):
         except Exception:
             pass
     STATE["manual_unload_mesh_shrink_d"] = shrink_d
-    if str(STATE.get("manual_unload_source", "")).startswith("selected_mesh"):
+    unload_source = str(STATE.get("manual_unload_source", "") or "")
+    if unload_source.startswith(("selected_mesh", "preset_mesh")):
         hull = STATE.get("manual_unload_selected_hull_xy")
         if hull is not None:
             poly = shrink_convex_polygon_xy(hull, shrink_d)
@@ -13826,7 +14726,7 @@ def sync_unload_from_sliders_live(force=False):
                 float(p[0]),
                 float(p[1]),
                 float(p[2]),
-                source="selected_mesh_ui",
+                source="preset_mesh_ui" if unload_source.startswith("preset_mesh") else "selected_mesh_ui",
                 inner_size=inner,
                 z_range=z_range,
                 selected_path=str(STATE.get("manual_unload_selected_path", "")),
@@ -14424,7 +15324,7 @@ def verify_motion_reached(q_goal, label="", mode="auto", record_failure=True):
     return False
 
 
-async def wait_for_motion_reached(q_goal, label="", mode="auto", seconds_eff=0.0):
+async def wait_for_motion_reached(q_goal, label="", mode="auto", seconds_eff=0.0, record_failure=True):
     max_frames = max(
         int(MOVE_REACH_WAIT_MAX_FRAMES),
         int(max(0.0, float(seconds_eff)) * CONTROL_HZ * MOVE_REACH_EXTRA_TIME_RATIO),
@@ -14449,7 +15349,8 @@ async def wait_for_motion_reached(q_goal, label="", mode="auto", seconds_eff=0.0
                 record_failure=False,
             )
         await step_updates(1)
-    info_print("[MOVE VERIFY WAIT TIMEOUT]", f"label={label}", f"mode={mode}", f"detail={last_detail}")
+    if record_failure:
+        info_print("[MOVE VERIFY WAIT TIMEOUT]", f"label={label}", f"mode={mode}", f"detail={last_detail}")
     if is_sand_contact_phase(str(label or mode)):
         report = STATE.get("sand_contact_last_report")
         report = report if isinstance(report, dict) else {}
@@ -14472,7 +15373,7 @@ async def wait_for_motion_reached(q_goal, label="", mode="auto", seconds_eff=0.0
             include_sand=True,
         )
         return True
-    return verify_motion_reached(q_goal, label=label, mode=mode, record_failure=True)
+    return verify_motion_reached(q_goal, label=label, mode=mode, record_failure=record_failure)
 
 
 async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="auto", q_start_override=None):
@@ -14792,11 +15693,7 @@ SWING_REBASE_EPS_DEG = 0.05
 
 BUCKET_TIP_LOCAL = np.array([0.75, 0.0, -0.18], dtype=np.float32)
 BUCKET_LOAD_LOCAL = np.array([0.35, 0.0, 0.08], dtype=np.float32)
-BUCKET_POUR_LOCAL = np.array([
-    float(SAND_BUCKET_LOCAL_MAX[0]) - 0.05,
-    0.0,
-    float(SAND_BUCKET_LOCAL_MAX[2]) - 0.25,
-], dtype=np.float32)
+BUCKET_POUR_LOCAL = np.array([0.85, 0.0, 0.30], dtype=np.float32)
 
 IK_MAX_DQ = np.array([0.075, 0.070, 0.080, 0.090], dtype=np.float32)
 IK_CALIBRATION_STEP = 0.08
@@ -16323,6 +17220,22 @@ def path_obstacle_result_cacheable(result):
     return "planning budget exceeded" not in reason and "deadline" not in reason
 
 
+def path_obstacle_check_debug_profile_data(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadline=None):
+    return {
+        "mode": str(mode),
+        "samples": int(max(2, int(samples))),
+        "auto_collect_active": bool(STATE.get("auto_collect_active", False)),
+        "dataset_recording": bool(STATE.get("dataset_recording", False)),
+        "dig_plan_planning_active": bool(STATE.get("dig_plan_planning_active", False)),
+        "active_task": str(STATE.get("active_task_name", "") or ""),
+        "timeline_open": bool(str(STATE.get("debug_timeline_path", "") or "")),
+        "cache_size": len(STATE.get("path_obstacle_check_cache", {}) or {}),
+        "cache_hits": int(STATE.get("path_obstacle_check_cache_hits", 0) or 0),
+        "cache_misses": int(STATE.get("path_obstacle_check_cache_misses", 0) or 0),
+        "deadline_present": deadline is not None,
+    }
+
+
 @debug_profiled("path_obstacle_check", threshold_ms=5.0)
 def path_obstacle_check(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadline=None):
     t0 = time.perf_counter()
@@ -16495,6 +17408,22 @@ def path_segment_result_cacheable(result):
         return False
     reason_text = " ".join(str(x).lower() for x in result[1:3])
     return "planning budget exceeded" not in reason_text and "deadline" not in reason_text
+
+
+def path_segment_check_debug_profile_data(q_start, q_goal, mode, samples=PATH_CHECK_SAMPLES, deadline=None):
+    return {
+        "mode": str(mode),
+        "samples": int(max(2, int(samples))),
+        "auto_collect_active": bool(STATE.get("auto_collect_active", False)),
+        "dataset_recording": bool(STATE.get("dataset_recording", False)),
+        "dig_plan_planning_active": bool(STATE.get("dig_plan_planning_active", False)),
+        "active_task": str(STATE.get("active_task_name", "") or ""),
+        "timeline_open": bool(str(STATE.get("debug_timeline_path", "") or "")),
+        "cache_size": len(STATE.get("path_segment_check_cache", {}) or {}),
+        "cache_hits": int(STATE.get("path_segment_check_cache_hits", 0) or 0),
+        "cache_misses": int(STATE.get("path_segment_check_cache_misses", 0) or 0),
+        "deadline_present": deadline is not None,
+    }
 
 
 @debug_profiled("path_segment_check", threshold_ms=5.0)
@@ -17140,7 +18069,14 @@ def set_joint_pose_direct(q_goal, label="direct_pose", mode="direct_pose", updat
     return ok
 
 
-async def set_joint_pose_direct_and_settle(q_goal, label="direct_pose", mode="direct_pose", settle_frames=0, task_id=None):
+async def set_joint_pose_direct_and_settle(
+    q_goal,
+    label="direct_pose",
+    mode="direct_pose",
+    settle_frames=0,
+    task_id=None,
+    record_failure=True,
+):
     ready, reason, _detail = await wait_for_articulation_action_ready(
         f"{label}_direct_pose",
         min_stable_frames=ACTION_READY_MIN_STABLE_FRAMES,
@@ -17162,9 +18098,144 @@ async def set_joint_pose_direct_and_settle(q_goal, label="direct_pose", mode="di
             label=label,
             mode=mode,
             seconds_eff=max(0.25, frames / 60.0),
+            record_failure=record_failure,
         )
         ok = bool(reached)
     return bool(ok and (task_id is None or task_alive(task_id)))
+
+
+def auto_collect_home_reach_detail(q_home):
+    q_goal = np.array(q_home, dtype=np.float32).reshape(-1)[: len(DOF_ORDER)].copy()
+    ok, detail, blocked, swing_err, max_err, q_real = motion_reach_report(q_goal)
+    if q_real is None:
+        try:
+            q_real = q_real_near_command(get_real_joint_positions(), q_goal)
+        except Exception:
+            q_real = None
+    err_by_name = {}
+    if q_real is not None:
+        try:
+            err_deg = q_delta_abs_deg(q_goal, q_real)
+            err_by_name = {
+                name: float(err_deg[idx])
+                for name, idx in CTRL.name_to_idx.items()
+                if idx < len(err_deg)
+            }
+        except Exception:
+            err_by_name = {}
+    bucket_err = float(err_by_name.get("bucket", max_err if blocked else 0.0) or 0.0)
+    boom_err = float(err_by_name.get("boom", 0.0) or 0.0)
+    arm_err = float(err_by_name.get("arm", 0.0) or 0.0)
+    swing_err = float(err_by_name.get("swing", swing_err) or 0.0)
+    non_bucket_scale = max(1.0, float(AUTO_COLLECT_HOME_NON_BUCKET_RELAXED_SCALE))
+    non_bucket_ok = (
+        swing_err <= float(MOVE_FINAL_SWING_TOL_DEG) * non_bucket_scale
+        and boom_err <= float(MOVE_FINAL_JOINT_TOL_DEG) * non_bucket_scale
+        and arm_err <= float(MOVE_FINAL_JOINT_TOL_DEG) * non_bucket_scale
+    )
+    bucket_relaxed_ok = bucket_err <= float(AUTO_COLLECT_HOME_BUCKET_RELAXED_TOL_DEG)
+    relaxed_ok = bool(non_bucket_ok and bucket_relaxed_ok and q_real is not None)
+    return {
+        "ok": bool(ok),
+        "relaxed_ok": relaxed_ok,
+        "reason": "ok" if ok else str(detail),
+        "blocked_joints": list(blocked or []),
+        "err_deg": err_by_name,
+        "max_err_deg": float(max_err),
+        "q_goal_deg": q_deg_values(q_goal, wrap_swing_for_display=True),
+        "q_real_deg": q_deg_values(q_real, wrap_swing_for_display=True) if q_real is not None else None,
+        "q_real": q_real,
+    }
+
+
+def accept_auto_collect_home_recovery(q_real, detail=None):
+    if q_real is None:
+        return False
+    q_hold = CTRL.clip_limits(np.array(q_real, dtype=np.float32).reshape(-1)[: len(DOF_ORDER)].copy())
+    CTRL.q_cmd = q_hold.copy()
+    CTRL.q_safe = q_hold.copy()
+    STATE["dataset_current_q_goal"] = q_hold.copy()
+    STATE["manual_joint_active"] = False
+    STATE["manual_joint_target"] = None
+    STATE["trace_active_motion"] = None
+    try:
+        CTRL.send_action(q_hold, mode="auto_collect_home_recovered_hold")
+    except Exception:
+        pass
+    try:
+        sync_sliders_from_real_q(force=True)
+    except Exception:
+        pass
+    err_detail = detail.get("err_deg", {}) if isinstance(detail, dict) else {}
+    info_print(
+        "[AUTO HOME RECOVERY]",
+        "decision=accept_relaxed_home",
+        f"q_hold_deg={q_deg_values(q_hold, wrap_swing_for_display=True)}",
+        f"err_deg={err_detail}",
+    )
+    debug_timeline_record(
+        "AUTO_HOME_RECOVERY",
+        result="accepted",
+        reason="accept_relaxed_home",
+        q_real=q_hold,
+        data={k: v for k, v in (detail or {}).items() if k != "q_real"} if isinstance(detail, dict) else {},
+        include_sand=True,
+    )
+    return True
+
+
+async def auto_collect_home_direct_with_recovery(q_home, task_id=None):
+    ok = await set_joint_pose_direct_and_settle(
+        q_home,
+        label="auto_collect_home",
+        mode="auto_collect_home_direct",
+        settle_frames=DIRECT_HOME_SETTLE_FRAMES,
+        task_id=task_id,
+        record_failure=False,
+    )
+    detail = auto_collect_home_reach_detail(q_home)
+    if ok or bool(detail.get("ok")):
+        detail["recovered"] = False
+        return True, {k: v for k, v in detail.items() if k != "q_real"}
+    if task_id is not None and not task_alive(task_id):
+        detail["recovered"] = False
+        detail["recovery_reason"] = "task_not_alive"
+        return False, {k: v for k, v in detail.items() if k != "q_real"}
+    info_print(
+        "[AUTO HOME RECOVERY]",
+        "first_check=miss",
+        f"reason={detail.get('reason')}",
+        f"err_deg={detail.get('err_deg')}",
+    )
+    if bool(detail.get("relaxed_ok")):
+        accepted = accept_auto_collect_home_recovery(detail.get("q_real"), detail=detail)
+        if accepted:
+            detail["recovered"] = True
+            detail["recovery_reason"] = "relaxed_bucket_home"
+            return True, {k: v for k, v in detail.items() if k != "q_real"}
+
+    retry_label = "auto_collect_home_recovery"
+    retry_ok = await set_joint_pose_direct_and_settle(
+        q_home,
+        label=retry_label,
+        mode="auto_collect_home_recovery_direct",
+        settle_frames=max(DIRECT_HOME_SETTLE_FRAMES, 20),
+        task_id=task_id,
+        record_failure=False,
+    )
+    retry_detail = auto_collect_home_reach_detail(q_home)
+    if retry_ok or bool(retry_detail.get("ok")):
+        retry_detail["recovered"] = True
+        retry_detail["recovery_reason"] = "retry_reached"
+        return True, {k: v for k, v in retry_detail.items() if k != "q_real"}
+    if bool(retry_detail.get("relaxed_ok")):
+        accepted = accept_auto_collect_home_recovery(retry_detail.get("q_real"), detail=retry_detail)
+        if accepted:
+            retry_detail["recovered"] = True
+            retry_detail["recovery_reason"] = "retry_relaxed_bucket_home"
+            return True, {k: v for k, v in retry_detail.items() if k != "q_real"}
+    retry_detail["recovered"] = False
+    return False, {k: v for k, v in retry_detail.items() if k != "q_real"}
 
 
 def maybe_prepare_swing_rebase_for_segment(q_goal, label="segment"):
@@ -26318,8 +27389,10 @@ async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"
             STATE["dataset_recording"] = was_recording
     if return_home:
         update_status("[DIG FINISHED] bucket curled, lifted, unloaded, and homed.", force=True)
-    else:
+    elif loaded_route_diag:
         update_status("[LOADED ROUTE TEST FINISHED] unloaded; holding current pose.", force=True)
+    else:
+        update_status("[AUTO COLLECT EPISODE FINISHED] unloaded; holding current pose for next direct initial pose.", force=True)
     return True
 
 
@@ -26651,6 +27724,9 @@ def build_ui():
     def toggle_calc_viz_from_ui():
         toggle_debug_visuals_from_ui()
 
+    def select_bucket_vol_source_from_ui():
+        set_bucket_load_volume_source_from_selected()
+
     def cycle_log_mode_from_ui():
         cycle_log_mode()
 
@@ -26813,11 +27889,16 @@ def build_ui():
                         model.add_value_changed_fn(on_manual_joint_slider_changed)
 
                     with ui.HStack(spacing=6, height=26):
-                        ui.Label("Manual joints", width=170)
-                        ui.Button("Home", width=82, clicked_fn=home)
-                        ui.Button("Print State", width=104, clicked_fn=print_state)
-                        ui.Button("Render Mode", width=112, clicked_fn=toggle_render_mode_from_ui)
-                        ui.Button("Calc Viz", width=92, clicked_fn=toggle_calc_viz_from_ui)
+                        ui.Label("Manual joints", width=126)
+                        ui.Button("Home", width=70, clicked_fn=home)
+                        ui.Button("Print State", width=92, clicked_fn=print_state)
+                        ui.Button("Render Mode", width=100, clicked_fn=toggle_render_mode_from_ui)
+                        ui.Button("Calc Viz", width=76, clicked_fn=toggle_calc_viz_from_ui)
+
+                    with ui.HStack(spacing=6, height=24):
+                        ui.Label("Bucket volume", width=126)
+                        ui.Button("Select Mesh", width=104, clicked_fn=select_bucket_vol_source_from_ui)
+                        ui.Label("Calc Viz shows closed count volume only.", width=260)
 
                     ui.Separator()
                     ui.Label("Auto Dataset (primary pipeline)")
@@ -27125,6 +28206,8 @@ async def main():
 
         if current_trace_mode() != 0:
             draw_trace(force=False)
+
+        maybe_draw_bucket_sand_count_debug(force=False)
 
         if not debug_visuals_enabled():
             now = time.time()

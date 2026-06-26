@@ -147,7 +147,7 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "trace_no_plan_notice_shown": False,
     "excavator_render_mode": True,
     "debug_visuals_visible": True,
-    "bucket_load_volume_selected_source_path": "/World/URDF_real3/bucket_link/visuals/bucket_link/node_STL_BINARY_/mesh",
+    "bucket_load_volume_selected_source_path": "/World/URDF_real3/bucket_link/bucket_cut/node_/mesh_",
     "bucket_load_volume_selected_used_paths": [],
     "debug_visuals_last_hide_time": 0.0,
     "request_calibrate": False,
@@ -677,7 +677,7 @@ SAND_RESET_ESCAPE_Z = -1.0
 SAND_RESET_ESCAPE_CHECK_FRAMES = 150
 SAND_RESET_MAX_NATIVE_ATTEMPTS = 2
 SAND_BUCKET_DIAG_EXPAND_LOCAL = np.array([0.40, 0.30, 0.45], dtype=np.float32)
-DEFAULT_BUCKET_LOAD_VOLUME_MESH_PATH = "/World/URDF_real3/bucket_link/visuals/bucket_link/node_STL_BINARY_/mesh"
+DEFAULT_BUCKET_LOAD_VOLUME_MESH_PATH = "/World/URDF_real3/bucket_link/bucket_cut/node_/mesh_"
 SAND_BUCKET_LOAD_VOLUME_ENABLED = str(os.environ.get("EXCAVATOR_BUCKET_LOAD_VOLUME", "1") or "1").strip().lower() not in (
     "0",
     "false",
@@ -4881,6 +4881,58 @@ def compact_bucket_load_metrics(metrics):
     }
 
 
+def sand_metrics_from_bucket_fast(bucket_metrics, base_metrics=None, scope="bucket_fast_only"):
+    """Build a sand-metrics-shaped row without scanning pile/bin/spill regions."""
+    base = base_metrics if isinstance(base_metrics, dict) else {}
+    if not isinstance(bucket_metrics, dict) or not bool(bucket_metrics.get("available", False)):
+        return {
+            "available": False,
+            "metrics_scope": str(scope),
+            "reason": "" if not isinstance(bucket_metrics, dict) else str(bucket_metrics.get("reason", "")),
+            "particle_count": int(bucket_metrics.get("particle_count", 0) if isinstance(bucket_metrics, dict) else 0),
+            "bucket_count": 0,
+            "bucket_from_pile_count": 0,
+            "bucket_from_initial_count": 0,
+            "bucket_from_pile_mass": 0.0,
+        }
+    mass = float(bucket_metrics.get("particle_mass", base.get("particle_mass", sand_particle_mass())) or 0.0)
+    metrics = {
+        "available": True,
+        "metrics_scope": str(scope),
+        "particle_count": int(bucket_metrics.get("particle_count", base.get("particle_count", 0)) or 0),
+        "particle_mass": mass,
+        "scene_source": str(base.get("scene_source", "bucket_fast")),
+        "bucket_count": int(bucket_metrics.get("bucket_count", 0) or 0),
+        "bucket_from_pile_count": int(bucket_metrics.get("bucket_from_pile_count", 0) or 0),
+        "bucket_from_initial_count": int(
+            bucket_metrics.get("bucket_from_initial_count", bucket_metrics.get("bucket_from_pile_count", 0)) or 0
+        ),
+        "bucket_from_pile_mass": float(bucket_metrics.get("bucket_from_pile_mass", 0.0) or 0.0),
+        "source_tracking": str(bucket_metrics.get("source_tracking", "bucket_fast")),
+        "source_tracking_notes": str(bucket_metrics.get("source_tracking_notes", "")),
+    }
+    for key in (
+        "initial_pile_count",
+        "pile_count",
+        "pile_from_initial_count",
+        "unload_bin_center",
+        "unload_bin_half_size",
+        "unload_bin_z_range",
+        "unload_point",
+    ):
+        if key in base:
+            metrics[key] = base.get(key)
+    return metrics
+
+
+def phase_metrics_requires_full(label):
+    text = str(label).lower()
+    if text in {"after_dump_settle", "episode_metrics"}:
+        return True
+    full_tokens = ("final", "score", "preflight")
+    return any(token in text for token in full_tokens)
+
+
 def compact_scene_context(ctx=None):
     ctx = task_scene_context() if ctx is None else ctx
     if not isinstance(ctx, dict):
@@ -7997,8 +8049,13 @@ def bucket_load_fast_current(force=False, points=None):
     pts = np.ascontiguousarray(pts[:, :3], dtype=np.float32)
 
     spatial_index = None
+    load_volume_source = ""
     if bool(SAND_BUCKET_LOAD_VOLUME_ENABLED):
         aabb_min, aabb_max = bucket_load_volume_world_aabb(expand=BUCKET_LOAD_FAST_AABB_MARGIN)
+        try:
+            _, _, load_volume_source = bucket_load_volume_mesh_local()
+        except Exception:
+            load_volume_source = "load_volume_source_unavailable"
     else:
         aabb_min, aabb_max = None, None
     if aabb_min is None or aabb_max is None:
@@ -8043,6 +8100,10 @@ def bucket_load_fast_current(force=False, points=None):
             "bucket_from_pile_count": 0,
             "bucket_from_initial_count": 0,
             "bucket_from_pile_mass": 0.0,
+            "load_volume_enabled": bool(SAND_BUCKET_LOAD_VOLUME_ENABLED),
+            "load_volume_source": str(load_volume_source),
+            "load_volume_aabb_min": np.asarray(aabb_min, dtype=np.float32).reshape(-1)[:3].tolist() if aabb_min is not None else None,
+            "load_volume_aabb_max": np.asarray(aabb_max, dtype=np.float32).reshape(-1)[:3].tolist() if aabb_max is not None else None,
             "particle_mass": float(mass),
             "source_tracking": "empty_candidate",
             "source_tracking_notes": source_detail,
@@ -8070,7 +8131,8 @@ def bucket_load_fast_current(force=False, points=None):
         STATE["bucket_load_fast_last_time"] = now
         return dict(metrics)
 
-    _, _, load_volume_source = bucket_load_volume_mesh_local()
+    if not load_volume_source:
+        _, _, load_volume_source = bucket_load_volume_mesh_local()
     strict = bucket_load_volume_mask_from_local(local) if bool(SAND_BUCKET_LOAD_VOLUME_ENABLED) else np.zeros(len(local), dtype=bool)
     bucket_idx = candidate_idx[np.nonzero(strict)[0]]
     bucket_count = int(len(bucket_idx))
@@ -8325,6 +8387,16 @@ def dataset_metrics_frame_full(label="", q_real=None, force=False):
     return dict(metrics or {})
 
 
+def dataset_metrics_frame_fast(label="", q_real=None, force=False):
+    bundle = dataset_metrics_frame_bundle(label=label, q_real=q_real, need_full=False, force=force)
+    bucket_metrics = bundle.get("bucket_metrics") if isinstance(bundle, dict) else None
+    return sand_metrics_from_bucket_fast(
+        bucket_metrics,
+        base_metrics=STATE.get("sand_metrics_last"),
+        scope="dataset_bucket_fast",
+    )
+
+
 def is_sand_contact_phase(mode):
     m = str(mode).lower()
     return any(phase in m for phase in SAND_CONTACT_PHASES)
@@ -8360,7 +8432,14 @@ def phase_collision_context(mode):
 
 
 def sand_contact_snapshot(force=False):
-    metrics = sand_metrics_current(force=force)
+    use_bucket_fast = bool(STATE.get("dataset_recording", False) or STATE.get("auto_collect_active", False))
+    if use_bucket_fast:
+        try:
+            metrics = dataset_metrics_frame_fast(label="sand_contact")
+        except Exception:
+            metrics = sand_metrics_current(force=False)
+    else:
+        metrics = sand_metrics_current(force=force)
     try:
         tip = bucket_tip_pos()
     except Exception:
@@ -10266,11 +10345,16 @@ def auto_collect_episode_metrics():
     }
 
 
-def record_phase_metrics(label, q_cmd=None, q_real=None, action=None):
+def record_phase_metrics(label, q_cmd=None, q_real=None, action=None, need_full=None):
     label = str(label)
     q_cmd_now = CTRL.q_cmd.copy() if q_cmd is None else np.array(q_cmd, dtype=np.float32).copy()
     q_real_now = get_real_joint_positions() if q_real is None else np.array(q_real, dtype=np.float32).copy()
-    metrics = dataset_metrics_frame_full(label=f"phase:{label}", q_real=q_real_now, force=False)
+    if need_full is None:
+        need_full = phase_metrics_requires_full(label)
+    if bool(need_full):
+        metrics = dataset_metrics_frame_full(label=f"phase:{label}", q_real=q_real_now, force=False)
+    else:
+        metrics = dataset_metrics_frame_fast(label=f"phase:{label}", q_real=q_real_now, force=False)
     update_episode_quality_trackers(metrics, label, q_cmd=q_cmd_now, q_real=q_real_now, action=action)
 
     phase_metrics = STATE.get("dataset_phase_metrics")
@@ -23656,8 +23740,7 @@ def append_staged_post_dig_secure_plan(task_label="dig_target_ball"):
 
     q_start = sync_motion_start_q("staged_post_dig_secure")
     cut_metrics = record_phase_metrics("after_cut", q_cmd=q_start, q_real=q_start)
-    cut_sand = cut_metrics.get("sand", {}) if isinstance(cut_metrics, dict) else {}
-    cut_bucket = int(cut_sand.get("bucket_from_pile", 0) or 0) if isinstance(cut_sand, dict) else 0
+    cut_bucket = int(cut_metrics.get("bucket_from_pile_count", 0) or 0) if isinstance(cut_metrics, dict) else 0
     rows, reason = staged_dig_secure_candidates(q_start, loaded_count_hint=cut_bucket)
     if not rows:
         if cut_bucket >= int(CURL_HOLD_MIN_BUCKET_PARTICLES):
@@ -25938,8 +26021,6 @@ def bucket_only_dump_ready(stage_name, dump_deg, label="before_dump"):
 
 
 async def wait_for_dump_settle(stage_name, task_id=None):
-    last_bin_count = None
-    stable_samples = 0
     max_frames = int(UNLOAD_DUMP_SETTLE_MAX_FRAMES)
     min_frames = int(UNLOAD_DUMP_SETTLE_MIN_FRAMES)
     sample_frames = max(1, int(UNLOAD_DUMP_SETTLE_SAMPLE_FRAMES))
@@ -25950,18 +26031,11 @@ async def wait_for_dump_settle(stage_name, task_id=None):
         await step_updates(1)
         if (frame + 1) % sample_frames != 0 and (frame + 1) < max_frames:
             continue
-        metrics = record_phase_metrics("after_dump_settle_probe")
         record_unload_trajectory_sample(stage_name, "after_dump_settle_probe")
-        bin_count = int(metrics.get("bin_from_pile_count", 0)) if isinstance(metrics, dict) else 0
-        if last_bin_count is not None and abs(bin_count - int(last_bin_count)) <= 1:
-            stable_samples += 1
-        else:
-            stable_samples = 0
-        last_bin_count = bin_count
-        if (frame + 1) >= min_frames and stable_samples >= int(UNLOAD_DUMP_STABLE_SAMPLES):
+        if (frame + 1) >= min_frames:
             break
 
-    record_phase_metrics("after_dump_settle")
+    record_phase_metrics("after_dump_settle", need_full=True)
     record_unload_trajectory_sample(stage_name, "after_dump_settle")
     return True
 
@@ -25990,7 +26064,7 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
     start_metrics = record_phase_metrics("before_dump_direct")
     record_unload_trajectory_sample(stage_name, "before_dump_direct", q_cmd=q0)
     start_bucket_count = int(start_metrics.get("bucket_from_pile_count", 0)) if isinstance(start_metrics, dict) else 0
-    start_bin_count = int(start_metrics.get("bin_from_pile_count", 0)) if isinstance(start_metrics, dict) else 0
+    start_bin_count = int(start_metrics.get("bin_from_pile_count", 0)) if isinstance(start_metrics, dict) and "bin_from_pile_count" in start_metrics else None
     if loaded_route_dump and bool(LOADED_ROUTE_STAGE_PARTICLE_DIAGNOSTICS):
         bucket_particle_diagnostic("before_dump_direct")
     info_print(
@@ -26002,7 +26076,7 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
         f"bucket_start={rad_to_deg(float(q0[bucket_idx])):.2f}deg",
         f"bucket_target={rad_to_deg(target_bucket):.2f}deg",
         f"bucket_start_particles={start_bucket_count}",
-        f"bin_start_particles={start_bin_count}",
+        f"bin_start_particles={'final_only' if start_bin_count is None else start_bin_count}",
         f"metric_stride={metric_stride}",
         force_log=debug_diagnostics_enabled(),
     )
@@ -26036,7 +26110,7 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
         if do_metric_sample:
             last_metrics = record_phase_metrics("during_dump_direct")
         bucket_now = int(last_metrics.get("bucket_from_pile_count", 0)) if isinstance(last_metrics, dict) else 0
-        bin_now = int(last_metrics.get("bin_from_pile_count", 0)) if isinstance(last_metrics, dict) else 0
+        bin_now = int(last_metrics.get("bin_from_pile_count", 0)) if isinstance(last_metrics, dict) and "bin_from_pile_count" in last_metrics else None
         if do_metric_sample:
             info_print(
                 "[UNLOAD DUMP DIRECT SAMPLE]",
@@ -26045,13 +26119,12 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
                 f"bucket_cmd={rad_to_deg(float(q[bucket_idx])):.2f}deg",
                 f"bucket_real={rad_to_deg(real_bucket):.2f}deg",
                 f"bucket_delta={bucket_now - start_bucket_count}",
-                f"bin_delta={bin_now - start_bin_count}",
+                f"bin_delta={'final_only' if bin_now is None or start_bin_count is None else bin_now - start_bin_count}",
                 force_log=debug_diagnostics_enabled(),
             )
         stop_bucket_count = max(0, int(start_bucket_count * float(UNLOAD_DUMP_STOP_BUCKET_FRACTION)))
         if (
-            bin_now - start_bin_count >= max(QUALITY_MIN_DUMP_PARTICLES, 8)
-            and bucket_now <= stop_bucket_count
+            bucket_now <= stop_bucket_count
             and float(q[bucket_idx]) >= target_bucket - deg_to_rad(8.0)
         ):
             q_final = q_real.copy()
@@ -26071,7 +26144,7 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
         end_metrics = record_phase_metrics("after_dump_direct")
         record_unload_trajectory_sample(stage_name, "after_dump_direct", q_cmd=q_final)
         bucket_end = int(end_metrics.get("bucket_from_pile_count", 0)) if isinstance(end_metrics, dict) else 0
-        bin_end = int(end_metrics.get("bin_from_pile_count", 0)) if isinstance(end_metrics, dict) else 0
+        bin_end = int(end_metrics.get("bin_from_pile_count", 0)) if isinstance(end_metrics, dict) and "bin_from_pile_count" in end_metrics else None
         if loaded_route_dump and bool(LOADED_ROUTE_STAGE_PARTICLE_DIAGNOSTICS):
             bucket_particle_diagnostic("after_dump_direct")
         info_print(
@@ -26081,7 +26154,7 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
             f"bucket_real={rad_to_deg(float(q_real[bucket_idx])):.2f}deg",
             f"bucket_err={err_deg:.2f}deg",
             f"bucket_delta={bucket_end - start_bucket_count}",
-            f"bin_delta={bin_end - start_bin_count}",
+            f"bin_delta={'final_only' if bin_end is None or start_bin_count is None else bin_end - start_bin_count}",
             force_log=debug_diagnostics_enabled(),
         )
     except Exception as e:

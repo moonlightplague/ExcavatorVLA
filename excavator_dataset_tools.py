@@ -951,6 +951,12 @@ def write_jsonl(path: Union[str, os.PathLike], rows: Sequence[dict]) -> str:
 
 def vector_or_none(value: object, length: Optional[int] = None) -> Optional[List[float]]:
     if not isinstance(value, (list, tuple)):
+        try:
+            if hasattr(value, "tolist"):
+                value = value.tolist()
+        except Exception:
+            return None
+    if not isinstance(value, (list, tuple)):
         return None
     out = []
     for item in value:
@@ -1218,7 +1224,8 @@ def vector_stats_for_rows(rows: Sequence[dict], key: str, dim: int) -> Dict[str,
     stds = []
     for index in range(dim):
         variance = max(0.0, (sums_sq[index] / count) - (means[index] * means[index]))
-        stds.append(math.sqrt(variance))
+        std = math.sqrt(variance)
+        stds.append(1.0 if std < 1.0e-6 else std)
     return {
         "count": [count],
         "mean": means,
@@ -1228,11 +1235,49 @@ def vector_stats_for_rows(rows: Sequence[dict], key: str, dim: int) -> Dict[str,
     }
 
 
+def scalar_stats_for_rows(rows: Sequence[dict], key: str) -> Dict[str, object]:
+    values = []
+    for row in rows:
+        value = row.get(key)
+        try:
+            values.append(float(value))
+        except Exception:
+            continue
+    if not values:
+        return {"count": [0]}
+    count = len(values)
+    minv = min(values)
+    maxv = max(values)
+    meanv = sum(values) / max(1, count)
+    mean_sq = sum(value * value for value in values) / max(1, count)
+    std = math.sqrt(max(0.0, mean_sq - meanv * meanv))
+    if std < 1.0e-6:
+        std = 1.0
+    return {
+        "count": [count],
+        "mean": [meanv],
+        "std": [std],
+        "min": [minv],
+        "max": [maxv],
+    }
+
+
+def visual_identity_stats() -> Dict[str, object]:
+    return {
+        "count": [0],
+        "mean": [0.485, 0.456, 0.406],
+        "std": [0.229, 0.224, 0.225],
+        "min": [0.0, 0.0, 0.0],
+        "max": [1.0, 1.0, 1.0],
+    }
+
+
 def build_lerobot_v3_stats(
     rows: Sequence[dict],
     state_dim: int,
     action_dim: int,
     effort_dim: Optional[int] = None,
+    image_keys: Optional[Sequence[str]] = None,
 ) -> Dict[str, object]:
     stats = {
         "observation.state": vector_stats_for_rows(rows, "observation.state", state_dim),
@@ -1240,6 +1285,10 @@ def build_lerobot_v3_stats(
     }
     if effort_dim is not None and effort_dim > 0:
         stats["observation.effort"] = vector_stats_for_rows(rows, "observation.effort", effort_dim)
+    for key in ["timestamp", "frame_index", "episode_index", "index", "task_index"]:
+        stats[key] = scalar_stats_for_rows(rows, key)
+    for key in (list(image_keys) if image_keys is not None else LEROBOT_IMAGE_KEYS):
+        stats[str(key)] = visual_identity_stats()
     return stats
 
 
@@ -1269,8 +1318,23 @@ def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Di
     if info.get("data_path") != "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet":
         reasons.append("info/data_path_not_v3")
     features = info.get("features", {}) if isinstance(info.get("features"), dict) else {}
+    stats = read_json(os.path.join(export_dir, "meta", "stats.json"), default={}) or {}
+    if not isinstance(stats, dict):
+        reasons.append("stats/not_dict")
+        stats = {}
     if "task" in features:
         reasons.append("info/features_contains_task")
+    required_stats = [
+        "observation.state",
+        "action",
+        "timestamp",
+        "frame_index",
+        "episode_index",
+        "index",
+        "task_index",
+    ]
+    if "observation.effort" in features:
+        required_stats.append("observation.effort")
     for key in image_keys:
         ft = features.get(key, {}) if isinstance(features.get(key), dict) else {}
         if ft.get("dtype") != "video":
@@ -1279,6 +1343,15 @@ def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Di
             reasons.append(f"{key}/shape_not_256")
         if "storage" in ft:
             reasons.append(f"{key}/storage_should_be_absent")
+        required_stats.append(key)
+    for key in required_stats:
+        row = stats.get(key)
+        if not isinstance(row, dict):
+            reasons.append(f"stats/missing_{key}")
+            continue
+        for stat_name in ["mean", "std", "min", "max"]:
+            if stat_name not in row:
+                reasons.append(f"stats/{key}_missing_{stat_name}")
     episodes_path = os.path.join(export_dir, "meta", "episodes", "chunk-000", "file-000.parquet")
     if os.path.exists(episodes_path):
         try:
@@ -1658,6 +1731,7 @@ def export_lerobot_dataset(
         len(state_names),
         len(action_names),
         effort_dim if effort_available else None,
+        image_features,
     )
     write_json(os.path.join(meta_dir, "stats.json"), stats)
 
@@ -1721,7 +1795,7 @@ def export_lerobot_dataset(
         "- `meta/info.json`: feature schema and dataset totals",
         "- `meta/tasks.parquet`: task text index to task_index mapping",
         "- `meta/episodes/chunk-000/file-000.parquet`: episode metadata and video/data chunk indices",
-        "- `meta/stats.json`: state/action statistics",
+        "- `meta/stats.json`: state/action/effort/scalar statistics plus video normalization entries",
         "- `data/chunk-000/file-000.parquet`: frame table",
         "- `observation.effort` is included in the frame table only when Isaac measured joint efforts were available for every exported frame.",
         "- `videos/observation.images.0/chunk-000/file-000.mp4`: camera 0 stream",

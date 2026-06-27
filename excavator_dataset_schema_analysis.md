@@ -1,653 +1,660 @@
-# Excavator Auto Dataset Schema Analysis
+# Excavator Auto Dataset Schema, Cost, and Optimization Report
 
-本文说明当前 excavator auto dataset 的数据结构、旧 run 中已经存在/缺失/不可用的数据、新代码会新增的数据，以及如何读取 `excavator_auto_dataset` 文件夹。
+This report describes the current excavator auto dataset format, the LeRobot v3 export folder, the latest measured runtime cost, and the highest-value optimization plan.
 
-参考旧 run：
-
-```text
-excavator_auto_dataset/run_20260624_050735
-```
-
-该 run 是修改 camera schema 之前生成的历史数据，因此它能代表“旧数据实际包含什么”。新 camera 字段只会在重新 reload runtime 并重新采集的新 run 中出现。
-
-## 1. Auto Dataset 文件夹结构
-
-一个 run 目录大致如下：
+Latest checked run:
 
 ```text
-excavator_auto_dataset/
-  run_YYYYMMDD_HHMMSS/
-    run_meta.json
-    summary.json
-    sand_config.json
-    auto_dataset_config.json
-    planner_config.json
-    quality_gate_config.json
-    camera_config.json                 # 新 run 会有
-    episodes.jsonl
-    successful_episodes.jsonl
-    trainable_episodes.jsonl
-    rejected_episodes.jsonl
-    failed_episodes.jsonl
-    diagnostic_episodes.jsonl
-    planning_diagnostics.jsonl
-    segment_dig.jsonl
-    segment_dig_secure.jsonl
-    segment_lift_carry.jsonl
-    segment_unload.jsonl
-    debug_timeline.jsonl
-    episode_000001/
-      trajectory.jsonl
-      events.jsonl
-      sand_metrics.jsonl
-      meta.json
-      plan_debug.json
-      score.json
-      images/                          # 新 run 会有
-        camera/
-        cameraleft/
-        cameraright/
+D:\450\assets\usd\URDF_real3\excavator_auto_dataset\run_20260628_052305
 ```
 
-### Index 文件含义
+## 1. Latest Run Result
+
+The latest run is complete and exported successfully.
 
 ```text
-episodes.jsonl              所有完成记录索引
-trainable_episodes.jsonl    可训练 full-chain 成功 episode
-successful_episodes.jsonl   full-chain success episode
-rejected_episodes.jsonl     执行过但被质量/执行原因拒绝的 episode
-failed_episodes.jsonl       hard failure episode
-diagnostic_episodes.jsonl   诊断样本
-planning_diagnostics.jsonl  规划失败诊断，不作为行为训练数据
-segment_*.jsonl             分段技能数据索引
+requested episodes : 99
+max attempts       : 200
+attempts used      : 200
+trainable/success  : 99
+rejected           : 97
+failed             : 4
+diagnostic         : 0
+LeRobot v3 export  : ok
 ```
 
-每个 index row 通常包含：
+LeRobot v3 output:
 
 ```text
-episode_id
-episode_index
-status
-score
-reason
-warning_reason
-target_xyz
-unload_point_xyz
-trajectory
-events
-sand_metrics
-meta
-score_path
-plan_debug
-samples
-max_bucket_from_pile_particles
-lift_bucket_from_pile_particles
-final_bin_from_pile_particles
-final_spill_from_pile_particles
-```
-
-## 2. 旧 run 已存在的数据
-
-旧 run `run_20260624_050735` 的 trajectory 格式：
-
-```text
-schema: excavator_auto_state_action_v3
-trajectory_format: compact_jsonl_v4
-```
-
-旧 run 里每帧 `trajectory.jsonl` 已经存在：
-
-```text
-v
-ep
-id
-i
-t
-phase
-phase.index
-phase.one_hot
-phase.context
-label
-obs.state
-obs.q
-obs.dq
-obs.ddq
-obs.q_cmd
-obs.q_err
-action
-action.ddq
-goal.q
-target
-bucket.tip
-bucket.load
-bucket.pour
-sand
-contact
-env
-cost
-label.flags
-```
-
-### `obs.state`
-
-旧 `obs.state` 是 14 维：
-
-```text
-[
-  base_x,
-  base_y,
-  base_yaw,
-  swing,
-  boom,
-  arm,
-  bucket,
-  bucket_load_estimate,
-  bucket_tip_x,
-  bucket_tip_y,
-  bucket_tip_z,
-  bucket_load_x,
-  bucket_load_y,
-  bucket_load_z
-]
-```
-
-注意：
-
-- 当前挖掘机是 fixed-base 采集，`base_yaw` 目前是固定读数/近似值。
-- `bucket_load_estimate` 来自沙粒统计估计，不是力传感器。
-
-### `action`
-
-旧 `action` 是 4 维：
-
-```text
-[
-  swing_cmd_velocity,
-  boom_cmd_velocity,
-  arm_cmd_velocity,
-  bucket_cmd_velocity
-]
-```
-
-这不是 6 维履带动作。当前 runtime 没有记录：
-
-```text
-track_left_velocity
-track_right_velocity
-```
-
-如果后续要兼容 6 维 LeRobot action，可以在 export 阶段补成：
-
-```text
-[0, 0, swing_cmd_velocity, boom_cmd_velocity, arm_cmd_velocity, bucket_cmd_velocity]
-```
-
-但原始 dataset 不应伪造履带运动。
-
-### `sand`
-
-旧 `sand` 已包含：
-
-```text
-available
-n
-pile
-bucket
-bucket_from_pile
-bucket_from_initial
-bin
-bin_from_pile
-bin_from_initial
-spill_from_pile
-spill_from_initial
-source_tracking
-bucket_from_pile_mass
-bin_from_pile_mass
-spill_from_pile_mass
-```
-
-可用于构造：
-
-```text
-bucket_load
-bin_transfer
-spill_ratio
-material_progress
-```
-
-### `env`
-
-旧 `env` 已包含：
-
-```text
-dig_target
-sand_surface_z
-sand_surface_source
-local_height_patch
-soil
-unload_landing
-unload_release
-bin_center
-bin_half_size
-bin_z_range
-bin_aabb
-rigid_obstacle_count
-```
-
-### `contact`
-
-旧 `contact` 已包含：
-
-```text
-bucket_soil_phase
-bucket_has_pile_sand
-bucket_has_any_sand
-bin_has_pile_sand
-spill_from_pile
-bucket_rigid_overlap
-```
-
-### `cost`
-
-旧 `cost` 已包含：
-
-```text
-joint_error_max_deg
-joint_error_l2_rad
-action_l2
-speed_l2
-accel_l2
-jerk_l2
-command_accel_l2
-energy_proxy
-clearance_to_rigid_m
-spill_ratio_instant
-bucket_from_pile
-spill_from_pile
-```
-
-## 3. 旧 run 缺失或不可用的数据
-
-旧 run 缺失：
-
-```text
-task
-observation.state
-observation.images.camera
-observation.images.cameraleft
-observation.images.cameraright
-observation.camera
-camera_config.json
-episode_xxxxxx/images/
-```
-
-旧 run 不可用：
-
-```text
-observation.effort
-joint torque
-hydraulic pressure
-track_left_velocity
-track_right_velocity
-depth image
-semantic segmentation
-camera intrinsics/extrinsics
-```
-
-说明：
-
-- `obs.state` 存在，但不是 LeRobot 风格的 `observation.state` 字段名。
-- 旧数据没有图像文件，也没有 camera pose，因此不能回填真实 camera observation。
-- effort/force/hydraulic pressure 当前 runtime 没有可靠读取接口，不能伪造。
-
-旧 run schema 检查结果示例：
-
-```text
-samples_scanned: 40
-obs.state: present
-action: present
-sand: present
-env: present
-task: missing
-observation.state: missing
-observation.images.camera: missing
-observation.images.cameraleft: missing
-observation.images.cameraright: missing
-observation.camera: missing
-```
-
-## 4. 新代码会新增的数据
-
-新 run 的 schema：
-
-```text
-schema: excavator_auto_state_action_v4
-trajectory_format: compact_jsonl_v5
-camera_schema: excavator_camera_observation_v1
-```
-
-每帧新增：
-
-```text
-task
-observation.state
-observation.images.camera
-observation.images.cameraleft
-observation.images.cameraright
-observation.camera
-```
-
-### `task`
-
-每帧写入：
-
-```text
-"Dig soil from the marked area and dump it into the target container."
-```
-
-### `observation.state`
-
-`observation.state` 是 `obs.state` 的 LeRobot 风格 alias，仍是 14 维：
-
-```text
-[
-  base_x,
-  base_y,
-  base_yaw,
-  swing,
-  boom,
-  arm,
-  bucket,
-  bucket_load_estimate,
-  bucket_tip_x,
-  bucket_tip_y,
-  bucket_tip_z,
-  bucket_load_x,
-  bucket_load_y,
-  bucket_load_z
-]
-```
-
-### `observation.images.*`
-
-新 run 每帧会尝试写相对路径：
-
-```json
-{
-  "observation.images.camera": "images/camera/000000.png",
-  "observation.images.cameraleft": "images/cameraleft/000000.png",
-  "observation.images.cameraright": "images/cameraright/000000.png"
-}
-```
-
-如果 PIL 不可用，会 fallback 为：
-
-```text
-.ppm
-```
-
-### Camera views
-
-```text
-camera       main excavator camera
-cameraleft   left / bucket-focused camera
-cameraright  right / third-person camera
-```
-
-### `observation.camera`
-
-每帧包含：
-
-```json
-{
-  "schema": "excavator_camera_observation_v1",
-  "available": true,
-  "frame_index": 0,
-  "image_format": "png",
-  "resolution": [256, 256],
-  "views": {
-    "camera": {
-      "available": true,
-      "path": "images/camera/000000.png",
-      "shape": [240, 320, 3],
-      "dtype": "uint8",
-      "format": "png",
-      "prim_path": "...",
-      "pose": {
-        "available": true,
-        "position": [x, y, z],
-        "world_transform": [[...], [...], [...], [...]]
-      }
-    }
-  }
-}
-```
-
-### New run-level files
-
-新 run 会新增：
-
-```text
-camera_config.json
-```
-
-`run_meta.json` 和每个 `episode_xxxxxx/meta.json` 也会新增：
-
-```text
-camera_observations
-lerobot_schema_notes
-trajectory_fields_added_v4
-```
-
-## 5. 新数据仍然不可用的字段
-
-新代码仍不写：
-
-```text
-observation.effort
-joint torque
-hydraulic pressure
-depth image
-semantic segmentation
-true mobile-base track action
-```
-
-原因：
-
-- 当前 runtime 没有可靠 effort/hydraulic pressure 读取接口。
-- 当前 auto collect 使用 fixed-base 挖掘机，上车 `swing/boom/arm/bucket` 是主要动作。
-- RGB camera 已加入，但 depth/segmentation 需要单独接 Isaac render product / annotator。
-
-## 6. 如何读取 Auto Dataset
-
-### 使用内置分析工具
-
-检查最新 run：
-
-```powershell
-D:\450\apps\isaacsim\kit\python\python.exe excavator_dataset_tools.py --latest --analysis --compact --no-timeline
-```
-
-生成 HTML 图表：
-
-```powershell
-D:\450\apps\isaacsim\kit\python\python.exe excavator_dataset_tools.py --latest --plots
-```
-
-打开：
-
-```text
-excavator_auto_dataset/<latest_run>/analysis_plots/report.html
-```
-
-### Python 读取 index 和 trajectory
-
-```python
-from pathlib import Path
-import json
-
-run_dir = Path(r"D:\450\assets\usd\URDF_real3\excavator_auto_dataset\run_20260624_050735")
-
-def read_jsonl(path):
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                yield json.loads(line)
-
-episodes = list(read_jsonl(run_dir / "trainable_episodes.jsonl"))
-row = episodes[0]
-
-trajectory_path = Path(row["trajectory"])
-episode_dir = trajectory_path.parent
-
-for sample in read_jsonl(trajectory_path):
-    state = sample.get("observation.state") or sample.get("obs.state")
-    action = sample["action"]
-    task = sample.get("task", "Dig soil from the marked area and dump it into the target container.")
-
-    camera_rel = sample.get("observation.images.camera")
-    camera_path = episode_dir / camera_rel if camera_rel else None
-
-    print(sample["i"], sample["phase"], len(state), len(action), camera_path)
-    break
-```
-
-### 读取图像为 Tensor
-
-```python
-from pathlib import Path
-import json
-import torch
-from PIL import Image
-import numpy as np
-
-def image_to_tensor(path):
-    img = Image.open(path).convert("RGB")
-    arr = np.asarray(img, dtype=np.uint8)
-    x = torch.from_numpy(arr).permute(2, 0, 1).float() / 255.0
-    return x
-
-sample = next(read_jsonl(trajectory_path))
-camera_rel = sample.get("observation.images.camera")
-
-if camera_rel:
-    image = image_to_tensor(episode_dir / camera_rel)
-    print(image.shape)  # [3, H, W]
-```
-
-### LeRobot-style 映射建议
-
-第一版可映射为：
-
-```python
-lerobot_sample = {
-    "observation.state": sample.get("observation.state") or sample.get("obs.state"),
-    "observation.images.camera": camera_tensor,
-    "observation.images.cameraleft": cameraleft_tensor,
-    "observation.images.cameraright": cameraright_tensor,
-    "action": sample["action"],
-    "task": sample.get("task", episode_meta.get("task", "")),
-}
-```
-
-如果下游必须使用 6 维 action：
-
-```python
-action4 = sample["action"]
-action6 = [0.0, 0.0] + action4
-```
-
-但推荐在 dataset metadata 里明确：
-
-```text
-native_action_dim = 4
-native_action_names = [
-  swing_cmd_velocity,
-  boom_cmd_velocity,
-  arm_cmd_velocity,
-  bucket_cmd_velocity
-]
-```
-
-## 7. Clean Training Export Subfolder
-
-Raw auto-collection runs keep all debug files in place. Training-ready data should be
-generated into a separate subfolder:
-
-```text
-run_xxxxxxxx/
-  episode_000001/
-  episode_000002/
-  trainable_episodes.jsonl
-  summary.json
-  ...
-  lerobot_export/
+run_20260628_052305/
+  lerobot_v3/
     manifest.json
     README.md
-    meta/
-      info.json
-      tasks.jsonl
-      episodes.jsonl
-      episodes_stats.jsonl
-    data/
-      chunk-000/
-        file-000.parquet
-        file-000.jsonl
-    videos/
-      chunk-000/
-        observation.images.camera/
-          file-000.mp4
-        observation.images.cameraleft/
-          file-000.mp4
-        observation.images.cameraright/
-          file-000.mp4
+    data/chunk-000/file-000.parquet
+    meta/info.json
+    meta/stats.json
+    meta/tasks.parquet
+    meta/episodes/chunk-000/file-000.parquet
+    videos/observation.images.0/chunk-000/file-000.mp4
+    videos/observation.images.1/chunk-000/file-000.mp4
+    videos/observation.images.2/chunk-000/file-000.mp4
 ```
 
-Generate it with:
+Export manifest says:
+
+```text
+standard_lerobot_ready : true
+state_action_ready     : true
+effort_available       : true
+vla_training_ready     : true
+fps                    : 10
+total_frames           : 20420
+total_episodes         : 99
+video frames/view      : 20420
+video shape            : [256, 256, 3]
+```
+
+Two raw samples were skipped because the first two frames of episode 0 had missing camera files. The exported parquet and all three videos are aligned at 20420 frames.
+
+## 2. Raw Auto Dataset Structure
+
+Each run contains raw debug and training files:
+
+```text
+run_YYYYMMDD_HHMMSS/
+  run_meta.json
+  summary.json
+  sand_config.json
+  auto_dataset_config.json
+  planner_config.json
+  quality_gate_config.json
+  camera_config.json
+  episodes.jsonl
+  successful_episodes.jsonl
+  trainable_episodes.jsonl
+  rejected_episodes.jsonl
+  failed_episodes.jsonl
+  diagnostic_episodes.jsonl
+  planning_diagnostics.jsonl
+  segment_dig.jsonl
+  segment_dig_secure.jsonl
+  segment_lift_carry.jsonl
+  segment_unload.jsonl
+  debug_timeline.jsonl
+  episode_000001/
+    trajectory.jsonl
+    events.jsonl
+    sand_metrics.jsonl
+    meta.json
+    plan_debug.json
+    score.json
+    images/
+      0/
+      1/
+      2/
+```
+
+The raw folder intentionally keeps debug-heavy files. The clean VLA/LeRobot training data is only inside `lerobot_v3/`.
+
+## 3. Current LeRobot v3 Export Schema
+
+The exported parquet columns are:
+
+```text
+index
+episode_index
+frame_index
+timestamp
+task_index
+observation.state
+action
+observation.effort
+```
+
+Image observations are stored as videos, not parquet arrays:
+
+```text
+observation.images.0 -> videos/observation.images.0/chunk-000/file-000.mp4
+observation.images.1 -> videos/observation.images.1/chunk-000/file-000.mp4
+observation.images.2 -> videos/observation.images.2/chunk-000/file-000.mp4
+```
+
+The current three cameras are:
+
+```text
+0 : /World/URDF_real3/arm_link/Camera_0
+1 : /World/URDF_real3/swing_link/Camera_1
+2 : /World/URDF_real3/swing_link/Camera_2
+```
+
+### 3.1 `observation.state`
+
+Current state shape:
+
+```text
+observation.state: [14]
+```
+
+Current meaning:
+
+```text
+[
+  base_x,
+  base_y,
+  base_yaw,
+  swing_angle,
+  boom_angle,
+  arm_angle,
+  bucket_angle,
+  bucket_load,
+  bucket_tip_x,
+  bucket_tip_y,
+  bucket_tip_z,
+  bucket_load_x,
+  bucket_load_y,
+  bucket_load_z
+]
+```
+
+For the latest export:
+
+```text
+bucket_load state index : 7
+bucket_load range       : 0 to 4055
+base_x/base_y/base_yaw  : fixed-base values; mostly constant
+```
+
+### 3.2 `action`
+
+Current action shape:
+
+```text
+action: [4]
+```
+
+Current meaning:
+
+```text
+[
+  swing_cmd_velocity,
+  boom_cmd_velocity,
+  arm_cmd_velocity,
+  bucket_cmd_velocity
+]
+```
+
+There is no real tracked-base action in the current fixed-base auto collection. Do not fabricate `track_left_velocity` or `track_right_velocity` in the raw dataset. If a downstream model requires a 6D action, add a documented adapter layer:
+
+```text
+[0, 0, swing, boom, arm, bucket]
+```
+
+### 3.3 `observation.effort`
+
+Current effort shape:
+
+```text
+observation.effort: [4]
+```
+
+The latest run has non-empty effort values. These are exported as real runtime readings, not invented placeholders. Their scale is large and should be normalized by `meta/stats.json` during training.
+
+### 3.4 Image Stats
+
+`meta/stats.json` contains visual stats entries for all three video keys:
+
+```text
+observation.images.0
+observation.images.1
+observation.images.2
+```
+
+These use identity/ImageNet-style visual normalization values so LeRobot/SmolVLA loaders can find expected keys. The images themselves are stored in mp4 videos.
+
+## 4. Bucket Load Volume and Sand Count
+
+Current bucket load volume source:
+
+```text
+/World/URDF_real3/bucket_link/bucket_cut/node_/mesh_
+```
+
+Current mode:
+
+```text
+mesh_authored_closed_cavity
+```
+
+Latest logs show:
+
+```text
+volume_source=mesh_authored_closed_cavity:/World/URDF_real3/bucket_link/bucket_cut/node_/mesh_;
+meshes=1;
+vertices=120;
+faces=40;
+edges=120;
+cap_faces=0
+```
+
+Important interpretation:
+
+- The runtime no longer generates artificial cap faces.
+- `cap_faces=0` means the previous boundary-fill logic is disabled.
+- `edges=120` comes from the authored USD mesh triangles as read by the runtime.
+- Blender may show the source object as 22 vertices / 33 edges / 13 faces / 40 triangles, while USD/runtime reads 120 vertices and 40 triangle faces because vertices may be split per triangle/attribute boundary.
+
+Current bucket count path:
+
+```text
+particle snapshot
+  -> bucket spatial AABB/grid prefilter
+  -> transform candidates into bucket_link local
+  -> point-in-authored-bucket-volume mesh test
+  -> bucket_from_pile
+```
+
+The value used in `observation.state[7]` follows this bucket count estimate.
+
+## 5. Latest Quality Analysis
+
+From 200 attempts:
+
+```text
+trainable : 99
+rejected  : 97
+failed    : 4
+```
+
+Trainable quality:
+
+```text
+score avg                         : 61.82
+score min/max                     : 48.87 / 73.62
+max_bucket_from_pile avg          : 2845
+lift_bucket_from_pile avg         : 2834
+final_bin_from_pile avg           : 774
+spill_ratio avg                   : 0.719
+freeze_count avg                  : 0
+```
+
+All attempts:
+
+```text
+score avg                         : 46.96
+max_bucket_from_pile avg          : 2563
+lift_bucket_from_pile avg         : 1497
+final_bin_from_pile avg           : 741
+final_spill_from_pile avg         : 28188
+spill_ratio avg                   : 0.805
+```
+
+Main warnings:
+
+```text
+quality_warning/high_spill_ratio : 153
+quality_warning/score_low        : 120
+```
+
+Interpretation:
+
+- The authored bucket mesh restored nonzero bucket load counts.
+- The collection can produce trainable episodes.
+- The major remaining quality issue is transfer efficiency into the bin and high spill.
+- The trainable threshold currently allows some episodes with high spill as long as they complete the full chain.
+
+## 6. Latest Failure Analysis
+
+Top rejection/failure reasons:
+
+```text
+planning_failed/staged_unload_dump_pose: best IK error too high: planar=1.128 m : 47
+planning_failed/staged_unload_dump_pose: best IK error too high: planar=0.499 m : 16
+execution_failed/freeze_detected / approach_contact bucket stall                 : ~31
+quality_rejected/low_final_bin_particles:0                                      : 24
+```
+
+Interpretation:
+
+1. Unload pose generation is still too often choosing targets that are hard or impossible for IK.
+2. Some approach-contact poses still push the bucket into a physical stall.
+3. Low final bin count can be a real physics outcome, but it is also affected by unload target quality and bin reachability.
+
+## 7. Runtime Cost Analysis
+
+The latest profile shows the largest inclusive costs:
+
+```text
+dataset_record_sample               total 1836.9s  count 58680  avg 31.30ms
+dataset_record_sample.features       total  862.2s  count 32609  avg 26.44ms
+dataset_metrics_frame.bucket_load    total  773.2s  count 66330  avg 11.66ms
+dataset_record_sample.particle_bucket total 741.2s  count 32609  avg 22.73ms
+dataset_record_sample.features.env   total  736.2s  count 32609  avg 22.58ms
+dataset_metrics_frame.snapshot       total  716.6s  count 66330  avg 10.80ms
+path_obstacle_check                  total  660.8s  count 20985  avg 31.49ms
+bucket_load_fast_current             total  652.1s  count 66330  avg  9.83ms
+sand_metrics_current                 total  645.3s  count 15409  avg 41.88ms
+build_dig_plan_from_current_target   total  643.0s  count   200  avg  3.22s
+path_segment_check                   total  327.2s  count 12537  avg 26.10ms
+find_clearance_route                 total  178.2s  count   436  avg 408.8ms
+dataset_save_rgb_image               total   87.9s  count 97821  avg 0.90ms
+dataset_capture_camera_observations  total   84.5s  count 32609  avg 2.59ms
+```
+
+### 7.1 Camera is not the bottleneck
+
+Camera capture and image write are not the main bottleneck:
+
+```text
+camera capture avg : 2.59ms/sample
+image save avg     : 0.90ms/image
+```
+
+The expensive parts are particle/sand metrics, environment feature generation, collision/path checks, and planning.
+
+### 7.2 Dataset sampling is now the largest total cost
+
+`dataset_record_sample` dominates because it runs tens of thousands of times. Its expensive subspans are:
+
+```text
+particle_bucket : ~22.73ms/sample
+features.env    : ~22.58ms/sample
+camera          : ~2.62ms/sample
+```
+
+This means optimizing sand metrics and environment feature caching will matter more than optimizing image encoding.
+
+### 7.3 Bucket load count remains expensive
+
+Bucket load count is called very often:
+
+```text
+bucket_load_fast_current count : 66330
+avg                           : 9.83ms
+dataset_metrics_frame.bucket_load avg: 11.66ms
+```
+
+Spatial grid is enabled and effective:
+
+```text
+bucket_load_spatial.enabled              : true
+bucket_load_spatial.hits                 : 66330
+bucket_load_spatial.misses               : 0
+bucket_load_spatial.fallbacks            : 0
+dataset_metrics_frame_hits               : 1941
+dataset_metrics_frame_misses             : 66330
+```
+
+But the number of calls is high, so total cost is still large.
+
+### 7.4 Planning early accept is working
+
+The planner no longer blindly consumes 10s per plan.
+
+Latest plan summary:
+
+```text
+budget_seconds       : 10.0
+candidate_count      : 10
+evaluated            : 1
+accepted_plan_ms     : 3348.94
+early_accept         : true
+early_accept_reason  : staged_prefix_ready:pull_exit_cut
+elapsed_ms           : 3348.95
+timeout              : false
+```
+
+This is a major improvement compared with earlier fixed 10s planning. Remaining planning cost is still meaningful because 200 attempts call it 200 times.
+
+### 7.5 Path cache is connected but hit rate is still limited
+
+Path cache telemetry:
+
+```text
+path_obstacle_invocations : 20985
+path_obstacle_hits        : 3607
+path_obstacle_misses      : 17378
+hit rate                  : ~17.2%
+
+path_segment_invocations  : 12537
+path_segment_hits         : 3765
+path_segment_misses       : 8772
+hit rate                  : ~30.0%
+
+predicted_segment_hits    : 9000
+predicted_segment_misses  : 92811
+```
+
+Interpretation:
+
+- The cache is now actually being queried.
+- The hit rate is not high enough.
+- Quantized keying and coarser equivalence classes should still help.
+- `path_obstacle_entries=0` likely means the entry counter is not representing the active backing store, because hits/misses/puts are nonzero.
+
+## 8. Optimization Priorities
+
+### Priority 1: Reduce unnecessary full sand metrics
+
+Requirement alignment:
+
+- During motion, the dataset mainly needs bucket load.
+- Final scoring needs final unload bin count.
+- Full pile/bin/spill metrics do not need to run every sample.
+
+Recommended changes:
+
+1. Keep `bucket_from_pile` per recorded sample.
+2. Compute full `sand_metrics_current` only at phase gates:
+   - after_cut
+   - after_secure_load
+   - after_lift_carry
+   - after_unload_settle
+   - final score
+3. During normal per-frame recording, avoid global pile/bin/spill scans.
+4. Reuse the same particle snapshot and transformed bucket-local candidate set for all same-frame consumers.
+
+Expected benefit:
+
+- Reduces `sand_metrics_current`, `dataset_metrics_frame.snapshot`, and `dataset_record_sample.particle_bucket` total cost.
+- This should be the highest-value optimization because these costs dominate total runtime.
+
+### Priority 2: Cache environment features per frame/stage
+
+`dataset_record_sample.features.env` costs ~736s total. Many fields are static or slowly changing:
+
+```text
+dig target
+unload bin center/half size/z range
+rigid obstacle count
+planner context
+local sand height patch, if not needed every frame
+```
+
+Recommended changes:
+
+1. Split env features into:
+   - static per run
+   - static per episode
+   - dynamic per frame
+2. Store static/per-episode env data once in episode meta.
+3. For every frame, write only a compact reference plus truly dynamic values.
+
+Expected benefit:
+
+- Reduces per-sample JSON construction and repeated expensive environment queries.
+- Reduces raw trajectory size.
+
+### Priority 3: Improve bucket mesh inside test cost
+
+Current bucket volume uses authored mesh faces, which is correct for geometry. Cost can still improve:
+
+1. Precompute triangulated mesh once per bucket volume cache version.
+2. Precompute triangle normals/edges for point-in-mesh.
+3. Vectorize ray intersections over candidate points instead of looping Python point/triangle operations.
+4. Keep the spatial AABB/grid prefilter.
+5. Only rebuild mesh cache when:
+   - mesh source changes
+   - stage reloads
+   - bucket link changes
+
+Expected benefit:
+
+- Reduces `bucket_load_fast_current` and `dataset_metrics_frame.bucket_load`.
+- Keeps the same authored mesh semantics.
+
+### Priority 4: Improve path collision cache hit rate
+
+Current hit rate:
+
+```text
+path_obstacle_check ~17%
+path_segment_check  ~30%
+```
+
+Recommended changes:
+
+1. Quantize joint states in cache key:
+   - start with 0.25deg or 0.5deg
+   - include obstacle snapshot version
+   - include mode and relevant clearance margins
+2. Normalize equivalent labels so the same geometry check does not miss due to debug labels.
+3. Cache negative results as well as positive results.
+4. Batch all samples in a path segment into a single numpy collision check.
+5. Keep exact recheck near collision margins to avoid unsafe false positives.
+
+Expected benefit:
+
+- Reduces `path_obstacle_check` and `path_segment_check` totals.
+- Directly improves planning throughput without changing behavior.
+
+### Priority 5: Unload pose reachability and target selection
+
+Failures are dominated by unload IK errors:
+
+```text
+best IK error too high: planar=1.128m
+best IK error too high: planar=0.499m
+```
+
+Recommended changes:
+
+1. Add stronger fail-fast before route planning if unload target is not IK-reachable.
+2. Cache unload reachability by bin target cell and carry/dump posture class.
+3. Prefer central high release targets that are reachable with positive margin.
+4. If several targets are reachable, choose the one with:
+   - lower IK error
+   - higher wall clearance
+   - lower expected drift outside bin
+
+Expected benefit:
+
+- Reduces rejected attempts.
+- Reduces wasted route planning on impossible unload goals.
+
+### Priority 6: Approach-contact stall reduction
+
+Many non-trainable episodes freeze during approach contact.
+
+Recommended changes:
+
+1. Detect near-ground/bucket-penetration risk earlier.
+2. Slightly lift/uncurl before pushing toward contact if bucket is already constrained.
+3. Add a softer approach trajectory around the last contact segment.
+4. Do not force bucket motion through hard physical resistance.
+
+Expected benefit:
+
+- Reduces `freeze_detected` and `path_deviation` rejections.
+
+## 9. Debug/Profile Mode Guidance
+
+The latest run produced:
+
+```text
+debug_timeline.jsonl: ~160 MB
+```
+
+For performance runs:
+
+- Use quiet or normal mode.
+- Disable detailed profile unless diagnosing costs.
+- Keep Calc Viz off unless inspecting geometry.
+- Keep camera export enabled only if producing VLA data.
+
+For optimization runs:
+
+- Use profile mode for short runs only.
+- Keep `PLAN_BUILD_SUMMARY`, path cache counters, and dataset exclusive spans.
+- Avoid writing huge debug timelines for 99+ episode collection unless needed.
+
+## 10. Commands to Inspect the Latest Dataset
+
+Read summary:
 
 ```powershell
-python excavator_dataset_tools.py excavator_auto_dataset/run_xxxxxxxx --export-lerobot --export-overwrite
+D:\450\apps\isaacsim\python.bat - <<'PY'
+import json
+from pathlib import Path
+root = Path(r"D:\450\assets\usd\URDF_real3\excavator_auto_dataset\run_20260628_052305")
+summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
+print(summary["requested"], summary["attempts"], summary["trainable"])
+print(summary["debug_profile_summary"].keys())
+PY
 ```
 
-Use the newest run:
+Read LeRobot parquet:
 
 ```powershell
-python excavator_dataset_tools.py --latest --root excavator_auto_dataset --export-lerobot --export-overwrite
+D:\450\conda\envs\isaaclab_py311\python.exe - <<'PY'
+from pathlib import Path
+import pandas as pd
+root = Path(r"D:\450\assets\usd\URDF_real3\excavator_auto_dataset\run_20260628_052305\lerobot_v3")
+df = pd.read_parquet(root / "data/chunk-000/file-000.parquet")
+print(len(df), df.columns.tolist())
+print(df["episode_index"].nunique())
+PY
 ```
 
-For a hard VLA-readiness check:
+Generate analysis plots:
 
 ```powershell
-python excavator_dataset_tools.py --latest --root excavator_auto_dataset --export-lerobot --export-overwrite --export-require-vla
+D:\450\conda\envs\isaaclab_py311\python.exe excavator_dataset_tools.py --latest --root excavator_auto_dataset --plots
 ```
 
-Important status fields:
+Export/regenerate LeRobot v3:
 
-- `manifest.json.standard_lerobot_ready`: parquet plus required video/image storage is available.
-- `manifest.json.state_action_ready`: state/action parquet is available.
-- `manifest.json.vla_training_ready`: image + state + action + task are available for VLA-style training.
+```powershell
+D:\450\conda\envs\isaaclab_py311\python.exe excavator_dataset_tools.py --latest --root excavator_auto_dataset --export-lerobot --export-overwrite
+```
 
-If `vla_training_ready=false`, do not send the folder to SmolVLA training yet. Usually this means
-the run is old and has no camera frames, or the local Python environment is missing `pyarrow` or
-a video encoder. The raw debug data remains untouched, so the export folder can be deleted and
-regenerated at any time.
+## 11. Current Technical Assessment
 
-## 8. 快速结论
+The dataset schema is now suitable for VLA training:
 
-旧数据：
+- state/action are aligned
+- three camera videos exist
+- effort exists
+- task metadata exists
+- stats include visual keys
+- clean LeRobot v3 subfolder exists
 
-- 有 state/action/sand/env/contact/cost。
-- 没有 camera image。
-- 没有 effort/force/hydraulic pressure。
-- 没有 LeRobot 风格 `observation.state` 字段名，但可以从 `obs.state` 直接映射。
+The main remaining problems are not schema-related. They are:
 
-新数据：
+1. High per-sample sand/bucket metrics cost.
+2. High path collision checking cost.
+3. Unload IK target failures.
+4. Approach-contact physical stalls.
+5. High spill ratio and low final transfer efficiency.
 
-- 保留所有旧字段。
-- 新增 `task`。
-- 新增 `observation.state`。
-- 新增 camera/cameraleft/cameraright RGB image path。
-- 新增 camera metadata 和 pose。
-- 新增 `camera_config.json`。
-- effort 仍不可用，必须后续接入真实传感/仿真接口。
+Recommended next engineering step:
+
+```text
+Optimize the data and planning computation path first:
+  1. make per-sample recording bucket-only
+  2. move full bin/spill metrics to phase/final gates
+  3. precompute/vectorize authored bucket mesh inside test
+  4. improve path collision cache quantization and batching
+  5. add unload reachability target cache/fail-fast
+```
+
+This keeps behavior and dataset schema stable while reducing runtime cost.

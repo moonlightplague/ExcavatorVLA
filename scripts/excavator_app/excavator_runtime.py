@@ -6406,7 +6406,7 @@ def sand_config_snapshot():
         "sand_bucket_load_volume": {
             "enabled": bool(SAND_BUCKET_LOAD_VOLUME_ENABLED),
             "mesh_path": bucket_load_volume_source_path(),
-            "mode": "mesh_boundary_capped_closed_cavity",
+            "mode": "mesh_authored_closed_cavity",
             "mesh_backed_inside_test": True,
             "bucket_vol_ui": "closed_count_volume_calc_viz",
         },
@@ -7453,79 +7453,19 @@ def bucket_load_source_mesh_local(path):
     return (vertices, faces), used_paths, failures
 
 
-def boundary_edges_from_faces(faces):
-    edge_counts = {}
-    for face in faces or []:
-        try:
-            ids = [int(i) for i in face]
-        except Exception:
-            continue
-        if len(ids) < 3:
-            continue
-        for idx, a in enumerate(ids):
-            b = ids[(idx + 1) % len(ids)]
-            if a == b:
-                continue
-            key = (min(int(a), int(b)), max(int(a), int(b)))
-            edge_counts[key] = int(edge_counts.get(key, 0)) + 1
-    return [edge for edge, count in edge_counts.items() if int(count) == 1]
-
-
-def connected_components_from_edges(edges):
-    adjacency = {}
-    for a, b in edges or []:
-        adjacency.setdefault(int(a), set()).add(int(b))
-        adjacency.setdefault(int(b), set()).add(int(a))
-    components = []
-    seen = set()
-    for start in list(adjacency.keys()):
-        if start in seen:
-            continue
-        stack = [start]
-        seen.add(start)
-        component = []
-        while stack:
-            node = stack.pop()
-            component.append(node)
-            for nxt in adjacency.get(node, []):
-                if nxt not in seen:
-                    seen.add(nxt)
-                    stack.append(nxt)
-        if len(component) >= 3:
-            components.append(component)
-    return components
-
-
-def close_mesh_boundary_faces(vertices, faces, source_path="", used_paths=None):
+def authored_bucket_volume_faces(vertices, faces, source_path="", used_paths=None):
     verts = np.asarray(vertices, dtype=np.float32)
     if verts.ndim != 2 or verts.shape[1] < 3 or len(verts) < 4 or not faces:
         return None
     verts = verts[:, :3].astype(np.float32, copy=False)
     out_faces = [[int(i) for i in face] for face in faces if len(face) >= 3]
-    base_face_count = len(out_faces)
-    boundary_edges = boundary_edges_from_faces(out_faces)
     try:
-        cap_vertices = []
-        cap_faces = []
-        for component in connected_components_from_edges(boundary_edges):
-            comp = [idx for idx in component if 0 <= int(idx) < len(verts)]
-            if len(comp) < 3:
-                continue
-            centroid = np.mean(verts[np.asarray(comp, dtype=np.int32)], axis=0).astype(np.float32)
-            centroid_idx = len(verts) + len(cap_vertices)
-            cap_vertices.append(centroid)
-            comp_set = set(int(i) for i in comp)
-            for a, b in boundary_edges:
-                if int(a) in comp_set and int(b) in comp_set:
-                    cap_faces.append([int(a), int(b), int(centroid_idx)])
-        if cap_vertices:
-            verts = np.vstack([verts, np.asarray(cap_vertices, dtype=np.float32).reshape(-1, 3)])
-            out_faces.extend(cap_faces)
+        source_edges = mesh_edge_pairs_from_faces(out_faces)
         used = ",".join(list(used_paths or [])[:3])
         source = (
-            f"mesh_boundary_capped_closed_cavity:{source_path};"
-            f"meshes={len(used_paths or [])};boundary_edges={len(boundary_edges)};"
-            f"cap_faces={len(out_faces) - base_face_count};used={used}"
+            f"mesh_authored_closed_cavity:{source_path};"
+            f"meshes={len(used_paths or [])};vertices={len(verts)};"
+            f"faces={len(out_faces)};edges={len(source_edges)};cap_faces=0;used={used}"
         )
         return verts, out_faces, source
     except Exception:
@@ -7552,9 +7492,9 @@ def bucket_load_volume_authored_mesh_local():
             STATE["bucket_load_volume_mesh_last_failures"] = list(failures or [])[:8]
             continue
         vertices, faces = source_mesh
-        closed = close_mesh_boundary_faces(vertices, faces, source_path=path, used_paths=used_paths)
-        if closed is not None:
-            value = closed
+        authored = authored_bucket_volume_faces(vertices, faces, source_path=path, used_paths=used_paths)
+        if authored is not None:
+            value = authored
             STATE["bucket_load_volume_mesh_last_failures"] = list(failures or [])[:8]
             break
 
@@ -7576,7 +7516,7 @@ def bucket_load_volume_mesh_local():
         return (
             np.zeros((0, 3), dtype=np.float32),
             [],
-            f"mesh_boundary_capped_closed_cavity_unavailable:{source_path}",
+            f"mesh_authored_closed_cavity_unavailable:{source_path}",
         )
     return default_bucket_load_volume_mesh_local()
 
@@ -7764,7 +7704,7 @@ def draw_bucket_sand_count_debug(force=False):
         root_prim = UsdGeom.Xform.Define(stage, root).GetPrim()
     set_prim_visibility(root_prim, True)
 
-    volume_source = "mesh_boundary_capped_closed_cavity"
+    _, _, volume_source = bucket_load_volume_mesh_local()
     hide_debug_prim(f"{root}/LoadVolumeMeshProxy")
     hide_debug_prim(f"{root}/LoadVolumeMeshEdges")
     volume_segments = bucket_load_volume_world_segments()

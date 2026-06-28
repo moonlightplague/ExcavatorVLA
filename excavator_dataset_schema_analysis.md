@@ -658,3 +658,433 @@ Optimize the data and planning computation path first:
 ```
 
 This keeps behavior and dataset schema stable while reducing runtime cost.
+
+## 12. Detailed Algorithm-Time Optimization Plan
+
+This section focuses on the user's current constraints:
+
+```text
+Per recorded frame:
+  compute bucket sand only
+
+Phase/final gates:
+  compute unload bin count and spill count
+
+Bucket volume mesh:
+  topology is constant
+  only bucket_link transform changes
+```
+
+These constraints allow a much cleaner and faster algorithm than the current mixed full-metrics path.
+
+### 12.1 Current hot path
+
+Current per-frame dataset recording does this:
+
+```text
+dataset_record_sample()
+  -> dataset_metrics_frame_bundle(need_full=False)
+    -> dataset_particle_snapshot(build_bucket_index=True)
+      -> get_sand_snapshot()
+        -> sand_particle_positions()
+        -> sand_settle_status()
+        -> filter_settled_sand_particles()
+        -> optional spatial index
+      -> build bucket spatial index
+    -> bucket_load_fast_current(points=snapshot)
+      -> bucket_load_volume_world_aabb()
+      -> bucket_spatial_aabb_indices()
+      -> project candidate points to bucket_link local
+      -> bucket_load_volume_mask_from_local()
+      -> initial pile mask check
+  -> optional diagnostic env/contact/cost fields
+  -> camera capture
+  -> jsonl write
+```
+
+The latest profile shows the cost of this design:
+
+```text
+dataset_record_sample                 1836.9s total
+dataset_record_sample.features         862.2s total
+dataset_metrics_frame.bucket_load      773.2s total
+dataset_record_sample.particle_bucket  741.2s total
+dataset_record_sample.features.env     736.2s total
+dataset_metrics_frame.snapshot         716.6s total
+bucket_load_fast_current               652.1s total
+```
+
+The key problem is not one single slow call. It is that per-frame recording still performs too much diagnostic and particle bookkeeping.
+
+### 12.2 First optimization: make per-frame recording bucket-only
+
+The current code already has a `need_full=False` route, but per-frame recording still:
+
+- builds a particle snapshot
+- may build/query a spatial index
+- computes bucket count
+- may record diagnostic env/contact/cost fields
+- writes a separate `sand_metrics.jsonl` row
+
+Recommended runtime policy:
+
+```text
+NORMAL / QUIET data collection:
+  per frame:
+    bucket_count only
+    observation.state
+    action
+    effort
+    camera
+
+  phase gates:
+    after_cut bucket count
+    after_secure_load bucket count
+    after_lift_carry bucket count
+    after_unload_settle full bin/spill count
+    final score full bin/spill count
+
+PROFILE / DEBUG:
+  optionally enable env/contact/cost/full sand diagnostics
+```
+
+This means `DATASET_RECORD_DIAGNOSTIC_FIELDS` should not be enabled by default during production auto collect. In the current code it is `True`, which explains the large `features.env` cost.
+
+Expected win:
+
+```text
+dataset_record_sample.features.env can drop close to zero in production runs.
+trajectory.jsonl becomes smaller.
+debug_timeline pressure decreases.
+```
+
+### 12.3 Second optimization: bucket mesh topology cache
+
+The selected bucket volume mesh is fixed:
+
+```text
+/World/URDF_real3/bucket_link/bucket_cut/node_/mesh_
+```
+
+Only the bucket pose changes. Therefore the following should be built once per stage reload or mesh path change:
+
+```text
+BucketVolumeCache:
+  local_vertices: float32[N,3]
+  faces: int32[M,*]
+  triangles: int32[T,3]
+  triangle_v0: float32[T,3]
+  triangle_e1: float32[T,3]
+  triangle_e2: float32[T,3]
+  triangle_normal or raycast precomputed terms
+  local_aabb_min/max
+  edge_pairs for debug drawing
+```
+
+Current code calls:
+
+```text
+bucket_load_volume_mesh_local()
+triangulate_mesh_faces()
+point_in_closed_mesh()
+```
+
+The triangulation and raycast triangle data should not be recomputed per bucket count. The runtime should only recompute:
+
+```text
+world_aabb = transform 8 local AABB corners by current bucket_link matrix
+world_to_bucket = inverse(bucket_link local-to-world matrix)
+candidate_local = candidate_world @ world_to_bucket
+inside = cached_closed_mesh_contains(candidate_local)
+```
+
+Expected win:
+
+```text
+bucket_load_fast_current avg should fall from ~9.8ms toward low single-digit ms,
+depending on candidate count.
+```
+
+### 12.4 Third optimization: matrix transform instead of repeated USD point transforms
+
+Current `project_points_to_link_local()` computes local axes by calling:
+
+```text
+transform_local_point_to_world(link, [0,0,0])
+transform_local_point_to_world(link, [1,0,0])
+transform_local_point_to_world(link, [0,1,0])
+transform_local_point_to_world(link, [0,0,1])
+```
+
+Then it does dot products with the derived axes.
+
+Because bucket pose changes frame by frame, the correct optimized form is:
+
+```text
+M_bucket_to_world = ComputeLocalToWorldTransform(bucket_link)
+M_world_to_bucket = inverse(M_bucket_to_world)
+candidate_local = transform_points(M_world_to_bucket, candidate_world)
+```
+
+Compute the matrix once per sample or once per physics frame. Do not call multiple USD transform helper functions per bucket count.
+
+Expected win:
+
+```text
+less Python/USD overhead
+less repeated transform calculation
+cleaner correctness because the full transform matrix is used directly
+```
+
+### 12.5 Fourth optimization: particle snapshot lifetime
+
+Current `get_sand_snapshot()` can do more than bucket counting needs:
+
+```text
+sand_particle_positions()
+sand_settle_status()
+filter_settled_sand_particles()
+build_sand_spatial_index()
+```
+
+For bucket-only per-frame count, the minimum required data is:
+
+```text
+points: float32[N,3]
+optional particle source mask
+optional bucket spatial index
+```
+
+Recommended split:
+
+```text
+get_particle_points_snapshot()
+  points only
+  no settle check
+  no settled_points
+  no general sand spatial index
+
+get_full_sand_snapshot()
+  current full behavior
+  only for phase/final diagnostics
+```
+
+Expected win:
+
+```text
+dataset_metrics_frame.snapshot avg can drop from ~10.8ms.
+```
+
+### 12.6 Fifth optimization: bucket spatial index reuse
+
+Current bucket spatial index is built from all particles and hit every time:
+
+```text
+bucket_load_spatial.hits   : 66330
+misses                     : 0
+fallbacks                  : 0
+```
+
+This proves the spatial path is working, but total call count is high.
+
+Potential improvement:
+
+```text
+Per physics frame:
+  read particle points once
+  build/reuse bucket spatial grid once
+  compute bucket count once
+  share result with:
+    dataset_record_sample
+    quality tracker
+    phase metrics if same frame
+    debug timeline if needed
+```
+
+The current frame cache hit count is small relative to misses:
+
+```text
+dataset_metrics_frame_hits   : 1941
+dataset_metrics_frame_misses : 66330
+```
+
+This indicates most consumers are still causing a new metrics frame. The cache key may be too strict (`q_sig` plus short time window), or calls happen with slightly different q/labels.
+
+Recommended cache key:
+
+```text
+bucket_metrics_cache_key = (
+  particle_snapshot_id or simulation_frame_index,
+  bucket_link_transform_quantized,
+  bucket_volume_cache_version
+)
+```
+
+Do not include label. Labels do not change geometry.
+
+### 12.7 Sixth optimization: point-in-mesh acceleration
+
+Since the mesh is fixed, there are three possible inside-test levels.
+
+#### Option A: cached triangle raycast
+
+Keep the current point-in-closed-mesh semantics but precompute triangles.
+
+Pros:
+
+- same behavior
+- safest first step
+
+Cons:
+
+- still O(candidate_count * triangle_count)
+
+#### Option B: convex/half-space approximation
+
+If `bucket_cut` is a simple closed convex-ish volume, convert it into planes:
+
+```text
+inside = all(dot(local_point, normal_i) <= offset_i + eps)
+```
+
+Pros:
+
+- very fast
+- vectorizes perfectly
+
+Cons:
+
+- only safe if volume is convex enough
+- may misclassify concave regions
+
+#### Option C: local voxel/SDF occupancy
+
+Precompute a local voxel occupancy grid inside the bucket volume:
+
+```text
+grid resolution: e.g. 32 x 24 x 24
+precompute inside/outside once
+per point:
+  local -> grid index
+  occupancy lookup
+```
+
+Pros:
+
+- very fast per point
+- works with arbitrary closed mesh
+
+Cons:
+
+- approximate
+- needs careful resolution/margin tuning
+
+Recommended sequence:
+
+```text
+1. cached triangle raycast
+2. benchmark
+3. if still expensive, add optional voxel occupancy backend
+```
+
+### 12.8 Full bin/spill metrics should be event-driven
+
+Current full metrics are still called in several places:
+
+```text
+sand_metrics_current(force=True)
+dataset_metrics_frame_full()
+record_phase_metrics(... need_full=True)
+final scoring
+unload settle
+```
+
+This is correct for phase/final gates. It should not be used per sample.
+
+Recommended gate list:
+
+```text
+after_cut:
+  bucket-only is enough unless debugging
+
+after_secure_load:
+  bucket-only is enough
+
+after_lift_carry:
+  bucket-only is enough
+
+before_unload:
+  bucket-only is enough
+
+after_unload_settle:
+  full bin/spill metrics
+
+episode_final_score:
+  full bin/spill metrics, can reuse after_unload_settle if no sand moved afterward
+```
+
+If final score currently calls full metrics twice, cache by final phase timestamp and reuse.
+
+### 12.9 Practical implementation order
+
+Lowest risk first:
+
+```text
+Step 1:
+  default DATASET_RECORD_DIAGNOSTIC_FIELDS to false for production auto collect
+  keep profile/debug modes able to turn it on
+
+Step 2:
+  add particle-points-only snapshot for bucket count
+  avoid settle/filter/general spatial index in per-frame bucket-only path
+
+Step 3:
+  add BucketVolumeCache with pre-triangulated authored mesh
+  cache edge pairs for debug
+
+Step 4:
+  replace project_points_to_link_local() in bucket load path with one matrix inverse transform
+
+Step 5:
+  cache bucket count per sim frame / particle snapshot / bucket transform
+  remove label from cache key
+
+Step 6:
+  move bin/spill to after_unload_settle and final score only
+  reuse final full metrics
+
+Step 7:
+  if still slow, add voxel/SDF occupancy backend for bucket volume
+```
+
+Expected impact:
+
+```text
+features.env:
+  can be almost eliminated in production data collection
+
+bucket/sand metrics:
+  should drop significantly because full sand scans leave the per-frame path
+
+bucket mesh inside:
+  should drop after precompute + matrix transform
+
+overall:
+  target dataset_record_sample avg can reasonably move from ~31ms toward ~8-15ms
+  without changing the exported LeRobot schema
+```
+
+### 12.10 What not to optimize first
+
+Do not start with camera/video encoding. Latest profile:
+
+```text
+camera capture avg : ~2.6ms/sample
+image save avg     : ~0.9ms/image
+```
+
+This is not the primary bottleneck.
+
+Do not remove bucket count from per-frame samples. It is part of `observation.state[7]` and is useful for VLA training.
+
+Do not fabricate bin/spill per-frame values if they are not computed. Store only bucket count per frame, and use phase/final metadata for bin/spill scoring.

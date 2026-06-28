@@ -5447,7 +5447,12 @@ DATASET_ACTION_NAMES = [
     "bucket_cmd_velocity",
 ]
 
-DATASET_RECORD_DIAGNOSTIC_FIELDS = True
+DATASET_RECORD_DIAGNOSTIC_FIELDS = str(os.environ.get("EXCAVATOR_DATASET_DIAGNOSTIC_FIELDS", "0") or "0").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
 
 DATASET_EFFORT_NAMES = [
     "swing_measured_effort",
@@ -6973,13 +6978,42 @@ async def delayed_startup_sand_reset():
     await reset_sand_site_stably("after_ui_ready")
 
 
+def link_world_transform(link_path):
+    if not link_path:
+        return None
+    prim = get_prim(link_path)
+    if prim is None or not prim.IsValid():
+        return None
+    try:
+        return UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+    except Exception:
+        return None
+
+
+def transform_local_points_to_world(link_path, local_points):
+    pts = np.asarray(local_points, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] < 3 or len(pts) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    mat = link_world_transform(link_path)
+    if mat is None:
+        return None
+    world = []
+    for p in pts[:, :3]:
+        wp = mat.Transform(Gf.Vec3d(float(p[0]), float(p[1]), float(p[2])))
+        world.append([float(wp[0]), float(wp[1]), float(wp[2])])
+    return np.asarray(world, dtype=np.float32)
+
+
 def project_points_to_link_local(points, link_path):
     if points is None or len(points) == 0 or not link_path:
         return None
-    origin = transform_local_point_to_world(link_path, np.array([0.0, 0.0, 0.0], dtype=np.float32))
-    xw = transform_local_point_to_world(link_path, np.array([1.0, 0.0, 0.0], dtype=np.float32))
-    yw = transform_local_point_to_world(link_path, np.array([0.0, 1.0, 0.0], dtype=np.float32))
-    zw = transform_local_point_to_world(link_path, np.array([0.0, 0.0, 1.0], dtype=np.float32))
+    mat = link_world_transform(link_path)
+    if mat is None:
+        return None
+    origin = mat.Transform(Gf.Vec3d(0.0, 0.0, 0.0))
+    xw = mat.Transform(Gf.Vec3d(1.0, 0.0, 0.0))
+    yw = mat.Transform(Gf.Vec3d(0.0, 1.0, 0.0))
+    zw = mat.Transform(Gf.Vec3d(0.0, 0.0, 1.0))
     if origin is None or xw is None or yw is None or zw is None:
         return None
     axes = []
@@ -7532,6 +7566,104 @@ def triangulate_mesh_faces(faces):
     return np.asarray(triangles, dtype=np.int32) if triangles else np.zeros((0, 3), dtype=np.int32)
 
 
+def bucket_load_volume_topology_cache():
+    vertices, faces, source = bucket_load_volume_mesh_local()
+    verts = np.asarray(vertices, dtype=np.float32).reshape(-1, 3)
+    face_count = int(len(faces or []))
+    checksum = (
+        float(np.sum(verts, dtype=np.float64)) if len(verts) else 0.0,
+        float(np.sum(verts * verts, dtype=np.float64)) if len(verts) else 0.0,
+    )
+    key = (str(source), int(len(verts)), face_count, round(checksum[0], 5), round(checksum[1], 5))
+    cache = STATE.get("bucket_load_volume_topology_cache")
+    if isinstance(cache, dict) and cache.get("key") == key:
+        return cache
+
+    triangles = triangulate_mesh_faces(faces)
+    if len(verts) >= 4 and len(triangles) > 0:
+        tri_v0 = verts[triangles[:, 0]]
+        tri_e1 = verts[triangles[:, 1]] - tri_v0
+        tri_e2 = verts[triangles[:, 2]] - tri_v0
+        direction = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        ray_h = np.cross(np.broadcast_to(direction.reshape(1, 3), tri_e2.shape), tri_e2)
+        ray_a = np.einsum("ij,ij->i", tri_e1, ray_h)
+        active = np.abs(ray_a) >= 1.0e-6
+        ray_inv_a = np.zeros(len(ray_a), dtype=np.float32)
+        ray_inv_a[active] = 1.0 / ray_a[active]
+    else:
+        tri_v0 = np.zeros((0, 3), dtype=np.float32)
+        tri_e1 = np.zeros((0, 3), dtype=np.float32)
+        tri_e2 = np.zeros((0, 3), dtype=np.float32)
+        ray_h = np.zeros((0, 3), dtype=np.float32)
+        ray_inv_a = np.zeros(0, dtype=np.float32)
+        active = np.zeros(0, dtype=bool)
+
+    if len(verts) >= 3:
+        local_min = np.min(verts, axis=0).astype(np.float32)
+        local_max = np.max(verts, axis=0).astype(np.float32)
+    else:
+        local_min = None
+        local_max = None
+    edge_pairs = np.asarray(mesh_edge_pairs_from_faces(faces), dtype=np.int32).reshape(-1, 2) if faces else np.zeros((0, 2), dtype=np.int32)
+    cache = {
+        "key": key,
+        "vertices": verts,
+        "faces": faces,
+        "source": str(source),
+        "triangles": triangles,
+        "tri_v0": tri_v0,
+        "tri_e1": tri_e1,
+        "tri_e2": tri_e2,
+        "ray_h": ray_h,
+        "ray_inv_a": ray_inv_a,
+        "ray_active": active,
+        "local_min": local_min,
+        "local_max": local_max,
+        "edge_pairs": edge_pairs,
+    }
+    STATE["bucket_load_volume_topology_cache"] = cache
+    return cache
+
+
+def point_in_closed_mesh_topology(points, topology):
+    pts = np.asarray(points, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] < 3:
+        return np.zeros(0, dtype=bool)
+    if len(pts) == 0:
+        return np.zeros(0, dtype=bool)
+    if not isinstance(topology, dict):
+        return np.zeros(len(pts), dtype=bool)
+    tri_v0 = np.asarray(topology.get("tri_v0"), dtype=np.float32).reshape(-1, 3)
+    tri_e1 = np.asarray(topology.get("tri_e1"), dtype=np.float32).reshape(-1, 3)
+    tri_e2 = np.asarray(topology.get("tri_e2"), dtype=np.float32).reshape(-1, 3)
+    ray_h = np.asarray(topology.get("ray_h"), dtype=np.float32).reshape(-1, 3)
+    ray_inv_a = np.asarray(topology.get("ray_inv_a"), dtype=np.float32).reshape(-1)
+    active = np.asarray(topology.get("ray_active"), dtype=bool).reshape(-1)
+    if len(tri_v0) == 0 or len(active) != len(tri_v0):
+        return np.zeros(len(pts), dtype=bool)
+
+    eps = 1.0e-6
+    direction = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    counts = np.zeros(len(pts), dtype=np.int32)
+    for idx in np.nonzero(active)[0]:
+        v0 = tri_v0[int(idx)]
+        e1 = tri_e1[int(idx)]
+        e2 = tri_e2[int(idx)]
+        h = ray_h[int(idx)]
+        inv_a = float(ray_inv_a[int(idx)])
+        s = pts - v0.reshape(1, 3)
+        u = inv_a * np.einsum("ij,j->i", s, h)
+        mask = (u >= -eps) & (u <= 1.0 + eps)
+        if not np.any(mask):
+            continue
+        q = np.cross(s, e1.reshape(1, 3))
+        v = inv_a * np.einsum("ij,j->i", q, direction)
+        t = inv_a * np.einsum("j,ij->i", e2, q)
+        hit = mask & (v >= -eps) & ((u + v) <= 1.0 + eps) & (t > eps)
+        counts[hit] += 1
+    return (counts % 2) == 1
+
+
 def point_in_closed_mesh(points, vertices, faces):
     pts = np.asarray(points, dtype=np.float32)
     if pts.ndim != 2 or pts.shape[1] < 3:
@@ -7576,11 +7708,12 @@ def bucket_load_volume_mask_from_local(local):
     pts = np.asarray(local, dtype=np.float32)
     if pts.ndim != 2 or pts.shape[1] < 3 or len(pts) == 0:
         return np.zeros(0, dtype=bool)
-    vertices, faces, source = bucket_load_volume_mesh_local()
     try:
-        verts = np.asarray(vertices, dtype=np.float32).reshape(-1, 3)
-        if len(verts) >= 4 and len(triangulate_mesh_faces(faces)) > 0:
-            return point_in_closed_mesh(pts, verts, faces)
+        topology = bucket_load_volume_topology_cache()
+        verts = np.asarray(topology.get("vertices"), dtype=np.float32).reshape(-1, 3)
+        triangles = np.asarray(topology.get("triangles"), dtype=np.int32).reshape(-1, 3)
+        if len(verts) >= 4 and len(triangles) > 0:
+            return point_in_closed_mesh_topology(pts, topology)
     except Exception:
         pass
     return np.zeros(len(pts), dtype=bool)
@@ -7588,15 +7721,17 @@ def bucket_load_volume_mask_from_local(local):
 
 def bucket_load_volume_local_bounds(expand=0.0):
     try:
-        vertices, _, _ = bucket_load_volume_mesh_local()
-        verts = np.asarray(vertices, dtype=np.float32).reshape(-1, 3)
+        topology = bucket_load_volume_topology_cache()
+        mn = topology.get("local_min")
+        mx = topology.get("local_max")
     except Exception:
-        verts = np.zeros((0, 3), dtype=np.float32)
-    if len(verts) < 3:
+        mn = None
+        mx = None
+    if mn is None or mx is None:
         return None, None
     expand = float(expand)
-    mn = np.min(verts, axis=0).astype(np.float32) - expand
-    mx = np.max(verts, axis=0).astype(np.float32) + expand
+    mn = np.asarray(mn, dtype=np.float32).reshape(3) - expand
+    mx = np.asarray(mx, dtype=np.float32).reshape(3) + expand
     return mn, mx
 
 
@@ -7616,45 +7751,21 @@ def bucket_load_volume_world_aabb(expand=0.0):
 def bucket_local_box_world_corners(local_min, local_max):
     if not BUCKET_LINK:
         return None
-    corners = []
-    for local in box_corners_from_min_max(local_min, local_max):
-        p = transform_local_point_to_world(BUCKET_LINK, local)
-        if p is None:
-            return None
-        corners.append(np.array(p, dtype=np.float32).reshape(3))
-    return corners
+    local_corners = np.asarray(box_corners_from_min_max(local_min, local_max), dtype=np.float32).reshape(-1, 3)
+    world = transform_local_points_to_world(BUCKET_LINK, local_corners)
+    if world is None:
+        return None
+    return [np.asarray(p, dtype=np.float32).reshape(3) for p in world]
 
 
 def bucket_load_volume_world_segments():
     if not BUCKET_LINK:
         return None
-    vertices, faces, source = bucket_load_volume_mesh_local()
-    world_vertices = bucket_load_volume_world_vertices(vertices)
+    topology = bucket_load_volume_topology_cache()
+    world_vertices = bucket_load_volume_world_vertices(topology.get("vertices"))
     if world_vertices is None:
         return None
-    edge_cache_key = (str(source), int(len(world_vertices)), int(len(faces or [])))
-    cache = STATE.get("bucket_load_volume_segment_edge_cache")
-    if isinstance(cache, dict) and cache.get("key") == edge_cache_key:
-        edge_pairs = cache.get("edge_pairs")
-    else:
-        pairs = []
-        seen = set()
-        for face in faces or []:
-            idx = [int(i) for i in face]
-            if len(idx) < 2:
-                continue
-            for k, i in enumerate(idx):
-                j = idx[(k + 1) % len(idx)]
-                key = tuple(sorted((int(i), int(j))))
-                if key in seen or i < 0 or j < 0 or i >= len(world_vertices) or j >= len(world_vertices):
-                    continue
-                seen.add(key)
-                pairs.append([int(i), int(j)])
-        edge_pairs = np.asarray(pairs, dtype=np.int32).reshape(-1, 2) if pairs else np.zeros((0, 2), dtype=np.int32)
-        STATE["bucket_load_volume_segment_edge_cache"] = {
-            "key": edge_cache_key,
-            "edge_pairs": edge_pairs,
-        }
+    edge_pairs = np.asarray(topology.get("edge_pairs"), dtype=np.int32).reshape(-1, 2)
     if edge_pairs is None or len(edge_pairs) == 0:
         return []
     segments = [
@@ -7669,13 +7780,7 @@ def bucket_load_volume_world_vertices(vertices=None):
     if not BUCKET_LINK:
         return None
     verts = np.asarray(vertices if vertices is not None else bucket_load_volume_mesh_local()[0], dtype=np.float32).reshape(-1, 3)
-    world = []
-    for local in verts:
-        p = transform_local_point_to_world(BUCKET_LINK, local)
-        if p is None:
-            return None
-        world.append(np.array(p, dtype=np.float32).reshape(3))
-    return np.asarray(world, dtype=np.float32)
+    return transform_local_points_to_world(BUCKET_LINK, verts)
 
 
 def bucket_load_volume_world_mesh():
@@ -9361,7 +9466,7 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False)
         span_t = time.perf_counter()
         phase_features = dataset_phase_features(phase)
         mark_span("dataset_record_sample.features.phase", span_t, threshold_ms=1.0)
-        debug_extra = bool(DATASET_RECORD_DIAGNOSTIC_FIELDS)
+        debug_extra = bool(DATASET_RECORD_DIAGNOSTIC_FIELDS or debug_diagnostics_enabled())
         if debug_extra:
             span_t = time.perf_counter()
             rigid_clearance = dataset_rigid_clearance_summary()

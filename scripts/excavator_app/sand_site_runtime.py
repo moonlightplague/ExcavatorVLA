@@ -160,6 +160,7 @@ UNLOAD_BIN_WALL_THICKNESS = SANDBOX_WALL_THICKNESS
 UNLOAD_BIN_WALL_HEIGHT = SANDBOX_WALL_HEIGHT
 UNLOAD_BIN_FLOOR_THICKNESS = SANDBOX_FLOOR_THICKNESS
 UNLOAD_BIN_DUMP_HEIGHT = 1.45
+UNLOAD_BIN_ENABLED = True
 UNLOAD_BIN_WALL_COLOR = (0.24, 0.27, 0.30)
 UNLOAD_BIN_FLOOR_COLOR = (0.20, 0.22, 0.24)
 SAND_SOURCE_SELECTION_EDGE_MARGIN = 0.10
@@ -200,6 +201,7 @@ builtins._SAND_SITE_STATE = {
     "particle_mass": PARTICLE_MASS,
     "particle_radius": PARTICLE_RADIUS,
     "particle_max_count": PARTICLE_MAX_COUNT,
+    "unload_bin_enabled": UNLOAD_BIN_ENABLED,
     "particle_spacing_xy": PARTICLE_DIGGABLE_SPACING,
     "particle_spacing_z": PARTICLE_LAYER_SPACING_Z,
     "particle_solver_iters": PARTICLE_SOLVER_POSITION_ITERATIONS,
@@ -556,6 +558,7 @@ def update_particle_runtime_state():
     STATE["particle_spacing_z"] = float(PARTICLE_LAYER_SPACING_Z)
     STATE["particle_solver_iters"] = int(PARTICLE_SOLVER_POSITION_ITERATIONS)
     STATE["particle_max_velocity"] = float(PARTICLE_MAX_VELOCITY)
+    STATE["unload_bin_enabled"] = bool(UNLOAD_BIN_ENABLED)
     STATE["particle_contact_offset"] = float(PARTICLE_CONTACT_OFFSET)
     STATE["particle_rest_offset"] = float(PARTICLE_REST_OFFSET)
     STATE["particle_solid_rest_offset"] = float(PARTICLE_SOLID_REST_OFFSET)
@@ -2479,8 +2482,23 @@ def ensure_physics_scene():
     return prim
 
 
+def clear_unload_bin(root=None, announce=False):
+    root = root_path() if root is None else str(root)
+    bin_root = f"{root}/UnloadBin"
+    try:
+        if get_prim(bin_root).IsValid():
+            get_stage().RemovePrim(Sdf.Path(bin_root))
+            if announce:
+                info("Removed unload bin:", bin_root)
+        return True
+    except Exception as e:
+        info("[WARN] clear unload bin failed:", type(e).__name__, e)
+        return False
+
+
 def make_unload_bin(root):
     bin_root = f"{root}/UnloadBin"
+    clear_unload_bin(root)
     UsdGeom.Xform.Define(get_stage(), bin_root)
 
     cx = float(UNLOAD_BIN_CENTER[0])
@@ -2543,6 +2561,114 @@ def make_unload_bin(root):
     )
     info("Unload bin dump point:", np.round(unload_bin_dump_point(), 3))
     return bin_root
+
+
+def set_unload_bin_enabled(enabled, rebuild=False):
+    global UNLOAD_BIN_ENABLED
+    UNLOAD_BIN_ENABLED = bool(enabled)
+    STATE["unload_bin_enabled"] = bool(UNLOAD_BIN_ENABLED)
+    if rebuild:
+        build_sand_site()
+    else:
+        root = root_path()
+        if UNLOAD_BIN_ENABLED:
+            make_unload_bin(root)
+        else:
+            clear_unload_bin(root, announce=True)
+        store_runtime_api()
+        notify_excavator_obstacle_cache_dirty("unload_bin_enabled_changed")
+    update_status(f"Unload bin 4-wall geometry enabled = {UNLOAD_BIN_ENABLED}", force=True)
+    return bool(UNLOAD_BIN_ENABLED)
+
+
+def apply_auto_scene_parameters(
+    sand_center_xy=None,
+    sand_amount_multiplier=None,
+    unload_center_xy=None,
+    unload_bin_enabled=None,
+    rebuild=False,
+):
+    global SAND_CENTER_X, SAND_CENTER_Y, PILE_CENTER_X, PILE_CENTER_Y
+    global WALL_CENTER_X, WALL_CENTER_Y, SAND_SOURCE_SELECTED_PATH, SAND_SOURCE_SELECTED_FACE_COUNT
+    global SAND_SOURCE_TOTAL_PROJECTED_FACE_COUNT, SAND_SOURCE_RAW_FACE_POLYGONS_XY, SAND_SOURCE_FACE_POLYGONS_XY
+    global SAND_SOURCE_SELECTED_HULL_XY, SAND_SOURCE_POLYGON_XY, SAND_AMOUNT_MULTIPLIER
+    global UNLOAD_BIN_CENTER, UNLOAD_BIN_ENABLED
+
+    changed = False
+    if sand_center_xy is not None:
+        arr = np.array(sand_center_xy, dtype=np.float32).reshape(-1)[:2]
+        if len(arr) >= 2:
+            x = float(arr[0])
+            y = float(arr[1])
+            if abs(x - float(SAND_CENTER_X)) > 1.0e-4 or abs(y - float(SAND_CENTER_Y)) > 1.0e-4:
+                changed = True
+            SAND_CENTER_X = x
+            SAND_CENTER_Y = y
+            PILE_CENTER_X = x
+            PILE_CENTER_Y = y
+            WALL_CENTER_X = x
+            WALL_CENTER_Y = y
+            SAND_SOURCE_SELECTED_PATH = ""
+            SAND_SOURCE_SELECTED_FACE_COUNT = 0
+            SAND_SOURCE_TOTAL_PROJECTED_FACE_COUNT = 0
+            SAND_SOURCE_RAW_FACE_POLYGONS_XY = None
+            SAND_SOURCE_FACE_POLYGONS_XY = None
+            SAND_SOURCE_SELECTED_HULL_XY = None
+            SAND_SOURCE_POLYGON_XY = None
+
+    if sand_amount_multiplier is not None:
+        amount = clamp_sand_amount(float(sand_amount_multiplier))
+        if abs(amount - float(SAND_AMOUNT_MULTIPLIER)) > 1.0e-4:
+            changed = True
+        SAND_AMOUNT_MULTIPLIER = amount
+
+    if unload_center_xy is not None:
+        arr = np.array(unload_center_xy, dtype=np.float32).reshape(-1)[:2]
+        if len(arr) >= 2:
+            x = float(arr[0])
+            y = float(arr[1])
+            if (
+                abs(x - float(UNLOAD_BIN_CENTER[0])) > 1.0e-4
+                or abs(y - float(UNLOAD_BIN_CENTER[1])) > 1.0e-4
+            ):
+                changed = True
+            UNLOAD_BIN_CENTER = np.array([x, y, 0.0], dtype=np.float32)
+
+    if unload_bin_enabled is not None:
+        enabled = bool(unload_bin_enabled)
+        if enabled != bool(UNLOAD_BIN_ENABLED):
+            changed = True
+        UNLOAD_BIN_ENABLED = enabled
+        STATE["unload_bin_enabled"] = bool(enabled)
+
+    recompute_derived_scene_params()
+    apply_sand_fidelity_to_particle_globals(SAND_FIDELITY, announce=False)
+    update_particle_runtime_state()
+
+    if rebuild:
+        build_sand_site()
+    else:
+        rebuild_sand_reference_grid("auto_scene_parameters")
+        set_sand_generation_range_box("auto_scene_parameters")
+        root = root_path()
+        if UNLOAD_BIN_ENABLED:
+            make_unload_bin(root)
+        else:
+            clear_unload_bin(root, announce=changed)
+        refresh_parameter_models_from_globals()
+        store_runtime_api()
+        if changed:
+            notify_excavator_obstacle_cache_dirty("auto_scene_parameters")
+
+    return {
+        "changed": bool(changed),
+        "sand_center": [float(SAND_CENTER_X), float(SAND_CENTER_Y)],
+        "sand_amount_multiplier": float(SAND_AMOUNT_MULTIPLIER),
+        "estimated_particle_count": int(STATE.get("estimated_particle_count", 0)),
+        "unload_bin_enabled": bool(UNLOAD_BIN_ENABLED),
+        "unload_bin_center": [float(UNLOAD_BIN_CENTER[0]), float(UNLOAD_BIN_CENTER[1])],
+        "rebuild": bool(rebuild),
+    }
 
 
 def make_sand_retaining_walls(root):
@@ -2653,6 +2779,7 @@ def sand_scene_context():
         "live_particle_count": live_stats.get("count"),
         "estimated_vram_gb": live_stats.get("vram_gb", {}).get("total_gb"),
         "unload_bin_center": np.array(UNLOAD_BIN_CENTER, dtype=np.float32).copy(),
+        "unload_bin_enabled": bool(UNLOAD_BIN_ENABLED),
         "unload_bin_inner_size": np.array([float(UNLOAD_BIN_INNER_SIZE_X), float(UNLOAD_BIN_INNER_SIZE_Y)], dtype=np.float32),
         "unload_bin_wall_height": float(UNLOAD_BIN_WALL_HEIGHT),
         "unload_bin_wall_thickness": float(UNLOAD_BIN_WALL_THICKNESS),
@@ -2939,6 +3066,9 @@ def store_runtime_api():
         "scene_context": context,
         "sand_pile_center": context["pile_center"],
         "sand_pile_radius": context["diggable_radius"],
+        "set_unload_bin_enabled": set_unload_bin_enabled,
+        "apply_auto_scene_parameters": apply_auto_scene_parameters,
+        "unload_bin_enabled": bool(UNLOAD_BIN_ENABLED),
         "unload_bin_center": context["unload_bin_center"],
         "unload_bin_inner_size": context["unload_bin_inner_size"],
         "unload_bin_z_range": context["unload_bin_z_range"],
@@ -2979,7 +3109,11 @@ def build_sand_site():
         STATE["real_sand_error"] = "waiting for stable reset after main.py world is ready"
         STATE["needs_reset_after_world_ready"] = True
         info("[SAND SITE] initial real particle sand creation delayed until stable reset")
-    make_unload_bin(root)
+    if bool(UNLOAD_BIN_ENABLED):
+        make_unload_bin(root)
+    else:
+        clear_unload_bin(root, announce=False)
+        info("[UNLOAD BIN] 4-wall geometry disabled; unload target can still use selected/preset mesh")
     store_runtime_api()
     notify_excavator_obstacle_cache_dirty("sand_site_rebuilt")
     if STATE.get("real_sand_enabled", False):

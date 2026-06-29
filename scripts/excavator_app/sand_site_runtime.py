@@ -74,8 +74,11 @@ WALL_INNER_SIZE_Y = SANDBOX_INNER_SIZE_Y
 PILE_CENTER_X = 0.0
 PILE_CENTER_Y = SAND_CENTER_Y
 PILE_HEIGHT = SANDBOX_FILL_HEIGHT
-PILE_SIGMA_X = 0.56
-PILE_SIGMA_Y = 0.56
+PILE_SIGMA_X = 0.38
+PILE_SIGMA_Y = 0.38
+PILE_RIM_HEIGHT_FRACTION = 0.04
+PILE_CONE_EXPONENT = 1.35
+PILE_GAUSSIAN_BLEND = 0.35
 
 RIPPLE_AMP = 0.018
 NOISE_AMP = 0.010
@@ -97,7 +100,7 @@ PARTICLE_MASS = 0.135
 PARTICLE_JITTER = 0.004
 PARTICLE_MAX_COUNT = 465000
 PARTICLE_SOLVER_POSITION_ITERATIONS = 16
-PARTICLE_MAX_VELOCITY = 22.0
+PARTICLE_MAX_VELOCITY = 8.0
 SAND_FIDELITY = 0.25
 SAND_FIDELITY_EFFICIENCY_SPACING = 0.060
 SAND_FIDELITY_REALISTIC_SPACING = 0.034
@@ -105,9 +108,9 @@ SAND_FIDELITY_EFFICIENCY_RADIUS = 0.022
 SAND_FIDELITY_REALISTIC_RADIUS = 0.014
 SAND_FIDELITY_EFFICIENCY_MAX_COUNT = 220000
 SAND_FIDELITY_REALISTIC_MAX_COUNT = 900000
-SAND_FIDELITY_EFFICIENCY_SOLVER_ITERS = 8
-SAND_FIDELITY_REALISTIC_SOLVER_ITERS = 20
-SAND_FIDELITY_MAX_VELOCITY = 18.0
+SAND_FIDELITY_EFFICIENCY_SOLVER_ITERS = 16
+SAND_FIDELITY_REALISTIC_SOLVER_ITERS = 24
+SAND_FIDELITY_MAX_VELOCITY = 8.0
 SAND_FIDELITY_REFERENCE_SPACING = 0.044
 SAND_BULK_DENSITY_KG_M3 = 1600.0
 SAND_FIDELITY_REFERENCE_MASS = SAND_BULK_DENSITY_KG_M3 * (SAND_FIDELITY_REFERENCE_SPACING ** 3)
@@ -117,16 +120,16 @@ PARTICLE_LAYER_SPACING_RATIO = 0.95
 PARTICLE_CENTER_SPACING_SAFETY = 2.12
 PARTICLE_JITTER_RATIO = 0.08
 PARTICLE_JITTER_MAX = 0.004
-PARTICLE_MATERIAL_FRICTION = 0.68
-PARTICLE_MATERIAL_FRICTION_SCALE = 0.75
-PARTICLE_MATERIAL_DAMPING = 0.03
-PARTICLE_MATERIAL_VISCOSITY = 0.0
-PARTICLE_MATERIAL_COHESION = 0.0
-PARTICLE_MATERIAL_ADHESION = 0.0
-PARTICLE_MATERIAL_GRAVITY_SCALE = 1.0
-PARTICLE_MATERIAL_STATIC_FRICTION = 0.72
-PARTICLE_MATERIAL_DYNAMIC_FRICTION = 0.56
-PARTICLE_MATERIAL_RESTITUTION = 0.01
+PARTICLE_MATERIAL_FRICTION = 0.95
+PARTICLE_MATERIAL_FRICTION_SCALE = 1.00
+PARTICLE_MATERIAL_DAMPING = 0.55
+PARTICLE_MATERIAL_VISCOSITY = 1.20
+PARTICLE_MATERIAL_COHESION = 0.08
+PARTICLE_MATERIAL_ADHESION = 0.03
+PARTICLE_MATERIAL_GRAVITY_SCALE = 0.90
+PARTICLE_MATERIAL_STATIC_FRICTION = 0.98
+PARTICLE_MATERIAL_DYNAMIC_FRICTION = 0.78
+PARTICLE_MATERIAL_RESTITUTION = 0.0
 STATIC_COLLIDER_CONTACT_OFFSET = 0.030
 STATIC_COLLIDER_REST_OFFSET = 0.000
 PARTICLE_SYSTEM_PATH_SUFFIX = "ParticleSystem"
@@ -659,6 +662,9 @@ def apply_parameter_models_to_globals():
     global PARTICLE_DIGGABLE_SPACING, PARTICLE_LAYER_SPACING_Z, PARTICLE_RADIUS, PARTICLE_CONTACT_OFFSET
     global PARTICLE_REST_OFFSET, PARTICLE_SOLID_REST_OFFSET, PARTICLE_FLUID_REST_OFFSET, PARTICLE_MASS
     global PARTICLE_JITTER, PARTICLE_SOLVER_POSITION_ITERATIONS, PARTICLE_MAX_VELOCITY, PARTICLE_MAX_COUNT
+    global PARTICLE_MATERIAL_FRICTION, PARTICLE_MATERIAL_FRICTION_SCALE, PARTICLE_MATERIAL_DAMPING
+    global PARTICLE_MATERIAL_VISCOSITY, PARTICLE_MATERIAL_COHESION, PARTICLE_MATERIAL_ADHESION
+    global PARTICLE_MATERIAL_GRAVITY_SCALE, PARTICLE_MATERIAL_STATIC_FRICTION, PARTICLE_MATERIAL_DYNAMIC_FRICTION
     global SAND_FIDELITY
     global UNLOAD_BIN_CENTER, UNLOAD_BIN_INNER_SIZE_X, UNLOAD_BIN_INNER_SIZE_Y, UNLOAD_BIN_WALL_HEIGHT
     global UNLOAD_BIN_WALL_THICKNESS, UNLOAD_BIN_FLOOR_THICKNESS, UNLOAD_BIN_DUMP_HEIGHT
@@ -741,6 +747,32 @@ def apply_parameter_models_to_globals():
     SAND_FIDELITY = model_value("sand_fidelity", SAND_FIDELITY, 0.0, 1.0)
     apply_sand_fidelity_to_particle_globals(SAND_FIDELITY, announce=True)
 
+    PARTICLE_MATERIAL_VISCOSITY = model_value("material_viscosity", PARTICLE_MATERIAL_VISCOSITY, 0.0, 4.0)
+    PARTICLE_MATERIAL_COHESION = model_value("material_cohesion", PARTICLE_MATERIAL_COHESION, 0.0, 0.60)
+    PARTICLE_MATERIAL_ADHESION = model_value("material_adhesion", PARTICLE_MATERIAL_ADHESION, 0.0, 0.30)
+    PARTICLE_MATERIAL_DAMPING = model_value("material_damping", PARTICLE_MATERIAL_DAMPING, 0.0, 2.0)
+    PARTICLE_MATERIAL_FRICTION = model_value("material_friction", PARTICLE_MATERIAL_FRICTION, 0.0, 1.50)
+    PARTICLE_MATERIAL_FRICTION_SCALE = model_value("material_friction_scale", PARTICLE_MATERIAL_FRICTION_SCALE, 0.0, 1.50)
+    PARTICLE_MATERIAL_GRAVITY_SCALE = model_value("material_gravity_scale", PARTICLE_MATERIAL_GRAVITY_SCALE, 0.50, 1.20)
+    PARTICLE_MATERIAL_STATIC_FRICTION = max(
+        PARTICLE_MATERIAL_FRICTION,
+        model_value("material_static_friction", PARTICLE_MATERIAL_STATIC_FRICTION, 0.0, 1.50),
+    )
+    PARTICLE_MATERIAL_DYNAMIC_FRICTION = model_value(
+        "material_dynamic_friction",
+        PARTICLE_MATERIAL_DYNAMIC_FRICTION,
+        0.0,
+        PARTICLE_MATERIAL_STATIC_FRICTION,
+    )
+    PARTICLE_MAX_VELOCITY = model_value("particle_max_velocity", PARTICLE_MAX_VELOCITY, 1.0, 20.0)
+    PARTICLE_SOLVER_POSITION_ITERATIONS = int(round(model_value(
+        "particle_solver_iters",
+        PARTICLE_SOLVER_POSITION_ITERATIONS,
+        4.0,
+        32.0,
+    )))
+    apply_current_particle_material_to_stage()
+
     unload_x = model_value("unload_x", float(UNLOAD_BIN_CENTER[0]), -20.0, 20.0)
     unload_y = model_value("unload_y", float(UNLOAD_BIN_CENTER[1]), -20.0, 20.0)
     UNLOAD_BIN_CENTER = np.array([unload_x, unload_y, 0.0], dtype=np.float32)
@@ -794,6 +826,15 @@ def refresh_parameter_models_from_globals():
         "pile_sigma_x": PILE_SIGMA_X,
         "pile_sigma_y": PILE_SIGMA_Y,
         "sand_fidelity": SAND_FIDELITY,
+        "material_viscosity": PARTICLE_MATERIAL_VISCOSITY,
+        "material_cohesion": PARTICLE_MATERIAL_COHESION,
+        "material_adhesion": PARTICLE_MATERIAL_ADHESION,
+        "material_damping": PARTICLE_MATERIAL_DAMPING,
+        "material_friction": PARTICLE_MATERIAL_FRICTION,
+        "material_friction_scale": PARTICLE_MATERIAL_FRICTION_SCALE,
+        "material_gravity_scale": PARTICLE_MATERIAL_GRAVITY_SCALE,
+        "material_static_friction": PARTICLE_MATERIAL_STATIC_FRICTION,
+        "material_dynamic_friction": PARTICLE_MATERIAL_DYNAMIC_FRICTION,
         "particle_spacing_xy": PARTICLE_DIGGABLE_SPACING,
         "particle_spacing_z": PARTICLE_LAYER_SPACING_Z,
         "particle_radius": PARTICLE_RADIUS,
@@ -1633,9 +1674,19 @@ def sand_y_max():
 def initial_sand_height_xy(x, y):
     if not is_inside_diggable_xy(x, y):
         return SAND_FLOOR_Z
-    dx = (float(x) - PILE_CENTER_X) / PILE_SIGMA_X
-    dy = (float(y) - PILE_CENTER_Y) / PILE_SIGMA_Y
-    mound = PILE_HEIGHT * (0.82 + 0.18 * math.exp(-0.5 * (dx * dx + dy * dy)))
+    rx = max(1.0e-6, float(DIGGABLE_RADIUS_X))
+    ry = max(1.0e-6, float(DIGGABLE_RADIUS_Y))
+    radial = math.sqrt(
+        ((float(x) - PILE_CENTER_X) / rx) ** 2
+        + ((float(y) - PILE_CENTER_Y) / ry) ** 2
+    )
+    cone = max(0.0, 1.0 - radial) ** float(PILE_CONE_EXPONENT)
+    dx = (float(x) - PILE_CENTER_X) / max(1.0e-6, float(PILE_SIGMA_X))
+    dy = (float(y) - PILE_CENTER_Y) / max(1.0e-6, float(PILE_SIGMA_Y))
+    gaussian = math.exp(-0.5 * (dx * dx + dy * dy))
+    profile = (1.0 - float(PILE_GAUSSIAN_BLEND)) * cone + float(PILE_GAUSSIAN_BLEND) * gaussian
+    rim = float(PILE_RIM_HEIGHT_FRACTION)
+    mound = PILE_HEIGHT * clamp_value(rim + (1.0 - rim) * profile, 0.0, 1.0)
     ripple = RIPPLE_AMP * (
         math.sin(3.7 * float(x) + 0.55 * math.sin(0.8 * float(y)))
         + 0.45 * math.sin(2.2 * float(y) + 0.25 * float(x))
@@ -1976,6 +2027,17 @@ def real_sand_stats():
         "solver_iters": int(PARTICLE_SOLVER_POSITION_ITERATIONS),
         "fidelity": float(SAND_FIDELITY),
         "mode": sand_mode_label(SAND_FIDELITY),
+        "material": {
+            "viscosity": float(PARTICLE_MATERIAL_VISCOSITY),
+            "cohesion": float(PARTICLE_MATERIAL_COHESION),
+            "adhesion": float(PARTICLE_MATERIAL_ADHESION),
+            "damping": float(PARTICLE_MATERIAL_DAMPING),
+            "friction": float(PARTICLE_MATERIAL_FRICTION),
+            "particle_friction_scale": float(PARTICLE_MATERIAL_FRICTION_SCALE),
+            "gravity_scale": float(PARTICLE_MATERIAL_GRAVITY_SCALE),
+            "static_friction": float(PARTICLE_MATERIAL_STATIC_FRICTION),
+            "dynamic_friction": float(PARTICLE_MATERIAL_DYNAMIC_FRICTION),
+        },
         "performance_budget_target": int(STATE.get("particle_budget_target", 0)),
         "performance_budget_applied": bool(STATE.get("particle_budget_applied", False)),
         "physics_timesteps_per_second": int(PHYSX_TIMESTEPS_PER_SECOND),
@@ -2205,6 +2267,27 @@ def create_sand_particle_material(root):
     return mat
 
 
+def apply_current_particle_material_to_stage(root=None):
+    root = root_path() if root is None else str(root)
+    material = get_prim(f"{root}/{PARTICLE_MATERIAL_PATH_SUFFIX}")
+    system = get_prim(f"{root}/{PARTICLE_SYSTEM_PATH_SUFFIX}")
+    if material.IsValid():
+        set_prim_attr(material, "physxPBDMaterial:friction", float(PARTICLE_MATERIAL_FRICTION), Sdf.ValueTypeNames.Float)
+        set_prim_attr(material, "physxPBDMaterial:particleFrictionScale", float(PARTICLE_MATERIAL_FRICTION_SCALE), Sdf.ValueTypeNames.Float)
+        set_prim_attr(material, "physxPBDMaterial:damping", float(PARTICLE_MATERIAL_DAMPING), Sdf.ValueTypeNames.Float)
+        set_prim_attr(material, "physxPBDMaterial:viscosity", float(PARTICLE_MATERIAL_VISCOSITY), Sdf.ValueTypeNames.Float)
+        set_prim_attr(material, "physxPBDMaterial:cohesion", float(PARTICLE_MATERIAL_COHESION), Sdf.ValueTypeNames.Float)
+        set_prim_attr(material, "physxPBDMaterial:adhesion", float(PARTICLE_MATERIAL_ADHESION), Sdf.ValueTypeNames.Float)
+        set_prim_attr(material, "physxPBDMaterial:gravityScale", float(PARTICLE_MATERIAL_GRAVITY_SCALE), Sdf.ValueTypeNames.Float)
+        set_prim_attr(material, "physxMaterial:staticFriction", float(PARTICLE_MATERIAL_STATIC_FRICTION), Sdf.ValueTypeNames.Float)
+        set_prim_attr(material, "physxMaterial:dynamicFriction", float(PARTICLE_MATERIAL_DYNAMIC_FRICTION), Sdf.ValueTypeNames.Float)
+        set_prim_attr(material, "physxMaterial:restitution", float(PARTICLE_MATERIAL_RESTITUTION), Sdf.ValueTypeNames.Float)
+    if system.IsValid():
+        set_prim_attr(system, "physxParticle:solverPositionIterationCount", int(PARTICLE_SOLVER_POSITION_ITERATIONS), Sdf.ValueTypeNames.Int)
+        set_prim_attr(system, "physxParticle:maxVelocity", float(PARTICLE_MAX_VELOCITY), Sdf.ValueTypeNames.Float)
+    return bool(material.IsValid() or system.IsValid())
+
+
 def sand_particle_points():
     rng = random.Random(4107)
     points = []
@@ -2388,6 +2471,9 @@ def make_real_particle_sand(root):
             "friction=", PARTICLE_MATERIAL_FRICTION,
             "friction_scale=", PARTICLE_MATERIAL_FRICTION_SCALE,
             "damping=", PARTICLE_MATERIAL_DAMPING,
+            "viscosity=", PARTICLE_MATERIAL_VISCOSITY,
+            "cohesion=", PARTICLE_MATERIAL_COHESION,
+            "adhesion=", PARTICLE_MATERIAL_ADHESION,
             "height_multiplier=", SAND_HEIGHT_MULTIPLIER,
             "range_area_fraction=", SAND_RANGE_AREA_FRACTION,
             "range_linear_scale=", SAND_RANGE_LINEAR_SCALE,
@@ -2777,6 +2863,9 @@ def print_status():
         f"friction={PARTICLE_MATERIAL_FRICTION}",
         f"friction_scale={PARTICLE_MATERIAL_FRICTION_SCALE}",
         f"damping={PARTICLE_MATERIAL_DAMPING}",
+        f"viscosity={PARTICLE_MATERIAL_VISCOSITY}",
+        f"cohesion={PARTICLE_MATERIAL_COHESION}",
+        f"adhesion={PARTICLE_MATERIAL_ADHESION}",
         f"max_count={PARTICLE_MAX_COUNT}",
     )
     info("real_sand_error:", STATE.get("real_sand_error"))
@@ -2851,6 +2940,7 @@ def print_particle_physics_diagnostics():
         attrs = [
             "physxPBDMaterial:gravityScale",
             "physxPBDMaterial:damping",
+            "physxPBDMaterial:viscosity",
             "physxPBDMaterial:cohesion",
             "physxPBDMaterial:adhesion",
             "physxPBDMaterial:friction",
@@ -2941,6 +3031,17 @@ def store_runtime_api():
             "performance_budget_target": int(STATE.get("particle_budget_target", 0)),
             "performance_budget_applied": bool(STATE.get("particle_budget_applied", False)),
             "physics_timesteps_per_second": int(PHYSX_TIMESTEPS_PER_SECOND),
+        },
+        "particle_material_config": {
+            "viscosity": float(PARTICLE_MATERIAL_VISCOSITY),
+            "cohesion": float(PARTICLE_MATERIAL_COHESION),
+            "adhesion": float(PARTICLE_MATERIAL_ADHESION),
+            "damping": float(PARTICLE_MATERIAL_DAMPING),
+            "friction": float(PARTICLE_MATERIAL_FRICTION),
+            "particle_friction_scale": float(PARTICLE_MATERIAL_FRICTION_SCALE),
+            "gravity_scale": float(PARTICLE_MATERIAL_GRAVITY_SCALE),
+            "static_friction": float(PARTICLE_MATERIAL_STATIC_FRICTION),
+            "dynamic_friction": float(PARTICLE_MATERIAL_DYNAMIC_FRICTION),
         },
         "unload_bin_dump_point": unload_bin_dump_point,
         "dump_point": unload_bin_dump_point(),
@@ -3257,6 +3358,35 @@ def build_ui():
                 width=610,
             )
 
+    def add_clay_material_controls():
+        def add_slider(key, label, value, lo, hi, hint):
+            if key not in PARAM_MODELS:
+                PARAM_MODELS[key] = ui.SimpleFloatModel(float(value))
+                add_listener(PARAM_MODELS[key], key)
+            with ui.HStack(spacing=8, height=24):
+                ui.Label(label, width=116)
+                ui.FloatSlider(model=PARAM_MODELS[key], min=float(lo), max=float(hi), width=320)
+                ui.FloatField(model=PARAM_MODELS[key], width=66)
+                ui.Label(hint, width=88)
+
+        with ui.VStack(spacing=3):
+            add_slider("material_viscosity", "Viscosity", PARTICLE_MATERIAL_VISCOSITY, 0.0, 4.0, "safe 1.0-2.0")
+            add_slider("material_cohesion", "Cohesion", PARTICLE_MATERIAL_COHESION, 0.0, 0.60, "safe 0.05-0.15")
+            add_slider("material_adhesion", "Adhesion", PARTICLE_MATERIAL_ADHESION, 0.0, 0.30, "safe 0.0-0.08")
+            add_slider("material_damping", "Damping", PARTICLE_MATERIAL_DAMPING, 0.0, 2.0, "safe 0.4-0.8")
+            add_slider("material_friction", "Friction", PARTICLE_MATERIAL_FRICTION, 0.0, 1.50, "safe 0.8-1.1")
+            add_slider("material_friction_scale", "Particle friction", PARTICLE_MATERIAL_FRICTION_SCALE, 0.0, 1.50, "safe 0.9-1.2")
+            add_slider("material_gravity_scale", "Gravity scale", PARTICLE_MATERIAL_GRAVITY_SCALE, 0.50, 1.20, "safe 0.85-1.0")
+            add_slider("particle_max_velocity", "Max velocity", PARTICLE_MAX_VELOCITY, 1.0, 20.0, "safe 6-10")
+            add_slider("particle_solver_iters", "Solver iters", float(PARTICLE_SOLVER_POSITION_ITERATIONS), 4.0, 32.0, "try 18-24")
+            ui.Label(
+                ui_short_text(
+                    "Apply updates material/system attrs; Reset Sand regenerates the pile with the same clay settings.",
+                    112,
+                ),
+                width=610,
+            )
+
     WINDOW = ui.Window("Sand Site Control", width=650, height=650)
     with WINDOW.frame:
         with ui.VStack(spacing=5):
@@ -3272,6 +3402,9 @@ def build_ui():
                 ui.Button("Status", width=82, clicked_fn=status_clicked)
             with ui.ScrollingFrame(height=ui.Fraction(1)):
                 with ui.VStack(spacing=5):
+                    section("Clay / Mud Tuning")
+                    add_clay_material_controls()
+
                     section("Sand Amount")
                     with ui.HStack(spacing=6, height=26):
                         ui.Button("Use Selected Sand Mesh", width=178, clicked_fn=use_selected_sand_mesh_clicked)

@@ -336,12 +336,10 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "auto_collect_sand_reset_done": False,
     "auto_collect_initial_pose": None,
     "auto_collect_initial_pose_id": "",
-    "auto_scene_4wall_unload_bin_enabled": True,
     "auto_scene_random_truck_enabled": False,
     "auto_scene_random_sand_xy_enabled": False,
     "auto_scene_random_sand_amount_enabled": False,
     "auto_scene_last_randomization": {},
-    "auto_scene_last_unload_bin_enabled": None,
     "auto_scene_truck_baseline": None,
     "last_dig_plan_candidates": [],
     "dig_plan_candidate": None,
@@ -589,7 +587,6 @@ AUTO_COLLECT_HOME_BUCKET_RELAXED_TOL_DEG = 28.0
 AUTO_COLLECT_HOME_NON_BUCKET_RELAXED_SCALE = 1.5
 DIRECT_INITIAL_POSE_SETTLE_FRAMES = 18
 DIRECT_PLAN_END_HOME_SETTLE_FRAMES = 8
-AUTO_SCENE_4WALL_UNLOAD_BIN_DEFAULT = True
 AUTO_SCENE_RANDOM_TRUCK_DEFAULT = False
 AUTO_SCENE_RANDOM_SAND_XY_DEFAULT = False
 AUTO_SCENE_RANDOM_SAND_AMOUNT_DEFAULT = False
@@ -3325,7 +3322,6 @@ def task_scene_context():
     bin_center = api_array(raw, "unload_bin_center", [float(AUTO_COLLECT_TARGET_CENTER[0]), -float(AUTO_COLLECT_TARGET_CENTER[1]), GROUND_TOP_Z], 3)
     bin_inner = api_array(raw, "unload_bin_inner_size", [2.0 * SAND_BIN_HALF_X, 2.0 * SAND_BIN_HALF_Y], 2)
     bin_z_range = api_array(raw, "unload_bin_z_range", [SAND_BIN_Z_MIN, SAND_BIN_Z_MAX], 2)
-    unload_bin_enabled = bool(raw.get("unload_bin_enabled", True))
     sand_floor_z = float(raw.get("sand_floor_z", GROUND_TOP_Z))
     sand_fill_height = float(raw.get("sand_fill_height", max(0.25, SAND_PILE_Z_MAX - SAND_PILE_Z_MIN)))
 
@@ -3397,7 +3393,6 @@ def task_scene_context():
         "unload_bin_inner_size": bin_inner,
         "unload_bin_half_size": bin_half,
         "unload_bin_z_range": bin_z_range,
-        "unload_bin_enabled": bool(unload_bin_enabled),
         "unload_point_raw": dump_raw,
         "unload_point": unload_point,
     }
@@ -6419,7 +6414,6 @@ def auto_dataset_config_snapshot():
         "sand_reset_policy": AUTO_COLLECT_SAND_RESET_POLICY,
         "preflight_min_particles": AUTO_PREFLIGHT_MIN_PARTICLES,
         "scene_randomization": {
-            "unload_bin_4wall_enabled": bool(STATE.get("auto_scene_4wall_unload_bin_enabled", AUTO_SCENE_4WALL_UNLOAD_BIN_DEFAULT)),
             "random_truck": bool(STATE.get("auto_scene_random_truck_enabled", AUTO_SCENE_RANDOM_TRUCK_DEFAULT)),
             "random_sand_xy": bool(STATE.get("auto_scene_random_sand_xy_enabled", AUTO_SCENE_RANDOM_SAND_XY_DEFAULT)),
             "random_sand_amount": bool(STATE.get("auto_scene_random_sand_amount_enabled", AUTO_SCENE_RANDOM_SAND_AMOUNT_DEFAULT)),
@@ -12024,7 +12018,6 @@ def update_unload_models_only(p):
 
 def auto_scene_randomization_config():
     return {
-        "unload_bin_4wall_enabled": bool(STATE.get("auto_scene_4wall_unload_bin_enabled", AUTO_SCENE_4WALL_UNLOAD_BIN_DEFAULT)),
         "random_truck": bool(STATE.get("auto_scene_random_truck_enabled", AUTO_SCENE_RANDOM_TRUCK_DEFAULT)),
         "random_sand_xy": bool(STATE.get("auto_scene_random_sand_xy_enabled", AUTO_SCENE_RANDOM_SAND_XY_DEFAULT)),
         "random_sand_amount": bool(STATE.get("auto_scene_random_sand_amount_enabled", AUTO_SCENE_RANDOM_SAND_AMOUNT_DEFAULT)),
@@ -12174,7 +12167,6 @@ def auto_scene_sample_candidate(attempt_index):
             "random_truck": bool(cfg["random_truck"]),
             "random_sand_xy": bool(cfg["random_sand_xy"]),
             "random_sand_amount": bool(cfg["random_sand_amount"]),
-            "unload_bin_4wall_enabled": bool(cfg["unload_bin_4wall_enabled"]),
             "sand_xy": sand_xy,
             "sand_amount_multiplier": amount,
             "truck_delta_xy": truck_delta,
@@ -12217,26 +12209,23 @@ def auto_scene_apply_candidate(candidate):
     if callable(apply_scene):
         sand_xy = candidate.get("sand_xy") if cfg["random_sand_xy"] else None
         amount = candidate.get("sand_amount_multiplier") if cfg["random_sand_amount"] else None
-        unload_xy = candidate.get("unload_xy") if (cfg["random_truck"] and cfg["unload_bin_4wall_enabled"]) else None
+        unload_xy = None
         needs_rebuild = bool(cfg["random_sand_xy"] or cfg["random_sand_amount"] or unload_xy is not None)
         result = apply_scene(
             sand_center_xy=sand_xy,
             sand_amount_multiplier=amount,
             unload_center_xy=unload_xy,
-            unload_bin_enabled=bool(cfg["unload_bin_4wall_enabled"]),
             rebuild=needs_rebuild,
         )
         candidate["sand_site_result"] = result
         if isinstance(result, dict) and result.get("changed"):
             scene_changed = True
-    elif cfg["random_sand_xy"] or cfg["random_sand_amount"] or not cfg["unload_bin_4wall_enabled"]:
+    elif cfg["random_sand_xy"] or cfg["random_sand_amount"]:
         return False, "sand_site_apply_api_missing"
 
     if truck_moved:
         apply_default_unload_source_mesh()
         scene_changed = True
-    elif not cfg["unload_bin_4wall_enabled"] and not bool(STATE.get("manual_unload_override_enabled", False)):
-        apply_default_unload_source_mesh()
 
     if scene_changed:
         STATE["auto_collect_sand_reset_done"] = False
@@ -12250,32 +12239,9 @@ def auto_scene_apply_candidate(candidate):
 
 async def auto_collect_apply_scene_randomization(attempt_index):
     cfg = auto_scene_randomization_config()
-    last_bin = STATE.get("auto_scene_last_unload_bin_enabled", None)
-    if (
-        not auto_scene_randomization_any_enabled()
-        and last_bin is not None
-        and cfg["unload_bin_4wall_enabled"] == bool(last_bin)
-    ):
+    if not auto_scene_randomization_any_enabled():
         return True
-    if auto_scene_randomization_any_enabled():
-        candidate = auto_scene_sample_candidate(attempt_index)
-    else:
-        ctx = task_scene_context()
-        candidate = {
-            "attempt": int(attempt_index),
-            "random_truck": False,
-            "random_sand_xy": False,
-            "random_sand_amount": False,
-            "unload_bin_4wall_enabled": bool(cfg["unload_bin_4wall_enabled"]),
-            "sand_xy": np.array(ctx.get("pile_center", [0.0, 6.7, 0.0]), dtype=np.float32).reshape(-1)[:2],
-            "sand_amount_multiplier": None,
-            "truck_delta_xy": np.zeros(2, dtype=np.float32),
-            "truck_center_xy": None,
-            "unload_xy": np.array(ctx.get("unload_bin_center", [-10.0, -5.0, 0.0]), dtype=np.float32).reshape(-1)[:2],
-            "estimated_particle_count": 0,
-            "sample_try": 0,
-            "legal_reason": "bin_state_sync_only",
-        }
+    candidate = auto_scene_sample_candidate(attempt_index)
     if "error" in candidate:
         STATE["auto_scene_last_randomization"] = {"ok": False, "reason": candidate.get("error"), "attempt": int(attempt_index)}
         info_print(
@@ -12304,13 +12270,11 @@ async def auto_collect_apply_scene_randomization(attempt_index):
         },
     }
     STATE["auto_scene_last_randomization"] = record
-    STATE["auto_scene_last_unload_bin_enabled"] = bool(cfg["unload_bin_4wall_enabled"])
     info_print(
         "[AUTO SCENE RANDOMIZE]",
         f"attempt={attempt_index}",
         f"ok={ok}",
         f"reason={reason}",
-        f"bin4wall={cfg['unload_bin_4wall_enabled']}",
         f"truck={cfg['random_truck']}",
         f"sand_xy={cfg['random_sand_xy']}",
         f"sand_amount={cfg['random_sand_amount']}",
@@ -16292,10 +16256,6 @@ PATH_RIGID_OBSTACLE_PATHS = [
     "/SandSite/SandRetainingWalls/WallRight",
     "/SandSite/SandRetainingWalls/WallFront",
     "/SandSite/SandRetainingWalls/WallBack",
-    "/SandSite/UnloadBin/WallLeft",
-    "/SandSite/UnloadBin/WallRight",
-    "/SandSite/UnloadBin/WallFront",
-    "/SandSite/UnloadBin/WallBack",
     "/World/truck",
     "/truck",
 ]
@@ -28352,11 +28312,6 @@ def build_ui():
 
                     with ui.HStack(spacing=6, height=24):
                         ui.Label("Scene", width=64)
-                        add_auto_scene_checkbox(
-                            "4Wall Bin",
-                            "auto_scene_4wall_unload_bin_enabled",
-                            width=112,
-                        )
                         add_auto_scene_checkbox(
                             "Rand Truck",
                             "auto_scene_random_truck_enabled",

@@ -304,6 +304,13 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_camera_png_compress_level": int(os.environ.get("EXCAVATOR_DATASET_CAMERA_PNG_COMPRESS", "3") or 3),
     "dataset_camera_png_optimize": str(os.environ.get("EXCAVATOR_DATASET_CAMERA_PNG_OPTIMIZE", "0") or "0").strip().lower()
     not in ("0", "false", "no", "off"),
+    "dataset_camera_require_complete_samples": str(os.environ.get("EXCAVATOR_DATASET_REQUIRE_COMPLETE_CAMERA", "1") or "1").strip().lower()
+    not in ("0", "false", "no", "off"),
+    "dataset_camera_warmup_frames": int(os.environ.get("EXCAVATOR_DATASET_CAMERA_WARMUP_FRAMES", "3") or 3),
+    "dataset_camera_warmup_ready_frames": int(os.environ.get("EXCAVATOR_DATASET_CAMERA_WARMUP_READY_FRAMES", "2") or 2),
+    "dataset_camera_warmup_max_frames": int(os.environ.get("EXCAVATOR_DATASET_CAMERA_WARMUP_MAX_FRAMES", "12") or 12),
+    "dataset_camera_warmup_status": {},
+    "dataset_camera_dropped_incomplete_samples": 0,
     "dataset_camera_retry_after_time": 0.0,
     "dataset_image_dir": "",
     "dataset_async_writer_enabled": str(os.environ.get("EXCAVATOR_DATASET_ASYNC_WRITER", "1") or "1").strip().lower()
@@ -337,6 +344,8 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "auto_collect_initial_pose": None,
     "auto_collect_initial_pose_id": "",
     "auto_scene_random_truck_enabled": False,
+    "auto_scene_random_truck_yaw_enabled": False,
+    "auto_scene_random_robot_yaw_enabled": False,
     "auto_scene_random_sand_xy_enabled": False,
     "auto_scene_random_sand_amount_enabled": False,
     "auto_scene_last_randomization": {},
@@ -588,21 +597,29 @@ AUTO_COLLECT_HOME_NON_BUCKET_RELAXED_SCALE = 1.5
 DIRECT_INITIAL_POSE_SETTLE_FRAMES = 18
 DIRECT_PLAN_END_HOME_SETTLE_FRAMES = 8
 AUTO_SCENE_RANDOM_TRUCK_DEFAULT = False
+AUTO_SCENE_RANDOM_TRUCK_YAW_DEFAULT = False
+AUTO_SCENE_RANDOM_ROBOT_YAW_DEFAULT = False
 AUTO_SCENE_RANDOM_SAND_XY_DEFAULT = False
 AUTO_SCENE_RANDOM_SAND_AMOUNT_DEFAULT = False
-AUTO_SCENE_RANDOM_MAX_TRIES = 32
+AUTO_SCENE_RANDOM_MAX_TRIES = 96
 AUTO_SCENE_TRUCK_ROOT_PATH = "/World/truck"
 AUTO_SCENE_TRUCK_RANDOM_DX_RANGE = (-1.20, 1.20)
 AUTO_SCENE_TRUCK_RANDOM_DY_RANGE = (-1.20, 1.20)
+AUTO_SCENE_TRUCK_RANDOM_RADIUS_RANGE = (5.80, 11.20)
+AUTO_SCENE_TRUCK_RANDOM_ANGLE_DEG_RANGE = (-178.0, 178.0)
+AUTO_SCENE_TRUCK_RANDOM_YAW_DEG_RANGE = (-180.0, 180.0)
+AUTO_SCENE_ROBOT_RANDOM_YAW_DEG_RANGE = (-170.0, 170.0)
 AUTO_SCENE_SAND_RANDOM_X_RANGE = (-0.85, 0.85)
 AUTO_SCENE_SAND_RANDOM_Y_RANGE = (5.80, 7.55)
+AUTO_SCENE_SAND_RANDOM_RADIUS_RANGE = (5.10, 7.60)
+AUTO_SCENE_SAND_RANDOM_ANGLE_DEG_RANGE = (-165.0, 165.0)
 AUTO_SCENE_SAND_AMOUNT_RANGE = (0.55, 1.35)
 AUTO_SCENE_SAND_MIN_REACH_RADIUS = 4.80
 AUTO_SCENE_SAND_MAX_REACH_RADIUS = 8.20
-AUTO_SCENE_UNLOAD_MIN_REACH_RADIUS = 7.00
-AUTO_SCENE_UNLOAD_MAX_REACH_RADIUS = 11.80
-AUTO_SCENE_MIN_SAND_UNLOAD_DIST = 5.00
-AUTO_SCENE_MIN_ROBOT_TRUCK_DIST = 5.50
+AUTO_SCENE_UNLOAD_MIN_REACH_RADIUS = 1.00
+AUTO_SCENE_UNLOAD_MAX_REACH_RADIUS = 12.50
+AUTO_SCENE_MIN_SAND_UNLOAD_DIST = 4.00
+AUTO_SCENE_MIN_ROBOT_TRUCK_DIST = 3.50
 AUTO_SCENE_MIN_SAND_PARTICLE_ESTIMATE = 3000
 AUTO_COLLECT_TARGET_CENTER = np.array([0.0, -6.7, 0.0], dtype=np.float32)
 AUTO_COLLECT_TARGET_RADIUS_X = 0.82
@@ -1835,6 +1852,137 @@ def set_translate_preserve_xform_ops(prim_or_path, translate):
     except Exception as e:
         info_print("[WARN] set translate preserve xform failed:", str(prim.GetPath()), type(e).__name__, e)
         return False
+
+
+def _xform_op_type(op):
+    try:
+        return op.GetOpType()
+    except Exception:
+        return None
+
+
+def _is_xform_rotate_op(op):
+    typ = _xform_op_type(op)
+    return typ in (
+        UsdGeom.XformOp.TypeRotateX,
+        UsdGeom.XformOp.TypeRotateY,
+        UsdGeom.XformOp.TypeRotateZ,
+        UsdGeom.XformOp.TypeRotateXYZ,
+        UsdGeom.XformOp.TypeRotateXZY,
+        UsdGeom.XformOp.TypeRotateYXZ,
+        UsdGeom.XformOp.TypeRotateYZX,
+        UsdGeom.XformOp.TypeRotateZXY,
+        UsdGeom.XformOp.TypeRotateZYX,
+        UsdGeom.XformOp.TypeOrient,
+    )
+
+
+def _set_rotation_op_z(op, yaw_deg):
+    typ = _xform_op_type(op)
+    yaw = float(yaw_deg)
+    if typ == UsdGeom.XformOp.TypeRotateZ:
+        op.Set(float(yaw))
+        return True
+    if typ in (
+        UsdGeom.XformOp.TypeRotateXYZ,
+        UsdGeom.XformOp.TypeRotateXZY,
+        UsdGeom.XformOp.TypeRotateYXZ,
+        UsdGeom.XformOp.TypeRotateYZX,
+        UsdGeom.XformOp.TypeRotateZXY,
+        UsdGeom.XformOp.TypeRotateZYX,
+    ):
+        try:
+            cur = op.Get(Usd.TimeCode.Default())
+        except Exception:
+            cur = None
+        x = float(cur[0]) if cur is not None and len(cur) >= 1 else 0.0
+        y = float(cur[1]) if cur is not None and len(cur) >= 2 else 0.0
+        op.Set(Gf.Vec3f(x, y, yaw))
+        return True
+    if typ == UsdGeom.XformOp.TypeOrient:
+        half = math.radians(yaw) * 0.5
+        op.Set(Gf.Quatf(float(math.cos(half)), Gf.Vec3f(0.0, 0.0, float(math.sin(half)))))
+        return True
+    return False
+
+
+def set_translate_rotate_z_preserve_xform_ops(prim_or_path, translate=None, yaw_deg=None):
+    prim = prim_or_path if hasattr(prim_or_path, "IsValid") else get_prim(prim_or_path)
+    if not prim or not prim.IsValid():
+        return False
+    try:
+        xform = UsdGeom.Xformable(prim)
+        ops = list(xform.GetOrderedXformOps())
+        translate_op = None
+        rotate_op = None
+        for op in ops:
+            typ = _xform_op_type(op)
+            if translate_op is None and typ == UsdGeom.XformOp.TypeTranslate:
+                translate_op = op
+            elif rotate_op is None and _is_xform_rotate_op(op):
+                rotate_op = op
+        if translate is not None:
+            t = Gf.Vec3d(float(translate[0]), float(translate[1]), float(translate[2]))
+            if translate_op is None:
+                translate_op = xform.AddTranslateOp()
+                ops.append(translate_op)
+            translate_op.Set(t)
+        if yaw_deg is not None:
+            if rotate_op is None:
+                rotate_op = xform.AddRotateXYZOp()
+                ops.append(rotate_op)
+            _set_rotation_op_z(rotate_op, yaw_deg)
+        ordered = []
+        for op in ops:
+            if _xform_op_type(op) == UsdGeom.XformOp.TypeTranslate and op not in ordered:
+                ordered.append(op)
+        if rotate_op is not None and rotate_op not in ordered:
+            ordered.append(rotate_op)
+        for op in ops:
+            if _xform_op_type(op) == UsdGeom.XformOp.TypeScale and op not in ordered:
+                ordered.append(op)
+        for op in ops:
+            if op not in ordered:
+                ordered.append(op)
+        try:
+            xform.SetXformOpOrder(ordered)
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        info_print("[WARN] set translate/rotate preserve xform failed:", str(prim.GetPath()), type(e).__name__, e)
+        return False
+
+
+def get_prim_local_yaw_z_deg(path, default=0.0):
+    prim = get_prim(path)
+    if not prim or not prim.IsValid():
+        return float(default)
+    try:
+        for op in UsdGeom.Xformable(prim).GetOrderedXformOps():
+            typ = _xform_op_type(op)
+            if typ == UsdGeom.XformOp.TypeRotateZ:
+                return float(op.Get(Usd.TimeCode.Default()))
+            if typ in (
+                UsdGeom.XformOp.TypeRotateXYZ,
+                UsdGeom.XformOp.TypeRotateXZY,
+                UsdGeom.XformOp.TypeRotateYXZ,
+                UsdGeom.XformOp.TypeRotateYZX,
+                UsdGeom.XformOp.TypeRotateZXY,
+                UsdGeom.XformOp.TypeRotateZYX,
+            ):
+                v = op.Get(Usd.TimeCode.Default())
+                return float(v[2]) if v is not None and len(v) >= 3 else float(default)
+            if typ == UsdGeom.XformOp.TypeOrient:
+                q = op.Get(Usd.TimeCode.Default())
+                if q is not None:
+                    imag = q.GetImaginary()
+                    real = float(q.GetReal())
+                    z = float(imag[2])
+                    return float(math.degrees(2.0 * math.atan2(z, real)))
+    except Exception:
+        pass
+    return float(default)
 
 
 def set_color(prim, color):
@@ -6079,6 +6227,132 @@ def dataset_camera_episode_cache(reset=False):
     return cache
 
 
+def dataset_camera_sample_requires_complete_images(sample_index):
+    if not bool(STATE.get("dataset_camera_enabled", True)):
+        return False
+    if not bool(STATE.get("dataset_camera_require_complete_samples", True)):
+        return False
+    stride = max(1, int(STATE.get("dataset_camera_sample_stride", 1) or 1))
+    return int(sample_index) % stride == 0
+
+
+def dataset_camera_payload_complete(payload, sample_index):
+    if not dataset_camera_sample_requires_complete_images(sample_index):
+        return True, "not_required"
+    if not isinstance(payload, dict):
+        return False, "payload_missing"
+    missing = []
+    for name in DATASET_CAMERA_NAMES:
+        key = f"observation.images.{name}"
+        if not payload.get(key):
+            missing.append(str(name))
+    if missing:
+        camera_info = payload.get("observation.camera", {})
+        reason = ""
+        if isinstance(camera_info, dict):
+            reason = str(camera_info.get("reason", "") or "")
+            if not reason:
+                view_reasons = []
+                views = camera_info.get("views", {})
+                if isinstance(views, dict):
+                    for name in missing:
+                        view = views.get(str(name), {})
+                        if isinstance(view, dict):
+                            view_reasons.append(f"{name}:{view.get('reason', 'missing')}")
+                reason = ",".join(view_reasons)
+        return False, reason or f"missing_camera_images:{','.join(missing)}"
+    return True, "ok"
+
+
+def dataset_camera_rgb_ready():
+    if not bool(STATE.get("dataset_camera_enabled", True)):
+        return True, "disabled"
+    if not dataset_camera_initialize(force=False):
+        status = STATE.get("dataset_camera_last_status", {})
+        reason = status.get("reason", "camera_unavailable") if isinstance(status, dict) else "camera_unavailable"
+        return False, str(reason)
+    objects = STATE.get("dataset_camera_objects")
+    if not isinstance(objects, dict):
+        return False, "camera_objects_missing"
+    missing = []
+    for name in DATASET_CAMERA_NAMES:
+        cam = objects.get(str(name))
+        if cam is None:
+            missing.append(f"{name}:object_missing")
+            continue
+        try:
+            rgb = cam.get_rgb()
+            if rgb is None:
+                missing.append(f"{name}:rgb_none")
+                continue
+            arr = np.asarray(rgb)
+            if arr.ndim != 3 or arr.shape[0] <= 0 or arr.shape[1] <= 0 or arr.shape[-1] < 3:
+                missing.append(f"{name}:bad_shape:{list(arr.shape)}")
+        except Exception as exc:
+            missing.append(f"{name}:{type(exc).__name__}")
+    if missing:
+        return False, ",".join(missing)
+    return True, "ok"
+
+
+async def dataset_camera_warmup_for_episode(label="episode"):
+    if not bool(STATE.get("dataset_camera_enabled", True)):
+        STATE["dataset_camera_warmup_status"] = {"ok": True, "reason": "disabled", "label": str(label)}
+        return True
+    if not bool(STATE.get("dataset_camera_require_complete_samples", True)):
+        STATE["dataset_camera_warmup_status"] = {"ok": True, "reason": "complete_samples_not_required", "label": str(label)}
+        return True
+    max_frames = max(0, int(STATE.get("dataset_camera_warmup_max_frames", 12) or 12))
+    min_frames = max(0, int(STATE.get("dataset_camera_warmup_frames", 3) or 3))
+    ready_required = max(1, int(STATE.get("dataset_camera_warmup_ready_frames", 2) or 2))
+    ready_streak = 0
+    last_reason = "not_checked"
+    if max_frames <= 0:
+        max_frames = max(min_frames, ready_required)
+    for frame in range(max_frames):
+        await step_updates(1)
+        ready, reason = dataset_camera_rgb_ready()
+        last_reason = reason
+        if ready:
+            ready_streak += 1
+        else:
+            ready_streak = 0
+        if frame + 1 >= min_frames and ready_streak >= ready_required:
+            status = {
+                "ok": True,
+                "reason": "ok",
+                "label": str(label),
+                "frames": int(frame + 1),
+                "ready_streak": int(ready_streak),
+            }
+            STATE["dataset_camera_warmup_status"] = status
+            info_print(
+                "[DATASET CAMERA WARMUP]",
+                f"label={label}",
+                f"ok=True",
+                f"frames={frame + 1}",
+                f"ready_streak={ready_streak}",
+            )
+            return True
+    status = {
+        "ok": False,
+        "reason": str(last_reason),
+        "label": str(label),
+        "frames": int(max_frames),
+        "ready_streak": int(ready_streak),
+    }
+    STATE["dataset_camera_warmup_status"] = status
+    info_print(
+        "[WARN] [DATASET CAMERA WARMUP]",
+        f"label={label}",
+        "ok=False",
+        f"frames={max_frames}",
+        f"ready_streak={ready_streak}",
+        f"reason={last_reason}",
+    )
+    return False
+
+
 @debug_profiled("dataset_capture_camera_observations", threshold_ms=5.0)
 def dataset_capture_camera_observations(sample_index):
     payload = {
@@ -6415,13 +6689,21 @@ def auto_dataset_config_snapshot():
         "preflight_min_particles": AUTO_PREFLIGHT_MIN_PARTICLES,
         "scene_randomization": {
             "random_truck": bool(STATE.get("auto_scene_random_truck_enabled", AUTO_SCENE_RANDOM_TRUCK_DEFAULT)),
+            "random_truck_yaw": bool(STATE.get("auto_scene_random_truck_yaw_enabled", AUTO_SCENE_RANDOM_TRUCK_YAW_DEFAULT)),
+            "random_robot_yaw": bool(STATE.get("auto_scene_random_robot_yaw_enabled", AUTO_SCENE_RANDOM_ROBOT_YAW_DEFAULT)),
             "random_sand_xy": bool(STATE.get("auto_scene_random_sand_xy_enabled", AUTO_SCENE_RANDOM_SAND_XY_DEFAULT)),
             "random_sand_amount": bool(STATE.get("auto_scene_random_sand_amount_enabled", AUTO_SCENE_RANDOM_SAND_AMOUNT_DEFAULT)),
             "truck_root_path": AUTO_SCENE_TRUCK_ROOT_PATH,
             "truck_dx_range": list(AUTO_SCENE_TRUCK_RANDOM_DX_RANGE),
             "truck_dy_range": list(AUTO_SCENE_TRUCK_RANDOM_DY_RANGE),
+            "truck_radius_range": list(AUTO_SCENE_TRUCK_RANDOM_RADIUS_RANGE),
+            "truck_angle_deg_range": list(AUTO_SCENE_TRUCK_RANDOM_ANGLE_DEG_RANGE),
+            "truck_yaw_deg_range": list(AUTO_SCENE_TRUCK_RANDOM_YAW_DEG_RANGE),
+            "robot_yaw_deg_range": list(AUTO_SCENE_ROBOT_RANDOM_YAW_DEG_RANGE),
             "sand_x_range": list(AUTO_SCENE_SAND_RANDOM_X_RANGE),
             "sand_y_range": list(AUTO_SCENE_SAND_RANDOM_Y_RANGE),
+            "sand_radius_range": list(AUTO_SCENE_SAND_RANDOM_RADIUS_RANGE),
+            "sand_angle_deg_range": list(AUTO_SCENE_SAND_RANDOM_ANGLE_DEG_RANGE),
             "sand_amount_range": list(AUTO_SCENE_SAND_AMOUNT_RANGE),
             "min_sand_particle_estimate": int(AUTO_SCENE_MIN_SAND_PARTICLE_ESTIMATE),
             "legal_constraints": {
@@ -6443,6 +6725,10 @@ def camera_config_snapshot():
         "resolution": dataset_camera_resolution(),
         "frequency": int(STATE.get("dataset_camera_frequency", 10) or 10),
         "sample_stride": max(1, int(STATE.get("dataset_camera_sample_stride", 1) or 1)),
+        "require_complete_samples": bool(STATE.get("dataset_camera_require_complete_samples", True)),
+        "warmup_frames": int(STATE.get("dataset_camera_warmup_frames", 3) or 3),
+        "warmup_ready_frames": int(STATE.get("dataset_camera_warmup_ready_frames", 2) or 2),
+        "warmup_max_frames": int(STATE.get("dataset_camera_warmup_max_frames", 12) or 12),
         "requested_image_format": str(STATE.get("dataset_camera_image_format", "ppm") or "ppm"),
         "image_format": dataset_camera_image_extension(),
         "image_format_note": "Default PPM keeps RGB frame content uncompressed during collection; LeRobot export converts images/videos after the run.",
@@ -9499,6 +9785,25 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False)
         mark_span("dataset_record_sample.motion", span_t, threshold_ms=1.0)
 
         sample_index = int(STATE.get("dataset_samples", 0)) - int(STATE.get("dataset_episode_sample_start", 0))
+        camera_payload = None
+        if dataset_camera_sample_requires_complete_images(sample_index):
+            span_t = time.perf_counter()
+            camera_payload = dataset_capture_camera_observations(sample_index)
+            camera_ok, camera_reason = dataset_camera_payload_complete(camera_payload, sample_index)
+            mark_span("dataset_record_sample.camera", span_t, threshold_ms=4.0)
+            if not camera_ok:
+                dropped = int(STATE.get("dataset_camera_dropped_incomplete_samples", 0) or 0) + 1
+                STATE["dataset_camera_dropped_incomplete_samples"] = dropped
+                if dropped <= 3 or dropped % 30 == 0:
+                    info_print(
+                        "[DATASET CAMERA DROP]",
+                        f"episode={STATE.get('dataset_episode_uid', '')}",
+                        f"sample_index={sample_index}",
+                        f"dropped={dropped}",
+                        f"reason={camera_reason}",
+                    )
+                return
+
         span_t = time.perf_counter()
         metrics_bundle = dataset_metrics_frame_bundle(label=f"sample:{sample_index}", q_real=q_real, need_full=False)
         particle_snapshot = metrics_bundle.get("snapshot") if isinstance(metrics_bundle, dict) else None
@@ -9617,9 +9922,11 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False)
                     "label.flags": constraint_flags,
                 }
             )
-        span_t = time.perf_counter()
-        sample.update(dataset_capture_camera_observations(sample_index))
-        mark_span("dataset_record_sample.camera", span_t, threshold_ms=4.0)
+        if camera_payload is None:
+            span_t = time.perf_counter()
+            camera_payload = dataset_capture_camera_observations(sample_index)
+            mark_span("dataset_record_sample.camera", span_t, threshold_ms=4.0)
+        sample.update(camera_payload)
 
         path = str(STATE.get("dataset_path", "excavator_dataset.jsonl"))
         span_t = time.perf_counter()
@@ -9897,6 +10204,7 @@ def ensure_auto_collect_run_dir():
         "segment_dig_secure.jsonl",
         "segment_lift_carry.jsonl",
         "segment_unload.jsonl",
+        "scene_randomization.jsonl",
         DATASET_DEBUG_TIMELINE_FILE,
     ]:
         open(os.path.join(run_dir, index_name), "a", encoding="utf-8").close()
@@ -9973,6 +10281,7 @@ def auto_collect_write_run_summary():
                 "unload": os.path.join(run_dir, "segment_unload.jsonl"),
             },
             "debug_timeline_index": os.path.join(run_dir, DATASET_DEBUG_TIMELINE_FILE),
+            "scene_randomization_index": os.path.join(run_dir, "scene_randomization.jsonl"),
             "debug_diagnostics_enabled": bool(debug_diagnostics_enabled()),
             "debug_profile_enabled": bool(debug_profile_enabled()),
             "debug_profile_summary": dict(STATE.get("debug_profile_summary", {}) or {}),
@@ -10913,6 +11222,7 @@ def auto_collect_record_planning_diagnostic(attempt_index, target, plan_attempts
         "unload_release_xyz": vec_list(unload_bin_dump_point(), 3),
         "initial_pose_id": str(initial_info.get("id", "")),
         "q_initial_deg": q_deg_values(initial_info.get("q"), wrap_swing_for_display=True) if initial_info.get("q") is not None else None,
+        "scene_randomization": dict(STATE.get("auto_scene_last_randomization", {}) or {}),
         "preflight": STATE.get("last_auto_preflight", {}),
         "prepare_gate_report": STATE.get("auto_collect_prepare_gate_report", {}),
         "planning_world": planning_world_snapshot(force=False),
@@ -11186,6 +11496,8 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
     STATE["dataset_last_ddq_real"] = None
     STATE["dataset_current_q_goal"] = None
     STATE["dataset_camera_frame_count"] = 0
+    STATE["dataset_camera_dropped_incomplete_samples"] = 0
+    STATE["dataset_camera_warmup_status"] = {}
     STATE["dataset_task_text"] = "Dig soil from the marked area and dump it into the target container."
     STATE["last_execution_failure_reason"] = ""
     STATE["sand_metrics_last_time"] = 0.0
@@ -11243,6 +11555,7 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
     else:
         unload_landing = unload_landing_point_from_release(unload_point)
     scene_ctx = compact_scene_context()
+    scene_randomization = dict(STATE.get("auto_scene_last_randomization", {}) or {})
     chosen_plan_compact = compact_plan_candidate(chosen_plan, include_stages=True)
     chosen_dig_primitive = chosen_plan_compact.get("dig_primitive", {})
     candidates_compact = [
@@ -11270,6 +11583,7 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
             "dig_primitive": chosen_dig_primitive,
             "shared_dig_plan": shared_plan,
             "preflight": STATE.get("last_auto_preflight", {}),
+            "scene_randomization": scene_randomization,
             "dig_target_candidates": STATE.get("last_auto_dig_target_scores", []),
             "unload_flat_fill_candidates": STATE.get("last_auto_unload_scores", []),
             "chosen_plan": chosen_plan_compact,
@@ -11296,6 +11610,12 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
         "task": "Dig soil from the marked area and dump it into the target container.",
         "trajectory_format": DATASET_TRAJECTORY_FORMAT,
         "camera_observations": dataset_camera_episode_metadata(),
+        "camera_capture_policy": {
+            "require_complete_samples": bool(STATE.get("dataset_camera_require_complete_samples", True)),
+            "warmup_frames": int(STATE.get("dataset_camera_warmup_frames", 3) or 3),
+            "warmup_ready_frames": int(STATE.get("dataset_camera_warmup_ready_frames", 2) or 2),
+            "warmup_max_frames": int(STATE.get("dataset_camera_warmup_max_frames", 12) or 12),
+        },
         "lerobot_schema_notes": {
             "observation.images.0": "relative image path; arm-tip top-down view, export loader should read as torch.Tensor [3,H,W]",
             "observation.images.1": "relative image path; original main swing-mounted view",
@@ -11312,6 +11632,7 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
         "unload_release_xyz": vec_list(unload_point, 3),
         "dig_primitive": chosen_dig_primitive,
         "scene_context": scene_ctx,
+        "scene_randomization": scene_randomization,
         "preflight": STATE.get("last_auto_preflight", {}),
         "initial_pose_id": initial_pose_id,
         "q_initial_rad": None if q_initial_arr is None or len(q_initial_arr) < 4 else vec_list(q_initial_arr[:4], 4),
@@ -11367,7 +11688,7 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
         (
             f"episode_id={uid}; target={vec_list(target, 3)}; "
             f"unload={vec_list(unload_point, 3)}; landing={vec_list(unload_landing, 3)}; initial_pose={initial_pose_id}; "
-            f"scene_source={scene_ctx.get('source')}"
+            f"scene_source={scene_ctx.get('source')}; scene_randomization={scene_randomization.get('reason', '')}"
         ),
     )
     dataset_record_event("plan_ready", f"steps={0 if seq is None else len(seq)}")
@@ -11380,6 +11701,7 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
             "target_xyz": vec_list(target, 3),
             "unload_landing_xyz": vec_list(unload_landing, 3),
             "unload_release_xyz": vec_list(unload_point, 3),
+            "scene_randomization": scene_randomization,
             "stage_count": 0 if seq is None else len(seq),
             "plan_debug": plan_debug_path,
         },
@@ -11422,6 +11744,8 @@ def auto_collect_finish_episode(meta, success, reason):
     meta["duration"] = now - float(meta.get("created_at", now))
     meta["final_counts"] = score_report.get("counts", {})
     meta["final_metrics"] = metrics
+    meta["camera_warmup_status"] = dict(STATE.get("dataset_camera_warmup_status", {}) or {})
+    meta["camera_dropped_incomplete_samples"] = int(STATE.get("dataset_camera_dropped_incomplete_samples", 0) or 0)
     write_json_file(STATE.get("dataset_meta_path", ""), meta)
     score_path = os.path.join(str(STATE.get("dataset_episode_dir", "")), "score.json")
     write_json_file(score_path, score_report)
@@ -11452,6 +11776,7 @@ def auto_collect_finish_episode(meta, success, reason):
         "unload_release_xyz": meta.get("unload_release_xyz"),
         "initial_pose_id": meta.get("initial_pose_id", ""),
         "q_initial_deg": meta.get("q_initial_deg"),
+        "scene_randomization": meta.get("scene_randomization", {}),
         "shared_plan_id": (meta.get("shared_dig_plan") or {}).get("plan_id", ""),
         "shared_plan_cost": (meta.get("shared_dig_plan") or {}).get("total_plan_cost"),
         "shared_plan_duration": (meta.get("shared_dig_plan") or {}).get("estimated_duration"),
@@ -12019,6 +12344,8 @@ def update_unload_models_only(p):
 def auto_scene_randomization_config():
     return {
         "random_truck": bool(STATE.get("auto_scene_random_truck_enabled", AUTO_SCENE_RANDOM_TRUCK_DEFAULT)),
+        "random_truck_yaw": bool(STATE.get("auto_scene_random_truck_yaw_enabled", AUTO_SCENE_RANDOM_TRUCK_YAW_DEFAULT)),
+        "random_robot_yaw": bool(STATE.get("auto_scene_random_robot_yaw_enabled", AUTO_SCENE_RANDOM_ROBOT_YAW_DEFAULT)),
         "random_sand_xy": bool(STATE.get("auto_scene_random_sand_xy_enabled", AUTO_SCENE_RANDOM_SAND_XY_DEFAULT)),
         "random_sand_amount": bool(STATE.get("auto_scene_random_sand_amount_enabled", AUTO_SCENE_RANDOM_SAND_AMOUNT_DEFAULT)),
     }
@@ -12026,7 +12353,13 @@ def auto_scene_randomization_config():
 
 def auto_scene_randomization_any_enabled():
     cfg = auto_scene_randomization_config()
-    return bool(cfg["random_truck"] or cfg["random_sand_xy"] or cfg["random_sand_amount"])
+    return bool(
+        cfg["random_truck"]
+        or cfg["random_truck_yaw"]
+        or cfg["random_robot_yaw"]
+        or cfg["random_sand_xy"]
+        or cfg["random_sand_amount"]
+    )
 
 
 def auto_scene_xy_radius(xy):
@@ -12034,6 +12367,27 @@ def auto_scene_xy_radius(xy):
     if len(arr) < 2:
         return 1.0e9
     return float(math.sqrt(float(arr[0]) * float(arr[0]) + float(arr[1]) * float(arr[1])))
+
+
+def auto_scene_xy_angle_deg(xy):
+    arr = np.array(xy, dtype=np.float32).reshape(-1)
+    if len(arr) < 2:
+        return None
+    return float(math.degrees(math.atan2(float(arr[1]), float(arr[0]))))
+
+
+def auto_scene_sample_polar_xy(rng, radius_range, angle_deg_range):
+    r0, r1 = float(radius_range[0]), float(radius_range[1])
+    a0, a1 = float(angle_deg_range[0]), float(angle_deg_range[1])
+    radius = float(rng.uniform(min(r0, r1), max(r0, r1)))
+    angle_deg = float(rng.uniform(min(a0, a1), max(a0, a1)))
+    angle = math.radians(angle_deg)
+    xy = np.array([radius * math.cos(angle), radius * math.sin(angle)], dtype=np.float32)
+    return xy, radius, angle_deg
+
+
+def wrap_deg_180(value):
+    return ((float(value) + 180.0) % 360.0) - 180.0
 
 
 def auto_scene_truck_baseline():
@@ -12056,6 +12410,7 @@ def auto_scene_truck_baseline():
         translate = np.array(translate, dtype=np.float32).reshape(-1)[:3]
     except Exception:
         translate = np.array(center, dtype=np.float32).reshape(-1)[:3]
+    yaw_deg = get_prim_local_yaw_z_deg(path, default=0.0)
     dump_center = None
     try:
         dump_center, _dump_size, _dump_mn, _dump_mx = bbox_center_size(DEFAULT_UNLOAD_SOURCE_MESH_PATH)
@@ -12068,6 +12423,7 @@ def auto_scene_truck_baseline():
         "path": path,
         "center": np.array(center, dtype=np.float32).reshape(-1)[:3],
         "translation": np.array(translate, dtype=np.float32).reshape(-1)[:3],
+        "yaw_deg": float(yaw_deg),
         "dump_center": np.array(dump_center, dtype=np.float32).reshape(-1)[:3],
         "size": np.array(size, dtype=np.float32).reshape(-1)[:3] if size is not None else np.zeros(3, dtype=np.float32),
     }
@@ -12117,23 +12473,76 @@ def auto_scene_estimate_particles_for_amount(amount):
     return max(0, int(round(float(current_est) * max(0.1, float(amount)))))
 
 
+def auto_scene_attempt_record(candidate=None, ok=False, reason="", cfg=None):
+    cfg = auto_scene_randomization_config() if cfg is None else dict(cfg)
+    candidate = candidate if isinstance(candidate, dict) else {}
+    sand_result = candidate.get("sand_site_result") if isinstance(candidate.get("sand_site_result"), dict) else {}
+    truck_translation = None
+    truck_yaw_deg = None
+    if bool(cfg.get("random_truck", False) or cfg.get("random_truck_yaw", False)):
+        try:
+            truck_translation = vec_list(get_prim_translation(AUTO_SCENE_TRUCK_ROOT_PATH), 3)
+        except Exception:
+            truck_translation = None
+        try:
+            truck_yaw_deg = get_prim_local_yaw_z_deg(AUTO_SCENE_TRUCK_ROOT_PATH, default=0.0)
+        except Exception:
+            truck_yaw_deg = None
+    return {
+        "ok": bool(ok),
+        "reason": str(reason),
+        "attempt": int(candidate.get("attempt", STATE.get("auto_collect_attempts", 0)) or 0),
+        "config": cfg,
+        "candidate": {
+            "sand_xy": vec_list(candidate.get("sand_xy"), 2),
+            "sand_radius_m": candidate.get("sand_radius_m"),
+            "sand_angle_deg": candidate.get("sand_angle_deg"),
+            "sand_amount_multiplier": candidate.get("sand_amount_multiplier"),
+            "truck_delta_xy": vec_list(candidate.get("truck_delta_xy"), 2),
+            "applied_truck_delta_xy": vec_list(candidate.get("applied_truck_delta_xy"), 2),
+            "truck_center_xy": vec_list(candidate.get("truck_center_xy"), 2) if candidate.get("truck_center_xy") is not None else None,
+            "truck_radius_m": candidate.get("truck_radius_m"),
+            "truck_angle_deg": candidate.get("truck_angle_deg"),
+            "truck_yaw_deg": candidate.get("truck_yaw_deg"),
+            "robot_body_yaw_deg": candidate.get("robot_body_yaw_deg"),
+            "unload_xy": vec_list(candidate.get("unload_xy"), 2),
+            "unload_radius_m": candidate.get("unload_radius_m"),
+            "unload_angle_deg": candidate.get("unload_angle_deg"),
+            "estimated_particle_count": int(candidate.get("estimated_particle_count", 0) or 0),
+            "sample_try": int(candidate.get("sample_try", 0) or 0),
+            "legal_reason": str(candidate.get("legal_reason", "")),
+        },
+        "applied": {
+            "sand_center": sand_result.get("sand_center"),
+            "sand_amount_multiplier": sand_result.get("sand_amount_multiplier"),
+            "estimated_particle_count": sand_result.get("estimated_particle_count"),
+            "truck_translation_xyz": truck_translation,
+            "truck_yaw_deg": truck_yaw_deg,
+            "robot_body_yaw_deg": candidate.get("robot_body_yaw_deg"),
+            "unload_point_xyz": vec_list(unload_bin_dump_point(), 3),
+            "unload_landing_xyz": vec_list(unload_bin_landing_point(), 3),
+            "scene_context": compact_scene_context(),
+        },
+    }
+
+
 def auto_scene_sample_candidate(attempt_index):
     cfg = auto_scene_randomization_config()
     ctx = task_scene_context()
     base_sand_xy = np.array(ctx.get("pile_center", [0.0, 6.7, 0.0]), dtype=np.float32).reshape(-1)[:2]
     base_unload_xy = np.array(ctx.get("unload_bin_center", [-10.0, -5.0, 0.0]), dtype=np.float32).reshape(-1)[:2]
     rng = np.random.default_rng(410700 + int(max(1, attempt_index)) * 7919)
-    truck_base = auto_scene_truck_baseline() if cfg["random_truck"] else None
+    truck_base = auto_scene_truck_baseline() if (cfg["random_truck"] or cfg["random_truck_yaw"]) else None
     last_reason = "not_sampled"
     for _try_index in range(max(1, int(AUTO_SCENE_RANDOM_MAX_TRIES))):
         sand_xy = np.array(base_sand_xy, dtype=np.float32)
+        sand_radius = auto_scene_xy_radius(sand_xy)
+        sand_angle_deg = auto_scene_xy_angle_deg(sand_xy)
         if cfg["random_sand_xy"]:
-            sand_xy = np.array(
-                [
-                    float(rng.uniform(float(AUTO_SCENE_SAND_RANDOM_X_RANGE[0]), float(AUTO_SCENE_SAND_RANDOM_X_RANGE[1]))),
-                    float(rng.uniform(float(AUTO_SCENE_SAND_RANDOM_Y_RANGE[0]), float(AUTO_SCENE_SAND_RANDOM_Y_RANGE[1]))),
-                ],
-                dtype=np.float32,
+            sand_xy, sand_radius, sand_angle_deg = auto_scene_sample_polar_xy(
+                rng,
+                AUTO_SCENE_SAND_RANDOM_RADIUS_RANGE,
+                AUTO_SCENE_SAND_RANDOM_ANGLE_DEG_RANGE,
             )
 
         amount = None
@@ -12142,24 +12551,48 @@ def auto_scene_sample_candidate(attempt_index):
 
         truck_delta = np.zeros(2, dtype=np.float32)
         truck_center_xy = None
+        truck_radius = None
+        truck_angle_deg = None
+        truck_yaw_deg = None
+        robot_body_yaw_deg = None
         unload_xy = np.array(base_unload_xy, dtype=np.float32)
+        unload_radius = auto_scene_xy_radius(unload_xy)
+        unload_angle_deg = auto_scene_xy_angle_deg(unload_xy)
+        if cfg["random_truck_yaw"]:
+            if not (isinstance(truck_base, dict) and truck_base.get("valid")):
+                last_reason = str((truck_base or {}).get("reason", "truck_baseline_invalid"))
+                break
+            truck_yaw_deg = float(
+                rng.uniform(
+                    float(AUTO_SCENE_TRUCK_RANDOM_YAW_DEG_RANGE[0]),
+                    float(AUTO_SCENE_TRUCK_RANDOM_YAW_DEG_RANGE[1]),
+                )
+            )
+        elif isinstance(truck_base, dict) and truck_base.get("valid"):
+            truck_yaw_deg = float(truck_base.get("yaw_deg", 0.0) or 0.0)
+        if cfg["random_robot_yaw"]:
+            robot_body_yaw_deg = float(
+                rng.uniform(
+                    float(AUTO_SCENE_ROBOT_RANDOM_YAW_DEG_RANGE[0]),
+                    float(AUTO_SCENE_ROBOT_RANDOM_YAW_DEG_RANGE[1]),
+                )
+            )
         if cfg["random_truck"]:
             if not (isinstance(truck_base, dict) and truck_base.get("valid")):
                 last_reason = str((truck_base or {}).get("reason", "truck_baseline_invalid"))
                 break
-            truck_delta = np.array(
-                [
-                    float(rng.uniform(float(AUTO_SCENE_TRUCK_RANDOM_DX_RANGE[0]), float(AUTO_SCENE_TRUCK_RANDOM_DX_RANGE[1]))),
-                    float(rng.uniform(float(AUTO_SCENE_TRUCK_RANDOM_DY_RANGE[0]), float(AUTO_SCENE_TRUCK_RANDOM_DY_RANGE[1]))),
-                ],
-                dtype=np.float32,
+            unload_xy, unload_radius, unload_angle_deg = auto_scene_sample_polar_xy(
+                rng,
+                AUTO_SCENE_TRUCK_RANDOM_RADIUS_RANGE,
+                AUTO_SCENE_TRUCK_RANDOM_ANGLE_DEG_RANGE,
             )
             truck_center = np.array(truck_base["center"], dtype=np.float32).reshape(-1)[:3].copy()
+            dump_center = np.array(truck_base.get("dump_center", truck_center), dtype=np.float32).reshape(-1)[:3].copy()
+            truck_delta = unload_xy - dump_center[:2]
             truck_center[:2] += truck_delta
             truck_center_xy = truck_center[:2].copy()
-            dump_center = np.array(truck_base.get("dump_center", truck_center), dtype=np.float32).reshape(-1)[:3].copy()
-            dump_center[:2] += truck_delta
-            unload_xy = dump_center[:2].copy()
+            truck_radius = auto_scene_xy_radius(truck_center_xy)
+            truck_angle_deg = auto_scene_xy_angle_deg(truck_center_xy)
 
         amount_for_estimate = amount if amount is not None else 1.0
         candidate = {
@@ -12168,10 +12601,18 @@ def auto_scene_sample_candidate(attempt_index):
             "random_sand_xy": bool(cfg["random_sand_xy"]),
             "random_sand_amount": bool(cfg["random_sand_amount"]),
             "sand_xy": sand_xy,
+            "sand_radius_m": float(sand_radius),
+            "sand_angle_deg": sand_angle_deg,
             "sand_amount_multiplier": amount,
             "truck_delta_xy": truck_delta,
             "truck_center_xy": truck_center_xy,
+            "truck_radius_m": truck_radius,
+            "truck_angle_deg": truck_angle_deg,
+            "truck_yaw_deg": truck_yaw_deg,
+            "robot_body_yaw_deg": robot_body_yaw_deg,
             "unload_xy": unload_xy,
+            "unload_radius_m": float(unload_radius),
+            "unload_angle_deg": unload_angle_deg,
             "estimated_particle_count": auto_scene_estimate_particles_for_amount(amount_for_estimate),
         }
         ok, reason = auto_scene_candidate_legal(candidate)
@@ -12190,17 +12631,48 @@ def auto_scene_apply_candidate(candidate):
     scene_changed = False
     truck_moved = False
 
-    if cfg["random_truck"]:
+    if cfg["random_truck"] or cfg["random_truck_yaw"]:
         truck_base = auto_scene_truck_baseline()
         if not (isinstance(truck_base, dict) and truck_base.get("valid")):
             return False, str(truck_base.get("reason", "truck_baseline_invalid"))
-        delta = np.array(candidate.get("truck_delta_xy", [0.0, 0.0]), dtype=np.float32).reshape(-1)[:2]
-        target_translate = np.array(truck_base["translation"], dtype=np.float32).reshape(-1)[:3].copy()
-        target_translate[0] += float(delta[0])
-        target_translate[1] += float(delta[1])
-        truck_moved = bool(set_translate_preserve_xform_ops(AUTO_SCENE_TRUCK_ROOT_PATH, target_translate))
+        target_yaw = float(
+            candidate.get(
+                "truck_yaw_deg",
+                truck_base.get("yaw_deg", 0.0),
+            )
+            or 0.0
+        )
+        base_translate = np.array(truck_base["translation"], dtype=np.float32).reshape(-1)[:3].copy()
+        truck_moved = bool(
+            set_translate_rotate_z_preserve_xform_ops(
+                AUTO_SCENE_TRUCK_ROOT_PATH,
+                translate=base_translate,
+                yaw_deg=target_yaw,
+            )
+        )
         if not truck_moved:
-            return False, "truck_translate_failed"
+            return False, "truck_pose_reset_failed"
+        if cfg["random_truck"]:
+            dump_center, _dump_size, _dump_mn, _dump_mx = bbox_center_size(DEFAULT_UNLOAD_SOURCE_MESH_PATH)
+            if dump_center is None:
+                return False, "truck_dump_center_missing_after_yaw"
+            desired_unload_xy = np.array(candidate.get("unload_xy", [0.0, 0.0]), dtype=np.float32).reshape(-1)[:2]
+            current_dump = np.array(dump_center, dtype=np.float32).reshape(-1)[:3]
+            current_translate = get_prim_translation(AUTO_SCENE_TRUCK_ROOT_PATH)
+            target_translate = np.array(current_translate, dtype=np.float32).reshape(-1)[:3].copy()
+            delta = desired_unload_xy - current_dump[:2]
+            target_translate[0] += float(delta[0])
+            target_translate[1] += float(delta[1])
+            truck_moved = bool(
+                set_translate_rotate_z_preserve_xform_ops(
+                    AUTO_SCENE_TRUCK_ROOT_PATH,
+                    translate=target_translate,
+                    yaw_deg=target_yaw,
+                )
+            )
+            if not truck_moved:
+                return False, "truck_translate_failed"
+            candidate["applied_truck_delta_xy"] = delta.copy()
         clear_rigid_obstacle_cache("auto_scene_random_truck")
         scene_changed = True
 
@@ -12240,10 +12712,18 @@ def auto_scene_apply_candidate(candidate):
 async def auto_collect_apply_scene_randomization(attempt_index):
     cfg = auto_scene_randomization_config()
     if not auto_scene_randomization_any_enabled():
+        STATE["auto_scene_last_randomization"] = auto_scene_attempt_record(
+            {"attempt": int(attempt_index)},
+            ok=True,
+            reason="disabled",
+            cfg=cfg,
+        )
         return True
     candidate = auto_scene_sample_candidate(attempt_index)
     if "error" in candidate:
-        STATE["auto_scene_last_randomization"] = {"ok": False, "reason": candidate.get("error"), "attempt": int(attempt_index)}
+        record = auto_scene_attempt_record(candidate, ok=False, reason=candidate.get("error"), cfg=cfg)
+        STATE["auto_scene_last_randomization"] = record
+        append_jsonl(os.path.join(ensure_auto_collect_run_dir(), "scene_randomization.jsonl"), record)
         info_print(
             "[AUTO SCENE RANDOMIZE]",
             f"attempt={attempt_index}",
@@ -12252,30 +12732,19 @@ async def auto_collect_apply_scene_randomization(attempt_index):
             f"config={cfg}",
         )
         update_status(f"[AUTO SCENE RANDOMIZE] skipped invalid sample: {candidate.get('error')}", force=True)
-        return True
+        return False
     ok, reason = auto_scene_apply_candidate(candidate)
-    record = {
-        "ok": bool(ok),
-        "reason": str(reason),
-        "attempt": int(attempt_index),
-        "config": cfg,
-        "candidate": {
-            "sand_xy": vec_list(candidate.get("sand_xy"), 2),
-            "sand_amount_multiplier": candidate.get("sand_amount_multiplier"),
-            "truck_delta_xy": vec_list(candidate.get("truck_delta_xy"), 2),
-            "truck_center_xy": vec_list(candidate.get("truck_center_xy"), 2) if candidate.get("truck_center_xy") is not None else None,
-            "unload_xy": vec_list(candidate.get("unload_xy"), 2),
-            "estimated_particle_count": int(candidate.get("estimated_particle_count", 0) or 0),
-            "sample_try": int(candidate.get("sample_try", 0) or 0),
-        },
-    }
+    record = auto_scene_attempt_record(candidate, ok=ok, reason=reason, cfg=cfg)
     STATE["auto_scene_last_randomization"] = record
+    append_jsonl(os.path.join(ensure_auto_collect_run_dir(), "scene_randomization.jsonl"), record)
     info_print(
         "[AUTO SCENE RANDOMIZE]",
         f"attempt={attempt_index}",
         f"ok={ok}",
         f"reason={reason}",
         f"truck={cfg['random_truck']}",
+        f"truck_yaw={cfg['random_truck_yaw']}",
+        f"robot_yaw={cfg['random_robot_yaw']}",
         f"sand_xy={cfg['random_sand_xy']}",
         f"sand_amount={cfg['random_sand_amount']}",
         f"candidate={record['candidate']}",
@@ -12284,7 +12753,7 @@ async def auto_collect_apply_scene_randomization(attempt_index):
         await step_updates(2)
     else:
         update_status(f"[AUTO SCENE RANDOMIZE] apply failed: {reason}", force=True)
-    return True
+    return bool(ok)
 
 
 def auto_collect_prepare_home_needed(policy=None, ready_reset_done=None):
@@ -12649,7 +13118,33 @@ async def auto_collect_one_episode():
     STATE["auto_collect_attempts"] = attempt
     update_status(f"[AUTO DATASET] episode {attempt} prepare", force=True)
 
-    await auto_collect_apply_scene_randomization(attempt)
+    scene_ok = await auto_collect_apply_scene_randomization(attempt)
+    if not scene_ok:
+        scene_record = dict(STATE.get("auto_scene_last_randomization", {}) or {})
+        scene_reason = str(scene_record.get("reason", "scene_randomization_failed"))
+        target = auto_collect_sample_target(attempt, 0)
+        plan_attempts = [{
+            "prepared": False,
+            "scene_randomization_ok": False,
+            "scene_randomization": scene_record,
+            "failure_reason": scene_reason,
+        }]
+        reason = f"planning_failed/scene_randomization_failed:{scene_reason}"
+        info_print(
+            "[AUTO DATASET ATTEMPT]",
+            f"attempt={attempt}",
+            "result=scene_randomization_failed",
+            "executed=False",
+            f"reason={scene_reason}",
+        )
+        auto_collect_record_planning_diagnostic(
+            attempt,
+            target,
+            plan_attempts,
+            reason,
+            initial_info=None,
+        )
+        return False
 
     prepared = await auto_collect_prepare_environment()
     if not prepared:
@@ -12772,6 +13267,7 @@ async def auto_collect_one_episode():
         return False
 
     meta = auto_collect_begin_episode(attempt, target, plan_attempts, seq, initial_info=initial_info)
+    await dataset_camera_warmup_for_episode(label=f"auto_collect_episode_{attempt:06d}")
 
     shared_plan = STATE.get("current_dig_plan")
     if isinstance(shared_plan, dict):
@@ -12887,7 +13383,6 @@ async def auto_collect_loop(count, max_attempts=None):
     STATE["plan_build_summary"] = {}
     STATE["dataset_record_sample_spans"] = {}
     STATE["auto_scene_last_randomization"] = {}
-    STATE["auto_scene_last_unload_bin_enabled"] = None
     STATE["auto_scene_truck_baseline"] = None
     for key in [
         "path_obstacle_check_cache_hits",
@@ -14749,7 +15244,19 @@ def q_from_pose_deg(pose, reference=None):
 
 def auto_collect_initial_pose_for_attempt(attempt_index):
     poses = AUTO_COLLECT_INITIAL_POSES_DEG
-    pose = poses[(max(1, int(attempt_index)) - 1) % max(1, len(poses))]
+    pose = dict(poses[(max(1, int(attempt_index)) - 1) % max(1, len(poses))])
+    scene_record = STATE.get("auto_scene_last_randomization", {})
+    scene_candidate = scene_record.get("candidate", {}) if isinstance(scene_record, dict) else {}
+    robot_body_yaw = None
+    if isinstance(scene_candidate, dict):
+        robot_body_yaw = scene_candidate.get("robot_body_yaw_deg")
+    if robot_body_yaw is not None:
+        base_swing = float(pose.get("swing", 0.0) or 0.0)
+        yaw = wrap_deg_180(float(robot_body_yaw))
+        pose["base_pose_swing_deg"] = base_swing
+        pose["swing"] = yaw
+        pose["robot_body_yaw_deg"] = yaw
+        pose["id"] = f"{pose.get('id', f'pose_{attempt_index}')}_yaw_{yaw:+.0f}"
     q = q_from_pose_deg(pose, reference=CTRL.q_cmd)
     return {
         "id": str(pose.get("id", f"pose_{attempt_index}")),
@@ -14954,7 +15461,7 @@ def clear_manual_unload_override():
     p = unload_bin_landing_point()
     ensure_unload_marker(p, label="clear_manual_unload_override")
     update_unload_models_only(p)
-    update_status("[UNLOAD SETUP] cleared manual override; using sand site/default unload bin", force=True)
+    update_status("[UNLOAD SETUP] cleared manual override; using default truck dump target", force=True)
 
 
 def update_target_from_models():
@@ -23120,17 +23627,20 @@ def secure_post_gate_report(q_start, current_metrics=None):
     geometry_retains = bool(carry_report.get("ok", False)) and bool(carry_report.get("retains_material", False))
     real_loaded_hold = real_loaded_secure_hold_allowed(carry_report, loaded_count=bucket_after)
     transitional_loaded_hold = loaded_transitional_hold_allowed(carry_report, loaded_count=bucket_after)
-    carry_ok = bool(geometry_retains or real_loaded_hold or transitional_loaded_hold)
+    # Transitional hold is only a recovery/monitoring state during secure curl.
+    # It must not unlock lift/carry; otherwise the arm can lift with the bucket
+    # still near vertical and dump most of the material.
+    carry_ok = bool(geometry_retains or real_loaded_hold)
     delta_ok = bool(delta_report.get("ok", False))
     ok = carry_ok and delta_ok
-    if ok and transitional_loaded_hold and not (geometry_retains or real_loaded_hold):
-        reason = "ok_transitional_loaded_hold"
-    elif ok:
+    if ok:
         reason = "ok"
     elif not delta_ok:
         reason = str(delta_report.get("reason", "secure_material_loss"))
     elif real_loaded_hold:
         reason = "ok_real_loaded_hold"
+    elif transitional_loaded_hold:
+        reason = "needs_carry_safe_projection:transitional_loaded_hold"
     else:
         reason = str(carry_report.get("reason", "current_pose_not_retaining_material"))
     return {
@@ -23161,9 +23671,10 @@ def post_lift_material_gate_report(current_metrics=None, q_pose=None):
     except Exception:
         q_check = CTRL.q_cmd.copy()
     carry_report = carry_material_report_for_q(q_check, end_effector="load")
+    geometry_retains = bool(carry_report.get("ok", False)) and bool(carry_report.get("retains_material", False))
     real_loaded_hold = real_loaded_secure_hold_allowed(carry_report, loaded_count=current_bucket)
     transitional_loaded_hold = loaded_transitional_hold_allowed(carry_report, loaded_count=current_bucket)
-    carry_ok = bool(real_loaded_hold or transitional_loaded_hold)
+    carry_ok = bool(geometry_retains or real_loaded_hold)
     baseline_name, baseline_sand = secure_material_baseline_sand()
     baseline_sand = baseline_sand if isinstance(baseline_sand, dict) else {}
     start_bucket = int(baseline_sand.get("bucket_from_pile", current_bucket) or 0)
@@ -23213,6 +23724,7 @@ def post_lift_material_gate_report(current_metrics=None, q_pose=None):
             f"lift_material_soft_gate bucket={current_bucket}/{min_bucket} retained={retained_fraction:.2f}"
         ),
         "carry_ok": bool(carry_ok),
+        "geometry_retains_material": bool(geometry_retains),
         "real_loaded_hold_allowed": bool(real_loaded_hold),
         "transitional_loaded_hold_allowed": bool(transitional_loaded_hold),
         "q_lift_real_deg": q_deg_values(q_check, wrap_swing_for_display=True),
@@ -23282,10 +23794,14 @@ def staged_carry_safe_projection_candidates(q_start):
                 "actual_report": actual_report,
             })
             continue
-        if not (retains_material or real_loaded_hold or transitional_hold):
+        if not (retains_material or real_loaded_hold):
             rows.append({
                 "ok": False,
-                "reason": f"carry_would_spill:{actual_report.get('reason', carry_report.get('reason', 'unknown'))}",
+                "reason": (
+                    "carry_would_spill:"
+                    f"{actual_report.get('reason', carry_report.get('reason', 'unknown'))}; "
+                    f"transitional_hold={bool(transitional_hold)}"
+                ),
                 "carry_report": carry_report,
                 "actual_report": actual_report,
             })
@@ -23346,34 +23862,41 @@ def staged_lift_candidates(q_start):
         q[arm_idx] = float(q[arm_idx]) + deg_to_rad(arm_retract_deg)
         q[bucket_idx] = float(q_start[bucket_idx])
         q = clip_command_near(q, reference=q_start)
-        preserved_report = carry_material_report_for_q(q, end_effector="load")
-        preserve_loaded_bucket = bool(loaded_transitional_hold_allowed(preserved_report, loaded_count=loaded_now))
-        if preserve_loaded_bucket:
-            carry_report = dict(preserved_report)
-            carry_report["transitional_load"] = True
-            carry_report["lift_preserves_bucket"] = True
-        else:
-            q, carry_report = carry_hold_adjusted_q(q, q_reference=q_start, end_effector="load")
-            q_forced = force_loaded_carry_bucket_q(q, reference=q_start, label="lift_carry_candidate")
-            forced_report = carry_material_report_for_q(q_forced, end_effector="load")
-            if bool((forced_report or {}).get("retains_material", False)):
-                q = q_forced.copy()
-                carry_report = dict(forced_report)
-                carry_report["projection_source"] = "forced_loaded_carry_joint"
-            elif isinstance(carry_report, dict):
-                carry_report = dict(carry_report)
-                carry_report["forced_loaded_carry_report"] = forced_report
+        q_adjusted, carry_report = carry_hold_adjusted_q(q, q_reference=q_start, end_effector="load")
+        q_forced = force_loaded_carry_bucket_q(q_adjusted, reference=q_start, label="lift_carry_candidate")
+        forced_report = carry_material_report_for_q(q_forced, end_effector="load")
+        adjusted_report = carry_material_report_for_q(q_adjusted, end_effector="load")
+        forced_real_hold = real_loaded_secure_hold_allowed(forced_report, loaded_count=loaded_now)
+        adjusted_real_hold = real_loaded_secure_hold_allowed(adjusted_report, loaded_count=loaded_now)
+        if bool((forced_report or {}).get("retains_material", False)) or forced_real_hold:
+            q = q_forced.copy()
+            carry_report = dict(forced_report)
+            carry_report["projection_source"] = "forced_loaded_carry_joint"
+            carry_report["forced_real_loaded_hold_allowed"] = bool(forced_real_hold)
+            carry_report["adjusted_carry_report"] = adjusted_report
+        elif bool((adjusted_report or {}).get("retains_material", False)) or adjusted_real_hold:
+            q = q_adjusted.copy()
+            carry_report = dict(adjusted_report)
+            carry_report["projection_source"] = "carry_hold_adjusted"
+            carry_report["adjusted_real_loaded_hold_allowed"] = bool(adjusted_real_hold)
+            carry_report["forced_loaded_carry_report"] = forced_report
+        elif isinstance(carry_report, dict):
+            carry_report = dict(carry_report)
+            carry_report["forced_loaded_carry_report"] = forced_report
+            carry_report["adjusted_actual_report"] = adjusted_report
         if not bool((carry_report or {}).get("ok", False)):
             continue
         retains_material = bool((carry_report or {}).get("retains_material", False))
+        real_material_hold = bool(real_loaded_secure_hold_allowed(carry_report, loaded_count=loaded_now))
         transitional_material_hold = bool(loaded_transitional_hold_allowed(carry_report, loaded_count=loaded_now))
-        if not (retains_material or transitional_material_hold):
+        if not (retains_material or real_material_hold):
             rows.append({
                 "ok": False,
                 "q": q,
                 "reason": (
                     "carry_would_spill_before_lift:"
-                    f"pour_above_load_z={fmt_optional((carry_report or {}).get('pour_above_load_z'))}"
+                    f"pour_above_load_z={fmt_optional((carry_report or {}).get('pour_above_load_z'))}; "
+                    f"transitional_hold={bool(transitional_material_hold)}"
                 ),
                 "carry_report": carry_report,
                 "transitional_material_hold": bool(transitional_material_hold),
@@ -23399,8 +23922,7 @@ def staged_lift_candidates(q_start):
         score = (
             float(motion.get("cost", 0.0) or 0.0)
             + carry_spill_risk_penalty(carry_report)
-            + (8.0 if preserve_loaded_bucket else 0.0)
-            + (24.0 if transitional_material_hold and not retains_material and not preserve_loaded_bucket else 0.0)
+            + (24.0 if transitional_material_hold and not (retains_material or real_material_hold) else 0.0)
         )
         rows.append({
             "ok": True,
@@ -23410,8 +23932,9 @@ def staged_lift_candidates(q_start):
             "target_point": target_point,
             "carry_report": carry_report,
             "retains_material": bool(retains_material),
+            "real_material_hold": bool(real_material_hold),
             "transitional_material_hold": bool(transitional_material_hold and not retains_material),
-            "preserve_loaded_bucket": bool(preserve_loaded_bucket),
+            "preserve_loaded_bucket": False,
             "loaded_now": int(loaded_now),
             "boom_lift_deg": float(boom_lift_deg),
             "arm_retract_deg": float(arm_retract_deg),
@@ -25500,7 +26023,7 @@ def plan_unload_from_current():
         allow_unaligned=True,
     )
     if q_dump is None:
-        update_status(f"[UNLOAD BLOCKED] could not plan dump landing above unload bin: {dump_info}", force=True)
+        update_status(f"[UNLOAD BLOCKED] could not plan dump landing above unload target: {dump_info}", force=True)
         return None
     q_pre_dump = np.array(q_dump, dtype=np.float32).copy()
     bucket_idx = CTRL.name_to_idx["bucket"]
@@ -28327,6 +28850,18 @@ def build_ui():
                             "auto_scene_random_sand_amount_enabled",
                             width=132,
                         )
+                    with ui.HStack(spacing=6, height=24):
+                        ui.Label("Yaw", width=64)
+                        add_auto_scene_checkbox(
+                            "Rand Truck Yaw",
+                            "auto_scene_random_truck_yaw_enabled",
+                            width=152,
+                        )
+                        add_auto_scene_checkbox(
+                            "Rand Body Yaw",
+                            "auto_scene_random_robot_yaw_enabled",
+                            width=150,
+                        )
 
                     with ui.HStack(spacing=6, height=24):
                         speed_model = ui.SimpleFloatModel(float(STATE.get("speed_multiplier", 1.0)))
@@ -28357,7 +28892,7 @@ def build_ui():
                                     ui.FloatField(model=model, width=70)
 
                         with ui.VStack(width=292, spacing=4):
-                            ui.Label("Unload point / Z range")
+                            ui.Label("Truck dump target / Z")
                             unload_p = np.array(STATE.get("manual_unload_point") if STATE.get("manual_unload_point") is not None else unload_bin_landing_point(), dtype=np.float32).reshape(-1)[:3]
                             unload_z_range = STATE.get("manual_unload_z_range")
                             if unload_z_range is not None:
@@ -28401,13 +28936,13 @@ def build_ui():
                             STATE["last_unload_model_shrink_d"] = float(manual_unload_mesh_shrink_d())
                             STATE["last_unload_sync_time"] = time.time()
 
-                    ui.Label("Z Min/Max sets the blue unload range height; Z Max is the marker/release height.", width=590)
-                    ui.Label("R applies to point/XYZ mode; D shrinks selected mesh XY footprint. Auto Dataset uses this unload target.", width=590)
-                    ui.Label("Unload point setup")
+                    ui.Label("Z Min/Max sets the blue dump target height; Z Max is the marker/release height.", width=590)
+                    ui.Label("R applies to point/XYZ mode; D shrinks selected dump mesh XY footprint. Auto Dataset uses this target.", width=590)
+                    ui.Label("Truck dump target setup")
                     with ui.HStack(spacing=6, height=26):
-                        ui.Button("Unload Selected Mesh", width=166, clicked_fn=use_selected_unload_mesh_from_ui)
-                        ui.Button("Unload Selected Point", width=166, clicked_fn=use_selected_unload_point_from_ui)
-                        ui.Button("Clear Unload Override", width=160, clicked_fn=clear_unload_override_from_ui)
+                        ui.Button("Use Dump Mesh", width=140, clicked_fn=use_selected_unload_mesh_from_ui)
+                        ui.Button("Use Drop Point", width=140, clicked_fn=use_selected_unload_point_from_ui)
+                        ui.Button("Clear Dump Target", width=150, clicked_fn=clear_unload_override_from_ui)
 
                     ui.Separator()
                     ui.Label("Debug Planner / Trace")

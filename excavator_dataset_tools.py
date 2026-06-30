@@ -7,6 +7,7 @@ import time
 from collections import Counter, defaultdict
 from statistics import mean, median
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 INDEX_FILES = {
@@ -1838,6 +1839,746 @@ def print_lerobot_export(
     print("[LEROBOT EXPORT]", json.dumps(result, ensure_ascii=True, indent=2))
 
 
+def nested_dict_value(data: object, path: Sequence[str], default=None):
+    cur = data
+    for key in path:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(key)
+    return default if cur is None else cur
+
+
+def vector_xy(value: object) -> Optional[List[float]]:
+    vec = vector_or_none(value)
+    if vec is None or len(vec) < 2:
+        return None
+    return [float(vec[0]), float(vec[1])]
+
+
+def vector_xyz(value: object) -> Optional[List[float]]:
+    vec = vector_or_none(value)
+    if vec is None or len(vec) < 3:
+        return None
+    return [float(vec[0]), float(vec[1]), float(vec[2])]
+
+
+def dashboard_scene_from_episode(row: dict) -> Dict[str, object]:
+    scene = row.get("scene_randomization") if isinstance(row.get("scene_randomization"), dict) else {}
+    candidate = scene.get("candidate") if isinstance(scene.get("candidate"), dict) else {}
+    applied = scene.get("applied") if isinstance(scene.get("applied"), dict) else {}
+    scene_context = applied.get("scene_context") if isinstance(applied.get("scene_context"), dict) else {}
+    sand_xy = (
+        vector_xy(applied.get("sand_center"))
+        or vector_xy(candidate.get("sand_xy"))
+        or vector_xy(row.get("target_xyz"))
+    )
+    truck_xy = (
+        vector_xy(candidate.get("truck_center_xy"))
+        or vector_xy(applied.get("truck_translation_xyz"))
+    )
+    unload_xy = (
+        vector_xy(scene_context.get("unload_bin_center"))
+        or vector_xy(candidate.get("unload_xy"))
+        or vector_xy(row.get("unload_landing_xyz"))
+    )
+    return {
+        "episode_index": row.get("episode_index"),
+        "episode_id": row.get("episode_id"),
+        "status": row.get("status"),
+        "score": row.get("score"),
+        "sand_xy": sand_xy,
+        "truck_xy": truck_xy,
+        "unload_xy": unload_xy,
+        "sand_amount_multiplier": safe_float_value(
+            applied.get("sand_amount_multiplier", candidate.get("sand_amount_multiplier"))
+        ),
+        "estimated_particle_count": safe_float_value(
+            applied.get("estimated_particle_count", candidate.get("estimated_particle_count"))
+        ),
+        "truck_yaw_deg": safe_float_value(applied.get("truck_yaw_deg", candidate.get("truck_yaw_deg"))),
+        "robot_body_yaw_deg": safe_float_value(
+            applied.get("robot_body_yaw_deg", candidate.get("robot_body_yaw_deg"))
+        ),
+        "truck_radius_m": safe_float_value(candidate.get("truck_radius_m")),
+        "unload_radius_m": safe_float_value(candidate.get("unload_radius_m")),
+        "sand_radius_m": safe_float_value(candidate.get("sand_radius_m")),
+        "unload_polygon_xy": scene_context.get("unload_polygon_xy") if isinstance(scene_context.get("unload_polygon_xy"), list) else [],
+        "unload_hull_xy": scene_context.get("unload_hull_xy") if isinstance(scene_context.get("unload_hull_xy"), list) else [],
+        "unload_shape": scene_context.get("manual_unload_range_shape"),
+        "unload_mesh": scene_context.get("manual_unload_selected_path"),
+    }
+
+
+def dashboard_episode_summary(row: dict) -> Dict[str, object]:
+    scene = dashboard_scene_from_episode(row)
+    return {
+        "episode_index": row.get("episode_index"),
+        "episode_id": row.get("episode_id"),
+        "status": row.get("status"),
+        "score": row.get("score"),
+        "reason": row.get("reason", ""),
+        "warning_reason": row.get("warning_reason", ""),
+        "samples": row.get("samples"),
+        "freeze_count": row.get("freeze_count"),
+        "max_bucket": row.get("max_bucket_from_pile_particles"),
+        "lift_bucket": row.get("lift_bucket_from_pile_particles"),
+        "final_bin": row.get("final_bin_from_pile_particles"),
+        "final_spill": row.get("final_spill_from_pile_particles"),
+        "initial_pose_id": row.get("initial_pose_id"),
+        "q_initial_deg": row.get("q_initial_deg"),
+        "target_xyz": row.get("target_xyz"),
+        "unload_landing_xyz": row.get("unload_landing_xyz"),
+        "scene": scene,
+    }
+
+
+def list_dashboard_runs(dataset_root: Union[str, os.PathLike], limit: int = 80) -> List[dict]:
+    root = os.path.abspath(str(dataset_root or "excavator_auto_dataset"))
+    if not os.path.isdir(root):
+        return []
+    runs = []
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        if not name.startswith("run_"):
+            continue
+        summary = read_json(os.path.join(path, "summary.json"), default={}) or {}
+        runs.append(
+            {
+                "name": name,
+                "path": path,
+                "mtime": os.path.getmtime(path),
+                "attempts": summary.get("attempts"),
+                "trainable": summary.get("trainable"),
+                "requested": summary.get("requested"),
+            }
+        )
+    runs.sort(key=lambda item: float(item.get("mtime", 0.0)), reverse=True)
+    return runs[: max(1, int(limit))]
+
+
+def dashboard_run_payload(run_dir: Union[str, os.PathLike]) -> Dict[str, object]:
+    run_dir = os.path.abspath(str(run_dir))
+    report = analyze_run(run_dir, include_timeline=False)
+    compact = compact_analysis(report)
+    rows = load_index(run_dir, "all")
+    episodes = [dashboard_episode_summary(row) for row in rows]
+    scene_points = [episode["scene"] for episode in episodes]
+    status_counts = Counter(str(row.get("status", "unknown")) for row in rows)
+    return {
+        "run_dir": run_dir,
+        "compact": compact,
+        "status_counts": dict(status_counts),
+        "episodes": episodes,
+        "scene_points": scene_points,
+        "generated_at": time.time(),
+    }
+
+
+def downsample_indices(count: int, max_points: int) -> List[int]:
+    count = int(count)
+    max_points = max(8, int(max_points))
+    if count <= max_points:
+        return list(range(count))
+    step = float(count - 1) / float(max_points - 1)
+    out = []
+    last = -1
+    for i in range(max_points):
+        idx = int(round(i * step))
+        if idx != last:
+            out.append(idx)
+            last = idx
+    if out[-1] != count - 1:
+        out.append(count - 1)
+    return out
+
+
+def contiguous_stage_spans(samples: Sequence[dict], t0: float) -> List[dict]:
+    spans = []
+    current = None
+    start_t = None
+    last_t = None
+    for sample in samples:
+        t = safe_float_value(sample.get("t"))
+        if t is None:
+            continue
+        phase = str(sample.get("phase") or sample.get("label") or "unknown")
+        rel_t = float(t) - float(t0)
+        if current is None:
+            current = phase
+            start_t = rel_t
+        elif phase != current:
+            spans.append({"stage": current, "start": start_t, "end": last_t if last_t is not None else rel_t})
+            current = phase
+            start_t = rel_t
+        last_t = rel_t
+    if current is not None:
+        spans.append({"stage": current, "start": start_t, "end": last_t if last_t is not None else start_t})
+    return spans
+
+
+def radians_vector_to_degrees(value: object, length: int = 4) -> List[Optional[float]]:
+    vec = vector_or_none(value)
+    if vec is None:
+        return [None for _ in range(length)]
+    out = []
+    for index in range(length):
+        if index < len(vec):
+            out.append(float(vec[index]) * 180.0 / math.pi)
+        else:
+            out.append(None)
+    return out
+
+
+def dashboard_episode_payload(
+    run_dir: Union[str, os.PathLike],
+    episode_index: Union[int, str],
+    max_points: int = 1800,
+) -> Dict[str, object]:
+    run_dir = os.path.abspath(str(run_dir))
+    rows = load_index(run_dir, "all")
+    selected = None
+    wanted = str(episode_index)
+    for row in rows:
+        if str(row.get("episode_index")) == wanted or str(row.get("episode_id")) == wanted:
+            selected = row
+            break
+    if selected is None:
+        return {"ok": False, "reason": f"episode_not_found:{episode_index}", "run_dir": run_dir}
+    trajectory = load_trajectory(selected)
+    if not trajectory:
+        return {
+            "ok": False,
+            "reason": "trajectory_empty",
+            "episode": dashboard_episode_summary(selected),
+            "run_dir": run_dir,
+        }
+    first_t = safe_float_value(trajectory[0].get("t"), 0.0) or 0.0
+    indices = downsample_indices(len(trajectory), max_points)
+    series = {
+        "t": [],
+        "phase": [],
+        "bucket_from_pile": [],
+        "bucket_total": [],
+        "bucket_mass": [],
+        "q_deg": [],
+        "dq_deg_s": [],
+        "ddq_deg_s2": [],
+        "cmd_q_deg": [],
+        "q_err_deg": [],
+        "action_deg_s": [],
+        "action_accel_deg_s2": [],
+        "effort": [],
+    }
+    for index in indices:
+        sample = trajectory[index]
+        t = safe_float_value(sample.get("t"), first_t) or first_t
+        sand = sample.get("sand") if isinstance(sample.get("sand"), dict) else {}
+        effort = vector_or_none(sample.get("observation.effort"))
+        series["t"].append(float(t) - float(first_t))
+        series["phase"].append(str(sample.get("phase") or sample.get("label") or "unknown"))
+        series["bucket_from_pile"].append(safe_float_value(sand.get("bucket_from_pile"), 0.0))
+        series["bucket_total"].append(safe_float_value(sand.get("bucket"), 0.0))
+        series["bucket_mass"].append(safe_float_value(sand.get("bucket_from_pile_mass"), 0.0))
+        series["q_deg"].append(radians_vector_to_degrees(sample.get("obs.q")))
+        series["dq_deg_s"].append(radians_vector_to_degrees(sample.get("obs.dq")))
+        series["ddq_deg_s2"].append(radians_vector_to_degrees(sample.get("obs.ddq")))
+        series["cmd_q_deg"].append(radians_vector_to_degrees(sample.get("obs.q_cmd")))
+        series["q_err_deg"].append(radians_vector_to_degrees(sample.get("obs.q_err")))
+        series["action_deg_s"].append(radians_vector_to_degrees(sample.get("action")))
+        series["action_accel_deg_s2"].append(radians_vector_to_degrees(sample.get("action.ddq")))
+        series["effort"].append(effort[:4] if effort else [None, None, None, None])
+    return {
+        "ok": True,
+        "run_dir": run_dir,
+        "episode": dashboard_episode_summary(selected),
+        "sample_count": len(trajectory),
+        "returned_points": len(indices),
+        "stage_spans": contiguous_stage_spans(trajectory, first_t),
+        "joint_names": ["swing", "boom", "arm", "bucket"],
+        "series": series,
+    }
+
+
+def dashboard_html() -> str:
+    return r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Excavator Auto Dataset Dashboard</title>
+<style>
+:root{font-family:Arial,sans-serif;color:#111827;background:#eef2f7;--border:#dbe3ee;}
+*{box-sizing:border-box}
+body{margin:0;padding:16px}
+header,.panel{background:#fff;border:1px solid var(--border);border-radius:8px}
+header{padding:14px 16px;margin-bottom:12px}
+h1{font-size:22px;margin:0 0 8px}
+h2{font-size:15px;margin:0 0 10px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+input,select,button{height:32px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;padding:0 9px;font-size:13px}
+input.path{min-width:420px;flex:1}
+button{background:#1f2937;color:#fff;border-color:#1f2937;cursor:pointer}
+button.secondary{background:#fff;color:#111827}
+.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}
+.panel{padding:12px;overflow:hidden}
+.span3{grid-column:span 3}.span4{grid-column:span 4}.span6{grid-column:span 6}.span8{grid-column:span 8}.span12{grid-column:span 12}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}
+.card{border:1px solid #e5e7eb;border-radius:8px;padding:10px;background:#f8fafc}
+.label{font-size:11px;text-transform:uppercase;color:#64748b;letter-spacing:.04em}.value{font-size:22px;font-weight:700;margin-top:3px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{padding:6px;border-bottom:1px solid #e5e7eb;text-align:left;vertical-align:top}
+th.sortable{cursor:pointer;user-select:none;color:#1d4ed8}
+th.sortable:hover{text-decoration:underline;background:#eff6ff}
+tbody tr{cursor:pointer}tbody tr:hover{background:#f1f5f9}tbody tr.selected{background:#dbeafe}
+.muted{color:#64748b;font-size:12px}.error{color:#b91c1c}.ok{color:#047857}
+.chart{width:100%;height:auto;border:1px solid #edf2f7;border-radius:6px;background:#fff}
+.timelineChart{margin-top:6px}
+.timelineChart .chart{max-height:210px}
+.legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:6px;font-size:12px;color:#475569}
+.dot{display:inline-block;width:10px;height:10px;border-radius:999px;margin-right:5px}
+pre{white-space:pre-wrap;font-size:12px;max-height:220px;overflow:auto;background:#0f172a;color:#e2e8f0;padding:10px;border-radius:6px}
+@media(max-width:980px){.span3,.span4,.span6,.span8,.span12{grid-column:span 12}input.path{min-width:240px}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Excavator Auto Dataset Dashboard</h1>
+  <div class="row">
+    <label>Dataset root</label>
+    <input id="rootInput" class="path" value="excavator_auto_dataset">
+    <button id="loadRunsBtn">Load runs</button>
+    <select id="runSelect"></select>
+    <button id="loadRunBtn">Analyze folder</button>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <label>Run folder</label>
+    <input id="runInput" class="path" placeholder="D:\450\assets\usd\URDF_real3\excavator_auto_dataset\run_...">
+    <span id="status" class="muted"></span>
+  </div>
+</header>
+<main class="grid">
+  <section class="panel span12">
+    <h2>Run Summary</h2>
+    <div id="cards" class="cards"></div>
+  </section>
+  <section class="panel span4">
+    <h2>Sand Position Distribution</h2>
+    <div id="sandScatter"></div>
+  </section>
+  <section class="panel span4">
+    <h2>Truck Position Distribution</h2>
+    <div id="truckScatter"></div>
+  </section>
+  <section class="panel span4">
+    <h2>Unload Point Distribution</h2>
+    <div id="unloadScatter"></div>
+  </section>
+  <section class="panel span4">
+    <h2>Robot Initial Yaw</h2>
+    <div id="robotYawHist"></div>
+  </section>
+  <section class="panel span4">
+    <h2>Truck Yaw</h2>
+    <div id="truckYawHist"></div>
+  </section>
+  <section class="panel span4">
+    <h2>Sand Amount</h2>
+    <div id="sandAmountHist"></div>
+  </section>
+  <section class="panel span4">
+    <h2>Attempts</h2>
+    <div class="muted">Click an attempt to inspect bucket sand, joints, velocity, acceleration and stage background.</div>
+    <div style="max-height:760px;overflow:auto;margin-top:8px"><table id="episodeTable"></table></div>
+  </section>
+  <section class="panel span8">
+    <h2 id="episodeTitle">Attempt Timeline</h2>
+    <div id="episodeMeta" class="muted"></div>
+    <div id="bucketChart" class="timelineChart"></div>
+    <div id="qChart" class="timelineChart"></div>
+    <div id="dqChart" class="timelineChart"></div>
+    <div id="ddqChart" class="timelineChart"></div>
+    <div id="effortChart" class="timelineChart"></div>
+  </section>
+  <section class="panel span12">
+    <h2>Raw Selected Attempt</h2>
+    <pre id="rawBox">{}</pre>
+  </section>
+</main>
+<script>
+const jointNames = ["swing","boom","arm","bucket"];
+const colors = {trainable:"#059669",success:"#059669",rejected:"#dc2626",failed:"#7c2d12",diagnostic:"#d97706",planning:"#2563eb",unknown:"#64748b"};
+const lineColors = ["#2563eb","#059669","#d97706","#dc2626","#7c3aed","#0891b2"];
+const stagePalette = ["#dbeafe","#dcfce7","#fef3c7","#fee2e2","#ede9fe","#cffafe","#fce7f3","#e2e8f0"];
+let currentRun = null;
+let currentEpisodeIndex = null;
+let episodeSort = {key:"episode_index", dir:1};
+
+function $(id){return document.getElementById(id)}
+function esc(s){return String(s ?? "").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]))}
+function setStatus(text, cls="muted"){const el=$("status"); el.className=cls; el.textContent=text}
+async function api(path, params){
+  const qs = new URLSearchParams(params || {});
+  const r = await fetch(path + "?" + qs.toString());
+  if(!r.ok) throw new Error(await r.text());
+  return await r.json();
+}
+function finite(v){return typeof v==="number" && Number.isFinite(v)}
+function numeric(values){return values.map(v=>Number(v)).filter(v=>Number.isFinite(v))}
+function statusColor(s){return colors[s] || colors.unknown}
+
+async function loadRuns(){
+  setStatus("Loading runs...");
+  const data = await api("/api/runs", {root:$("rootInput").value});
+  const sel = $("runSelect");
+  sel.innerHTML = "";
+  for(const run of data.runs){
+    const opt = document.createElement("option");
+    opt.value = run.path;
+    opt.textContent = `${run.name}  attempts=${run.attempts ?? "-"} trainable=${run.trainable ?? "-"}`;
+    sel.appendChild(opt);
+  }
+  if(data.runs.length){
+    $("runInput").value = data.runs[0].path;
+    setStatus(`Loaded ${data.runs.length} runs`, "ok");
+  }else{
+    setStatus("No run_* folders found", "error");
+  }
+}
+
+async function loadRun(){
+  const runDir = $("runInput").value || $("runSelect").value;
+  if(!runDir){setStatus("Choose a run folder first", "error"); return}
+  setStatus("Analyzing run...");
+  const data = await api("/api/run", {run_dir:runDir});
+  currentRun = data;
+  currentEpisodeIndex = null;
+  renderRun(data);
+  setStatus("Run loaded", "ok");
+  if(data.episodes && data.episodes.length) loadEpisode(data.episodes[0].episode_index);
+}
+
+async function loadEpisode(index){
+  if(!currentRun) return;
+  currentEpisodeIndex = index;
+  markSelectedRow(index);
+  setStatus(`Loading attempt ${index}...`);
+  const data = await api("/api/episode", {run_dir:currentRun.run_dir, episode_index:index, max_points:2200});
+  if(!data.ok){setStatus(data.reason || "episode load failed", "error"); return}
+  renderEpisode(data);
+  setStatus(`Attempt ${index} loaded`, "ok");
+}
+
+function renderRun(data){
+  const counts = (data.compact && data.compact.counts) || {};
+  const cards = [
+    ["Attempts", counts.all || 0],
+    ["Trainable", counts.trainable || 0],
+    ["Rejected", counts.rejected || 0],
+    ["Failed", counts.failed || 0],
+    ["Diagnostic", counts.diagnostic || 0],
+    ["Success rate", `${(((data.compact && data.compact.success_rate)||0)*100).toFixed(1)}%`],
+    ["Run", (data.run_dir||"").split(/[\\/]/).pop()],
+  ];
+  $("cards").innerHTML = cards.map(c=>`<div class="card"><div class="label">${esc(c[0])}</div><div class="value">${esc(c[1])}</div></div>`).join("");
+  const pts = data.scene_points || [];
+  drawScatter(
+    "sandScatter",
+    pts.map(p=>({x:p.sand_xy&&p.sand_xy[0], y:p.sand_xy&&p.sand_xy[1], status:p.status, label:p.episode_index})),
+    "x from excavator origin", "y from excavator origin", {origin:true}
+  );
+  drawScatter(
+    "truckScatter",
+    pts.map(p=>({x:p.truck_xy&&p.truck_xy[0], y:p.truck_xy&&p.truck_xy[1], status:p.status, label:p.episode_index, yaw:p.truck_yaw_deg, polygon:(p.unload_polygon_xy&&p.unload_polygon_xy.length?p.unload_polygon_xy:p.unload_hull_xy)})),
+    "x from excavator origin", "y from excavator origin", {origin:true, polygons:true, heading:true}
+  );
+  drawScatter(
+    "unloadScatter",
+    pts.map(p=>({x:p.unload_xy&&p.unload_xy[0], y:p.unload_xy&&p.unload_xy[1], status:p.status, label:p.episode_index, polygon:(p.unload_polygon_xy&&p.unload_polygon_xy.length?p.unload_polygon_xy:p.unload_hull_xy)})),
+    "unload mesh x", "unload mesh y", {polygons:true, rangeFromPolygons:true}
+  );
+  drawHistogram("robotYawHist", pts.map(p=>p.robot_body_yaw_deg), "deg");
+  drawHistogram("truckYawHist", pts.map(p=>p.truck_yaw_deg), "deg");
+  drawHistogram("sandAmountHist", pts.map(p=>p.sand_amount_multiplier), "x");
+  renderEpisodes(data.episodes || []);
+}
+
+function renderEpisodes(episodes){
+  const sortable = {
+    episode_index: "Ep",
+    score: "Score",
+    max_bucket: "Bucket",
+    lift_bucket: "Lift",
+    final_bin: "Bin",
+    final_spill: "Spill",
+    robot_yaw: "Robot yaw",
+    truck_yaw: "Truck yaw",
+  };
+  const sorted = [...episodes].sort((a,b)=>{
+    const av = sortValue(a, episodeSort.key);
+    const bv = sortValue(b, episodeSort.key);
+    if(av === bv) return Number(a.episode_index||0) - Number(b.episode_index||0);
+    if(av === null) return 1;
+    if(bv === null) return -1;
+    return (av < bv ? -1 : 1) * episodeSort.dir;
+  });
+  const head = key => {
+    const label = sortable[key];
+    const arrow = episodeSort.key === key ? (episodeSort.dir > 0 ? " ▲" : " ▼") : "";
+    return `<th class="sortable" onclick="sortEpisodes('${key}')" title="Click to sort">${esc(label)}${arrow}</th>`;
+  };
+  const rows = [`<thead><tr>${head("episode_index")}<th>Status</th>${head("score")}${head("max_bucket")}${head("lift_bucket")}${head("final_bin")}${head("final_spill")}${head("robot_yaw")}${head("truck_yaw")}<th>Reason</th></tr></thead><tbody>`];
+  for(const ep of sorted){
+    const s = ep.scene || {};
+    rows.push(`<tr data-ep="${esc(ep.episode_index)}" onclick="loadEpisode('${esc(ep.episode_index)}')">
+      <td>${esc(ep.episode_index)}</td><td style="color:${statusColor(ep.status)}">${esc(ep.status)}</td>
+      <td>${fmt(ep.score,1)}</td><td>${esc(ep.max_bucket ?? "")}</td><td>${esc(ep.lift_bucket ?? "")}</td>
+      <td>${esc(ep.final_bin ?? "")}</td><td>${esc(ep.final_spill ?? "")}</td>
+      <td>${fmt(s.robot_body_yaw_deg,1)}</td><td>${fmt(s.truck_yaw_deg,1)}</td>
+      <td>${esc(shortText(ep.reason || ep.warning_reason || "", 120))}</td></tr>`);
+  }
+  rows.push("</tbody>");
+  $("episodeTable").innerHTML = rows.join("");
+  if(currentEpisodeIndex !== null) markSelectedRow(currentEpisodeIndex);
+}
+function sortValue(ep, key){
+  if(key === "robot_yaw") return numericOrNull((ep.scene||{}).robot_body_yaw_deg);
+  if(key === "truck_yaw") return numericOrNull((ep.scene||{}).truck_yaw_deg);
+  return numericOrNull(ep[key]);
+}
+function numericOrNull(v){ const n=Number(v); return Number.isFinite(n) ? n : null; }
+function sortEpisodes(key){
+  if(episodeSort.key === key) episodeSort.dir *= -1;
+  else episodeSort = {key, dir: key === "episode_index" ? 1 : -1};
+  if(currentRun) renderEpisodes(currentRun.episodes || []);
+}
+function markSelectedRow(index){
+  document.querySelectorAll("#episodeTable tbody tr").forEach(tr=>tr.classList.toggle("selected", tr.dataset.ep == String(index)));
+}
+function shortText(s,n){s=String(s||""); return s.length>n?s.slice(0,n-1)+"...":s}
+function fmt(v,d=2){return finite(Number(v)) ? Number(v).toFixed(d) : ""}
+
+function renderEpisode(data){
+  const ep = data.episode || {};
+  $("episodeTitle").textContent = `Attempt ${ep.episode_index} Timeline`;
+  $("episodeMeta").textContent = `${ep.status} score=${fmt(ep.score,1)} samples=${data.sample_count} shown=${data.returned_points} reason=${shortText(ep.reason || ep.warning_reason || "", 280)}`;
+  $("rawBox").textContent = JSON.stringify({episode:ep, stage_spans:data.stage_spans}, null, 2);
+  const s = data.series || {};
+  drawLineChart("bucketChart", "Bucket sand holding", s.t, [
+    {name:"bucket_from_pile", values:s.bucket_from_pile},
+    {name:"bucket_total", values:s.bucket_total},
+  ], data.stage_spans, "particles");
+  drawVectorChart("qChart", "Joint angles", s.t, s.q_deg, data.stage_spans, "deg");
+  drawVectorChart("dqChart", "Joint velocity", s.t, s.dq_deg_s, data.stage_spans, "deg/s");
+  drawVectorChart("ddqChart", "Joint acceleration", s.t, s.ddq_deg_s2, data.stage_spans, "deg/s^2");
+  drawVectorChart("effortChart", "Measured joint effort", s.t, s.effort, data.stage_spans, "effort");
+}
+
+function chartFrame(width=760,height=190){
+  return {w:width,h:height,l:50,r:14,t:22,b:32,pw:width-64,ph:height-54};
+}
+function extent(vals){
+  const arr = numeric(vals).filter(v=>Math.abs(v)<1e12);
+  if(!arr.length) return [0,1];
+  let lo=Math.min(...arr), hi=Math.max(...arr);
+  if(Math.abs(hi-lo)<1e-9){lo-=1;hi+=1}
+  const pad=(hi-lo)*0.08; return [lo-pad,hi+pad];
+}
+function drawStageRects(parts, spans, scaleX, top, height){
+  const seen = new Map(); let next = 0;
+  for(const span of spans||[]){
+    if(!seen.has(span.stage)) seen.set(span.stage, stagePalette[next++ % stagePalette.length]);
+    const x = scaleX(span.start), w = Math.max(1, scaleX(span.end)-x);
+    parts.push(`<rect x="${x.toFixed(1)}" y="${top}" width="${w.toFixed(1)}" height="${height}" fill="${seen.get(span.stage)}" opacity="0.48"><title>${esc(span.stage)}</title></rect>`);
+  }
+}
+function drawAxes(parts, f, x0, x1, y0, y1, unit){
+  parts.push(`<rect x="${f.l}" y="${f.t}" width="${f.pw}" height="${f.ph}" fill="none" stroke="#cbd5e1"/>`);
+  for(let i=0;i<=4;i++){
+    const x=f.l+f.pw*i/4, y=f.t+f.ph*i/4;
+    parts.push(`<line x1="${x}" y1="${f.t}" x2="${x}" y2="${f.t+f.ph}" stroke="#e5e7eb"/>`);
+    parts.push(`<line x1="${f.l}" y1="${y}" x2="${f.l+f.pw}" y2="${y}" stroke="#e5e7eb"/>`);
+  }
+  parts.push(`<text x="${f.l}" y="${f.h-16}" font-size="11" fill="#64748b">${fmt(x0,1)}s</text>`);
+  parts.push(`<text x="${f.l+f.pw}" y="${f.h-16}" text-anchor="end" font-size="11" fill="#64748b">${fmt(x1,1)}s</text>`);
+  parts.push(`<text x="${f.l-6}" y="${f.t+f.ph}" text-anchor="end" font-size="11" fill="#64748b">${fmt(y0,1)}</text>`);
+  parts.push(`<text x="${f.l-6}" y="${f.t+10}" text-anchor="end" font-size="11" fill="#64748b">${fmt(y1,1)}</text>`);
+  parts.push(`<text x="${f.w-20}" y="${f.h-16}" text-anchor="end" font-size="11" fill="#64748b">${esc(unit||"")}</text>`);
+}
+function drawLineChart(targetId, title, xs, lines, spans, unit){
+  const f=chartFrame(); xs=xs||[];
+  const xVals=numeric(xs); const x0=xVals.length?Math.min(...xVals):0, x1=xVals.length?Math.max(...xVals):1;
+  const allY=[]; for(const line of lines){ for(const v of line.values||[]) if(finite(Number(v))) allY.push(Number(v)); }
+  const [y0,y1]=extent(allY);
+  const sx=x=>f.l+(Number(x)-x0)/(x1-x0||1)*f.pw;
+  const sy=y=>f.t+f.ph-(Number(y)-y0)/(y1-y0||1)*f.ph;
+  const parts=[`<svg class="chart" viewBox="0 0 ${f.w} ${f.h}" role="img">`,`<text x="12" y="17" font-size="14" font-weight="700" fill="#111827">${esc(title)}</text>`];
+  drawStageRects(parts, spans, sx, f.t, f.ph); drawAxes(parts,f,x0,x1,y0,y1,unit);
+  lines.forEach((line,li)=>{
+    const pts=[]; (line.values||[]).forEach((v,i)=>{ if(finite(Number(v)) && finite(Number(xs[i]))) pts.push(`${sx(xs[i]).toFixed(1)},${sy(v).toFixed(1)}`); });
+    if(pts.length) parts.push(`<polyline points="${pts.join(" ")}" fill="none" stroke="${lineColors[li%lineColors.length]}" stroke-width="1.8"/>`);
+  });
+  let lx=f.l+8; lines.forEach((line,li)=>{parts.push(`<circle cx="${lx}" cy="${f.h-28}" r="4" fill="${lineColors[li%lineColors.length]}"/><text x="${lx+7}" y="${f.h-24}" font-size="11" fill="#334155">${esc(line.name)}</text>`); lx+=86;});
+  parts.push(`</svg>`);
+  $(targetId).innerHTML=parts.join("");
+}
+function drawVectorChart(targetId, title, xs, vectors, spans, unit){
+  const lines = jointNames.map((name, j)=>({name, values:(vectors||[]).map(row=>Array.isArray(row)?row[j]:null)}));
+  drawLineChart(targetId, title, xs, lines, spans, unit);
+}
+function cleanPolygon(poly){
+  if(!Array.isArray(poly)) return [];
+  const out=[];
+  for(const pt of poly){
+    if(Array.isArray(pt) && finite(Number(pt[0])) && finite(Number(pt[1]))) out.push([Number(pt[0]), Number(pt[1])]);
+  }
+  return out;
+}
+function drawScatter(targetId, pts, xLabel, yLabel, opts={}){
+  const f=chartFrame(430,320);
+  const rows=(pts||[]).map(p=>Object.assign({}, p, {poly:cleanPolygon(p.polygon)}));
+  const clean=rows.filter(p=>finite(Number(p.x))&&finite(Number(p.y)));
+  const xs=[], ys=[];
+  for(const p of rows){
+    if(finite(Number(p.x))&&finite(Number(p.y))){ xs.push(Number(p.x)); ys.push(Number(p.y)); }
+    if((opts.polygons || opts.rangeFromPolygons) && p.poly.length){
+      for(const pt of p.poly){ xs.push(pt[0]); ys.push(pt[1]); }
+    }
+  }
+  if(opts.origin){ xs.push(0); ys.push(0); }
+  if(!xs.length || !ys.length){$(targetId).innerHTML='<div class="muted">no data</div>';return}
+  const [x0,x1]=extent(xs), [y0,y1]=extent(ys);
+  const sx=x=>f.l+(Number(x)-x0)/(x1-x0||1)*f.pw, sy=y=>f.t+f.ph-(Number(y)-y0)/(y1-y0||1)*f.ph;
+  const parts=[`<svg class="chart" viewBox="0 0 ${f.w} ${f.h}">`]; drawAxes(parts,f,x0,x1,y0,y1,"m");
+  if(opts.origin){
+    parts.push(`<line x1="${sx(0).toFixed(1)}" y1="${f.t}" x2="${sx(0).toFixed(1)}" y2="${f.t+f.ph}" stroke="#111827" stroke-width="1.2" stroke-dasharray="4 4" opacity="0.45"/>`);
+    parts.push(`<line x1="${f.l}" y1="${sy(0).toFixed(1)}" x2="${f.l+f.pw}" y2="${sy(0).toFixed(1)}" stroke="#111827" stroke-width="1.2" stroke-dasharray="4 4" opacity="0.45"/>`);
+    parts.push(`<circle cx="${sx(0).toFixed(1)}" cy="${sy(0).toFixed(1)}" r="5" fill="#111827"><title>excavator origin</title></circle>`);
+  }
+  if(opts.polygons){
+    for(const p of rows){
+      if(!p.poly.length) continue;
+      const color=statusColor(p.status);
+      const d=p.poly.map(pt=>`${sx(pt[0]).toFixed(1)},${sy(pt[1]).toFixed(1)}`).join(" ");
+      parts.push(`<polygon points="${d}" fill="${color}" fill-opacity="0.045" stroke="${color}" stroke-width="1.2" stroke-opacity="0.55"><title>ep ${esc(p.label)} unload mesh / dump bed polygon</title></polygon>`);
+    }
+  }
+  if(opts.heading){
+    const span=Math.max(Math.abs(x1-x0), Math.abs(y1-y0));
+    const len=Math.max(0.45, span*0.055);
+    for(const p of clean){
+      if(!finite(Number(p.yaw))) continue;
+      const a=Number(p.yaw)*Math.PI/180.0;
+      const x2=Number(p.x)+Math.cos(a)*len;
+      const y2=Number(p.y)+Math.sin(a)*len;
+      parts.push(`<line x1="${sx(p.x).toFixed(1)}" y1="${sy(p.y).toFixed(1)}" x2="${sx(x2).toFixed(1)}" y2="${sy(y2).toFixed(1)}" stroke="${statusColor(p.status)}" stroke-width="2.2" opacity="0.85"><title>truck yaw ${fmt(p.yaw,1)} deg</title></line>`);
+    }
+  }
+  for(const p of clean){
+    parts.push(`<circle cx="${sx(p.x).toFixed(1)}" cy="${sy(p.y).toFixed(1)}" r="4.5" fill="${statusColor(p.status)}" opacity="0.9"><title>ep ${esc(p.label)} ${esc(p.status)} (${fmt(p.x,2)}, ${fmt(p.y,2)})${finite(Number(p.yaw)) ? " yaw " + fmt(p.yaw,1) + " deg" : ""}</title></circle>`);
+  }
+  parts.push(`<text x="${f.l+f.pw/2}" y="${f.h-4}" text-anchor="middle" font-size="11" fill="#64748b">${esc(xLabel)}</text>`);
+  parts.push(`<text transform="translate(13 ${f.t+f.ph/2}) rotate(-90)" text-anchor="middle" font-size="11" fill="#64748b">${esc(yLabel)}</text>`);
+  parts.push(`</svg>`); $(targetId).innerHTML=parts.join("");
+}
+function drawHistogram(targetId, values, unit){
+  const nums=numeric(values); if(!nums.length){$(targetId).innerHTML='<div class="muted">no data</div>';return}
+  let lo=Math.min(...nums), hi=Math.max(...nums); if(Math.abs(hi-lo)<1e-9){lo-=1;hi+=1}
+  const bins=12, step=(hi-lo)/bins, counts=Array(bins).fill(0);
+  for(const v of nums){let i=Math.floor((v-lo)/step); if(i>=bins)i=bins-1; if(i<0)i=0; counts[i]++}
+  const f=chartFrame(430,260), max=Math.max(...counts,1), parts=[`<svg class="chart" viewBox="0 0 ${f.w} ${f.h}">`];
+  drawAxes(parts,f,lo,hi,0,max,unit);
+  counts.forEach((c,i)=>{const x=f.l+f.pw*i/bins+2, w=f.pw/bins-4, h=f.ph*c/max; parts.push(`<rect x="${x}" y="${f.t+f.ph-h}" width="${w}" height="${h}" fill="#2563eb" opacity="0.78"/>`)});
+  parts.push(`</svg>`); $(targetId).innerHTML=parts.join("");
+}
+
+$("loadRunsBtn").onclick=()=>loadRuns().catch(e=>setStatus(e.message,"error"));
+$("loadRunBtn").onclick=()=>loadRun().catch(e=>setStatus(e.message,"error"));
+$("runSelect").onchange=()=>{$("runInput").value=$("runSelect").value};
+loadRuns().then(()=>loadRun()).catch(e=>setStatus(e.message,"error"));
+</script>
+</body>
+</html>
+"""
+
+
+def serve_dashboard(
+    dataset_root: Union[str, os.PathLike] = "excavator_auto_dataset",
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    open_browser: bool = False,
+) -> None:
+    import http.server
+    import socketserver
+    import webbrowser
+
+    default_root = os.path.abspath(str(dataset_root or "excavator_auto_dataset"))
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            return
+
+        def send_bytes(self, data: bytes, content_type: str = "application/json", status: int = 200):
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def send_json(self, data: object, status: int = 200):
+            self.send_bytes(json.dumps(data, ensure_ascii=True).encode("utf-8"), "application/json; charset=utf-8", status)
+
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            params = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
+            try:
+                if parsed.path == "/":
+                    self.send_bytes(dashboard_html().encode("utf-8"), "text/html; charset=utf-8")
+                    return
+                if parsed.path == "/api/runs":
+                    root = os.path.abspath(unquote(params.get("root") or default_root))
+                    self.send_json({"root": root, "runs": list_dashboard_runs(root)})
+                    return
+                if parsed.path == "/api/run":
+                    run_dir = os.path.abspath(unquote(params.get("run_dir") or latest_run(default_root)))
+                    if not run_dir or not os.path.isdir(run_dir):
+                        self.send_json({"error": f"run_dir_not_found:{run_dir}"}, status=404)
+                        return
+                    self.send_json(dashboard_run_payload(run_dir))
+                    return
+                if parsed.path == "/api/episode":
+                    run_dir = os.path.abspath(unquote(params.get("run_dir") or latest_run(default_root)))
+                    episode = params.get("episode_index") or "1"
+                    max_points = int(params.get("max_points") or 1800)
+                    self.send_json(dashboard_episode_payload(run_dir, episode, max_points=max_points))
+                    return
+                self.send_json({"error": "not_found"}, status=404)
+            except Exception as exc:
+                self.send_json({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+
+    class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+    server = ThreadingServer((host, int(port)), Handler)
+    url = f"http://{host}:{server.server_address[1]}/"
+    print(f"[DASHBOARD] {url}")
+    print(f"[DASHBOARD] dataset_root={default_root}")
+    if open_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("[DASHBOARD] stopped")
+    finally:
+        server.server_close()
+
+
 def print_summary(run_dir: Union[str, os.PathLike]) -> None:
     summary = summarize_run(run_dir)
     print("[INFO]", json.dumps(summary, ensure_ascii=True, indent=2))
@@ -1871,7 +2612,19 @@ if __name__ == "__main__":
     parser.add_argument("--export-overwrite", action="store_true", help="Delete and rebuild the export directory if it already exists.")
     parser.add_argument("--export-require-standard", action="store_true", help="Fail if parquet/mp4 standard export cannot be produced.")
     parser.add_argument("--export-require-vla", action="store_true", help="Fail unless image + state + action + task VLA export is ready.")
+    parser.add_argument("--dashboard", action="store_true", help="Serve a local web dashboard for browsing run folders.")
+    parser.add_argument("--dashboard-host", default="127.0.0.1", help="Host for --dashboard.")
+    parser.add_argument("--dashboard-port", type=int, default=8765, help="Port for --dashboard.")
+    parser.add_argument("--dashboard-open", action="store_true", help="Open the dashboard URL in the default browser.")
     args = parser.parse_args()
+    if args.dashboard:
+        serve_dashboard(
+            dataset_root=args.root,
+            host=args.dashboard_host,
+            port=args.dashboard_port,
+            open_browser=args.dashboard_open,
+        )
+        raise SystemExit(0)
     run_dir = latest_run(args.root) if args.latest else (args.run_dir or "")
     if not run_dir:
         raise SystemExit("run_dir is required unless --latest finds a run.")

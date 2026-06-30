@@ -448,14 +448,14 @@ def estimate_particle_count_from_config():
         spacing_xy = max(1.0e-6, float(PARTICLE_DIGGABLE_SPACING))
         spacing_z = max(1.0e-6, float(PARTICLE_LAYER_SPACING_Z))
         floor_z = float(SAND_FLOOR_Z)
-        count = 0
-        for x, y in footprint_xy_samples(spacing_xy):
-            surface_z = initial_sand_height_xy(float(x), float(y))
-            fill_depth = max(spacing_z, float(surface_z) - floor_z)
-            pile_depth = min(float(SAND_THICKNESS) + float(PILE_HEIGHT), fill_depth)
-            count += max(1, int(pile_depth / spacing_z))
-            if count >= int(PARTICLE_MAX_COUNT):
-                return int(PARTICLE_MAX_COUNT)
+        xy = np.array(list(footprint_xy_samples(spacing_xy)), dtype=np.float32).reshape(-1, 2)
+        if xy.size <= 0:
+            return 0
+        surface_z = initial_sand_height_xy_batch(xy[:, 0], xy[:, 1])
+        fill_depth = np.maximum(spacing_z, surface_z.astype(np.float64) - floor_z)
+        pile_depth = np.minimum(float(SAND_THICKNESS) + float(PILE_HEIGHT), fill_depth)
+        layers = np.maximum(1, np.floor(pile_depth / spacing_z).astype(np.int64))
+        count = int(np.sum(layers, dtype=np.int64))
         return int(min(int(PARTICLE_MAX_COUNT), max(0, count)))
     except Exception:
         return int(PARTICLE_MAX_COUNT)
@@ -1152,6 +1152,29 @@ def point_in_polygon_xy(x, y, poly):
     return inside
 
 
+def points_in_polygon_xy_mask(x_values, y_values, poly):
+    p = np.array(poly, dtype=np.float64).reshape(-1, 2)
+    x = np.asarray(x_values, dtype=np.float64)
+    y = np.asarray(y_values, dtype=np.float64)
+    if p.shape[0] < 3:
+        return np.zeros(x.shape, dtype=bool)
+
+    inside = np.zeros(x.shape, dtype=bool)
+    j = p.shape[0] - 1
+    for i in range(p.shape[0]):
+        xi, yi = p[i]
+        xj, yj = p[j]
+        denom = float(yj - yi)
+        if abs(denom) < 1.0e-12:
+            j = i
+            continue
+        crosses = ((float(yi) > y) != (float(yj) > y))
+        x_at_y = float(xi) + (float(xj - xi) * (y - float(yi)) / denom)
+        inside ^= crosses & (x < x_at_y)
+        j = i
+    return inside
+
+
 def visual_polygon_xy(poly, max_vertices):
     p = np.array(poly, dtype=np.float32).reshape(-1, 2)
     n = int(p.shape[0])
@@ -1697,6 +1720,48 @@ def is_inside_diggable_xy(x, y):
     return (dx * dx + dy * dy) <= 1.0
 
 
+def is_inside_diggable_xy_batch(x_values, y_values):
+    x = np.asarray(x_values, dtype=np.float64)
+    y = np.asarray(y_values, dtype=np.float64)
+    if SAND_SOURCE_POLYGON_XY is not None:
+        return points_in_polygon_xy_mask(x, y, SAND_SOURCE_POLYGON_XY)
+    rx = max(1.0e-6, float(DIGGABLE_RADIUS_X))
+    ry = max(1.0e-6, float(DIGGABLE_RADIUS_Y))
+    dx = (x - float(PILE_CENTER_X)) / rx
+    dy = (y - float(PILE_CENTER_Y)) / ry
+    return (dx * dx + dy * dy) <= 1.0
+
+
+def initial_sand_height_xy_batch(x_values, y_values):
+    x = np.asarray(x_values, dtype=np.float64)
+    y = np.asarray(y_values, dtype=np.float64)
+    out = np.full(x.shape, float(SAND_FLOOR_Z), dtype=np.float64)
+    inside = is_inside_diggable_xy_batch(x, y)
+    if not np.any(inside):
+        return out
+
+    rx = max(1.0e-6, float(DIGGABLE_RADIUS_X))
+    ry = max(1.0e-6, float(DIGGABLE_RADIUS_Y))
+    xi = x[inside]
+    yi = y[inside]
+    radial = np.sqrt(((xi - float(PILE_CENTER_X)) / rx) ** 2 + ((yi - float(PILE_CENTER_Y)) / ry) ** 2)
+    cone = np.maximum(0.0, 1.0 - radial) ** float(PILE_CONE_EXPONENT)
+    dx = (xi - float(PILE_CENTER_X)) / max(1.0e-6, float(PILE_SIGMA_X))
+    dy = (yi - float(PILE_CENTER_Y)) / max(1.0e-6, float(PILE_SIGMA_Y))
+    gaussian = np.exp(-0.5 * (dx * dx + dy * dy))
+    profile = (1.0 - float(PILE_GAUSSIAN_BLEND)) * cone + float(PILE_GAUSSIAN_BLEND) * gaussian
+    rim = float(PILE_RIM_HEIGHT_FRACTION)
+    mound = float(PILE_HEIGHT) * np.clip(rim + (1.0 - rim) * profile, 0.0, 1.0)
+    ripple = float(RIPPLE_AMP) * (
+        np.sin(3.7 * xi + 0.55 * np.sin(0.8 * yi))
+        + 0.45 * np.sin(2.2 * yi + 0.25 * xi)
+    )
+    noise_raw = np.sin(12.9898 * xi + 78.233 * yi + float(NOISE_SEED)) * 43758.5453
+    noise = noise_raw - np.floor(noise_raw)
+    out[inside] = float(SAND_FLOOR_Z) + mound + ripple + float(NOISE_AMP) * (2.0 * noise - 1.0)
+    return out
+
+
 def height_from_grid(x, y):
     if HEIGHTS is None or X_VALUES is None or Y_VALUES is None:
         return initial_sand_height_xy(x, y)
@@ -2062,10 +2127,8 @@ def build_height_arrays():
     x_min, x_max, y_min, y_max = current_sand_footprint_bbox_xy()
     X_VALUES = np.linspace(x_min, x_max, NX, dtype=np.float32)
     Y_VALUES = np.linspace(y_min, y_max, NY, dtype=np.float32)
-    HEIGHTS = np.zeros((NY, NX), dtype=np.float32)
-    for j, y in enumerate(Y_VALUES):
-        for i, x in enumerate(X_VALUES):
-            HEIGHTS[j, i] = initial_sand_height_xy(float(x), float(y))
+    xx, yy = np.meshgrid(X_VALUES.astype(np.float64), Y_VALUES.astype(np.float64))
+    HEIGHTS = initial_sand_height_xy_batch(xx, yy).astype(np.float32)
     BASE_HEIGHTS = HEIGHTS.copy()
     CELL_AREA = float(((x_max - x_min) / max(1, NX - 1)) * ((y_max - y_min) / max(1, NY - 1)))
 
@@ -2275,7 +2338,7 @@ def apply_current_particle_material_to_stage(root=None):
     return bool(material.IsValid() or system.IsValid())
 
 
-def sand_particle_points():
+def sand_particle_points_scalar():
     rng = random.Random(4107)
     points = []
     floor_z = float(SAND_FLOOR_Z)
@@ -2297,6 +2360,7 @@ def sand_particle_points():
                     "z_min": z_min,
                     "z_max": z_max,
                     "limited": True,
+                    "generator": "scalar",
                 }
                 velocities = [Gf.Vec3f(0.0, 0.0, 0.0)] * len(points)
                 widths = [float(PARTICLE_RADIUS * 2.0)] * len(points)
@@ -2321,10 +2385,107 @@ def sand_particle_points():
         "z_min": z_min,
         "z_max": z_max,
         "limited": False,
+        "generator": "scalar",
     }
     velocities = [Gf.Vec3f(0.0, 0.0, 0.0)] * len(points)
     widths = [float(PARTICLE_RADIUS * 2.0)] * len(points)
     return points, velocities, widths, meta
+
+
+def sand_particle_points_vectorized():
+    spacing_xy = max(1.0e-6, float(PARTICLE_DIGGABLE_SPACING))
+    spacing_z = max(1.0e-6, float(PARTICLE_LAYER_SPACING_Z))
+    max_count = max(0, int(PARTICLE_MAX_COUNT))
+    xy = np.array(list(footprint_xy_samples(spacing_xy)), dtype=np.float64).reshape(-1, 2)
+    if xy.size <= 0 or max_count <= 0:
+        meta = {
+            "candidate_count": 0,
+            "generated_outside": 0,
+            "z_min": None,
+            "z_max": None,
+            "limited": False,
+            "generator": "vectorized",
+            "xy_samples": 0,
+        }
+        return [], [], [], meta
+
+    floor_z = float(SAND_FLOOR_Z)
+    surface_z = initial_sand_height_xy_batch(xy[:, 0], xy[:, 1]).astype(np.float64, copy=False)
+    fill_depth = np.maximum(spacing_z, surface_z - floor_z)
+    pile_depth = np.minimum(float(SAND_THICKNESS) + float(PILE_HEIGHT), fill_depth)
+    layers = np.maximum(1, np.floor(pile_depth / spacing_z).astype(np.int64))
+    total_candidates = int(np.sum(layers, dtype=np.int64))
+    if total_candidates <= 0:
+        meta = {
+            "candidate_count": 0,
+            "generated_outside": 0,
+            "z_min": None,
+            "z_max": None,
+            "limited": False,
+            "generator": "vectorized",
+            "xy_samples": int(xy.shape[0]),
+        }
+        return [], [], [], meta
+
+    row_idx = np.repeat(np.arange(xy.shape[0], dtype=np.int64), layers)
+    starts = np.cumsum(layers, dtype=np.int64) - layers
+    layer_idx = np.arange(total_candidates, dtype=np.int64) - np.repeat(starts, layers)
+    z = floor_z + float(PARTICLE_RADIUS) * 1.2 + layer_idx.astype(np.float64) * spacing_z
+    z_ok = z <= (surface_z[row_idx] + float(PARTICLE_RADIUS) * 0.8)
+    row_idx = row_idx[z_ok]
+    z = z[z_ok]
+    candidate_count = int(row_idx.shape[0])
+
+    raw_limited = False
+    raw_limit = max(max_count * 2, max_count + 4096)
+    if candidate_count > raw_limit:
+        raw_limited = True
+        row_idx = row_idx[:raw_limit]
+        z = z[:raw_limit]
+
+    rng = np.random.default_rng(4107)
+    jitter = float(PARTICLE_JITTER)
+    px = xy[row_idx, 0] + rng.uniform(-jitter, jitter, size=row_idx.shape[0])
+    py = xy[row_idx, 1] + rng.uniform(-jitter, jitter, size=row_idx.shape[0])
+    pz = z + rng.uniform(-jitter * 0.4, jitter * 0.4, size=row_idx.shape[0])
+    inside = is_inside_diggable_xy_batch(px, py)
+    generated_outside = int(row_idx.shape[0] - int(np.count_nonzero(inside)))
+    if np.any(inside):
+        xyz = np.column_stack((px[inside], py[inside], pz[inside]))
+    else:
+        xyz = np.empty((0, 3), dtype=np.float64)
+
+    limited_by_max = raw_limited or int(xyz.shape[0]) > max_count
+    if int(xyz.shape[0]) > max_count:
+        xyz = xyz[:max_count]
+
+    points = [Gf.Vec3f(float(p[0]), float(p[1]), float(p[2])) for p in xyz]
+    velocities = [Gf.Vec3f(0.0, 0.0, 0.0)] * len(points)
+    widths = [float(PARTICLE_RADIUS * 2.0)] * len(points)
+    z_min = float(np.min(xyz[:, 2])) if xyz.shape[0] > 0 else None
+    z_max = float(np.max(xyz[:, 2])) if xyz.shape[0] > 0 else None
+    meta = {
+        "candidate_count": candidate_count,
+        "generated_outside": generated_outside,
+        "z_min": z_min,
+        "z_max": z_max,
+        "limited": bool(limited_by_max),
+        "generator": "vectorized",
+        "xy_samples": int(xy.shape[0]),
+        "raw_limited": bool(raw_limited),
+    }
+    return points, velocities, widths, meta
+
+
+def sand_particle_points():
+    try:
+        return sand_particle_points_vectorized()
+    except Exception as e:
+        info("[WARN] vectorized sand generation failed; falling back to scalar:", type(e).__name__, e)
+        points, velocities, widths, meta = sand_particle_points_scalar()
+        meta["generator"] = "scalar_fallback"
+        meta["fallback_reason"] = f"{type(e).__name__}: {e}"
+        return points, velocities, widths, meta
 
 
 def print_particle_spacing_diagnostics():
@@ -2372,15 +2533,18 @@ def make_real_particle_sand(root):
         raw_count = int(gen_meta.get("candidate_count", len(points)))
         generated_outside = int(gen_meta.get("generated_outside", 0))
         limited_by_max_count = bool(gen_meta.get("limited", False)) or len(points) >= int(PARTICLE_MAX_COUNT)
+        generator = str(gen_meta.get("generator", "unknown"))
         bbox = current_sand_footprint_bbox_xy()
         footprint_vertices = int(len(current_sand_footprint_polygon_xy()))
         info(
             "[SAND GEN FOOTPRINT]",
             "source=", "mesh" if SAND_SOURCE_POLYGON_XY is not None else "point_xyz",
-            "sampler=polygon_scanline",
+            f"sampler=polygon_scanline/{generator}",
             "particles_raw=", int(raw_count),
             "particles_kept=", int(len(points)),
             "generated_outside_footprint=", int(generated_outside),
+            "xy_samples=", int(gen_meta.get("xy_samples", 0) or 0),
+            "raw_limited=", bool(gen_meta.get("raw_limited", False)),
             "footprint_vertices=", footprint_vertices,
             "projected_faces=", int(SAND_SOURCE_SELECTED_FACE_COUNT),
             "bbox=", tuple(round(float(v), 3) for v in bbox),
@@ -2609,8 +2773,12 @@ def apply_auto_scene_parameters(
     if rebuild:
         build_sand_site()
     else:
-        rebuild_sand_reference_grid("auto_scene_parameters")
-        set_sand_generation_range_box("auto_scene_parameters")
+        if sand_center_xy is not None:
+            make_sand_retaining_walls(root_path())
+            apply_default_sand_source_mesh()
+        else:
+            rebuild_sand_reference_grid("auto_scene_parameters")
+            set_sand_generation_range_box("auto_scene_parameters")
         refresh_parameter_models_from_globals()
         store_runtime_api()
         if changed:

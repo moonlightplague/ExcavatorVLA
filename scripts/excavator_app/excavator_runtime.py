@@ -605,20 +605,20 @@ AUTO_SCENE_RANDOM_MAX_TRIES = 96
 AUTO_SCENE_TRUCK_ROOT_PATH = "/World/truck"
 AUTO_SCENE_TRUCK_RANDOM_DX_RANGE = (-1.20, 1.20)
 AUTO_SCENE_TRUCK_RANDOM_DY_RANGE = (-1.20, 1.20)
-AUTO_SCENE_TRUCK_RANDOM_RADIUS_RANGE = (5.80, 11.20)
-AUTO_SCENE_TRUCK_RANDOM_ANGLE_DEG_RANGE = (-178.0, 178.0)
+AUTO_SCENE_TRUCK_RANDOM_RADIUS_RANGE = (8.00, 10.80)
+AUTO_SCENE_TRUCK_RANDOM_ANGLE_DEG_RANGE = (-170.0, -120.0)
 AUTO_SCENE_TRUCK_RANDOM_YAW_DEG_RANGE = (-180.0, 180.0)
 AUTO_SCENE_ROBOT_RANDOM_YAW_DEG_RANGE = (-170.0, 170.0)
-AUTO_SCENE_SAND_RANDOM_X_RANGE = (-0.85, 0.85)
-AUTO_SCENE_SAND_RANDOM_Y_RANGE = (5.80, 7.55)
-AUTO_SCENE_SAND_RANDOM_RADIUS_RANGE = (5.10, 7.60)
-AUTO_SCENE_SAND_RANDOM_ANGLE_DEG_RANGE = (-165.0, 165.0)
+AUTO_SCENE_SAND_RANDOM_X_RANGE = (-0.95, 0.95)
+AUTO_SCENE_SAND_RANDOM_Y_RANGE = (5.80, 7.30)
+AUTO_SCENE_SAND_RANDOM_RADIUS_RANGE = (5.80, 7.35)
+AUTO_SCENE_SAND_RANDOM_ANGLE_DEG_RANGE = (82.0, 98.0)
 AUTO_SCENE_SAND_AMOUNT_RANGE = (0.55, 1.35)
-AUTO_SCENE_SAND_MIN_REACH_RADIUS = 4.80
-AUTO_SCENE_SAND_MAX_REACH_RADIUS = 8.20
-AUTO_SCENE_UNLOAD_MIN_REACH_RADIUS = 1.00
-AUTO_SCENE_UNLOAD_MAX_REACH_RADIUS = 12.50
-AUTO_SCENE_MIN_SAND_UNLOAD_DIST = 4.00
+AUTO_SCENE_SAND_MIN_REACH_RADIUS = 5.60
+AUTO_SCENE_SAND_MAX_REACH_RADIUS = 7.45
+AUTO_SCENE_UNLOAD_MIN_REACH_RADIUS = 7.80
+AUTO_SCENE_UNLOAD_MAX_REACH_RADIUS = 11.00
+AUTO_SCENE_MIN_SAND_UNLOAD_DIST = 6.00
 AUTO_SCENE_MIN_ROBOT_TRUCK_DIST = 3.50
 AUTO_SCENE_MIN_SAND_PARTICLE_ESTIMATE = 3000
 AUTO_COLLECT_TARGET_CENTER = np.array([0.0, -6.7, 0.0], dtype=np.float32)
@@ -2310,6 +2310,7 @@ def debug_visual_root_paths():
                 f"{root}/TracePath",
                 f"{root}/LoadedRouteDebug",
                 f"{root}/UnloadPointBall",
+                f"{root}/UnloadSelectedRangePolygon",
                 f"{root}/UnloadSelectedRangeBox",
                 f"{root}/UnloadSelectedRangeCylinder",
                 f"{root}/BucketSandDebug",
@@ -3206,8 +3207,7 @@ def make_polygon_wire_column(path, polygon_xy, z_min, z_max, color, width=None):
     points.extend(top)
     counts.append(len(top))
 
-    step = max(1, n // 8)
-    for i in range(0, n, step):
+    for i in range(n):
         x, y = poly[i]
         points.extend([Gf.Vec3f(float(x), float(y), z0), Gf.Vec3f(float(x), float(y), z1)])
         counts.append(2)
@@ -3530,6 +3530,23 @@ def task_scene_context():
         float(bin_z_range[1]) + UNLOAD_BIN_DUMP_WALL_CLEARANCE_Z,
     )
     unload_point = np.array([float(bin_center[0]), float(bin_center[1]), dump_z], dtype=np.float32)
+    unload_polygon = None
+    unload_hull = None
+    try:
+        use_manual_polygon = bool(STATE.get("manual_unload_override_enabled", False))
+        poly = STATE.get("manual_unload_polygon_xy") if use_manual_polygon else None
+        if poly is not None:
+            poly = np.array(poly, dtype=np.float32).reshape(-1, 2)
+            if poly.shape[0] >= 3 and abs(float(polygon_signed_area(poly))) > 1.0e-6:
+                unload_polygon = poly.copy()
+        hull = STATE.get("manual_unload_selected_hull_xy") if use_manual_polygon else None
+        if hull is not None:
+            hull = np.array(hull, dtype=np.float32).reshape(-1, 2)
+            if hull.shape[0] >= 3 and abs(float(polygon_signed_area(hull))) > 1.0e-6:
+                unload_hull = hull.copy()
+    except Exception:
+        unload_polygon = None
+        unload_hull = None
 
     return {
         "source": source,
@@ -3541,8 +3558,13 @@ def task_scene_context():
         "unload_bin_inner_size": bin_inner,
         "unload_bin_half_size": bin_half,
         "unload_bin_z_range": bin_z_range,
+        "unload_polygon_xy": unload_polygon,
+        "unload_hull_xy": unload_hull,
         "unload_point_raw": dump_raw,
         "unload_point": unload_point,
+        "manual_unload_source": str(STATE.get("manual_unload_source", "")),
+        "manual_unload_selected_path": str(STATE.get("manual_unload_selected_path", "")),
+        "manual_unload_range_shape": str(STATE.get("manual_unload_range_shape", "")),
     }
 
 
@@ -3570,9 +3592,10 @@ def unload_bin_dump_point(height_delta=0.0, xy_offset=None, ctx=None):
     if xy_offset is not None:
         off = np.array(xy_offset, dtype=np.float32).reshape(-1)
         if len(off) >= 2:
-            safe_half = np.maximum(bin_half[:2] - UNLOAD_BIN_SAFE_XY_MARGIN, np.array([0.02, 0.02], dtype=np.float32))
-            p[0] += float(np.clip(float(off[0]), -float(safe_half[0]), float(safe_half[0])))
-            p[1] += float(np.clip(float(off[1]), -float(safe_half[1]), float(safe_half[1])))
+            desired_xy = np.array([float(p[0]) + float(off[0]), float(p[1]) + float(off[1])], dtype=np.float32)
+            clamped_xy = clamp_unload_xy_to_context(ctx, desired_xy, safe_margin=UNLOAD_BIN_SAFE_XY_MARGIN)
+            p[0] = float(clamped_xy[0])
+            p[1] = float(clamped_xy[1])
     p[2] += float(height_delta)
     return p
 
@@ -3596,9 +3619,10 @@ def unload_bin_landing_point(height_delta=0.06, xy_offset=None, ctx=None):
     if xy_offset is not None:
         off = np.array(xy_offset, dtype=np.float32).reshape(-1)
         if len(off) >= 2:
-            safe_half = np.maximum(bin_half[:2] - UNLOAD_BIN_SAFE_XY_MARGIN, np.array([0.02, 0.02], dtype=np.float32))
-            p[0] += float(np.clip(float(off[0]), -float(safe_half[0]), float(safe_half[0])))
-            p[1] += float(np.clip(float(off[1]), -float(safe_half[1]), float(safe_half[1])))
+            desired_xy = np.array([float(p[0]) + float(off[0]), float(p[1]) + float(off[1])], dtype=np.float32)
+            clamped_xy = clamp_unload_xy_to_context(ctx, desired_xy, safe_margin=UNLOAD_BIN_SAFE_XY_MARGIN)
+            p[0] = float(clamped_xy[0])
+            p[1] = float(clamped_xy[1])
     return p
 
 
@@ -3613,21 +3637,118 @@ def unload_landing_point_from_release(point=None):
     return p
 
 
+def unload_context_polygon_xy(ctx, safe_margin=0.0):
+    if not isinstance(ctx, dict):
+        return None
+    poly = ctx.get("unload_polygon_xy")
+    if poly is None:
+        return None
+    try:
+        poly = np.array(poly, dtype=np.float32).reshape(-1, 2)
+    except Exception:
+        return None
+    if poly.shape[0] < 3 or abs(float(polygon_signed_area(poly))) <= 1.0e-6:
+        return None
+    margin = max(0.0, float(safe_margin))
+    if margin <= 1.0e-6:
+        return poly
+    shrunk = shrink_convex_polygon_xy(poly, margin)
+    if shrunk is None or len(shrunk) < 3 or abs(float(polygon_signed_area(shrunk))) <= 1.0e-6:
+        return None
+    return np.array(shrunk, dtype=np.float32).reshape(-1, 2)
+
+
+def point_to_segment_projection_xy(point_xy, a_xy, b_xy):
+    p = np.array(point_xy, dtype=np.float64).reshape(-1)[:2]
+    a = np.array(a_xy, dtype=np.float64).reshape(-1)[:2]
+    b = np.array(b_xy, dtype=np.float64).reshape(-1)[:2]
+    ab = b - a
+    denom = float(np.dot(ab, ab))
+    if denom <= 1.0e-12:
+        return a.astype(np.float32), float(np.linalg.norm(p - a))
+    t = max(0.0, min(1.0, float(np.dot(p - a, ab) / denom)))
+    proj = a + t * ab
+    return proj.astype(np.float32), float(np.linalg.norm(p - proj))
+
+
+def closest_point_on_polygon_boundary_xy(point_xy, poly):
+    poly = np.array(poly, dtype=np.float32).reshape(-1, 2)
+    if poly.shape[0] < 3:
+        return np.array(point_xy, dtype=np.float32).reshape(-1)[:2], 0.0
+    best_p = None
+    best_d = None
+    for i in range(poly.shape[0]):
+        proj, dist = point_to_segment_projection_xy(point_xy, poly[i], poly[(i + 1) % poly.shape[0]])
+        if best_d is None or dist < best_d:
+            best_p = proj
+            best_d = dist
+    return np.array(best_p, dtype=np.float32), float(best_d or 0.0)
+
+
+def unload_xy_inside_context(ctx, xy, safe_margin=0.0, outside_margin=0.0):
+    poly = unload_context_polygon_xy(ctx, safe_margin=safe_margin)
+    if poly is not None:
+        return bool(point_in_polygon_with_margin_xy(xy, poly, margin_xy=outside_margin))
+    bin_center = np.array(ctx["unload_bin_center"], dtype=np.float32).reshape(-1)[:3]
+    bin_half = np.array(ctx["unload_bin_half_size"], dtype=np.float32).reshape(-1)[:2]
+    half = np.maximum(bin_half - max(0.0, float(safe_margin)), np.array([0.02, 0.02], dtype=np.float32))
+    half = half + max(0.0, float(outside_margin))
+    p = np.array(xy, dtype=np.float32).reshape(-1)[:2]
+    return bool(abs(float(p[0] - bin_center[0])) <= float(half[0]) and abs(float(p[1] - bin_center[1])) <= float(half[1]))
+
+
+def unload_xy_overflow_context(ctx, xy, safe_margin=0.0):
+    poly = unload_context_polygon_xy(ctx, safe_margin=safe_margin)
+    if poly is not None:
+        if point_in_convex_polygon_xy(xy, poly):
+            return 0.0, 0.0, 0.0
+        _closest, dist = closest_point_on_polygon_boundary_xy(xy, poly)
+        return float(dist), float(dist), 0.0
+    bin_center = np.array(ctx["unload_bin_center"], dtype=np.float32).reshape(-1)[:3]
+    bin_half = np.array(ctx["unload_bin_half_size"], dtype=np.float32).reshape(-1)[:2]
+    safe_half = np.maximum(bin_half - max(0.0, float(safe_margin)), np.array([0.02, 0.02], dtype=np.float32))
+    p = np.array(xy, dtype=np.float32).reshape(-1)[:2]
+    dx = float(p[0] - bin_center[0])
+    dy = float(p[1] - bin_center[1])
+    overflow_x = max(0.0, abs(dx) - float(safe_half[0]))
+    overflow_y = max(0.0, abs(dy) - float(safe_half[1]))
+    return float(math.sqrt(overflow_x * overflow_x + overflow_y * overflow_y)), float(overflow_x), float(overflow_y)
+
+
+def clamp_unload_xy_to_context(ctx, xy, safe_margin=0.0):
+    p = np.array(xy, dtype=np.float32).reshape(-1)[:2].copy()
+    poly = unload_context_polygon_xy(ctx, safe_margin=safe_margin)
+    if poly is not None:
+        if point_in_convex_polygon_xy(p, poly):
+            return p
+        closest, _dist = closest_point_on_polygon_boundary_xy(p, poly)
+        return np.array(closest, dtype=np.float32).reshape(-1)[:2]
+    bin_center = np.array(ctx["unload_bin_center"], dtype=np.float32).reshape(-1)[:3]
+    bin_half = np.array(ctx["unload_bin_half_size"], dtype=np.float32).reshape(-1)[:2]
+    safe_half = np.maximum(bin_half - max(0.0, float(safe_margin)), np.array([0.02, 0.02], dtype=np.float32))
+    p[0] = float(bin_center[0]) + float(np.clip(float(p[0] - bin_center[0]), -float(safe_half[0]), float(safe_half[0])))
+    p[1] = float(bin_center[1]) + float(np.clip(float(p[1] - bin_center[1]), -float(safe_half[1]), float(safe_half[1])))
+    return p
+
+
 def choose_unload_landing_point_for_flat_fill():
     ctx = task_scene_context()
     bin_center = np.array(ctx["unload_bin_center"], dtype=np.float32).reshape(-1)[:3]
     bin_half = np.array(ctx["unload_bin_half_size"], dtype=np.float32).reshape(-1)[:2]
     bin_z_range = np.array(ctx["unload_bin_z_range"], dtype=np.float32).reshape(-1)[:2]
-    safe_half = np.maximum(
-        bin_half - max(float(UNLOAD_BIN_SAFE_XY_MARGIN), float(AUTO_UNLOAD_WALL_MARGIN)),
-        np.array([0.04, 0.04], dtype=np.float32),
-    )
+    margin = max(float(UNLOAD_BIN_SAFE_XY_MARGIN), float(AUTO_UNLOAD_WALL_MARGIN))
+    safe_half = np.maximum(bin_half - margin, np.array([0.04, 0.04], dtype=np.float32))
+    safe_poly = unload_context_polygon_xy(ctx, safe_margin=margin)
     wall_top = float(bin_z_range[1]) if len(bin_z_range) >= 2 else GROUND_TOP_Z
     landing_z = wall_top + 0.06
     points = sand_particle_positions()
     grid = max(3, int(AUTO_UNLOAD_GRID_SIZE))
-    xs = np.linspace(float(bin_center[0] - safe_half[0]), float(bin_center[0] + safe_half[0]), grid)
-    ys = np.linspace(float(bin_center[1] - safe_half[1]), float(bin_center[1] + safe_half[1]), grid)
+    if safe_poly is not None:
+        xs = np.linspace(float(np.min(safe_poly[:, 0])), float(np.max(safe_poly[:, 0])), grid)
+        ys = np.linspace(float(np.min(safe_poly[:, 1])), float(np.max(safe_poly[:, 1])), grid)
+    else:
+        xs = np.linspace(float(bin_center[0] - safe_half[0]), float(bin_center[0] + safe_half[0]), grid)
+        ys = np.linspace(float(bin_center[1] - safe_half[1]), float(bin_center[1] + safe_half[1]), grid)
     cell_half = np.array([
         max(0.04, float(safe_half[0]) / max(1, grid - 1)),
         max(0.04, float(safe_half[1]) / max(1, grid - 1)),
@@ -3640,6 +3761,8 @@ def choose_unload_landing_point_for_flat_fill():
     rows = []
     for x in xs:
         for y in ys:
+            if safe_poly is not None and not point_in_convex_polygon_xy([x, y], safe_poly):
+                continue
             center = np.array([float(x), float(y), 0.0], dtype=np.float32)
             if points is None or len(points) == 0:
                 cell_count = 0
@@ -3696,6 +3819,8 @@ def log_unload_context(label, target_xyz=None, unload_point=None):
     info_print(
         f"[UNLOAD TARGET] {label}: "
         f"source={ctx.get('source')} "
+        f"mesh_path={ctx.get('manual_unload_selected_path', '')} "
+        f"polygon_vertices={0 if ctx.get('unload_polygon_xy') is None else len(ctx.get('unload_polygon_xy'))} "
         f"target={vec_list(target, 3)} "
         f"unload={vec_list(unload, 3)} "
         f"landing={vec_list(landing, 3)} "
@@ -3913,6 +4038,21 @@ def update_debug_rect_loop(path, center_xy, half_xy, z, color, width=0.025):
         return None
 
 
+def update_debug_polygon_loop(path, polygon_xy, z, color, width=0.025):
+    try:
+        poly = np.array(polygon_xy, dtype=np.float32).reshape(-1, 2)
+        if poly.shape[0] < 3:
+            hide_debug_prim(path)
+            return None
+        zz = float(z)
+        pts = [[float(x), float(y), zz] for x, y in poly]
+        pts.append([float(poly[0][0]), float(poly[0][1]), zz])
+        return update_debug_line(path, pts, color, width=width)
+    except Exception:
+        hide_debug_prim(path)
+        return None
+
+
 def draw_unload_dump_debug(
     label,
     landing_target=None,
@@ -3947,22 +4087,39 @@ def draw_unload_dump_debug(
         wall_z = float(bin_z_range[1]) if len(bin_z_range) >= 2 else float(GROUND_TOP_Z)
         overpass_z = wall_z + float(UNLOAD_BIN_WALL_OVERPASS_CLEARANCE_Z)
         preferred_z = preferred_unload_release_z(ctx=ctx, wall_z=wall_z)
-        update_debug_rect_loop(
-            f"{root}/WallOverpassClearanceOutline",
-            bin_center[:2],
-            bin_half,
-            overpass_z,
-            (1.0, 0.92, 0.05),
-            width=0.035,
-        )
-        update_debug_rect_loop(
-            f"{root}/PreferredHighReleaseOutline",
-            bin_center[:2],
-            bin_half,
-            preferred_z,
-            (0.10, 0.95, 1.0),
-            width=0.028,
-        )
+        outline_poly = unload_context_polygon_xy(ctx)
+        if outline_poly is not None:
+            update_debug_polygon_loop(
+                f"{root}/WallOverpassClearanceOutline",
+                outline_poly,
+                overpass_z,
+                (1.0, 0.92, 0.05),
+                width=0.035,
+            )
+            update_debug_polygon_loop(
+                f"{root}/PreferredHighReleaseOutline",
+                outline_poly,
+                preferred_z,
+                (0.10, 0.95, 1.0),
+                width=0.028,
+            )
+        else:
+            update_debug_rect_loop(
+                f"{root}/WallOverpassClearanceOutline",
+                bin_center[:2],
+                bin_half,
+                overpass_z,
+                (1.0, 0.92, 0.05),
+                width=0.035,
+            )
+            update_debug_rect_loop(
+                f"{root}/PreferredHighReleaseOutline",
+                bin_center[:2],
+                bin_half,
+                preferred_z,
+                (0.10, 0.95, 1.0),
+                width=0.028,
+            )
     except Exception:
         hide_debug_prim(f"{root}/WallOverpassClearanceOutline")
         hide_debug_prim(f"{root}/PreferredHighReleaseOutline")
@@ -4094,10 +4251,46 @@ def ensure_unload_range_column(point=None, label=""):
     height = float(z_max - z_min)
     center = (float(p[0]), float(p[1]), z_min + 0.5 * height)
     shape = str(STATE.get("manual_unload_range_shape", "circle") or "circle")
+    poly_path = f"{CONTROL_ROOT}/UnloadSelectedRangePolygon"
     box_path = f"{CONTROL_ROOT}/UnloadSelectedRangeBox"
     cyl_path = f"{CONTROL_ROOT}/UnloadSelectedRangeCylinder"
 
-    if shape in ("box", "mesh"):
+    poly = STATE.get("manual_unload_polygon_xy")
+    if shape in ("mesh_polygon", "mesh") and poly is not None:
+        try:
+            stage.RemovePrim(Sdf.Path(box_path))
+        except Exception:
+            pass
+        try:
+            stage.RemovePrim(Sdf.Path(cyl_path))
+        except Exception:
+            pass
+        visual_poly = visual_polygon_xy(poly, UNLOAD_RANGE_VISUAL_MAX_VERTICES)
+        prim = make_polygon_wire_column(
+            poly_path,
+            polygon_xy=visual_poly,
+            z_min=z_min,
+            z_max=z_max,
+            color=UNLOAD_RANGE_COLUMN_COLOR,
+            width=UNLOAD_RANGE_GUIDE_WIDTH,
+        )
+        if label:
+            info_print(
+                f"[UNLOAD RANGE] {label}: "
+                f"shape=mesh_polygon path={poly_path} center={vec_list(center, 3)} "
+                f"polygon_vertices={len(poly)} visual_vertices={len(visual_poly)} "
+                f"z_range=({z_min:.3f},{z_max:.3f}) height={height:.3f} "
+                f"mesh_shrink_d={manual_unload_mesh_shrink_d():.3f} "
+                f"mesh_path={STATE.get('manual_unload_selected_path', '')}"
+            )
+        set_prim_visibility(prim, debug_visuals_enabled())
+        return prim
+
+    if shape in ("box", "mesh_polygon", "mesh"):
+        try:
+            stage.RemovePrim(Sdf.Path(poly_path))
+        except Exception:
+            pass
         try:
             stage.RemovePrim(Sdf.Path(cyl_path))
         except Exception:
@@ -4107,48 +4300,40 @@ def ensure_unload_range_column(point=None, label=""):
             radius = manual_unload_radius()
             inner = np.array([2.0 * radius, 2.0 * radius], dtype=np.float32)
         inner = np.maximum(np.array(inner, dtype=np.float32).reshape(-1)[:2], np.array([0.05, 0.05], dtype=np.float32))
-        poly = STATE.get("manual_unload_polygon_xy")
-        if poly is not None:
-            visual_poly = visual_polygon_xy(poly, UNLOAD_RANGE_VISUAL_MAX_VERTICES)
-            prim = make_polygon_wire_column(
-                box_path,
-                polygon_xy=visual_poly,
-                z_min=z_min,
-                z_max=z_max,
-                color=UNLOAD_RANGE_COLUMN_COLOR,
-                width=UNLOAD_RANGE_GUIDE_WIDTH,
-            )
-        else:
-            half_x = 0.5 * float(inner[0])
-            half_y = 0.5 * float(inner[1])
-            visual_poly = np.array(
-                [
-                    [float(p[0]) - half_x, float(p[1]) - half_y],
-                    [float(p[0]) + half_x, float(p[1]) - half_y],
-                    [float(p[0]) + half_x, float(p[1]) + half_y],
-                    [float(p[0]) - half_x, float(p[1]) + half_y],
-                ],
-                dtype=np.float32,
-            )
-            prim = make_polygon_wire_column(
-                box_path,
-                polygon_xy=visual_poly,
-                z_min=z_min,
-                z_max=z_max,
-                color=UNLOAD_RANGE_COLUMN_COLOR,
-                width=UNLOAD_RANGE_GUIDE_WIDTH,
-            )
+        half_x = 0.5 * float(inner[0])
+        half_y = 0.5 * float(inner[1])
+        visual_poly = np.array(
+            [
+                [float(p[0]) - half_x, float(p[1]) - half_y],
+                [float(p[0]) + half_x, float(p[1]) - half_y],
+                [float(p[0]) + half_x, float(p[1]) + half_y],
+                [float(p[0]) - half_x, float(p[1]) + half_y],
+            ],
+            dtype=np.float32,
+        )
+        prim = make_polygon_wire_column(
+            box_path,
+            polygon_xy=visual_poly,
+            z_min=z_min,
+            z_max=z_max,
+            color=UNLOAD_RANGE_COLUMN_COLOR,
+            width=UNLOAD_RANGE_GUIDE_WIDTH,
+        )
         if label:
             info_print(
                 f"[UNLOAD RANGE] {label}: "
                 f"shape=box path={box_path} center={vec_list(center, 3)} "
-                f"inner_size={vec_list(inner, 2)} vertices={0 if poly is None else len(poly)} "
-                f"visual_vertices={0 if poly is None else len(visual_polygon_xy(poly, UNLOAD_RANGE_VISUAL_MAX_VERTICES))} z_range=({z_min:.3f},{z_max:.3f}) height={height:.3f} "
+                f"inner_size={vec_list(inner, 2)} vertices=4 visual_vertices=4 "
+                f"z_range=({z_min:.3f},{z_max:.3f}) height={height:.3f} "
                 f"mesh_shrink_d={manual_unload_mesh_shrink_d():.3f}"
             )
         set_prim_visibility(prim, debug_visuals_enabled())
         return prim
 
+    try:
+        stage.RemovePrim(Sdf.Path(poly_path))
+    except Exception:
+        pass
     try:
         stage.RemovePrim(Sdf.Path(box_path))
     except Exception:
@@ -4217,7 +4402,7 @@ def unload_alignment_report(q=None, effector="pour", reference_q=None):
     dx = float(point[0] - bin_center[0])
     dy = float(point[1] - bin_center[1])
     dz_wall = float(point[2] - bin_z_range[1])
-    inside_xy = abs(dx) <= float(safe_half[0]) and abs(dy) <= float(safe_half[1])
+    inside_xy = unload_xy_inside_context(ctx, point[:2], safe_margin=UNLOAD_BIN_SAFE_XY_MARGIN)
     above_wall = dz_wall >= 0.05
     return {
         "ok": bool(inside_xy and above_wall),
@@ -4232,6 +4417,7 @@ def unload_alignment_report(q=None, effector="pour", reference_q=None):
         "bin_center": vec_list(bin_center, 3),
         "bin_half": vec_list(bin_half, 2),
         "safe_half": vec_list(safe_half, 2),
+        "unload_polygon_vertices": 0 if unload_context_polygon_xy(ctx) is None else int(len(unload_context_polygon_xy(ctx))),
         "bin_z_range": vec_list(bin_z_range, 2),
         "dx": dx,
         "dy": dy,
@@ -4468,12 +4654,14 @@ def unload_drop_report(q=None, reference_q=None):
     release_xy_err = float(math.sqrt(release_dx * release_dx + release_dy * release_dy))
     bin_dx = float(landing[0] - bin_center[0])
     bin_dy = float(landing[1] - bin_center[1])
-    inside_xy = abs(bin_dx) <= float(safe_half[0]) and abs(bin_dy) <= float(safe_half[1])
+    inside_xy = unload_xy_inside_context(ctx, landing[:2], safe_margin=UNLOAD_BIN_SAFE_XY_MARGIN)
     above_wall = float(drop["source_clearance"]) >= UNLOAD_DROP_SOURCE_MIN_CLEARANCE_Z
     close_xy = xy_err <= UNLOAD_DROP_XY_TOL
-    overflow_x = max(0.0, abs(bin_dx) - float(safe_half[0]))
-    overflow_y = max(0.0, abs(bin_dy) - float(safe_half[1]))
-    overflow_xy = float(math.sqrt(overflow_x * overflow_x + overflow_y * overflow_y))
+    overflow_xy, overflow_x, overflow_y = unload_xy_overflow_context(
+        ctx,
+        landing[:2],
+        safe_margin=UNLOAD_BIN_SAFE_XY_MARGIN,
+    )
     scatter_center_tol = float(np.linalg.norm(safe_half + scatter_margin))
     scatter_xy_ok = bool(above_wall and overflow_xy <= scatter_margin and xy_err <= scatter_center_tol)
     release_center_tol = max(float(UNLOAD_CENTER_RELEASE_XY_TOL), 0.12)
@@ -4529,6 +4717,7 @@ def unload_drop_report(q=None, reference_q=None):
         "source_clearance": float(drop.get("source_clearance", 0.0)),
         "bin_center": vec_list(bin_center, 3),
         "safe_half": vec_list(safe_half, 2),
+        "unload_polygon_vertices": 0 if unload_context_polygon_xy(ctx) is None else int(len(unload_context_polygon_xy(ctx))),
         "dx": dx,
         "dy": dy,
         "xy_err": xy_err,
@@ -4601,7 +4790,12 @@ def actual_unload_position_report():
         marker_dx = float(p[0] - marker[0])
         marker_dy = float(p[1] - marker[1])
         xy_err = float(math.sqrt(marker_dx * marker_dx + marker_dy * marker_dy))
-        inside_gate = abs(dx) <= float(gate_half[0]) and abs(dy) <= float(gate_half[1])
+        inside_gate = unload_xy_inside_context(
+            ctx,
+            p[:2],
+            safe_margin=UNLOAD_BIN_SAFE_XY_MARGIN,
+            outside_margin=UNLOAD_ACTUAL_BUCKET_XY_MARGIN,
+        )
         above_wall = dz_wall >= float(UNLOAD_ACTUAL_MIN_ABOVE_WALL_Z)
         marker_xy_ok = xy_err <= float(UNLOAD_ACTUAL_LOAD_MARKER_XY_TOL)
         return {
@@ -4643,6 +4837,7 @@ def actual_unload_position_report():
         "bin_center": vec_list(bin_center, 3),
         "safe_half": vec_list(safe_half, 2),
         "gate_half": vec_list(gate_half, 2),
+        "unload_polygon_vertices": 0 if unload_context_polygon_xy(ctx) is None else int(len(unload_context_polygon_xy(ctx))),
         "bin_z_range": vec_list(bin_z_range, 2),
         "marker": vec_list(marker, 3),
         "source": str(ctx.get("source", "unknown")),
@@ -4755,13 +4950,11 @@ def unload_arrival_report(q_goal=None):
         release = drop.get("release")
         if release is not None:
             release_arr = np.array(release, dtype=np.float32).reshape(-1)[:3]
-            bin_center = np.array(ctx["unload_bin_center"], dtype=np.float32).reshape(-1)[:3]
-            bin_half = np.array(ctx["unload_bin_half_size"], dtype=np.float32).reshape(-1)[:2]
-            safe_half = np.maximum(bin_half - UNLOAD_BIN_SAFE_XY_MARGIN, np.array([0.02, 0.02], dtype=np.float32))
-            gate_half = safe_half + float(UNLOAD_ACTUAL_BUCKET_XY_MARGIN)
-            release_inside_gate = (
-                abs(float(release_arr[0] - bin_center[0])) <= float(gate_half[0])
-                and abs(float(release_arr[1] - bin_center[1])) <= float(gate_half[1])
+            release_inside_gate = unload_xy_inside_context(
+                ctx,
+                release_arr[:2],
+                safe_margin=UNLOAD_BIN_SAFE_XY_MARGIN,
+                outside_margin=UNLOAD_ACTUAL_BUCKET_XY_MARGIN,
             )
             release_z_clearance = float(release_arr[2] - wall_z)
             release_xy_err = float(math.sqrt(float(release_arr[0] - target[0]) ** 2 + float(release_arr[1] - target[1]) ** 2))
@@ -5132,6 +5325,8 @@ def compact_scene_context(ctx=None):
     ctx = task_scene_context() if ctx is None else ctx
     if not isinstance(ctx, dict):
         ctx = {}
+    poly = ctx.get("unload_polygon_xy")
+    hull = ctx.get("unload_hull_xy")
     return {
         "source": str(ctx.get("source", "unknown")),
         "pile_center": vec_list(ctx.get("pile_center"), 3),
@@ -5139,8 +5334,13 @@ def compact_scene_context(ctx=None):
         "unload_bin_center": vec_list(ctx.get("unload_bin_center"), 3),
         "unload_bin_half_size": vec_list(ctx.get("unload_bin_half_size"), 2),
         "unload_bin_z_range": vec_list(ctx.get("unload_bin_z_range"), 2),
+        "unload_polygon_xy": None if poly is None else [vec_list(p, 2) for p in np.array(poly, dtype=np.float32).reshape(-1, 2)],
+        "unload_hull_xy": None if hull is None else [vec_list(p, 2) for p in np.array(hull, dtype=np.float32).reshape(-1, 2)],
         "unload_point_raw": vec_list(ctx.get("unload_point_raw"), 3),
         "unload_point": vec_list(ctx.get("unload_point"), 3),
+        "manual_unload_source": str(ctx.get("manual_unload_source", "")),
+        "manual_unload_selected_path": str(ctx.get("manual_unload_selected_path", "")),
+        "manual_unload_range_shape": str(ctx.get("manual_unload_range_shape", "")),
     }
 
 
@@ -6706,6 +6906,7 @@ def auto_dataset_config_snapshot():
             "sand_angle_deg_range": list(AUTO_SCENE_SAND_RANDOM_ANGLE_DEG_RANGE),
             "sand_amount_range": list(AUTO_SCENE_SAND_AMOUNT_RANGE),
             "min_sand_particle_estimate": int(AUTO_SCENE_MIN_SAND_PARTICLE_ESTIMATE),
+            "effective_workspace": auto_scene_random_workspace_bounds(),
             "legal_constraints": {
                 "sand_reach_radius": [float(AUTO_SCENE_SAND_MIN_REACH_RADIUS), float(AUTO_SCENE_SAND_MAX_REACH_RADIUS)],
                 "unload_reach_radius": [float(AUTO_SCENE_UNLOAD_MIN_REACH_RADIUS), float(AUTO_SCENE_UNLOAD_MAX_REACH_RADIUS)],
@@ -7636,17 +7837,25 @@ def sand_region_masks(points):
         else:
             bucket_mask = empty.copy()
 
-    bin_center_3 = np.array(ctx["unload_bin_center"], dtype=np.float32)
-    bin_center = np.array([float(bin_center_3[0]), float(bin_center_3[1]), 0.0], dtype=np.float32)
-    bin_half = np.array(ctx["unload_bin_half_size"], dtype=np.float32)
     bin_z_range = np.array(ctx["unload_bin_z_range"], dtype=np.float32)
-    bin_mask = mask_points_in_box(
-        points,
-        bin_center,
-        bin_half,
-        float(bin_z_range[0]),
-        float(bin_z_range[1]),
-    )
+    unload_poly = unload_context_polygon_xy(ctx)
+    if unload_poly is not None:
+        bin_mask = (
+            point_in_polygon_2d(points[:, :2], unload_poly)
+            & (points[:, 2] >= float(bin_z_range[0]))
+            & (points[:, 2] <= float(bin_z_range[1]))
+        )
+    else:
+        bin_center_3 = np.array(ctx["unload_bin_center"], dtype=np.float32)
+        bin_center = np.array([float(bin_center_3[0]), float(bin_center_3[1]), 0.0], dtype=np.float32)
+        bin_half = np.array(ctx["unload_bin_half_size"], dtype=np.float32)
+        bin_mask = mask_points_in_box(
+            points,
+            bin_center,
+            bin_half,
+            float(bin_z_range[0]),
+            float(bin_z_range[1]),
+        )
     return pile_mask, bucket_mask, bin_mask
 
 
@@ -12386,6 +12595,64 @@ def auto_scene_sample_polar_xy(rng, radius_range, angle_deg_range):
     return xy, radius, angle_deg
 
 
+def angle_in_deg_range(angle_deg, range_pair):
+    if angle_deg is None:
+        return False
+    a = wrap_deg_180(float(angle_deg))
+    lo = wrap_deg_180(float(range_pair[0]))
+    hi = wrap_deg_180(float(range_pair[1]))
+    if lo <= hi:
+        return bool(lo <= a <= hi)
+    return bool(a >= lo or a <= hi)
+
+
+def auto_scene_random_workspace_bounds():
+    key = (
+        tuple(round(float(v), 4) for v in AUTO_SCENE_SAND_RANDOM_X_RANGE),
+        tuple(round(float(v), 4) for v in AUTO_SCENE_SAND_RANDOM_Y_RANGE),
+        tuple(round(float(v), 4) for v in AUTO_SCENE_TRUCK_RANDOM_RADIUS_RANGE),
+        tuple(round(float(v), 4) for v in AUTO_SCENE_TRUCK_RANDOM_ANGLE_DEG_RANGE),
+        tuple(round(float(v), 4) for v in AUTO_SCENE_SAND_AMOUNT_RANGE),
+    )
+    cached = STATE.get("auto_scene_random_workspace_bounds")
+    if isinstance(cached, dict) and cached.get("key") == key:
+        return cached
+
+    sand_x = [float(min(AUTO_SCENE_SAND_RANDOM_X_RANGE)), float(max(AUTO_SCENE_SAND_RANDOM_X_RANGE))]
+    sand_y = [float(min(AUTO_SCENE_SAND_RANDOM_Y_RANGE)), float(max(AUTO_SCENE_SAND_RANDOM_Y_RANGE))]
+    truck_r = [float(min(AUTO_SCENE_TRUCK_RANDOM_RADIUS_RANGE)), float(max(AUTO_SCENE_TRUCK_RANDOM_RADIUS_RANGE))]
+    truck_a = [float(AUTO_SCENE_TRUCK_RANDOM_ANGLE_DEG_RANGE[0]), float(AUTO_SCENE_TRUCK_RANDOM_ANGLE_DEG_RANGE[1])]
+    amount = [float(min(AUTO_SCENE_SAND_AMOUNT_RANGE)), float(max(AUTO_SCENE_SAND_AMOUNT_RANGE))]
+    bounds = {
+        "key": key,
+        "mode": "fixed_base_cached_workspace",
+        "sand_xy_box": {"x": sand_x, "y": sand_y},
+        "sand_radius_limit": [float(AUTO_SCENE_SAND_MIN_REACH_RADIUS), float(AUTO_SCENE_SAND_MAX_REACH_RADIUS)],
+        "truck_unload_polar": {"radius": truck_r, "angle_deg": truck_a},
+        "unload_radius_limit": [float(AUTO_SCENE_UNLOAD_MIN_REACH_RADIUS), float(AUTO_SCENE_UNLOAD_MAX_REACH_RADIUS)],
+        "sand_amount": amount,
+        "min_sand_unload_xy_dist": float(AUTO_SCENE_MIN_SAND_UNLOAD_DIST),
+        "reason": "base_is_fixed__avoid_full_ring_randomization",
+    }
+    STATE["auto_scene_random_workspace_bounds"] = bounds
+    info_print(
+        "[AUTO SCENE WORKSPACE]",
+        f"sand_x={sand_x}",
+        f"sand_y={sand_y}",
+        f"truck_unload_radius={truck_r}",
+        f"truck_unload_angle={truck_a}",
+        f"min_sand_unload_dist={AUTO_SCENE_MIN_SAND_UNLOAD_DIST:.2f}",
+    )
+    return bounds
+
+
+def auto_scene_sample_box_xy(rng, x_range, y_range):
+    x = float(rng.uniform(float(x_range[0]), float(x_range[1])))
+    y = float(rng.uniform(float(y_range[0]), float(y_range[1])))
+    xy = np.array([x, y], dtype=np.float32)
+    return xy, auto_scene_xy_radius(xy), auto_scene_xy_angle_deg(xy)
+
+
 def wrap_deg_180(value):
     return ((float(value) + 180.0) % 360.0) - 180.0
 
@@ -12432,16 +12699,33 @@ def auto_scene_truck_baseline():
 
 
 def auto_scene_candidate_legal(candidate):
+    workspace = auto_scene_random_workspace_bounds()
     sand_xy = np.array(candidate.get("sand_xy"), dtype=np.float32).reshape(-1)[:2]
     unload_xy = np.array(candidate.get("unload_xy"), dtype=np.float32).reshape(-1)[:2]
     if len(sand_xy) < 2 or len(unload_xy) < 2:
         return False, "missing_xy"
+    if bool(candidate.get("random_sand_xy", False)):
+        sand_box = workspace.get("sand_xy_box", {}) if isinstance(workspace, dict) else {}
+        x_range = sand_box.get("x", AUTO_SCENE_SAND_RANDOM_X_RANGE)
+        y_range = sand_box.get("y", AUTO_SCENE_SAND_RANDOM_Y_RANGE)
+        if not (float(x_range[0]) <= float(sand_xy[0]) <= float(x_range[1])):
+            return False, f"sand_x_out_of_workspace:{float(sand_xy[0]):.2f}"
+        if not (float(y_range[0]) <= float(sand_xy[1]) <= float(y_range[1])):
+            return False, f"sand_y_out_of_workspace:{float(sand_xy[1]):.2f}"
     sand_r = auto_scene_xy_radius(sand_xy)
     unload_r = auto_scene_xy_radius(unload_xy)
     if sand_r < float(AUTO_SCENE_SAND_MIN_REACH_RADIUS) or sand_r > float(AUTO_SCENE_SAND_MAX_REACH_RADIUS):
         return False, f"sand_reach_radius:{sand_r:.2f}"
     if unload_r < float(AUTO_SCENE_UNLOAD_MIN_REACH_RADIUS) or unload_r > float(AUTO_SCENE_UNLOAD_MAX_REACH_RADIUS):
         return False, f"unload_reach_radius:{unload_r:.2f}"
+    if bool(candidate.get("random_truck", False)):
+        unload_angle = auto_scene_xy_angle_deg(unload_xy)
+        unload_angle_range = (workspace.get("truck_unload_polar", {}) or {}).get(
+            "angle_deg",
+            AUTO_SCENE_TRUCK_RANDOM_ANGLE_DEG_RANGE,
+        )
+        if not angle_in_deg_range(unload_angle, unload_angle_range):
+            return False, f"unload_angle_out_of_workspace:{float(unload_angle):.1f}"
     dist = float(np.linalg.norm(sand_xy - unload_xy))
     if dist < float(AUTO_SCENE_MIN_SAND_UNLOAD_DIST):
         return False, f"sand_unload_overlap:{dist:.2f}"
@@ -12493,6 +12777,7 @@ def auto_scene_attempt_record(candidate=None, ok=False, reason="", cfg=None):
         "reason": str(reason),
         "attempt": int(candidate.get("attempt", STATE.get("auto_collect_attempts", 0)) or 0),
         "config": cfg,
+        "workspace": auto_scene_random_workspace_bounds(),
         "candidate": {
             "sand_xy": vec_list(candidate.get("sand_xy"), 2),
             "sand_radius_m": candidate.get("sand_radius_m"),
@@ -12529,6 +12814,7 @@ def auto_scene_attempt_record(candidate=None, ok=False, reason="", cfg=None):
 def auto_scene_sample_candidate(attempt_index):
     cfg = auto_scene_randomization_config()
     ctx = task_scene_context()
+    workspace = auto_scene_random_workspace_bounds()
     base_sand_xy = np.array(ctx.get("pile_center", [0.0, 6.7, 0.0]), dtype=np.float32).reshape(-1)[:2]
     base_unload_xy = np.array(ctx.get("unload_bin_center", [-10.0, -5.0, 0.0]), dtype=np.float32).reshape(-1)[:2]
     rng = np.random.default_rng(410700 + int(max(1, attempt_index)) * 7919)
@@ -12539,10 +12825,11 @@ def auto_scene_sample_candidate(attempt_index):
         sand_radius = auto_scene_xy_radius(sand_xy)
         sand_angle_deg = auto_scene_xy_angle_deg(sand_xy)
         if cfg["random_sand_xy"]:
-            sand_xy, sand_radius, sand_angle_deg = auto_scene_sample_polar_xy(
+            sand_box = workspace.get("sand_xy_box", {}) if isinstance(workspace, dict) else {}
+            sand_xy, sand_radius, sand_angle_deg = auto_scene_sample_box_xy(
                 rng,
-                AUTO_SCENE_SAND_RANDOM_RADIUS_RANGE,
-                AUTO_SCENE_SAND_RANDOM_ANGLE_DEG_RANGE,
+                sand_box.get("x", AUTO_SCENE_SAND_RANDOM_X_RANGE),
+                sand_box.get("y", AUTO_SCENE_SAND_RANDOM_Y_RANGE),
             )
 
         amount = None
@@ -12581,10 +12868,11 @@ def auto_scene_sample_candidate(attempt_index):
             if not (isinstance(truck_base, dict) and truck_base.get("valid")):
                 last_reason = str((truck_base or {}).get("reason", "truck_baseline_invalid"))
                 break
+            unload_polar = workspace.get("truck_unload_polar", {}) if isinstance(workspace, dict) else {}
             unload_xy, unload_radius, unload_angle_deg = auto_scene_sample_polar_xy(
                 rng,
-                AUTO_SCENE_TRUCK_RANDOM_RADIUS_RANGE,
-                AUTO_SCENE_TRUCK_RANDOM_ANGLE_DEG_RANGE,
+                unload_polar.get("radius", AUTO_SCENE_TRUCK_RANDOM_RADIUS_RANGE),
+                unload_polar.get("angle_deg", AUTO_SCENE_TRUCK_RANDOM_ANGLE_DEG_RANGE),
             )
             truck_center = np.array(truck_base["center"], dtype=np.float32).reshape(-1)[:3].copy()
             dump_center = np.array(truck_base.get("dump_center", truck_center), dtype=np.float32).reshape(-1)[:3].copy()
@@ -12682,7 +12970,9 @@ def auto_scene_apply_candidate(candidate):
         sand_xy = candidate.get("sand_xy") if cfg["random_sand_xy"] else None
         amount = candidate.get("sand_amount_multiplier") if cfg["random_sand_amount"] else None
         unload_xy = None
-        needs_rebuild = bool(cfg["random_sand_xy"] or cfg["random_sand_amount"] or unload_xy is not None)
+        # Auto collect invalidates the stable-reset flag below; let prepare perform
+        # the single real particle rebuild after the robot is safely at home.
+        needs_rebuild = False
         result = apply_scene(
             sand_center_xy=sand_xy,
             sand_amount_multiplier=amount,
@@ -12696,7 +12986,11 @@ def auto_scene_apply_candidate(candidate):
         return False, "sand_site_apply_api_missing"
 
     if truck_moved:
-        apply_default_unload_source_mesh()
+        if not apply_default_unload_source_mesh():
+            return False, "unload_source_mesh_refresh_failed_after_truck_move"
+        ctx_after_unload_mesh = task_scene_context()
+        candidate["applied_unload_point_xyz"] = np.array(ctx_after_unload_mesh.get("unload_point"), dtype=np.float32).reshape(-1)[:3].copy()
+        candidate["applied_unload_selected_path"] = str(ctx_after_unload_mesh.get("manual_unload_selected_path", ""))
         scene_changed = True
 
     if scene_changed:
@@ -15388,7 +15682,7 @@ def set_manual_unload_from_mesh_path(path, source="selected_mesh", status=True):
         inner_size=inner,
         z_range=np.array([float(mn[2]), float(point[2])], dtype=np.float32),
         selected_path=path,
-        range_shape="box",
+        range_shape="mesh_polygon",
     )
     update_unload_models_only(point)
     info_print(
@@ -17175,6 +17469,16 @@ def fmt_optional(x):
 
 
 def format_ground_report(mode, report, reason):
+    if not isinstance(report, dict):
+        if mode == "manual":
+            phase_kind = "manual"
+        elif is_cutting_phase(mode):
+            phase_kind = "cut"
+        elif is_curl_phase(mode):
+            phase_kind = "curl"
+        else:
+            phase_kind = "free"
+        return f"phase={mode} kind={phase_kind} {reason}; report=unavailable"
     tip_hard_depth = depth_below_ground(report.get("tip_z"))
     load_hard_depth = depth_below_ground(report.get("load_z"))
     pour_hard_depth = depth_below_ground(report.get("pour_z"))

@@ -287,8 +287,9 @@ def _ensure_zsp_configuration_aliases(project_root):
         if not os.path.isfile(source):
             print(f"[WARN] ZSP source USD missing for configuration alias: {source}")
             continue
-        needs_copy = not os.path.exists(target)
-        if os.path.exists(target):
+        target_exists = os.path.lexists(target)
+        needs_copy = not target_exists
+        if target_exists:
             try:
                 needs_copy = os.path.islink(target) or os.path.getsize(target) < 128 or os.path.getsize(target) != os.path.getsize(source)
             except Exception:
@@ -296,7 +297,7 @@ def _ensure_zsp_configuration_aliases(project_root):
         if not needs_copy:
             continue
         try:
-            if os.path.exists(target) and not os.path.islink(target):
+            if os.path.lexists(target):
                 os.remove(target)
             shutil.copy2(source, target)
             print(f"[INFO] Refreshed ZSP configuration USD alias: {target}")

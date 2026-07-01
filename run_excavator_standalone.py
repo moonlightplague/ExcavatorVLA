@@ -261,6 +261,7 @@ def main():
 
     print(f"[INFO] Robot prim found: {ROBOT_PRIM_PATH}")
 
+
     # Create World.
     world = World(physics_dt=1.0 / 60.0, rendering_dt=1.0 / 60.0)
 
@@ -354,6 +355,27 @@ def main():
     # Reset world and initialize robot.
     world.reset()
     robot.initialize()
+
+    # -----------------------------------------------------------------
+    # TEMP TEST: force move excavator after world.reset() and robot.initialize()
+    # Sand center is around (0.0, 6.7). This puts the bucket near the sand.
+    # -----------------------------------------------------------------
+    ROBOT_INITIAL_POS_AFTER_RESET = np.array([-9.2, 6.7, 1.243], dtype=np.float32)
+    ROBOT_INITIAL_ORI_AFTER_RESET = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)  # wxyz quaternion
+
+    try:
+        robot.set_world_pose(
+            position=ROBOT_INITIAL_POS_AFTER_RESET,
+            orientation=ROBOT_INITIAL_ORI_AFTER_RESET,
+        )
+        for _ in range(10):
+            world.step(render=True)
+            simulation_app.update()
+
+        print("[INFO] FORCE robot world pose after reset:", robot.get_world_pose(), flush=True)
+    except Exception as e:
+        print("[ERROR] Failed to force robot pose after reset:", repr(e), flush=True)
+
 
     print("[INFO] World initialized")
     print("[INFO] Robot joint positions:", robot.get_joint_positions())

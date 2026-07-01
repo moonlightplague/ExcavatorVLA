@@ -41,7 +41,7 @@ SANDBOX_FLOOR_THICKNESS = 0.16
 SANDBOX_WALL_COLOR = (0.34, 0.32, 0.28)
 SANDBOX_FLOOR_COLOR = (0.24, 0.23, 0.20)
 SAND_AMOUNT_BASE_HEIGHT = 3.00
-SAND_AMOUNT_MULTIPLIER = 1.00
+SAND_AMOUNT_MULTIPLIER = 3.00
 SAND_AMOUNT_MIN_MULTIPLIER = 0.25
 SAND_AMOUNT_MAX_MULTIPLIER = 10.00
 SAND_AMOUNT_HEIGHT_EXPONENT = 0.75
@@ -76,6 +76,12 @@ PILE_CENTER_Y = SAND_CENTER_Y
 PILE_HEIGHT = SANDBOX_FILL_HEIGHT
 PILE_SIGMA_X = 0.38
 PILE_SIGMA_Y = 0.38
+# Height profile parameters used by the vectorized reference grid builder.
+# Defaults preserve the older scalar formula:
+#   mound = height * (0.82 + 0.18 * gaussian)
+PILE_RIM_HEIGHT_FRACTION = 0.82
+PILE_GAUSSIAN_BLEND = 1.0
+PILE_CONE_EXPONENT = 1.0
 
 RIPPLE_AMP = 0.018
 NOISE_AMP = 0.010
@@ -127,6 +133,40 @@ PARTICLE_MATERIAL_GRAVITY_SCALE = 0.90
 PARTICLE_MATERIAL_STATIC_FRICTION = 1.10
 PARTICLE_MATERIAL_DYNAMIC_FRICTION = 1.10
 PARTICLE_MATERIAL_RESTITUTION = 0.0
+SAND_PARAMETER_MODE = "legacy"
+SAND_PARAMETER_MODES = ("legacy", "soft_dig")
+SAND_PARAMETER_PRESETS = {
+    "legacy": {
+        "label": "Legacy",
+        "sand_fidelity": 0.0,
+        "material_viscosity": 1.80,
+        "material_cohesion": 0.15,
+        "material_adhesion": 0.08,
+        "material_damping": 0.70,
+        "material_friction": 1.10,
+        "material_friction_scale": 1.20,
+        "material_gravity_scale": 0.90,
+        "material_static_friction": 1.10,
+        "material_dynamic_friction": 1.10,
+        "particle_max_velocity": 9.0,
+        "particle_solver_iters": 16,
+    },
+    "soft_dig": {
+        "label": "Soft Dig",
+        "sand_fidelity": 0.0,
+        "material_viscosity": 0.85,
+        "material_cohesion": 0.035,
+        "material_adhesion": 0.015,
+        "material_damping": 0.45,
+        "material_friction": 0.82,
+        "material_friction_scale": 0.90,
+        "material_gravity_scale": 1.00,
+        "material_static_friction": 0.85,
+        "material_dynamic_friction": 0.82,
+        "particle_max_velocity": 12.0,
+        "particle_solver_iters": 16,
+    },
+}
 STATIC_COLLIDER_CONTACT_OFFSET = 0.030
 STATIC_COLLIDER_REST_OFFSET = 0.000
 PARTICLE_SYSTEM_PATH_SUFFIX = "ParticleSystem"
@@ -202,6 +242,8 @@ builtins._SAND_SITE_STATE = {
     "particle_spacing_z": PARTICLE_LAYER_SPACING_Z,
     "particle_solver_iters": PARTICLE_SOLVER_POSITION_ITERATIONS,
     "particle_max_velocity": PARTICLE_MAX_VELOCITY,
+    "sand_parameter_mode": SAND_PARAMETER_MODE,
+    "sand_parameter_mode_label": SAND_PARAMETER_PRESETS[SAND_PARAMETER_MODE]["label"],
     "sand_fidelity": SAND_FIDELITY,
     "sand_mode_label": "Balanced",
     "estimated_particle_count": 0,
@@ -349,6 +391,25 @@ def sand_mode_label(fidelity=None):
     if f >= 0.75:
         return "Realistic"
     return "Balanced"
+
+
+def normalize_sand_parameter_mode(mode):
+    text = str(mode).strip().lower()
+    return text if text in SAND_PARAMETER_MODES else "legacy"
+
+
+def sand_parameter_mode_label(mode=None):
+    mode = normalize_sand_parameter_mode(SAND_PARAMETER_MODE if mode is None else mode)
+    preset = SAND_PARAMETER_PRESETS.get(mode, SAND_PARAMETER_PRESETS["legacy"])
+    return str(preset.get("label", mode))
+
+
+def current_sand_parameter_mode():
+    global SAND_PARAMETER_MODE
+    SAND_PARAMETER_MODE = normalize_sand_parameter_mode(SAND_PARAMETER_MODE)
+    STATE["sand_parameter_mode"] = SAND_PARAMETER_MODE
+    STATE["sand_parameter_mode_label"] = sand_parameter_mode_label(SAND_PARAMETER_MODE)
+    return SAND_PARAMETER_MODE
 
 
 def clamp_sand_amount(amount=None):
@@ -543,6 +604,8 @@ def apply_particle_performance_budget(announce=False):
 
 
 def update_particle_runtime_state():
+    STATE["sand_parameter_mode"] = current_sand_parameter_mode()
+    STATE["sand_parameter_mode_label"] = sand_parameter_mode_label()
     STATE["sand_amount_x"] = float(SAND_AMOUNT_MULTIPLIER)
     STATE["sand_fill_height"] = float(SANDBOX_FILL_HEIGHT)
     STATE["sand_fidelity"] = float(SAND_FIDELITY)
@@ -619,6 +682,103 @@ def apply_sand_fidelity_to_particle_globals(fidelity=None, announce=False):
             f"mass={PARTICLE_MASS:.4f}",
             f"estimated={STATE.get('estimated_particle_count')}",
         )
+
+
+def apply_sand_parameter_mode(mode=None, announce=True):
+    global SAND_PARAMETER_MODE, SAND_FIDELITY
+    global PARTICLE_MATERIAL_FRICTION, PARTICLE_MATERIAL_FRICTION_SCALE, PARTICLE_MATERIAL_DAMPING
+    global PARTICLE_MATERIAL_VISCOSITY, PARTICLE_MATERIAL_COHESION, PARTICLE_MATERIAL_ADHESION
+    global PARTICLE_MATERIAL_GRAVITY_SCALE, PARTICLE_MATERIAL_STATIC_FRICTION, PARTICLE_MATERIAL_DYNAMIC_FRICTION
+    global PARTICLE_MAX_VELOCITY, PARTICLE_SOLVER_POSITION_ITERATIONS
+
+    if mode is None:
+        mode = "legacy" if current_sand_parameter_mode() == "soft_dig" else "soft_dig"
+    mode = normalize_sand_parameter_mode(mode)
+    preset = dict(SAND_PARAMETER_PRESETS.get(mode, SAND_PARAMETER_PRESETS["legacy"]))
+
+    SAND_PARAMETER_MODE = mode
+    SAND_FIDELITY = clamp_value(preset.get("sand_fidelity", SAND_FIDELITY), 0.0, 1.0)
+    apply_sand_fidelity_to_particle_globals(SAND_FIDELITY, announce=False)
+
+    PARTICLE_MATERIAL_VISCOSITY = clamp_value(preset.get("material_viscosity", PARTICLE_MATERIAL_VISCOSITY), 0.0, 4.0)
+    PARTICLE_MATERIAL_COHESION = clamp_value(preset.get("material_cohesion", PARTICLE_MATERIAL_COHESION), 0.0, 0.60)
+    PARTICLE_MATERIAL_ADHESION = clamp_value(preset.get("material_adhesion", PARTICLE_MATERIAL_ADHESION), 0.0, 0.30)
+    PARTICLE_MATERIAL_DAMPING = clamp_value(preset.get("material_damping", PARTICLE_MATERIAL_DAMPING), 0.0, 2.0)
+    PARTICLE_MATERIAL_FRICTION = clamp_value(preset.get("material_friction", PARTICLE_MATERIAL_FRICTION), 0.0, 1.50)
+    PARTICLE_MATERIAL_FRICTION_SCALE = clamp_value(
+        preset.get("material_friction_scale", PARTICLE_MATERIAL_FRICTION_SCALE),
+        0.0,
+        1.50,
+    )
+    PARTICLE_MATERIAL_GRAVITY_SCALE = clamp_value(
+        preset.get("material_gravity_scale", PARTICLE_MATERIAL_GRAVITY_SCALE),
+        0.50,
+        1.20,
+    )
+    PARTICLE_MATERIAL_STATIC_FRICTION = clamp_value(
+        max(PARTICLE_MATERIAL_FRICTION, preset.get("material_static_friction", PARTICLE_MATERIAL_STATIC_FRICTION)),
+        0.0,
+        1.50,
+    )
+    PARTICLE_MATERIAL_DYNAMIC_FRICTION = clamp_value(
+        preset.get("material_dynamic_friction", PARTICLE_MATERIAL_DYNAMIC_FRICTION),
+        0.0,
+        PARTICLE_MATERIAL_STATIC_FRICTION,
+    )
+    PARTICLE_MAX_VELOCITY = clamp_value(preset.get("particle_max_velocity", PARTICLE_MAX_VELOCITY), 1.0, 20.0)
+    PARTICLE_SOLVER_POSITION_ITERATIONS = int(round(clamp_value(
+        preset.get("particle_solver_iters", PARTICLE_SOLVER_POSITION_ITERATIONS),
+        4.0,
+        32.0,
+    )))
+
+    update_particle_runtime_state()
+    current_sand_parameter_mode()
+    try:
+        apply_current_particle_material_to_stage()
+    except NameError:
+        pass
+    except Exception as exc:
+        info("[WARN] applying sand parameter material failed:", type(exc).__name__, exc)
+    try:
+        refresh_parameter_models_from_globals()
+    except NameError:
+        pass
+    try:
+        store_runtime_api()
+    except NameError:
+        pass
+
+    if announce:
+        info(
+            "[SAND PARAM MODE]",
+            f"mode={mode}",
+            f"label={sand_parameter_mode_label(mode)}",
+            f"viscosity={PARTICLE_MATERIAL_VISCOSITY:.3f}",
+            f"cohesion={PARTICLE_MATERIAL_COHESION:.3f}",
+            f"adhesion={PARTICLE_MATERIAL_ADHESION:.3f}",
+            f"friction={PARTICLE_MATERIAL_FRICTION:.3f}",
+            f"particle_friction={PARTICLE_MATERIAL_FRICTION_SCALE:.3f}",
+            f"max_velocity={PARTICLE_MAX_VELOCITY:.1f}",
+        )
+        update_status(
+            f"Sand params: {sand_parameter_mode_label(mode)}; Reset Sand regenerates particles with this preset",
+            force=True,
+        )
+    return {
+        "sand_parameter_mode": mode,
+        "sand_parameter_mode_label": sand_parameter_mode_label(mode),
+        "sand_fidelity": float(SAND_FIDELITY),
+        "material": {
+            "viscosity": float(PARTICLE_MATERIAL_VISCOSITY),
+            "cohesion": float(PARTICLE_MATERIAL_COHESION),
+            "adhesion": float(PARTICLE_MATERIAL_ADHESION),
+            "damping": float(PARTICLE_MATERIAL_DAMPING),
+            "friction": float(PARTICLE_MATERIAL_FRICTION),
+            "particle_friction_scale": float(PARTICLE_MATERIAL_FRICTION_SCALE),
+            "gravity_scale": float(PARTICLE_MATERIAL_GRAVITY_SCALE),
+        },
+    }
 
 
 def set_sand_fidelity(fidelity, rebuild=False):
@@ -2890,6 +3050,8 @@ def sand_scene_context():
         "sand_size": np.array([float(SAND_SIZE_X), float(SAND_SIZE_Y)], dtype=np.float32),
         "pile_center": np.array([float(footprint_center[0]), float(footprint_center[1]), float(SAND_FLOOR_Z)], dtype=np.float32),
         "diggable_radius": np.array([float(footprint_radius[0]), float(footprint_radius[1])], dtype=np.float32),
+        "sand_footprint_polygon_xy": np.array(footprint, dtype=np.float32).reshape(-1, 2),
+        "sand_source_selected_path": str(SAND_SOURCE_SELECTED_PATH),
         "sandbox_inner_size": np.array([float(SANDBOX_INNER_SIZE_X), float(SANDBOX_INNER_SIZE_Y)], dtype=np.float32),
         "sandbox_wall_height": float(SANDBOX_WALL_HEIGHT),
         "wall_center": np.array([float(WALL_CENTER_X), float(WALL_CENTER_Y), float(WALL_BASE_Z)], dtype=np.float32),
@@ -2998,6 +3160,7 @@ def print_status():
         "sand_fidelity:",
         f"value={SAND_FIDELITY:.2f}",
         f"mode={sand_mode_label(SAND_FIDELITY)}",
+        f"param_mode={sand_parameter_mode_label()}",
         f"estimated_particles={STATE.get('estimated_particle_count')}",
         f"budget_target={STATE.get('particle_budget_target')}",
         f"budget_applied={STATE.get('particle_budget_applied')}",
@@ -3167,6 +3330,9 @@ def store_runtime_api():
         "rebuild_real_particle_sand": rebuild_real_particle_sand,
         "set_particle_size_and_limit": set_particle_size_and_limit,
         "set_sand_fidelity": set_sand_fidelity,
+        "set_sand_parameter_mode": apply_sand_parameter_mode,
+        "sand_parameter_mode": current_sand_parameter_mode(),
+        "sand_parameter_mode_label": sand_parameter_mode_label(),
         "sand_fidelity": float(SAND_FIDELITY),
         "sand_mode_label": sand_mode_label(SAND_FIDELITY),
         "derived_particle_config": {
@@ -3324,6 +3490,20 @@ def build_ui():
     def status_clicked():
         print_status()
         set_clean(str(STATE.get("status", "Status printed")))
+
+    sand_param_mode_label_widget = None
+
+    def refresh_sand_param_mode_label():
+        if sand_param_mode_label_widget is not None:
+            try:
+                sand_param_mode_label_widget.text = sand_parameter_mode_label()
+            except Exception:
+                pass
+
+    def toggle_sand_parameter_mode_clicked():
+        apply_sand_parameter_mode()
+        refresh_sand_param_mode_label()
+        set_dirty("Sand params changed; Reset Sand")
 
     PARAM_MODELS = {}
 
@@ -3514,6 +3694,8 @@ def build_ui():
             )
 
     def add_clay_material_controls():
+        nonlocal sand_param_mode_label_widget
+
         def add_slider(key, label, value, lo, hi, hint):
             if key not in PARAM_MODELS:
                 PARAM_MODELS[key] = ui.SimpleFloatModel(float(value))
@@ -3525,6 +3707,10 @@ def build_ui():
                 ui.Label(hint, width=88)
 
         with ui.VStack(spacing=3):
+            with ui.HStack(spacing=8, height=24):
+                ui.Label("Preset", width=116)
+                ui.Button("Sand Params", width=116, clicked_fn=toggle_sand_parameter_mode_clicked)
+                sand_param_mode_label_widget = ui.Label(sand_parameter_mode_label(), width=116)
             add_slider("material_viscosity", "Viscosity", PARTICLE_MATERIAL_VISCOSITY, 0.0, 4.0, "safe 1.0-2.0")
             add_slider("material_cohesion", "Cohesion", PARTICLE_MATERIAL_COHESION, 0.0, 0.60, "safe 0.05-0.15")
             add_slider("material_adhesion", "Adhesion", PARTICLE_MATERIAL_ADHESION, 0.0, 0.30, "safe 0.0-0.08")

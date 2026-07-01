@@ -343,11 +343,11 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "auto_collect_sand_reset_done": False,
     "auto_collect_initial_pose": None,
     "auto_collect_initial_pose_id": "",
-    "auto_scene_random_truck_enabled": False,
-    "auto_scene_random_truck_yaw_enabled": False,
-    "auto_scene_random_robot_yaw_enabled": False,
-    "auto_scene_random_sand_xy_enabled": False,
-    "auto_scene_random_sand_amount_enabled": False,
+    "auto_scene_random_truck_enabled": True,
+    "auto_scene_random_truck_yaw_enabled": True,
+    "auto_scene_random_robot_yaw_enabled": True,
+    "auto_scene_random_sand_xy_enabled": True,
+    "auto_scene_random_sand_amount_enabled": True,
     "auto_scene_last_randomization": {},
     "auto_scene_truck_baseline": None,
     "last_dig_plan_candidates": [],
@@ -596,11 +596,11 @@ AUTO_COLLECT_HOME_BUCKET_RELAXED_TOL_DEG = 28.0
 AUTO_COLLECT_HOME_NON_BUCKET_RELAXED_SCALE = 1.5
 DIRECT_INITIAL_POSE_SETTLE_FRAMES = 18
 DIRECT_PLAN_END_HOME_SETTLE_FRAMES = 8
-AUTO_SCENE_RANDOM_TRUCK_DEFAULT = False
-AUTO_SCENE_RANDOM_TRUCK_YAW_DEFAULT = False
-AUTO_SCENE_RANDOM_ROBOT_YAW_DEFAULT = False
-AUTO_SCENE_RANDOM_SAND_XY_DEFAULT = False
-AUTO_SCENE_RANDOM_SAND_AMOUNT_DEFAULT = False
+AUTO_SCENE_RANDOM_TRUCK_DEFAULT = True
+AUTO_SCENE_RANDOM_TRUCK_YAW_DEFAULT = True
+AUTO_SCENE_RANDOM_ROBOT_YAW_DEFAULT = True
+AUTO_SCENE_RANDOM_SAND_XY_DEFAULT = True
+AUTO_SCENE_RANDOM_SAND_AMOUNT_DEFAULT = True
 AUTO_SCENE_RANDOM_MAX_TRIES = 96
 AUTO_SCENE_TRUCK_ROOT_PATH = "/World/truck"
 AUTO_SCENE_TRUCK_RANDOM_DX_RANGE = (-1.20, 1.20)
@@ -608,6 +608,7 @@ AUTO_SCENE_TRUCK_RANDOM_DY_RANGE = (-1.20, 1.20)
 AUTO_SCENE_TRUCK_RANDOM_RADIUS_RANGE = (8.00, 10.80)
 AUTO_SCENE_TRUCK_RANDOM_ANGLE_DEG_RANGE = (-170.0, -120.0)
 AUTO_SCENE_TRUCK_RANDOM_YAW_DEG_RANGE = (-180.0, 180.0)
+AUTO_SCENE_TRUCK_REAR_TO_ROBOT_YAW_RANGE_DEG = 90.0
 AUTO_SCENE_ROBOT_RANDOM_YAW_DEG_RANGE = (-170.0, 170.0)
 AUTO_SCENE_SAND_RANDOM_X_RANGE = (-0.95, 0.95)
 AUTO_SCENE_SAND_RANDOM_Y_RANGE = (5.80, 7.30)
@@ -621,6 +622,18 @@ AUTO_SCENE_UNLOAD_MAX_REACH_RADIUS = 11.00
 AUTO_SCENE_MIN_SAND_UNLOAD_DIST = 6.00
 AUTO_SCENE_MIN_ROBOT_TRUCK_DIST = 3.50
 AUTO_SCENE_MIN_SAND_PARTICLE_ESTIMATE = 3000
+AUTO_SCENE_ROBOT_SAFETY_RADIUS = 2.35
+AUTO_SCENE_TRUCK_SAFETY_MARGIN = 0.35
+AUTO_SCENE_SAND_SAFETY_MARGIN = 0.25
+AUTO_SCENE_UNLOAD_MESH_MIN_RADIUS = 7.80
+AUTO_SCENE_UNLOAD_MESH_MAX_RADIUS = 11.00
+AUTO_DIG_TARGET_SAND_EDGE_MARGIN = 0.08
+AUTO_DIG_TARGET_REAL_SURFACE_REQUIRED = True
+AUTO_DIG_TARGET_LOCAL_SURFACE_RADIUS = 0.14
+AUTO_DIG_TARGET_LOCAL_SURFACE_LOW_PERCENTILE = 25.0
+AUTO_DIG_TARGET_LOCAL_SURFACE_MAX_DROP = 0.95
+AUTO_DIG_TARGET_EXTRA_BITE_M = 0.06
+AUTO_DIG_TARGET_PATH_SURFACE_PROBES_M = (-0.34, -0.18, 0.0, 0.24, 0.46, 0.68)
 AUTO_COLLECT_TARGET_CENTER = np.array([0.0, -6.7, 0.0], dtype=np.float32)
 AUTO_COLLECT_TARGET_RADIUS_X = 0.82
 AUTO_COLLECT_TARGET_RADIUS_Y = 0.82
@@ -867,6 +880,9 @@ BUCKET_DIG_APPROACH_WORLD_DEG = -52.0
 BUCKET_DIG_INSERT_WORLD_DEG = -78.0
 BUCKET_DIG_PULL_WORLD_DEG = -92.0
 BUCKET_DIG_EXIT_WORLD_DEG = -96.0
+BUCKET_DIG_INSERT_JOINT_DEG = -84.0
+BUCKET_DIG_PULL_JOINT_DEG = -104.0
+BUCKET_DIG_EXIT_JOINT_DEG = -114.0
 BUCKET_UNLOAD_DUMP_DEG = 82.0
 LOADED_ROUTE_UNLOAD_DUMP_DEG = 45.0
 UNLOAD_DUMP_BUCKET_TOL_DEG = 18.0
@@ -2007,6 +2023,17 @@ def set_prim_visibility(prim_or_path, visible):
         return False
 
 
+def bucket_load_volume_hidden_root_path():
+    bucket_path = str(BUCKET_LINK or "/World/URDF_real3/bucket_link").rstrip("/")
+    return f"{bucket_path}/bucket_cut"
+
+
+def is_bucket_load_volume_runtime_path(path):
+    text = str(path or "").rstrip("/")
+    root = bucket_load_volume_hidden_root_path().rstrip("/")
+    return bool(text == root or text.startswith(root + "/"))
+
+
 def set_dataset_camera_prims_invisible():
     if not bool(STATE.get("dataset_camera_keep_invisible", True)):
         return 0
@@ -2089,6 +2116,8 @@ def collect_excavator_display_roots():
             child_name = child.GetName()
             if child_name.lower() in ignored_child_names:
                 continue
+            if is_bucket_load_volume_runtime_path(child.GetPath().pathString):
+                continue
             if subtree_has_mesh(child):
                 render_roots.append(child.GetPath().pathString)
 
@@ -2109,12 +2138,13 @@ def apply_excavator_render_mode(render_on=None, force_status=True):
     for path in render_roots:
         set_prim_visibility(path, render_on)
     dataset_camera_hidden_count = set_dataset_camera_prims_invisible()
+    bucket_cut_hidden = enforce_bucket_cut_volume_hidden("render_mode", force_log=force_status)
 
     mode = "render" if render_on else "physics"
     msg = (
         f"Excavator display mode = {mode}; "
         f"render_roots={len(render_roots)} physical_visuals={len(physical_roots)} "
-        f"world_model_visible={world_model_visible}"
+        f"world_model_visible={world_model_visible} bucket_cut_hidden={bucket_cut_hidden}"
     )
     info_print(
         "[DISPLAY MODE]",
@@ -2123,6 +2153,7 @@ def apply_excavator_render_mode(render_on=None, force_status=True):
         f"render_roots={len(render_roots)}",
         f"physical_visuals={len(physical_roots)}",
         f"dataset_cameras_hidden={dataset_camera_hidden_count}",
+        f"bucket_cut_hidden={bucket_cut_hidden}",
     )
     if force_status:
         update_status(msg, force=True)
@@ -2775,6 +2806,97 @@ def mesh_world_xy_points_under(prim):
     return np.array(pts, dtype=np.float32)
 
 
+def mesh_points_under_in_root_local(root_prim):
+    if root_prim is None or not root_prim.IsValid():
+        return np.empty((0, 3), dtype=np.float32)
+    pts = []
+    try:
+        root_world = UsdGeom.Xformable(root_prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+        root_inv = root_world.GetInverse()
+    except Exception:
+        root_inv = None
+    for p in Usd.PrimRange(root_prim):
+        try:
+            if not p.IsA(UsdGeom.Mesh):
+                continue
+            local_points = UsdGeom.Mesh(p).GetPointsAttr().Get()
+            if not local_points:
+                continue
+            mat = UsdGeom.Xformable(p).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+            for lp in local_points:
+                wp = mat.Transform(Gf.Vec3d(float(lp[0]), float(lp[1]), float(lp[2])))
+                rp = root_inv.Transform(wp) if root_inv is not None else wp
+                pts.append((float(rp[0]), float(rp[1]), float(rp[2])))
+        except Exception:
+            continue
+    if not pts:
+        return np.empty((0, 3), dtype=np.float32)
+    return np.array(pts, dtype=np.float32)
+
+
+def transform_root_local_points_to_world(root_prim, points):
+    points = np.array(points, dtype=np.float32).reshape(-1, 3)
+    if root_prim is None or not root_prim.IsValid() or points.size == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    try:
+        mat = UsdGeom.Xformable(root_prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+    except Exception:
+        return points.copy()
+    out = []
+    for p in points:
+        wp = mat.Transform(Gf.Vec3d(float(p[0]), float(p[1]), float(p[2])))
+        out.append((float(wp[0]), float(wp[1]), float(wp[2])))
+    return np.array(out, dtype=np.float32)
+
+
+def unload_mesh_local_frame_footprint(root_prim, shrink_d):
+    pts_local = mesh_points_under_in_root_local(root_prim)
+    if pts_local.shape[0] < 3:
+        return None
+    hull_local = convex_hull_xy(pts_local[:, :2])
+    if hull_local is None:
+        return None
+    poly_local = shrink_convex_polygon_xy(hull_local, shrink_d)
+    if poly_local is None:
+        return None
+    z_min = float(np.min(pts_local[:, 2]))
+    z_max = float(np.max(pts_local[:, 2]))
+    z_top = z_max
+    z_bottom = z_min
+    center_local_xy = polygon_centroid_xy(poly_local)
+    poly_local_3 = np.array([[float(x), float(y), z_top] for x, y in poly_local], dtype=np.float32)
+    hull_local_3 = np.array([[float(x), float(y), z_top] for x, y in hull_local], dtype=np.float32)
+    center_world = transform_root_local_points_to_world(
+        root_prim,
+        np.array([[float(center_local_xy[0]), float(center_local_xy[1]), z_top]], dtype=np.float32),
+    )
+    bottom_world = transform_root_local_points_to_world(
+        root_prim,
+        np.array([[float(center_local_xy[0]), float(center_local_xy[1]), z_bottom]], dtype=np.float32),
+    )
+    poly_world = transform_root_local_points_to_world(root_prim, poly_local_3)[:, :2]
+    hull_world = transform_root_local_points_to_world(root_prim, hull_local_3)[:, :2]
+    if center_world.shape[0] < 1 or bottom_world.shape[0] < 1 or poly_world.shape[0] < 3:
+        return None
+    poly_min = np.min(poly_world, axis=0)
+    poly_max = np.max(poly_world, axis=0)
+    hull_min = np.min(hull_world, axis=0)
+    hull_max = np.max(hull_world, axis=0)
+    return {
+        "frame": "selected_mesh_local",
+        "poly_world_xy": np.array(poly_world, dtype=np.float32),
+        "hull_world_xy": np.array(hull_world, dtype=np.float32),
+        "center_world": np.array(center_world[0], dtype=np.float32),
+        "bottom_world": np.array(bottom_world[0], dtype=np.float32),
+        "inner_size_world_xy": np.maximum(poly_max - poly_min, np.array([0.2, 0.2], dtype=np.float32)),
+        "hull_size_world_xy": np.maximum(hull_max - hull_min, np.array([0.2, 0.2], dtype=np.float32)),
+        "local_z_range": np.array([z_bottom, z_top], dtype=np.float32),
+        "local_vertices": int(pts_local.shape[0]),
+        "local_hull_vertices": int(len(hull_local)),
+        "active_vertices": int(len(poly_world)),
+    }
+
+
 def convex_hull_xy(points):
     pts = np.array(points, dtype=np.float64).reshape(-1, 2)
     if pts.shape[0] < 3:
@@ -2922,6 +3044,52 @@ def disable_collision(prim, label="", log=True):
     set_prim_attr(prim, "physics:collisionEnabled", False, Sdf.ValueTypeNames.Bool)
     if label and bool(log):
         info_print("[COLLISION OFF]", label, prim.GetPath())
+
+
+def enforce_bucket_cut_volume_hidden(label="", force_log=False):
+    root_path = bucket_load_volume_hidden_root_path()
+    root = get_prim(root_path)
+    if root is None or not root.IsValid():
+        return False
+
+    hidden_count = 0
+    collision_count = 0
+    for prim in iter_prim_subtree(root):
+        if prim is None or not prim.IsValid():
+            continue
+        try:
+            if prim.IsA(UsdGeom.Imageable):
+                if set_prim_visibility(prim, False):
+                    hidden_count += 1
+        except Exception:
+            pass
+        try:
+            has_collision_api = bool(prim.HasAPI(UsdPhysics.CollisionAPI))
+        except Exception:
+            has_collision_api = False
+        attr = None
+        try:
+            attr = prim.GetAttribute("physics:collisionEnabled")
+        except Exception:
+            attr = None
+        attr_valid = False
+        try:
+            attr_valid = bool(attr is not None and attr.IsValid())
+        except Exception:
+            attr_valid = False
+        if has_collision_api or attr_valid:
+            disable_collision(prim, "bucket_cut_volume", log=False)
+            collision_count += 1
+
+    if force_log:
+        info_print(
+            "[BUCKET CUT HIDDEN]",
+            f"label={label or 'runtime'}",
+            f"path={root_path}",
+            f"hidden_prims={hidden_count}",
+            f"collision_off={collision_count}",
+        )
+    return True
 
 
 def iter_prim_subtree(root_prim):
@@ -3472,6 +3640,15 @@ def task_scene_context():
     bin_z_range = api_array(raw, "unload_bin_z_range", [SAND_BIN_Z_MIN, SAND_BIN_Z_MAX], 2)
     sand_floor_z = float(raw.get("sand_floor_z", GROUND_TOP_Z))
     sand_fill_height = float(raw.get("sand_fill_height", max(0.25, SAND_PILE_Z_MAX - SAND_PILE_Z_MIN)))
+    sand_polygon = None
+    try:
+        raw_sand_polygon = raw.get("sand_footprint_polygon_xy")
+        if raw_sand_polygon is not None:
+            p = np.array(raw_sand_polygon, dtype=np.float32).reshape(-1, 2)
+            if p.shape[0] >= 3 and abs(float(polygon_signed_area(p))) > 1.0e-6:
+                sand_polygon = p.copy()
+    except Exception:
+        sand_polygon = None
 
     dump_default = [
         float(bin_center[0]),
@@ -3552,6 +3729,8 @@ def task_scene_context():
         "source": source,
         "pile_center": pile_center[:3],
         "pile_radius": np.maximum(pile_radius[:2], np.array([0.1, 0.1], dtype=np.float32)),
+        "sand_polygon_xy": sand_polygon,
+        "sand_source_selected_path": str(raw.get("sand_source_selected_path", "")),
         "sand_floor_z": float(sand_floor_z),
         "sand_fill_height": max(0.05, float(sand_fill_height)),
         "unload_bin_center": bin_center,
@@ -3564,6 +3743,7 @@ def task_scene_context():
         "unload_point": unload_point,
         "manual_unload_source": str(STATE.get("manual_unload_source", "")),
         "manual_unload_selected_path": str(STATE.get("manual_unload_selected_path", "")),
+        "manual_unload_fit_frame": str(STATE.get("manual_unload_fit_frame", "")),
         "manual_unload_range_shape": str(STATE.get("manual_unload_range_shape", "")),
     }
 
@@ -5327,10 +5507,13 @@ def compact_scene_context(ctx=None):
         ctx = {}
     poly = ctx.get("unload_polygon_xy")
     hull = ctx.get("unload_hull_xy")
+    sand_poly = ctx.get("sand_polygon_xy")
     return {
         "source": str(ctx.get("source", "unknown")),
         "pile_center": vec_list(ctx.get("pile_center"), 3),
         "pile_radius": vec_list(ctx.get("pile_radius"), 2),
+        "sand_polygon_xy": None if sand_poly is None else [vec_list(p, 2) for p in np.array(sand_poly, dtype=np.float32).reshape(-1, 2)],
+        "sand_source_selected_path": str(ctx.get("sand_source_selected_path", "")),
         "unload_bin_center": vec_list(ctx.get("unload_bin_center"), 3),
         "unload_bin_half_size": vec_list(ctx.get("unload_bin_half_size"), 2),
         "unload_bin_z_range": vec_list(ctx.get("unload_bin_z_range"), 2),
@@ -5340,8 +5523,13 @@ def compact_scene_context(ctx=None):
         "unload_point": vec_list(ctx.get("unload_point"), 3),
         "manual_unload_source": str(ctx.get("manual_unload_source", "")),
         "manual_unload_selected_path": str(ctx.get("manual_unload_selected_path", "")),
+        "manual_unload_fit_frame": str(ctx.get("manual_unload_fit_frame", "")),
         "manual_unload_range_shape": str(ctx.get("manual_unload_range_shape", "")),
     }
+
+
+def auto_scene_context_signature(ctx=None):
+    return stable_json_hash(compact_scene_context(ctx))
 
 
 def compact_unload_drop(report=None):
@@ -5643,6 +5831,23 @@ def compact_dig_primitive_params(candidate):
         "bucket_mid_cut_world",
         "bucket_exit_world",
         "bucket_curl",
+        "dig_stage_profile",
+        "computed_plan_surface_z",
+        "computed_insert_depth",
+        "computed_mid_depth",
+        "computed_exit_depth",
+        "computed_curl_z",
+        "computed_exit_cut_z",
+        "computed_low_curl_before_exit",
+        "computed_target_depth",
+        "computed_cut_depth",
+        "computed_load_mid_depth",
+        "computed_load_exit_depth",
+        "computed_bucket_cut_joint_deg",
+        "computed_bucket_mid_joint_deg",
+        "computed_bucket_exit_joint_deg",
+        "computed_mid_effector",
+        "computed_exit_effector",
         "curl_boom_lift_deg",
     ]
     out = {}
@@ -5661,8 +5866,8 @@ DIG_PLAN_REQUIRED_PHASE_ORDER = [
     "approach_contact",
     "insert_cut",
     "pull_mid_cut",
-    "pull_exit_cut",
     "curl_to_hold_material",
+    "pull_exit_cut",
     "secure_load",
     "lift_carry",
     "unload_to_bin",
@@ -6814,10 +7019,12 @@ def stable_json_hash(data):
 def planner_config_snapshot():
     return {
         "planner_version": PLANNER_VERSION,
+        "dig_stage_profile": "load_volume_continuous",
         "dig_plan_max_build_seconds": DIG_PLAN_MAX_BUILD_SECONDS,
         "auto_collect_candidate_plan_seconds": AUTO_COLLECT_CANDIDATE_PLAN_SECONDS,
         "auto_collect_candidate_hard_budget_grace_seconds": AUTO_COLLECT_CANDIDATE_HARD_BUDGET_GRACE_SECONDS,
         "auto_collect_find_plan_max_seconds": AUTO_COLLECT_FIND_PLAN_MAX_SECONDS,
+        "auto_collect_require_pre_sample_secure": bool(AUTO_COLLECT_REQUIRE_PRE_SAMPLE_SECURE),
         "planning_path_penalty_cache_max": PLANNING_PATH_PENALTY_CACHE_MAX,
         "dig_plan_max_candidates": DIG_PLAN_MAX_CANDIDATES,
         "dig_plan_beam_size": DIG_PLAN_BEAM_SIZE,
@@ -7397,6 +7604,9 @@ async def wait_for_sand_settled_on_ground(label="sand_settle"):
 
 async def reset_sand_site_stably(label=""):
     label = str(label or "sand_reset")
+    if label in ("after_ui_ready", "after_world_ready") and bool(STATE.get("auto_collect_active", False)):
+        info_print("[SAND RESET] skipped", f"label={label}", "reason=auto_collect_active")
+        return False
     if not timeline_allows_background_work():
         handle_timeline_stop_if_needed(label)
         info_print("[SAND RESET] skipped: timeline stopped or runtime stopped", f"label={label}")
@@ -7506,6 +7716,9 @@ builtins._EXCAVATOR_STABLE_SAND_RESET = request_sand_site_stable_reset
 async def delayed_startup_sand_reset():
     await step_updates(max(1, int(AUTO_RESET_SAND_UI_READY_DELAY_FRAMES)))
     if not STATE.get("running", False):
+        return
+    if bool(STATE.get("auto_collect_active", False)) or str(STATE.get("active_task_name", "")) == "auto_collect_prepare":
+        info_print("[SAND RESET] skipped after_ui_ready", "reason=auto_collect_active")
         return
     if not simulation_timeline_is_playing():
         handle_timeline_stop_if_needed("after_ui_ready")
@@ -10754,6 +10967,43 @@ async def auto_collect_export_lerobot_v3_on_finish(run_dir):
             "reason": "disabled",
         }
         return STATE["auto_collect_lerobot_v3_export"]
+    trainable_index = os.path.join(run_dir, "trainable_episodes.jsonl") if run_dir else ""
+    trainable_count = jsonl_line_count(trainable_index) if trainable_index else 0
+    if trainable_count <= 0:
+        export_dir = os.path.join(run_dir, AUTO_COLLECT_LEROBOT_V3_DIRNAME) if run_dir else ""
+        if export_dir:
+            os.makedirs(export_dir, exist_ok=True)
+            marker_path = os.path.join(export_dir, "EXPORT_SKIPPED_NO_TRAINABLE.txt")
+            try:
+                with open(marker_path, "w", encoding="utf-8") as f:
+                    f.write("LeRobot v3 export skipped.\n")
+                    f.write("reason: no trainable episodes in this run.\n")
+                    f.write(f"trainable_index: {trainable_index}\n")
+            except Exception:
+                pass
+        result = {
+            "enabled": True,
+            "ok": False,
+            "skipped": True,
+            "run_dir": run_dir,
+            "export_dir": export_dir,
+            "split": AUTO_COLLECT_LEROBOT_V3_SPLIT,
+            "reason": "skipped_no_trainable_episodes",
+            "trainable_count": int(trainable_count),
+        }
+        STATE["auto_collect_lerobot_v3_export"] = result
+        info_print(
+            "[LEROBOT V3 EXPORT]",
+            "skipped",
+            "reason=no_trainable_episodes",
+            f"run_dir={run_dir}",
+        )
+        try:
+            write_json_file(os.path.join(run_dir, "lerobot_v3_export.json"), result)
+            auto_collect_write_run_summary()
+        except Exception as exc:
+            info_print("[WARN] [LEROBOT V3 EXPORT]", "skip_summary_update_failed", type(exc).__name__, exc)
+        return result
     info_print(
         "[LEROBOT V3 EXPORT]",
         "start",
@@ -11161,7 +11411,14 @@ def auto_collect_preflight_report(target_successes=None):
     run_dir = ensure_auto_collect_run_dir()
     ctx = task_scene_context()
     t0 = time.perf_counter()
-    snapshot = get_sand_snapshot(force=True, label="auto_preflight")
+    prepare_snapshot = STATE.get("auto_collect_prepare_sand_snapshot")
+    prepare_snapshot_age = time.time() - float(STATE.get("auto_collect_prepare_sand_snapshot_time", 0.0) or 0.0)
+    if isinstance(prepare_snapshot, dict) and prepare_snapshot_age <= 2.0:
+        snapshot = prepare_snapshot
+        snapshot_source = "prepare_reuse"
+    else:
+        snapshot = get_sand_snapshot(force=True, label="auto_preflight")
+        snapshot_source = "fresh"
     if isinstance(snapshot, dict):
         STATE["auto_collect_episode_sand_snapshot"] = snapshot
         STATE["auto_collect_episode_sand_snapshot_time"] = float(time.time())
@@ -11275,6 +11532,7 @@ def auto_collect_preflight_report(target_successes=None):
             "settle_reason": str(settle.get("reason", "")),
             "settle": settle,
             "status": dataset_sand_status(),
+            "snapshot_source": snapshot_source,
             "snapshot_ms": float(preflight_snapshot_ms),
             "snapshot_perf_ms": dict(snapshot.get("perf_ms", {}) if isinstance(snapshot, dict) else {}),
         },
@@ -11313,7 +11571,7 @@ def auto_collect_preflight_report(target_successes=None):
         "[AUTO PREFLIGHT]",
         f"sand={'OK' if report['sand']['ok'] else 'BAD'} center={report['sand']['center']} radius={report['sand']['radius']} particles={particle_count}",
         f"settled={report['sand'].get('settled')} settle_reason={report['sand'].get('settle_reason')}",
-        f"snapshot_ms={preflight_snapshot_ms:.1f}",
+        f"snapshot_ms={preflight_snapshot_ms:.1f} snapshot_source={snapshot_source}",
         f"bin={'OK' if report['bin']['ok'] else 'BAD'} center={report['bin']['center']} size={report['bin']['inner_size']}",
         f"robot={'OK' if report['robot']['ok'] else 'BAD'} IK={checks['ik']} action_ready={action_ready} bucket_collider={bucket_collider_ready}",
         f"planner={'OK' if report['planner']['ok'] else 'BAD'} trace_cache={trace_cache_ready}",
@@ -11336,6 +11594,175 @@ def auto_collect_preflight_report(target_successes=None):
         include_sand=False,
     )
     return not bool(reason), report, reason
+
+
+def auto_collect_scene_pre_sample_gate(attempt_index):
+    """Cheap scene legality gate before any episode recording/camera work."""
+    record = STATE.get("auto_scene_last_randomization", {})
+    if not isinstance(record, dict):
+        return False, "planning_failed/pre_sample_scene_missing", {"attempt": int(attempt_index)}
+    if record and record.get("ok") is False:
+        return False, "planning_failed/pre_sample_scene_invalid:" + str(record.get("reason", "")), {"scene_randomization": record}
+
+    ctx = task_scene_context()
+    detail = {"attempt": int(attempt_index), "scene_randomization": record}
+    try:
+        pile_xy = np.array(ctx.get("pile_center", [0.0, 0.0, 0.0]), dtype=np.float32).reshape(-1)[:2]
+        unload_xy = np.array(ctx.get("unload_bin_center", ctx.get("unload_point", [0.0, 0.0, 0.0])), dtype=np.float32).reshape(-1)[:2]
+        pile_r = auto_scene_xy_radius(pile_xy)
+        unload_r = auto_scene_xy_radius(unload_xy)
+        dist = float(np.linalg.norm(pile_xy - unload_xy))
+        detail.update(
+            {
+                "pile_xy": vec_list(pile_xy, 2),
+                "pile_radius_m": float(pile_r),
+                "unload_xy": vec_list(unload_xy, 2),
+                "unload_radius_m": float(unload_r),
+                "sand_unload_dist_m": float(dist),
+            }
+        )
+        if pile_r < float(AUTO_SCENE_SAND_MIN_REACH_RADIUS) or pile_r > float(AUTO_SCENE_SAND_MAX_REACH_RADIUS):
+            return False, f"planning_failed/pre_sample_sand_reach_radius:{pile_r:.2f}", detail
+        if unload_r < float(AUTO_SCENE_UNLOAD_MIN_REACH_RADIUS) or unload_r > float(AUTO_SCENE_UNLOAD_MAX_REACH_RADIUS):
+            return False, f"planning_failed/pre_sample_unload_reach_radius:{unload_r:.2f}", detail
+        if dist < float(AUTO_SCENE_MIN_SAND_UNLOAD_DIST):
+            return False, f"planning_failed/pre_sample_sand_unload_overlap:{dist:.2f}", detail
+    except Exception as exc:
+        detail["exception"] = f"{type(exc).__name__}: {exc}"
+        return False, "planning_failed/pre_sample_scene_exception:" + type(exc).__name__, detail
+
+    inner = ctx.get("unload_bin_inner_size")
+    z_range = ctx.get("unload_bin_z_range")
+    try:
+        inner_arr = np.array(inner, dtype=np.float32).reshape(-1)[:2]
+        z_arr = np.array(z_range, dtype=np.float32).reshape(-1)[:2]
+        detail["unload_inner_size"] = vec_list(inner_arr, 2)
+        detail["unload_z_range"] = vec_list(z_arr, 2)
+        if len(inner_arr) < 2 or float(np.min(inner_arr)) <= 0.05:
+            return False, "planning_failed/pre_sample_unload_mesh_empty", detail
+        if len(z_arr) < 2 or float(z_arr[1]) <= float(z_arr[0]):
+            return False, "planning_failed/pre_sample_unload_z_invalid", detail
+    except Exception as exc:
+        detail["exception"] = f"{type(exc).__name__}: {exc}"
+        return False, "planning_failed/pre_sample_unload_mesh_exception:" + type(exc).__name__, detail
+
+    scene_signature = auto_scene_context_signature(ctx)
+    detail["scene_signature"] = scene_signature
+    detail["scene_version"] = scene_signature
+    applied_record = record.get("applied", {}) if isinstance(record, dict) else {}
+    applied_scene_signature = str(
+        applied_record.get("scene_signature", "") or applied_record.get("scene_version", "")
+    )
+    reuse_geometry = (
+        isinstance(applied_record, dict)
+        and bool(record.get("ok", False))
+        and applied_scene_signature == str(scene_signature)
+        and isinstance(applied_record.get("geometry_legal_detail"), dict)
+        and bool(applied_record.get("geometry_legal_detail"))
+    )
+    if reuse_geometry:
+        geom_detail = dict(applied_record.get("geometry_legal_detail", {}) or {})
+        geom_detail["reused_from_scene_randomization"] = True
+        geom_detail["scene_version"] = scene_signature
+        detail["geometry"] = geom_detail
+    else:
+        geom_ok, geom_reason, geom_detail = auto_scene_geometry_legal(ctx=ctx, applied=True)
+        detail["geometry"] = geom_detail
+        if not geom_ok:
+            return False, "planning_failed/pre_sample_scene_geometry:" + str(geom_reason), detail
+
+    return True, "ok", detail
+
+
+def auto_collect_initial_pose_pre_sample_gate(initial_info):
+    """Reject obviously unsafe initial poses before direct-settle and recording."""
+    initial_info = initial_info if isinstance(initial_info, dict) else {}
+    q = initial_info.get("q")
+    detail = {"initial_pose_id": str(initial_info.get("id", ""))}
+    if q is None:
+        return False, "planning_failed/pre_sample_initial_pose_missing", detail
+    try:
+        q_goal = np.array(q, dtype=np.float32).reshape(-1)[:4].copy()
+        detail["q_goal_deg"] = q_deg_values(q_goal, wrap_swing_for_display=True)
+    except Exception as exc:
+        detail["exception"] = f"{type(exc).__name__}: {exc}"
+        return False, "planning_failed/pre_sample_initial_pose_bad_q:" + type(exc).__name__, detail
+
+    # Initial auto-collect poses are applied with set_joint_pose_direct_and_settle(),
+    # not executed as a routed motion. Predictive ground/path gates here can
+    # reject valid direct resets before the scene settles; real checks happen
+    # after the transform through direct-pose status and preflight.
+    detail["ground_reason"] = "skipped_direct_pose_post_check"
+    detail["path_reason"] = "skipped_direct_pose"
+
+    return True, "ok", detail
+
+
+def auto_collect_plan_pre_sample_gate(seq, target=None):
+    """Keep auto dataset recording for plans that are likely to reach secure/load stages."""
+    detail = {
+        "stage_count": 0 if seq is None else len(seq),
+        "require_secure": bool(AUTO_COLLECT_REQUIRE_PRE_SAMPLE_SECURE),
+    }
+    if not seq:
+        return False, "planning_failed/pre_sample_plan_empty", detail
+
+    plan = STATE.get("current_dig_plan")
+    candidate = STATE.get("dig_plan_candidate")
+    if isinstance(plan, dict):
+        detail["plan_id"] = plan.get("plan_id", "")
+        detail["staged_execution"] = bool(plan.get("staged_execution", False))
+        detail["staged_prefix_ready"] = bool(plan.get("staged_prefix_ready", False))
+        detail["staged_prefix_terminal_phase"] = str(plan.get("staged_prefix_terminal_phase", "") or "")
+        detail["staged_post_dig_secure_pending"] = bool(plan.get("staged_post_dig_secure_pending", False))
+        detail["staged_post_secure_load_pending"] = bool(plan.get("staged_post_secure_load_pending", False))
+        contract = plan.get("fsm_contract")
+        if isinstance(contract, dict):
+            detail["fsm_contract_ok"] = bool(contract.get("ok", True))
+            detail["fsm_missing"] = list(contract.get("missing", []) or [])
+    if isinstance(candidate, dict):
+        detail["candidate_id"] = str(candidate.get("id", ""))
+        detail["candidate_failed_stage"] = str(candidate.get("failed_stage", ""))
+        detail["candidate_failure_reason"] = str(candidate.get("failure_reason", ""))
+
+    semantic = [dig_plan_semantic_phase_name(str(item[0])) for item in seq if item]
+    detail["semantic"] = semantic
+    terminal = str(next((phase for phase in reversed(semantic) if phase != "clearance_route"), ""))
+    detail["terminal"] = terminal
+
+    if bool(AUTO_COLLECT_REQUIRE_PRE_SAMPLE_SECURE):
+        has_secure = any(phase in ("secure_load", "secure_carry_safe") for phase in semantic)
+        if not has_secure:
+            if (
+                isinstance(plan, dict)
+                and bool(plan.get("staged_execution", False))
+                and bool(plan.get("staged_prefix_ready", False))
+                and bool(plan.get("staged_post_dig_secure_pending", False))
+            ):
+                detail["secure_pending_allowed"] = True
+                detail["secure_pending_reason"] = "staged_post_dig_secure_pending"
+            else:
+                reason = "planning_failed/pre_sample_secure_unverified"
+                if isinstance(plan, dict) and bool(plan.get("staged_post_dig_secure_pending", False)):
+                    reason += ":staged_post_dig_secure_pending"
+                elif terminal:
+                    reason += f":terminal={terminal}"
+                return False, reason, detail
+
+    try:
+        landing = unload_bin_landing_point()
+        release = unload_bin_dump_point()
+        detail["unload_landing_xyz"] = vec_list(landing, 3)
+        detail["unload_release_xyz"] = vec_list(release, 3)
+        unload_r = auto_scene_xy_radius(np.array(landing, dtype=np.float32).reshape(-1)[:2])
+        detail["unload_landing_radius_m"] = float(unload_r)
+        if unload_r < float(AUTO_SCENE_UNLOAD_MIN_REACH_RADIUS) or unload_r > float(AUTO_SCENE_UNLOAD_MAX_REACH_RADIUS):
+            return False, f"planning_failed/pre_sample_unload_plan_radius:{unload_r:.2f}", detail
+    except Exception as exc:
+        detail["unload_exception"] = f"{type(exc).__name__}: {exc}"
+        return False, "planning_failed/pre_sample_unload_plan_exception:" + type(exc).__name__, detail
+
+    return True, "ok", detail
 
 
 def clamp01(x):
@@ -11369,6 +11796,7 @@ def compact_target_score_row(row):
         "center_score",
         "approach_score",
         "approach_quality",
+        "sand_region",
         "score_components",
         "score",
         "planned",
@@ -11405,6 +11833,7 @@ def compact_auto_plan_attempts(plan_attempts, limit=4):
                 "wall_ms": item.get("wall_ms"),
                 "candidate_count": item.get("candidate_count"),
                 "planning_world": item.get("planning_world", {}),
+                "pre_sample_gate": item.get("pre_sample_gate", {}),
                 "target_score": compact_target_score_row(item.get("target_score", {})),
                 "best_failure": compact_plan_candidate(item.get("best_failure", {}), include_stages=False),
             }
@@ -12132,8 +12561,10 @@ def auto_collect_sample_target(attempt_index, retry_index=0):
 
     snapshot = get_sand_snapshot(force=False, label="auto_sample_target", max_age=1.0)
     surface_z = sand_surface_height_for_auto_target(x, y, snapshot=snapshot)
+    surface_report = auto_dig_local_cut_surface_report(x, y, snapshot=snapshot, fallback_surface_z=surface_z)
+    plan_surface_z = float(surface_report.get("plan_surface_z", surface_z))
     depth = float(depths[retry % max(1, len(depths))])
-    z = auto_dig_target_z_from_surface(surface_z, depth)
+    z = auto_dig_target_z_from_surface(plan_surface_z, depth + float(AUTO_DIG_TARGET_EXTRA_BITE_M))
     return np.array([x, y, z], dtype=np.float32)
 
 
@@ -12142,6 +12573,66 @@ def auto_dig_target_z_from_surface(surface_z, depth):
     depth = max(0.04, float(depth))
     dynamic_max_z = max(float(AUTO_COLLECT_TARGET_MAX_Z), surface_z + 0.05)
     return float(max(AUTO_COLLECT_TARGET_MIN_Z, min(dynamic_max_z, surface_z - depth)))
+
+
+def auto_dig_local_cut_surface_report(x, y, snapshot=None, fallback_surface_z=None):
+    """Estimate the sand surface along the bucket's actual cut path.
+
+    The ranked target center can sit on the pile peak, while the tooth/load
+    points sweep through offset XY positions. Planning against the peak makes
+    the bucket skim air on steep piles, so use a low local percentile along the
+    intended approach/pull path as the planning surface.
+    """
+    fallback = None if fallback_surface_z is None else float(fallback_surface_z)
+    inward = dig_direction_unit(np.array([float(x), float(y), 0.0], dtype=np.float32))
+    if float(np.linalg.norm(inward)) < 1.0e-6:
+        inward = np.array([-1.0, 0.0], dtype=np.float32)
+    xy = np.array([float(x), float(y)], dtype=np.float32)
+    radius = max(0.06, float(AUTO_DIG_TARGET_LOCAL_SURFACE_RADIUS))
+    samples = []
+    sample_rows = []
+    for offset in AUTO_DIG_TARGET_PATH_SURFACE_PROBES_M:
+        p = xy + inward * float(offset)
+        z = sand_snapshot_surface_height(snapshot, float(p[0]), float(p[1]), radius=radius) if isinstance(snapshot, dict) else None
+        if z is None and abs(float(offset)) < 1.0e-6:
+            z = fallback
+        row = {
+            "offset_m": float(offset),
+            "xy": vec_list(p, 2),
+            "surface_z": None if z is None else float(z),
+        }
+        sample_rows.append(row)
+        if z is not None and np.isfinite(float(z)):
+            samples.append(float(z))
+
+    if not samples:
+        plan_surface = fallback if fallback is not None else sand_surface_height_for_auto_target(float(x), float(y), snapshot=snapshot)
+        local_surface = plan_surface
+        reason = "fallback_center_surface"
+    else:
+        values = np.array(samples, dtype=np.float32)
+        pct = max(0.0, min(100.0, float(AUTO_DIG_TARGET_LOCAL_SURFACE_LOW_PERCENTILE)))
+        local_surface = float(np.percentile(values, pct))
+        if fallback is None:
+            plan_surface = local_surface
+        else:
+            max_drop = max(0.05, float(AUTO_DIG_TARGET_LOCAL_SURFACE_MAX_DROP))
+            plan_surface = max(float(fallback) - max_drop, min(float(fallback), local_surface))
+        reason = "local_cut_path_surface"
+
+    plan_surface = float(max(GROUND_TOP_Z + 0.08, plan_surface))
+    return {
+        "plan_surface_z": float(plan_surface),
+        "local_surface_z": float(local_surface),
+        "center_surface_z": None if fallback is None else float(fallback),
+        "sample_count": int(len(samples)),
+        "radius": float(radius),
+        "low_percentile": float(AUTO_DIG_TARGET_LOCAL_SURFACE_LOW_PERCENTILE),
+        "max_drop": float(AUTO_DIG_TARGET_LOCAL_SURFACE_MAX_DROP),
+        "probe_offsets_m": [float(v) for v in AUTO_DIG_TARGET_PATH_SURFACE_PROBES_M],
+        "samples": sample_rows,
+        "reason": reason,
+    }
 
 
 def sand_surface_height_for_auto_target(x, y, particles=None, snapshot=None):
@@ -12166,13 +12657,48 @@ def sand_surface_height_for_auto_target(x, y, particles=None, snapshot=None):
 
 def auto_dig_depth_candidates():
     values = []
+    configured_depths = [float(x) for x in AUTO_COLLECT_TARGET_DEPTHS]
+    max_depth = max(0.24, max(configured_depths) if configured_depths else 0.24)
     for depth in list(AUTO_DIG_DEPTH_PRIORITY) + sorted([float(x) for x in AUTO_COLLECT_TARGET_DEPTHS], reverse=True):
         depth = float(depth)
-        if depth > 0.24:
+        if depth > max_depth:
             continue
         if not any(abs(depth - old) < 1.0e-5 for old in values):
             values.append(depth)
     return values or [0.22, 0.18, 0.14, 0.10]
+
+
+def auto_dig_target_sand_region_check(x, y, snapshot=None, ctx=None, real_surface_z=None):
+    ctx = task_scene_context() if ctx is None else ctx
+    poly = valid_polygon_xy(ctx.get("sand_polygon_xy") if isinstance(ctx, dict) else None)
+    if poly is None:
+        center = np.array(ctx.get("pile_center", [0.0, 6.7, 0.0]), dtype=np.float32).reshape(-1)[:2]
+        radius = np.array(ctx.get("pile_radius", [SAND_PILE_RADIUS_X, SAND_PILE_RADIUS_Y]), dtype=np.float32).reshape(-1)[:2]
+        poly = ellipse_polygon_xy(float(center[0]), float(center[1]), float(radius[0]), float(radius[1]), 32)
+    safe_poly = shrink_convex_polygon_xy(poly, float(AUTO_DIG_TARGET_SAND_EDGE_MARGIN))
+    if safe_poly is None:
+        safe_poly = poly
+    point = np.array([float(x), float(y)], dtype=np.float32)
+    detail = {
+        "sand_polygon_vertices": int(len(poly)),
+        "sand_edge_margin": float(AUTO_DIG_TARGET_SAND_EDGE_MARGIN),
+        "sand_source_selected_path": str((ctx or {}).get("sand_source_selected_path", "")),
+    }
+    if not point_in_convex_polygon_xy(point, safe_poly):
+        detail["target_xy"] = vec_list(point, 2)
+        return False, "outside_sand_polygon", detail
+    surface = real_surface_z
+    if surface is None and isinstance(snapshot, dict):
+        surface = sand_snapshot_surface_height(snapshot, float(x), float(y))
+    detail["real_surface_z"] = None if surface is None else float(surface)
+    if bool(AUTO_DIG_TARGET_REAL_SURFACE_REQUIRED) and surface is None:
+        return False, "no_real_surface_near_target", detail
+    if isinstance(snapshot, dict):
+        local_count = sand_snapshot_density_count(snapshot, float(x), float(y), max(float(AUTO_DIG_DENSITY_RADIUS), 0.16))
+        detail["local_particle_count"] = int(local_count)
+        if local_count <= 0:
+            return False, "no_local_sand_particles", detail
+    return True, "ok", detail
 
 
 def auto_dig_swept_density_count(target, surface_z, particles=None, snapshot=None):
@@ -12323,9 +12849,21 @@ def auto_collect_rank_dig_targets(attempt_index):
                 x = float(center[0]) + rx * float(radius_norm) * math.cos(angle)
                 y = float(center[1]) + ry * float(radius_norm) * math.sin(angle)
                 norm = float(radius_norm)
-            surface_z = sand_surface_height_for_auto_target(x, y, particles=settled_particles, snapshot=snapshot)
+            real_surface_z = sand_snapshot_surface_height(snapshot, x, y) if isinstance(snapshot, dict) else None
+            surface_z = float(real_surface_z) if real_surface_z is not None else sand_surface_height_for_auto_target(x, y, particles=settled_particles, snapshot=snapshot)
+            surface_report = auto_dig_local_cut_surface_report(x, y, snapshot=snapshot, fallback_surface_z=surface_z)
+            plan_surface_z = float(surface_report.get("plan_surface_z", surface_z))
+            local_surface_z = surface_report.get("local_surface_z", plan_surface_z)
+            sand_region_ok, sand_region_reason, sand_region_detail = auto_dig_target_sand_region_check(
+                x,
+                y,
+                snapshot=snapshot,
+                ctx=ctx,
+                real_surface_z=real_surface_z,
+            )
             for depth in depths:
-                z = auto_dig_target_z_from_surface(surface_z, depth)
+                planned_depth = float(depth) + float(AUTO_DIG_TARGET_EXTRA_BITE_M)
+                z = auto_dig_target_z_from_surface(plan_surface_z, planned_depth)
                 target = np.array([x, y, z], dtype=np.float32)
                 center_distance = float(np.linalg.norm(target[:2] - center[:2]))
                 ok, reason = validate_dig_target(target, hard_block=False)
@@ -12337,12 +12875,24 @@ def auto_collect_rank_dig_targets(attempt_index):
                     "angle_rad": float(angle),
                     "center_distance": center_distance,
                     "surface_z": float(surface_z),
+                    "plan_surface_z": float(plan_surface_z),
+                    "local_surface_z": None if local_surface_z is None else float(local_surface_z),
+                    "surface_report": surface_report,
                     "depth_candidate": float(depth),
-                    "target_depth": float(surface_z - z),
+                    "planned_depth": float(planned_depth),
+                    "target_depth": float(plan_surface_z - z),
+                    "center_surface_depth": float(surface_z - z),
+                    "target_z_extra_bite_m": float(AUTO_DIG_TARGET_EXTRA_BITE_M),
                     "full_plan_ok": None,
                     "failed_stage": "",
                     "failure_reason": "",
+                    "sand_region": sand_region_detail,
                 }
+                if not sand_region_ok:
+                    row = dict(base_row)
+                    row.update({"planned": False, "score": -1.0e9, "reason": sand_region_reason})
+                    rows.append(row)
+                    continue
                 if not ok:
                     row = dict(base_row)
                     row.update({"planned": False, "score": -1.0e9, "reason": reason})
@@ -12355,7 +12905,7 @@ def auto_collect_rank_dig_targets(attempt_index):
                     if density_count <= 0:
                         dxy = np.linalg.norm(settled_particles[:, :2] - np.array([[x, y]], dtype=np.float32), axis=1)
                         density_count = int(np.count_nonzero(dxy <= float(AUTO_DIG_DENSITY_RADIUS)))
-                swept_density_count = auto_dig_swept_density_count(target, surface_z, particles=settled_particles, snapshot=snapshot)
+                swept_density_count = auto_dig_swept_density_count(target, plan_surface_z, particles=settled_particles, snapshot=snapshot)
                 effective_density_count = max(int(density_count), int(swept_density_count))
                 min_local = int(AUTO_DIG_MIN_LOCAL_PARTICLES)
                 min_swept = int(AUTO_DIG_MIN_SWEPT_PARTICLES)
@@ -12382,10 +12932,10 @@ def auto_collect_rank_dig_targets(attempt_index):
 
                 density_score = clamp01(effective_density_count / 320.0)
                 swept_density_score = clamp01(swept_density_count / 320.0)
-                depth_score = clamp01((surface_z - z) / max(0.01, max(AUTO_COLLECT_TARGET_DEPTHS)))
+                depth_score = clamp01((plan_surface_z - z) / max(0.01, max(AUTO_COLLECT_TARGET_DEPTHS)))
                 center_score = clamp01(1.0 - float(norm) / max(0.01, max(AUTO_DIG_RING_RADII)))
                 fill_potential_score = clamp01(0.58 * swept_density_score + 0.42 * depth_score)
-                approach_quality = auto_dig_approach_quality(target, surface_z, snapshot=snapshot)
+                approach_quality = auto_dig_approach_quality(target, plan_surface_z, snapshot=snapshot)
                 approach_score = float(approach_quality.get("approach_score", 0.0))
                 swing_goal = target_to_swing_angle(target)
                 swing_delta_deg_abs = abs(rad_to_deg(swing_delta(swing_goal, q_ref[CTRL.name_to_idx["swing"]])))
@@ -12471,7 +13021,12 @@ def auto_collect_rank_dig_targets(attempt_index):
         f"ring_index={usable[0].get('ring_index')}",
         f"center_distance={fmt_optional(usable[0].get('center_distance'))}",
         f"score={fmt_optional(usable[0].get('score'))}",
+        f"surface_z={fmt_optional(usable[0].get('surface_z'))}",
+        f"plan_surface_z={fmt_optional(usable[0].get('plan_surface_z'))}",
+        f"local_surface_z={fmt_optional(usable[0].get('local_surface_z'))}",
+        f"target_z={fmt_optional((usable[0].get('target_xyz') or [None, None, None])[2])}",
         f"depth={fmt_optional(usable[0].get('target_depth'))}",
+        f"extra_bite={fmt_optional(usable[0].get('target_z_extra_bite_m'))}",
         f"swept_density={usable[0].get('swept_density_count')}",
         f"target_rank_ms={rank_ms:.1f}",
         f"snapshot_ms={fmt_optional((snapshot.get('perf_ms') or {}).get('total') if isinstance(snapshot, dict) else None)}",
@@ -12606,13 +13161,282 @@ def angle_in_deg_range(angle_deg, range_pair):
     return bool(a >= lo or a <= hi)
 
 
+def valid_polygon_xy(poly):
+    try:
+        p = np.array(poly, dtype=np.float32).reshape(-1, 2)
+        if p.shape[0] < 3:
+            return None
+        if abs(float(polygon_signed_area(p))) < 1.0e-6:
+            return None
+        return p
+    except Exception:
+        return None
+
+
+def obb_polygon_xy(center_xy, size_xy, yaw_deg=0.0, min_size=0.05):
+    center = np.array(center_xy, dtype=np.float32).reshape(-1)[:2]
+    size = np.array(size_xy, dtype=np.float32).reshape(-1)[:2]
+    if len(center) < 2 or len(size) < 2:
+        return None
+    half = 0.5 * np.maximum(size, np.array([float(min_size), float(min_size)], dtype=np.float32))
+    corners = np.array(
+        [
+            [-half[0], -half[1]],
+            [half[0], -half[1]],
+            [half[0], half[1]],
+            [-half[0], half[1]],
+        ],
+        dtype=np.float32,
+    )
+    yaw = math.radians(float(yaw_deg))
+    c = math.cos(yaw)
+    s = math.sin(yaw)
+    rot = np.array([[c, -s], [s, c]], dtype=np.float32)
+    return (corners @ rot.T + center.reshape(1, 2)).astype(np.float32)
+
+
+def rotate_xy_deg(vec_xy, yaw_deg):
+    v = np.array(vec_xy, dtype=np.float32).reshape(-1)[:2]
+    if len(v) < 2:
+        return np.zeros(2, dtype=np.float32)
+    yaw = math.radians(float(yaw_deg))
+    c = math.cos(yaw)
+    s = math.sin(yaw)
+    return np.array([c * float(v[0]) - s * float(v[1]), s * float(v[0]) + c * float(v[1])], dtype=np.float32)
+
+
+def auto_scene_robot_safety_polygon():
+    try:
+        base = get_prim_translation(ROBOT_BASE) if ROBOT_BASE else np.zeros(3, dtype=np.float32)
+        cx, cy = float(base[0]), float(base[1])
+    except Exception:
+        cx, cy = 0.0, 0.0
+    return circle_polygon_xy(cx, cy, float(AUTO_SCENE_ROBOT_SAFETY_RADIUS), segments=24)
+
+
+def ellipse_polygon_xy(cx, cy, rx, ry, segments=32):
+    n = max(8, int(segments))
+    pts = []
+    for i in range(n):
+        a = 2.0 * math.pi * float(i) / float(n)
+        pts.append((float(cx) + float(rx) * math.cos(a), float(cy) + float(ry) * math.sin(a)))
+    return np.array(pts, dtype=np.float32)
+
+
+def auto_scene_sand_polygon_for_candidate(sand_xy=None, ctx=None):
+    ctx = task_scene_context() if ctx is None else ctx
+    poly = valid_polygon_xy(ctx.get("sand_polygon_xy") if isinstance(ctx, dict) else None)
+    center = None
+    if isinstance(ctx, dict):
+        center = np.array(ctx.get("pile_center", [0.0, 0.0, 0.0]), dtype=np.float32).reshape(-1)[:2]
+    if poly is not None:
+        if sand_xy is not None:
+            target = np.array(sand_xy, dtype=np.float32).reshape(-1)[:2]
+            if len(target) >= 2:
+                src_center = polygon_centroid_xy(poly)
+                poly = poly + (target.reshape(1, 2) - src_center.reshape(1, 2))
+        return poly.astype(np.float32)
+    if center is None or len(center) < 2:
+        center = np.array([0.0, 6.7], dtype=np.float32)
+    if sand_xy is not None:
+        target = np.array(sand_xy, dtype=np.float32).reshape(-1)[:2]
+        if len(target) >= 2:
+            center = target
+    radius = np.array((ctx or {}).get("pile_radius", [SAND_PILE_RADIUS_X, SAND_PILE_RADIUS_Y]), dtype=np.float32).reshape(-1)[:2]
+    return ellipse_polygon_xy(float(center[0]), float(center[1]), float(radius[0]), float(radius[1]), 32)
+
+
+def auto_scene_current_truck_polygon_xy():
+    prim = get_prim(AUTO_SCENE_TRUCK_ROOT_PATH)
+    if prim and prim.IsValid():
+        pts = mesh_world_xy_points_under(prim)
+        hull = convex_hull_xy(pts)
+        if hull is not None:
+            return hull
+    center, size, _mn, _mx = bbox_center_size(AUTO_SCENE_TRUCK_ROOT_PATH)
+    if center is None or size is None:
+        return None
+    yaw = get_prim_local_yaw_z_deg(AUTO_SCENE_TRUCK_ROOT_PATH, default=0.0)
+    return obb_polygon_xy(center[:2], size[:2], yaw)
+
+
+def auto_scene_candidate_truck_polygon_xy(candidate):
+    baseline = auto_scene_truck_baseline()
+    if not (isinstance(baseline, dict) and baseline.get("valid")):
+        return auto_scene_current_truck_polygon_xy()
+    center = None
+    if candidate.get("truck_center_xy") is not None:
+        center = np.array(candidate.get("truck_center_xy"), dtype=np.float32).reshape(-1)[:2]
+    if center is None or len(center) < 2:
+        center = np.array(baseline.get("center", [0.0, 0.0, 0.0]), dtype=np.float32).reshape(-1)[:2]
+    yaw = candidate.get("truck_yaw_deg")
+    if yaw is None:
+        yaw = float(baseline.get("yaw_deg", 0.0) or 0.0)
+    size = np.array(baseline.get("size", [5.0, 2.5, 1.0]), dtype=np.float32).reshape(-1)[:2]
+    return obb_polygon_xy(center, size, float(yaw))
+
+
+def auto_scene_truck_dump_offset_for_yaw(baseline, yaw_deg):
+    if not (isinstance(baseline, dict) and baseline.get("valid")):
+        return np.zeros(2, dtype=np.float32)
+    center = np.array(baseline.get("center", [0.0, 0.0, 0.0]), dtype=np.float32).reshape(-1)[:3]
+    dump = np.array(baseline.get("dump_center", center), dtype=np.float32).reshape(-1)[:3]
+    base_yaw = float(baseline.get("yaw_deg", 0.0) or 0.0)
+    world_offset = dump[:2] - center[:2]
+    local_offset = rotate_xy_deg(world_offset, -base_yaw)
+    return rotate_xy_deg(local_offset, float(yaw_deg))
+
+
+def auto_scene_truck_center_for_unload_xy(unload_xy, yaw_deg, baseline):
+    unload = np.array(unload_xy, dtype=np.float32).reshape(-1)[:2]
+    if len(unload) < 2:
+        return None
+    offset = auto_scene_truck_dump_offset_for_yaw(baseline, yaw_deg)
+    return (unload - offset).astype(np.float32)
+
+
+def auto_scene_robot_xy():
+    try:
+        base = get_prim_translation(ROBOT_BASE) if ROBOT_BASE else np.zeros(3, dtype=np.float32)
+        arr = np.array(base, dtype=np.float32).reshape(-1)[:2]
+        if len(arr) >= 2:
+            return arr.astype(np.float32)
+    except Exception:
+        pass
+    return np.zeros(2, dtype=np.float32)
+
+
+def auto_scene_truck_rear_to_robot_yaw_for_unload(rng, unload_xy, baseline):
+    if not (isinstance(baseline, dict) and baseline.get("valid")):
+        yaw_range = AUTO_SCENE_TRUCK_RANDOM_YAW_DEG_RANGE
+        return float(rng.uniform(float(yaw_range[0]), float(yaw_range[1])))
+    center = np.array(baseline.get("center", [0.0, 0.0, 0.0]), dtype=np.float32).reshape(-1)[:3]
+    dump = np.array(baseline.get("dump_center", center), dtype=np.float32).reshape(-1)[:3]
+    base_yaw = float(baseline.get("yaw_deg", 0.0) or 0.0)
+    local_rear_offset = rotate_xy_deg(dump[:2] - center[:2], -base_yaw)
+    if float(np.linalg.norm(local_rear_offset)) < 1.0e-4:
+        return float(base_yaw)
+    unload = np.array(unload_xy, dtype=np.float32).reshape(-1)[:2]
+    robot_xy = auto_scene_robot_xy()
+    rear_to_robot = robot_xy - unload
+    if float(np.linalg.norm(rear_to_robot)) < 1.0e-4:
+        desired_rear_angle = auto_scene_xy_angle_deg(-unload)
+    else:
+        desired_rear_angle = float(math.degrees(math.atan2(float(rear_to_robot[1]), float(rear_to_robot[0]))))
+    local_rear_angle = float(math.degrees(math.atan2(float(local_rear_offset[1]), float(local_rear_offset[0]))))
+    half_range = max(0.0, min(90.0, float(AUTO_SCENE_TRUCK_REAR_TO_ROBOT_YAW_RANGE_DEG)))
+    side_offset = 0.0
+    if half_range > 0.0:
+        side_offset = float(rng.uniform(-half_range, half_range))
+    return float(wrap_deg_180(float(desired_rear_angle) - local_rear_angle + side_offset))
+
+
+def auto_scene_truck_rear_alignment_error_deg(unload_xy, truck_center_xy):
+    unload = np.array(unload_xy, dtype=np.float32).reshape(-1)[:2]
+    center = np.array(truck_center_xy, dtype=np.float32).reshape(-1)[:2]
+    if len(unload) < 2 or len(center) < 2:
+        return None
+    rear_vec = unload - center
+    robot_vec = auto_scene_robot_xy() - center
+    if float(np.linalg.norm(rear_vec)) < 1.0e-4 or float(np.linalg.norm(robot_vec)) < 1.0e-4:
+        return None
+    rear_angle = float(math.degrees(math.atan2(float(rear_vec[1]), float(rear_vec[0]))))
+    robot_angle = float(math.degrees(math.atan2(float(robot_vec[1]), float(robot_vec[0]))))
+    return abs(float(wrap_deg_180(rear_angle - robot_angle)))
+
+
+def auto_scene_sample_truck_yaw_for_unload(rng, unload_xy, unload_angle_deg, baseline):
+    return auto_scene_truck_rear_to_robot_yaw_for_unload(rng, unload_xy, baseline)
+
+
+def polygons_overlap_with_margin_xy(a, b, margin=0.0):
+    pa = valid_polygon_xy(a)
+    pb = valid_polygon_xy(b)
+    if pa is None or pb is None:
+        return False
+    m = max(0.0, float(margin))
+    for p in pa:
+        if point_in_polygon_with_margin_xy(p, pb, margin_xy=m):
+            return True
+    for p in pb:
+        if point_in_polygon_with_margin_xy(p, pa, margin_xy=m):
+            return True
+    for i in range(pa.shape[0]):
+        a0 = pa[i]
+        a1 = pa[(i + 1) % pa.shape[0]]
+        for j in range(pb.shape[0]):
+            b0 = pb[j]
+            b1 = pb[(j + 1) % pb.shape[0]]
+            if segment_segment_distance_xy(a0, a1, b0, b1) <= m:
+                return True
+    return False
+
+
+def polygon_radius_range(poly):
+    p = valid_polygon_xy(poly)
+    if p is None:
+        return None
+    r = np.linalg.norm(p, axis=1)
+    return float(np.min(r)), float(np.max(r))
+
+
+def auto_scene_geometry_legal(candidate=None, ctx=None, applied=False):
+    candidate = candidate if isinstance(candidate, dict) else {}
+    ctx = task_scene_context() if ctx is None else ctx
+    sand_poly = valid_polygon_xy(ctx.get("sand_polygon_xy")) if applied and isinstance(ctx, dict) else None
+    if sand_poly is None:
+        sand_poly = auto_scene_sand_polygon_for_candidate(sand_xy=candidate.get("sand_xy"), ctx=ctx)
+    truck_poly = auto_scene_current_truck_polygon_xy() if applied else auto_scene_candidate_truck_polygon_xy(candidate)
+    robot_poly = auto_scene_robot_safety_polygon()
+    detail = {
+        "applied": bool(applied),
+        "sand_vertices": 0 if sand_poly is None else int(len(sand_poly)),
+        "truck_vertices": 0 if truck_poly is None else int(len(truck_poly)),
+        "robot_radius": float(AUTO_SCENE_ROBOT_SAFETY_RADIUS),
+    }
+    if sand_poly is None:
+        return False, "sand_footprint_missing", detail
+    if truck_poly is None:
+        return False, "truck_footprint_missing", detail
+    if polygons_overlap_with_margin_xy(robot_poly, truck_poly, AUTO_SCENE_TRUCK_SAFETY_MARGIN):
+        return False, "robot_truck_footprint_overlap", detail
+    if polygons_overlap_with_margin_xy(sand_poly, truck_poly, AUTO_SCENE_SAND_SAFETY_MARGIN):
+        return False, "sand_truck_footprint_overlap", detail
+    if polygons_overlap_with_margin_xy(robot_poly, sand_poly, AUTO_SCENE_SAND_SAFETY_MARGIN):
+        return False, "robot_sand_footprint_overlap", detail
+    unload_poly = valid_polygon_xy(ctx.get("unload_polygon_xy")) if applied and isinstance(ctx, dict) else None
+    if unload_poly is not None:
+        rr = polygon_radius_range(unload_poly)
+        if rr is not None:
+            detail["unload_mesh_radius_range"] = [float(rr[0]), float(rr[1])]
+        unload_centroid = polygon_centroid_xy(unload_poly)
+        unload_r = auto_scene_xy_radius(unload_centroid)
+        detail["unload_mesh_centroid"] = vec_list(unload_centroid, 2)
+        detail["unload_mesh_centroid_radius"] = float(unload_r)
+        if unload_r < float(AUTO_SCENE_UNLOAD_MESH_MIN_RADIUS) or unload_r > float(AUTO_SCENE_UNLOAD_MESH_MAX_RADIUS):
+            return False, f"unload_mesh_centroid_radius:{unload_r:.2f}", detail
+    return True, "ok", detail
+
+
 def auto_scene_random_workspace_bounds():
+    try:
+        dynamic_reach = float(estimate_dynamic_reach_radius())
+    except Exception:
+        dynamic_reach = float(DIG_MAX_RADIUS_FALLBACK)
+    sand_r_min = max(float(AUTO_SCENE_SAND_MIN_REACH_RADIUS), float(min(AUTO_SCENE_SAND_RANDOM_RADIUS_RANGE)))
+    sand_r_max = min(float(AUTO_SCENE_SAND_MAX_REACH_RADIUS), float(max(AUTO_SCENE_SAND_RANDOM_RADIUS_RANGE)), dynamic_reach - 0.25)
+    unload_r_min = max(float(AUTO_SCENE_UNLOAD_MIN_REACH_RADIUS), float(min(AUTO_SCENE_TRUCK_RANDOM_RADIUS_RANGE)))
+    unload_r_max = min(float(AUTO_SCENE_UNLOAD_MAX_REACH_RADIUS), float(max(AUTO_SCENE_TRUCK_RANDOM_RADIUS_RANGE)), dynamic_reach + 0.15)
+    valid = bool(sand_r_max >= sand_r_min + 0.05 and unload_r_max >= unload_r_min + 0.05)
     key = (
         tuple(round(float(v), 4) for v in AUTO_SCENE_SAND_RANDOM_X_RANGE),
         tuple(round(float(v), 4) for v in AUTO_SCENE_SAND_RANDOM_Y_RANGE),
+        tuple(round(float(v), 4) for v in AUTO_SCENE_SAND_RANDOM_RADIUS_RANGE),
+        tuple(round(float(v), 4) for v in AUTO_SCENE_SAND_RANDOM_ANGLE_DEG_RANGE),
         tuple(round(float(v), 4) for v in AUTO_SCENE_TRUCK_RANDOM_RADIUS_RANGE),
         tuple(round(float(v), 4) for v in AUTO_SCENE_TRUCK_RANDOM_ANGLE_DEG_RANGE),
         tuple(round(float(v), 4) for v in AUTO_SCENE_SAND_AMOUNT_RANGE),
+        round(float(dynamic_reach), 3),
     )
     cached = STATE.get("auto_scene_random_workspace_bounds")
     if isinstance(cached, dict) and cached.get("key") == key:
@@ -12620,27 +13444,41 @@ def auto_scene_random_workspace_bounds():
 
     sand_x = [float(min(AUTO_SCENE_SAND_RANDOM_X_RANGE)), float(max(AUTO_SCENE_SAND_RANDOM_X_RANGE))]
     sand_y = [float(min(AUTO_SCENE_SAND_RANDOM_Y_RANGE)), float(max(AUTO_SCENE_SAND_RANDOM_Y_RANGE))]
-    truck_r = [float(min(AUTO_SCENE_TRUCK_RANDOM_RADIUS_RANGE)), float(max(AUTO_SCENE_TRUCK_RANDOM_RADIUS_RANGE))]
+    sand_r = [float(sand_r_min), float(sand_r_max)]
+    sand_a = [float(AUTO_SCENE_SAND_RANDOM_ANGLE_DEG_RANGE[0]), float(AUTO_SCENE_SAND_RANDOM_ANGLE_DEG_RANGE[1])]
+    truck_r = [float(unload_r_min), float(unload_r_max)]
     truck_a = [float(AUTO_SCENE_TRUCK_RANDOM_ANGLE_DEG_RANGE[0]), float(AUTO_SCENE_TRUCK_RANDOM_ANGLE_DEG_RANGE[1])]
     amount = [float(min(AUTO_SCENE_SAND_AMOUNT_RANGE)), float(max(AUTO_SCENE_SAND_AMOUNT_RANGE))]
     bounds = {
         "key": key,
-        "mode": "fixed_base_cached_workspace",
+        "mode": "dynamic_reach_constrained_workspace",
+        "valid": bool(valid),
+        "dynamic_reach_radius": float(dynamic_reach),
         "sand_xy_box": {"x": sand_x, "y": sand_y},
-        "sand_radius_limit": [float(AUTO_SCENE_SAND_MIN_REACH_RADIUS), float(AUTO_SCENE_SAND_MAX_REACH_RADIUS)],
+        "sand_polar": {"radius": sand_r, "angle_deg": sand_a},
+        "sand_radius_limit": [float(sand_r_min), float(sand_r_max)],
         "truck_unload_polar": {"radius": truck_r, "angle_deg": truck_a},
-        "unload_radius_limit": [float(AUTO_SCENE_UNLOAD_MIN_REACH_RADIUS), float(AUTO_SCENE_UNLOAD_MAX_REACH_RADIUS)],
+        "truck_yaw_policy": {
+            "mode": "rear_or_side_to_excavator_using_unload_mesh",
+            "rear_reference": "truck_center_to_dump_bed_collision_center",
+            "allowed_rear_alignment_error_deg": float(AUTO_SCENE_TRUCK_REAR_TO_ROBOT_YAW_RANGE_DEG),
+            "allowed_deg": list(AUTO_SCENE_TRUCK_RANDOM_YAW_DEG_RANGE),
+        },
+        "unload_radius_limit": [float(unload_r_min), float(unload_r_max)],
         "sand_amount": amount,
         "min_sand_unload_xy_dist": float(AUTO_SCENE_MIN_SAND_UNLOAD_DIST),
-        "reason": "base_is_fixed__avoid_full_ring_randomization",
+        "reason": "ok" if valid else "dynamic_reach_workspace_empty",
     }
     STATE["auto_scene_random_workspace_bounds"] = bounds
     info_print(
         "[AUTO SCENE WORKSPACE]",
-        f"sand_x={sand_x}",
-        f"sand_y={sand_y}",
+        f"valid={valid}",
+        f"dynamic_reach={dynamic_reach:.2f}",
+        f"sand_radius={sand_r}",
+        f"sand_angle={sand_a}",
         f"truck_unload_radius={truck_r}",
         f"truck_unload_angle={truck_a}",
+        f"truck_yaw=rear_or_side_to_excavator error<= {AUTO_SCENE_TRUCK_REAR_TO_ROBOT_YAW_RANGE_DEG:.1f}deg",
         f"min_sand_unload_dist={AUTO_SCENE_MIN_SAND_UNLOAD_DIST:.2f}",
     )
     return bounds
@@ -12704,15 +13542,16 @@ def auto_scene_candidate_legal(candidate):
     unload_xy = np.array(candidate.get("unload_xy"), dtype=np.float32).reshape(-1)[:2]
     if len(sand_xy) < 2 or len(unload_xy) < 2:
         return False, "missing_xy"
-    if bool(candidate.get("random_sand_xy", False)):
-        sand_box = workspace.get("sand_xy_box", {}) if isinstance(workspace, dict) else {}
-        x_range = sand_box.get("x", AUTO_SCENE_SAND_RANDOM_X_RANGE)
-        y_range = sand_box.get("y", AUTO_SCENE_SAND_RANDOM_Y_RANGE)
-        if not (float(x_range[0]) <= float(sand_xy[0]) <= float(x_range[1])):
-            return False, f"sand_x_out_of_workspace:{float(sand_xy[0]):.2f}"
-        if not (float(y_range[0]) <= float(sand_xy[1]) <= float(y_range[1])):
-            return False, f"sand_y_out_of_workspace:{float(sand_xy[1]):.2f}"
     sand_r = auto_scene_xy_radius(sand_xy)
+    sand_angle = auto_scene_xy_angle_deg(sand_xy)
+    if bool(candidate.get("random_sand_xy", False)):
+        sand_polar = workspace.get("sand_polar", {}) if isinstance(workspace, dict) else {}
+        sand_radius_range = sand_polar.get("radius", AUTO_SCENE_SAND_RANDOM_RADIUS_RANGE)
+        sand_angle_range = sand_polar.get("angle_deg", AUTO_SCENE_SAND_RANDOM_ANGLE_DEG_RANGE)
+        if not (float(sand_radius_range[0]) <= float(sand_r) <= float(sand_radius_range[1])):
+            return False, f"sand_radius_out_of_workspace:{sand_r:.2f}"
+        if not angle_in_deg_range(sand_angle, sand_angle_range):
+            return False, f"sand_angle_out_of_workspace:{float(sand_angle or 0.0):.1f}"
     unload_r = auto_scene_xy_radius(unload_xy)
     if sand_r < float(AUTO_SCENE_SAND_MIN_REACH_RADIUS) or sand_r > float(AUTO_SCENE_SAND_MAX_REACH_RADIUS):
         return False, f"sand_reach_radius:{sand_r:.2f}"
@@ -12735,6 +13574,17 @@ def auto_scene_candidate_legal(candidate):
             truck_r = auto_scene_xy_radius(truck_xy)
             if truck_r < float(AUTO_SCENE_MIN_ROBOT_TRUCK_DIST):
                 return False, f"truck_too_close_to_robot:{truck_r:.2f}"
+    rear_err = candidate.get("truck_rear_alignment_error_deg")
+    if rear_err is not None:
+        try:
+            if float(rear_err) > float(AUTO_SCENE_TRUCK_REAR_TO_ROBOT_YAW_RANGE_DEG) + 1.0e-3:
+                return False, f"truck_head_toward_robot:{float(rear_err):.1f}deg"
+        except Exception:
+            pass
+    geom_ok, geom_reason, geom_detail = auto_scene_geometry_legal(candidate, applied=False)
+    candidate["geometry_legal_detail"] = geom_detail
+    if not geom_ok:
+        return False, f"scene_geometry:{geom_reason}"
     amount = float(candidate.get("sand_amount_multiplier", 1.0) or 1.0)
     if amount < float(AUTO_SCENE_SAND_AMOUNT_RANGE[0]):
         return False, f"sand_amount_too_low:{amount:.2f}"
@@ -12772,6 +13622,8 @@ def auto_scene_attempt_record(candidate=None, ok=False, reason="", cfg=None):
             truck_yaw_deg = get_prim_local_yaw_z_deg(AUTO_SCENE_TRUCK_ROOT_PATH, default=0.0)
         except Exception:
             truck_yaw_deg = None
+    current_scene_context = compact_scene_context()
+    current_scene_signature = auto_scene_context_signature(current_scene_context)
     return {
         "ok": bool(ok),
         "reason": str(reason),
@@ -12796,6 +13648,7 @@ def auto_scene_attempt_record(candidate=None, ok=False, reason="", cfg=None):
             "estimated_particle_count": int(candidate.get("estimated_particle_count", 0) or 0),
             "sample_try": int(candidate.get("sample_try", 0) or 0),
             "legal_reason": str(candidate.get("legal_reason", "")),
+            "geometry_legal_detail": candidate.get("geometry_legal_detail", {}),
         },
         "applied": {
             "sand_center": sand_result.get("sand_center"),
@@ -12804,9 +13657,12 @@ def auto_scene_attempt_record(candidate=None, ok=False, reason="", cfg=None):
             "truck_translation_xyz": truck_translation,
             "truck_yaw_deg": truck_yaw_deg,
             "robot_body_yaw_deg": candidate.get("robot_body_yaw_deg"),
+            "geometry_legal_detail": candidate.get("applied_geometry_legal_detail", {}),
+            "scene_signature": current_scene_signature,
+            "scene_version": current_scene_signature,
             "unload_point_xyz": vec_list(unload_bin_dump_point(), 3),
             "unload_landing_xyz": vec_list(unload_bin_landing_point(), 3),
-            "scene_context": compact_scene_context(),
+            "scene_context": current_scene_context,
         },
     }
 
@@ -12815,6 +13671,12 @@ def auto_scene_sample_candidate(attempt_index):
     cfg = auto_scene_randomization_config()
     ctx = task_scene_context()
     workspace = auto_scene_random_workspace_bounds()
+    if not bool(workspace.get("valid", True)):
+        return {
+            "error": str(workspace.get("reason", "dynamic_reach_workspace_empty")),
+            "attempt": int(attempt_index),
+            "workspace": workspace,
+        }
     base_sand_xy = np.array(ctx.get("pile_center", [0.0, 6.7, 0.0]), dtype=np.float32).reshape(-1)[:2]
     base_unload_xy = np.array(ctx.get("unload_bin_center", [-10.0, -5.0, 0.0]), dtype=np.float32).reshape(-1)[:2]
     rng = np.random.default_rng(410700 + int(max(1, attempt_index)) * 7919)
@@ -12825,11 +13687,11 @@ def auto_scene_sample_candidate(attempt_index):
         sand_radius = auto_scene_xy_radius(sand_xy)
         sand_angle_deg = auto_scene_xy_angle_deg(sand_xy)
         if cfg["random_sand_xy"]:
-            sand_box = workspace.get("sand_xy_box", {}) if isinstance(workspace, dict) else {}
-            sand_xy, sand_radius, sand_angle_deg = auto_scene_sample_box_xy(
+            sand_polar = workspace.get("sand_polar", {}) if isinstance(workspace, dict) else {}
+            sand_xy, sand_radius, sand_angle_deg = auto_scene_sample_polar_xy(
                 rng,
-                sand_box.get("x", AUTO_SCENE_SAND_RANDOM_X_RANGE),
-                sand_box.get("y", AUTO_SCENE_SAND_RANDOM_Y_RANGE),
+                sand_polar.get("radius", AUTO_SCENE_SAND_RANDOM_RADIUS_RANGE),
+                sand_polar.get("angle_deg", AUTO_SCENE_SAND_RANDOM_ANGLE_DEG_RANGE),
             )
 
         amount = None
@@ -12845,18 +13707,6 @@ def auto_scene_sample_candidate(attempt_index):
         unload_xy = np.array(base_unload_xy, dtype=np.float32)
         unload_radius = auto_scene_xy_radius(unload_xy)
         unload_angle_deg = auto_scene_xy_angle_deg(unload_xy)
-        if cfg["random_truck_yaw"]:
-            if not (isinstance(truck_base, dict) and truck_base.get("valid")):
-                last_reason = str((truck_base or {}).get("reason", "truck_baseline_invalid"))
-                break
-            truck_yaw_deg = float(
-                rng.uniform(
-                    float(AUTO_SCENE_TRUCK_RANDOM_YAW_DEG_RANGE[0]),
-                    float(AUTO_SCENE_TRUCK_RANDOM_YAW_DEG_RANGE[1]),
-                )
-            )
-        elif isinstance(truck_base, dict) and truck_base.get("valid"):
-            truck_yaw_deg = float(truck_base.get("yaw_deg", 0.0) or 0.0)
         if cfg["random_robot_yaw"]:
             robot_body_yaw_deg = float(
                 rng.uniform(
@@ -12874,13 +13724,26 @@ def auto_scene_sample_candidate(attempt_index):
                 unload_polar.get("radius", AUTO_SCENE_TRUCK_RANDOM_RADIUS_RANGE),
                 unload_polar.get("angle_deg", AUTO_SCENE_TRUCK_RANDOM_ANGLE_DEG_RANGE),
             )
-            truck_center = np.array(truck_base["center"], dtype=np.float32).reshape(-1)[:3].copy()
-            dump_center = np.array(truck_base.get("dump_center", truck_center), dtype=np.float32).reshape(-1)[:3].copy()
-            truck_delta = unload_xy - dump_center[:2]
-            truck_center[:2] += truck_delta
-            truck_center_xy = truck_center[:2].copy()
+        if cfg["random_truck_yaw"]:
+            if not (isinstance(truck_base, dict) and truck_base.get("valid")):
+                last_reason = str((truck_base or {}).get("reason", "truck_baseline_invalid"))
+                break
+            truck_yaw_deg = auto_scene_sample_truck_yaw_for_unload(rng, unload_xy, unload_angle_deg, truck_base)
+        elif isinstance(truck_base, dict) and truck_base.get("valid"):
+            truck_yaw_deg = float(truck_base.get("yaw_deg", 0.0) or 0.0)
+        if cfg["random_truck"]:
+            target_center_xy = auto_scene_truck_center_for_unload_xy(unload_xy, truck_yaw_deg, truck_base)
+            if target_center_xy is None:
+                last_reason = "truck_center_from_unload_failed"
+                continue
+            baseline_center = np.array(truck_base["center"], dtype=np.float32).reshape(-1)[:3]
+            truck_delta = target_center_xy - baseline_center[:2]
+            truck_center_xy = target_center_xy.copy()
             truck_radius = auto_scene_xy_radius(truck_center_xy)
             truck_angle_deg = auto_scene_xy_angle_deg(truck_center_xy)
+        truck_rear_alignment_error_deg = None
+        if truck_center_xy is not None:
+            truck_rear_alignment_error_deg = auto_scene_truck_rear_alignment_error_deg(unload_xy, truck_center_xy)
 
         amount_for_estimate = amount if amount is not None else 1.0
         candidate = {
@@ -12897,6 +13760,8 @@ def auto_scene_sample_candidate(attempt_index):
             "truck_radius_m": truck_radius,
             "truck_angle_deg": truck_angle_deg,
             "truck_yaw_deg": truck_yaw_deg,
+            "truck_yaw_policy": "rear_or_side_to_excavator_using_unload_mesh" if cfg["random_truck_yaw"] else "fixed",
+            "truck_rear_alignment_error_deg": truck_rear_alignment_error_deg,
             "robot_body_yaw_deg": robot_body_yaw_deg,
             "unload_xy": unload_xy,
             "unload_radius_m": float(unload_radius),
@@ -12982,6 +13847,20 @@ def auto_scene_apply_candidate(candidate):
         candidate["sand_site_result"] = result
         if isinstance(result, dict) and result.get("changed"):
             scene_changed = True
+            if cfg["random_sand_xy"] or cfg["random_sand_amount"]:
+                clear_sand_fn = api.get("clear_real_particle_sand") if isinstance(api, dict) else None
+                if callable(clear_sand_fn):
+                    try:
+                        clear_sand_fn()
+                        candidate["cleared_old_sand_particles"] = True
+                        info_print(
+                            "[AUTO SCENE RANDOMIZE]",
+                            "cleared_old_sand_particles=True",
+                            "reason=sand_source_changed_waiting_for_prepare_reset",
+                        )
+                    except Exception as exc:
+                        candidate["cleared_old_sand_particles"] = False
+                        candidate["clear_old_sand_error"] = f"{type(exc).__name__}: {exc}"
     elif cfg["random_sand_xy"] or cfg["random_sand_amount"]:
         return False, "sand_site_apply_api_missing"
 
@@ -12992,6 +13871,13 @@ def auto_scene_apply_candidate(candidate):
         candidate["applied_unload_point_xyz"] = np.array(ctx_after_unload_mesh.get("unload_point"), dtype=np.float32).reshape(-1)[:3].copy()
         candidate["applied_unload_selected_path"] = str(ctx_after_unload_mesh.get("manual_unload_selected_path", ""))
         scene_changed = True
+
+    if scene_changed:
+        ctx_after = task_scene_context()
+        geom_ok, geom_reason, geom_detail = auto_scene_geometry_legal(candidate, ctx=ctx_after, applied=True)
+        candidate["applied_geometry_legal_detail"] = geom_detail
+        if not geom_ok:
+            return False, f"applied_scene_geometry:{geom_reason}"
 
     if scene_changed:
         STATE["auto_collect_sand_reset_done"] = False
@@ -13300,6 +14186,10 @@ async def auto_collect_prepare_environment():
             )
             reset_ok = await reset_sand_site_stably("auto_collect_prepare")
             STATE["auto_collect_sand_reset_done"] = bool(reset_ok)
+            prepare_snapshot = get_sand_snapshot(force=False, label="auto_prepare_after_reset", max_age=1.0)
+            if isinstance(prepare_snapshot, dict):
+                STATE["auto_collect_prepare_sand_snapshot"] = prepare_snapshot
+                STATE["auto_collect_prepare_sand_snapshot_time"] = float(time.time())
             record_gate(
                 "sand_settled",
                 bool(reset_ok),
@@ -13334,6 +14224,9 @@ async def auto_collect_prepare_environment():
         )
         await step_updates(20)
         settle_snapshot = get_sand_snapshot(force=False, label="auto_prepare_sand_gate", max_age=1.0)
+        if isinstance(settle_snapshot, dict):
+            STATE["auto_collect_prepare_sand_snapshot"] = settle_snapshot
+            STATE["auto_collect_prepare_sand_snapshot_time"] = float(time.time())
         settle = (
             settle_snapshot.get("settle")
             if isinstance(settle_snapshot, dict) and isinstance(settle_snapshot.get("settle"), dict)
@@ -13416,7 +14309,7 @@ async def auto_collect_one_episode():
     if not scene_ok:
         scene_record = dict(STATE.get("auto_scene_last_randomization", {}) or {})
         scene_reason = str(scene_record.get("reason", "scene_randomization_failed"))
-        target = auto_collect_sample_target(attempt, 0)
+        target = None
         plan_attempts = [{
             "prepared": False,
             "scene_randomization_ok": False,
@@ -13440,6 +14333,35 @@ async def auto_collect_one_episode():
         )
         return False
 
+    scene_gate_ok, scene_gate_reason, scene_gate_detail = auto_collect_scene_pre_sample_gate(attempt)
+    if not scene_gate_ok:
+        target = None
+        plan_attempts = [{
+            "prepared": False,
+            "scene_randomization_ok": True,
+            "pre_sample_gate": {
+                "ok": False,
+                "reason": scene_gate_reason,
+                "detail": scene_gate_detail,
+            },
+            "failure_reason": scene_gate_reason,
+        }]
+        info_print(
+            "[AUTO DATASET ATTEMPT]",
+            f"attempt={attempt}",
+            "result=pre_sample_scene_failed",
+            "executed=False",
+            f"reason={scene_gate_reason}",
+        )
+        auto_collect_record_planning_diagnostic(
+            attempt,
+            target,
+            plan_attempts,
+            scene_gate_reason,
+            initial_info=None,
+        )
+        return False
+
     prepared = await auto_collect_prepare_environment()
     if not prepared:
         prepare_reason = str(
@@ -13447,7 +14369,7 @@ async def auto_collect_one_episode():
             or "prepare_failed/prepare_environment_failed"
         )
         gate_report = STATE.get("auto_collect_prepare_gate_report", {}) or {}
-        target = auto_collect_sample_target(attempt, 0)
+        target = None
         plan_attempts = [{
             "prepared": False,
             "failed_gate": str(gate_report.get("reason", prepare_reason)) if isinstance(gate_report, dict) else prepare_reason,
@@ -13469,16 +14391,47 @@ async def auto_collect_one_episode():
         )
         return False
 
-    initial_ok, initial_info = await auto_collect_move_to_initial_pose(attempt)
-    if not initial_ok:
-        target = auto_collect_sample_target(attempt, 0)
-        meta = auto_collect_begin_episode(
+    planned_initial_info = auto_collect_initial_pose_for_attempt(attempt)
+    initial_gate_ok, initial_gate_reason, initial_gate_detail = auto_collect_initial_pose_pre_sample_gate(planned_initial_info)
+    if not initial_gate_ok:
+        target = None
+        plan_attempts = [{
+            "prepared": True,
+            "initial_pose_ok": False,
+            "initial_pose_id": planned_initial_info.get("id", ""),
+            "pre_sample_gate": {
+                "ok": False,
+                "reason": initial_gate_reason,
+                "detail": initial_gate_detail,
+            },
+            "failure_reason": initial_gate_reason,
+        }]
+        info_print(
+            "[AUTO DATASET ATTEMPT]",
+            f"attempt={attempt}",
+            "result=pre_sample_initial_pose_failed",
+            "executed=False",
+            f"initial_pose_id={planned_initial_info.get('id', '')}",
+            f"reason={initial_gate_reason}",
+        )
+        auto_collect_record_planning_diagnostic(
             attempt,
             target,
-            [{"prepared": True, "initial_pose_ok": False, "initial_pose_id": initial_info.get("id", "")}],
-            None,
-            initial_info=initial_info,
+            plan_attempts,
+            initial_gate_reason,
+            initial_info=planned_initial_info,
         )
+        return False
+
+    initial_ok, initial_info = await auto_collect_move_to_initial_pose(attempt)
+    if not initial_ok:
+        target = None
+        plan_attempts = [{
+            "prepared": True,
+            "initial_pose_ok": False,
+            "initial_pose_id": initial_info.get("id", ""),
+            "failure_reason": "execution_failed/initial_pose_failed",
+        }]
         info_print(
             "[AUTO DATASET ATTEMPT]",
             f"attempt={attempt}",
@@ -13486,7 +14439,14 @@ async def auto_collect_one_episode():
             "executed=False",
             f"initial_pose_id={initial_info.get('id', '')}",
         )
-        return auto_collect_finish_episode(meta, False, "execution_failed/initial_pose_failed")
+        auto_collect_record_planning_diagnostic(
+            attempt,
+            target,
+            plan_attempts,
+            "execution_failed/initial_pose_failed",
+            initial_info=initial_info,
+        )
+        return False
 
     action_ready, action_reason, _action_detail = await wait_for_articulation_action_ready(
         "auto_preflight",
@@ -13495,14 +14455,13 @@ async def auto_collect_one_episode():
         record_failure=False,
     )
     if not action_ready:
-        target = auto_collect_sample_target(attempt, 0)
-        meta = auto_collect_begin_episode(
-            attempt,
-            target,
-            [{"prepared": True, "initial_pose_ok": True, "action_channel_ready": False}],
-            None,
-            initial_info=initial_info,
-        )
+        target = None
+        plan_attempts = [{
+            "prepared": True,
+            "initial_pose_ok": True,
+            "action_channel_ready": False,
+            "failure_reason": f"preflight_failed/action_channel_not_ready:{action_reason}",
+        }]
         info_print(
             "[AUTO DATASET ATTEMPT]",
             f"attempt={attempt}",
@@ -13510,27 +14469,40 @@ async def auto_collect_one_episode():
             "executed=False",
             f"reason={action_reason}",
         )
-        return auto_collect_finish_episode(meta, False, f"preflight_failed/action_channel_not_ready:{action_reason}")
+        auto_collect_record_planning_diagnostic(
+            attempt,
+            target,
+            plan_attempts,
+            f"preflight_failed/action_channel_not_ready:{action_reason}",
+            initial_info=initial_info,
+        )
+        return False
 
     preflight_ok, preflight, preflight_reason = auto_collect_preflight_report(
         target_successes=STATE.get("auto_collect_requested")
     )
     if not preflight_ok:
-        target = auto_collect_sample_target(attempt, 0)
-        meta = auto_collect_begin_episode(
-            attempt,
-            target,
-            [{"prepared": True, "initial_pose_ok": True, "preflight": preflight}],
-            None,
-            initial_info=initial_info,
-        )
+        target = None
+        plan_attempts = [{
+            "prepared": True,
+            "initial_pose_ok": True,
+            "preflight": preflight,
+            "failure_reason": preflight_reason,
+        }]
         info_print(
             "[AUTO DATASET ATTEMPT]",
             f"attempt={attempt}",
             f"result={preflight_reason}",
             "executed=False",
         )
-        return auto_collect_finish_episode(meta, False, preflight_reason)
+        auto_collect_record_planning_diagnostic(
+            attempt,
+            target,
+            plan_attempts,
+            preflight_reason,
+            initial_info=initial_info,
+        )
+        return False
 
     target, seq, plan_attempts = await auto_collect_find_plan(attempt)
     if not seq:
@@ -13667,6 +14639,8 @@ async def auto_collect_loop(count, max_attempts=None):
     STATE["auto_collect_run_dir"] = ""
     STATE["auto_collect_run_id"] = ""
     STATE["auto_collect_lerobot_v3_export"] = {}
+    STATE["auto_collect_prepare_sand_snapshot"] = None
+    STATE["auto_collect_prepare_sand_snapshot_time"] = 0.0
     STATE["stage_timing_active"] = {}
     STATE["stage_timing_summary"] = {}
     STATE["stage_timing_recent"] = []
@@ -13678,6 +14652,7 @@ async def auto_collect_loop(count, max_attempts=None):
     STATE["dataset_record_sample_spans"] = {}
     STATE["auto_scene_last_randomization"] = {}
     STATE["auto_scene_truck_baseline"] = None
+    cancel_registered_task("startup_sand_reset", reason="auto_collect_loop_start")
     for key in [
         "path_obstacle_check_cache_hits",
         "path_obstacle_check_cache_misses",
@@ -15650,37 +16625,58 @@ def set_manual_unload_from_mesh_path(path, source="selected_mesh", status=True):
         return False
     shrink = get_unload_mesh_shrink_from_model()
     STATE["manual_unload_mesh_shrink_d"] = float(shrink)
-    xy_points = mesh_world_xy_points_under(prim)
-    hull = convex_hull_xy(xy_points)
-    if hull is None:
-        hull = np.array(
-            [
-                [float(mn[0]), float(mn[1])],
-                [float(mx[0]), float(mn[1])],
-                [float(mx[0]), float(mx[1])],
-                [float(mn[0]), float(mx[1])],
-            ],
-            dtype=np.float32,
-        )
-    poly = shrink_convex_polygon_xy(hull, shrink)
-    if poly is None:
-        update_status(f"[UNLOAD SETUP] selected mesh footprint failed: {path}", force=True)
-        return False
-    footprint_center = polygon_centroid_xy(poly)
-    poly_min = np.min(poly, axis=0)
-    poly_max = np.max(poly, axis=0)
-    inner = np.maximum(poly_max - poly_min, np.array([0.2, 0.2], dtype=np.float32))
-    point = np.array([float(footprint_center[0]), float(footprint_center[1]), float(mx[2]) + 0.06], dtype=np.float32)
-    STATE["manual_unload_selected_size_xy"] = np.maximum(np.max(hull, axis=0) - np.min(hull, axis=0), np.array([0.2, 0.2], dtype=np.float32))
+    local_fit = unload_mesh_local_frame_footprint(prim, shrink)
+    if local_fit is not None:
+        hull = np.array(local_fit["hull_world_xy"], dtype=np.float32)
+        poly = np.array(local_fit["poly_world_xy"], dtype=np.float32)
+        footprint_center = np.array(local_fit["center_world"], dtype=np.float32).reshape(-1)[:3]
+        inner = np.array(local_fit["inner_size_world_xy"], dtype=np.float32).reshape(-1)[:2]
+        point = np.array([float(footprint_center[0]), float(footprint_center[1]), float(footprint_center[2]) + 0.06], dtype=np.float32)
+        z0 = float(np.array(local_fit["bottom_world"], dtype=np.float32).reshape(-1)[2])
+        z1 = float(point[2])
+        STATE["manual_unload_selected_size_xy"] = np.array(local_fit["hull_size_world_xy"], dtype=np.float32).reshape(-1)[:2]
+        unload_fit_frame = str(local_fit.get("frame", "selected_mesh_local"))
+        unload_local_z_range = np.array(local_fit.get("local_z_range", []), dtype=np.float32).reshape(-1)
+        unload_fit_vertices = int(local_fit.get("local_vertices", 0) or 0)
+    else:
+        xy_points = mesh_world_xy_points_under(prim)
+        hull = convex_hull_xy(xy_points)
+        if hull is None:
+            hull = np.array(
+                [
+                    [float(mn[0]), float(mn[1])],
+                    [float(mx[0]), float(mn[1])],
+                    [float(mx[0]), float(mx[1])],
+                    [float(mn[0]), float(mx[1])],
+                ],
+                dtype=np.float32,
+            )
+        poly = shrink_convex_polygon_xy(hull, shrink)
+        if poly is None:
+            update_status(f"[UNLOAD SETUP] selected mesh footprint failed: {path}", force=True)
+            return False
+        footprint_center = polygon_centroid_xy(poly)
+        poly_min = np.min(poly, axis=0)
+        poly_max = np.max(poly, axis=0)
+        inner = np.maximum(poly_max - poly_min, np.array([0.2, 0.2], dtype=np.float32))
+        point = np.array([float(footprint_center[0]), float(footprint_center[1]), float(mx[2]) + 0.06], dtype=np.float32)
+        z0 = float(mn[2])
+        z1 = float(point[2])
+        STATE["manual_unload_selected_size_xy"] = np.maximum(np.max(hull, axis=0) - np.min(hull, axis=0), np.array([0.2, 0.2], dtype=np.float32))
+        unload_fit_frame = "world_xy_fallback"
+        unload_local_z_range = np.empty((0,), dtype=np.float32)
+        unload_fit_vertices = int(len(xy_points) if xy_points is not None else 0)
     STATE["manual_unload_selected_hull_xy"] = np.array(hull, dtype=np.float32)
     STATE["manual_unload_polygon_xy"] = np.array(poly, dtype=np.float32)
+    STATE["manual_unload_fit_frame"] = unload_fit_frame
+    STATE["manual_unload_local_z_range"] = unload_local_z_range.copy()
     set_manual_unload_point_xyz(
         float(point[0]),
         float(point[1]),
         float(point[2]),
         source=source,
         inner_size=inner,
-        z_range=np.array([float(mn[2]), float(point[2])], dtype=np.float32),
+        z_range=np.array([min(z0, z1), max(z0, z1)], dtype=np.float32),
         selected_path=path,
         range_shape="mesh_polygon",
     )
@@ -15693,6 +16689,9 @@ def set_manual_unload_from_mesh_path(path, source="selected_mesh", status=True):
         f"size={vec_list(size, 3)}",
         f"inner_size={vec_list(inner, 2)}",
         f"mesh_shrink_d={shrink:.3f}",
+        f"frame={unload_fit_frame}",
+        f"local_z_range={vec_list(unload_local_z_range, 2) if unload_local_z_range.size >= 2 else []}",
+        f"fit_vertices={unload_fit_vertices}",
         f"hull_vertices={len(hull)}",
         f"active_vertices={len(poly)}",
         f"point={vec_list(point, 3)}",
@@ -15921,7 +16920,7 @@ def sync_unload_from_sliders_live(force=False):
                 inner_size=inner,
                 z_range=z_range,
                 selected_path=str(STATE.get("manual_unload_selected_path", "")),
-                range_shape="box",
+                range_shape="mesh_polygon",
             )
             STATE["last_unload_model_xyz"] = p.copy()
             STATE["last_unload_model_z_range"] = z_range.copy()
@@ -16923,6 +17922,14 @@ DIG_PLAN_STAGED_PREFIX_EARLY_ACCEPT_ENABLED = str(
 DIG_PLAN_STAGED_PREFIX_EARLY_ACCEPT_AFTER_CANDIDATES = int(
     os.environ.get("EXCAVATOR_DIG_PLAN_STAGED_PREFIX_EARLY_ACCEPT_AFTER", "1") or 1
 )
+AUTO_COLLECT_REQUIRE_PRE_SAMPLE_SECURE = str(
+    os.environ.get("EXCAVATOR_AUTO_COLLECT_REQUIRE_PRE_SAMPLE_SECURE", "1") or "1"
+).strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
 PLANNER_SYNC_BLOCK_WARN_MS = 250.0
 AUTO_COLLECT_FIND_PLAN_MAX_SECONDS = 30.0
 AUTO_COLLECT_CANDIDATE_PLAN_SECONDS = 10.0
@@ -17589,6 +18596,19 @@ def cut_front_edge_quality(mode, report):
     deepest_body = max(body_depths)
     body_over_tip = float(deepest_body - tip_depth)
     mode_l = str(mode).lower()
+    if "pull_mid_cut" in mode_l:
+        # Pull-mid is the actual loading pass. Requiring the front tip to be
+        # much deeper than the bucket body makes the planner scrape with the
+        # teeth while keeping the cavity above the sand. Allow the cavity/load
+        # proxy to enter with the front as long as some bucket volume is
+        # engaged and the body is not wildly below the cutting edge.
+        if max(float(tip_depth), float(deepest_body)) < float(FRONT_EDGE_MIN_TIP_DEPTH):
+            return False, f"pull_mid not engaged enough: tip={tip_depth:.3f} body={deepest_body:.3f}", 80.0
+        if body_over_tip > max(0.34, float(FRONT_EDGE_BODY_DEPTH_HARD_MARGIN) * 2.4):
+            return False, f"pull_mid bucket body too far below front: tip={tip_depth:.3f} body={deepest_body:.3f}", 95.0
+        load_bonus = max(0.0, 0.08 - float(deepest_body)) * 24.0
+        balance_penalty = max(0.0, body_over_tip - max(0.18, float(FRONT_EDGE_BODY_DEPTH_SOFT_MARGIN) * 3.0)) * 14.0
+        return True, f"pull_mid_load_ok tip={tip_depth:.3f} body={deepest_body:.3f}", float(load_bonus + balance_penalty)
     if "pull_exit_cut" in mode_l:
         if deepest_body > float(EXIT_BODY_DEPTH_HARD_MARGIN):
             return False, f"exit bucket body still too deep: body={deepest_body:.3f}", 90.0
@@ -21892,13 +22912,18 @@ def dig_plan_specs_from_candidate(target_xyz, candidate):
     # Target Z is a material/sand target. Clamp only against the hard floor;
     # sand is deformable and should be entered during cut phases.
     target[2] = max(float(target[2]), GROUND_TOP_Z)
-    surface_z = candidate.get("surface_z", None)
+    raw_surface_z = candidate.get("surface_z", None)
+    surface_z = candidate.get("plan_surface_z", raw_surface_z)
     if surface_z is None:
         surface_z = sand_surface_z_at_xy(float(target[0]), float(target[1]))
     if surface_z is None:
         surface_z = max(float(target[2]) + 0.35, GROUND_TOP_Z + 0.35)
     surface_z = max(float(surface_z), float(target[2]) + 0.05)
-    target_depth = max(0.0, min(0.24, float(surface_z) - float(target[2])))
+    center_surface_z = None if raw_surface_z is None else float(raw_surface_z)
+    configured_depths = [float(x) for x in AUTO_COLLECT_TARGET_DEPTHS]
+    max_configured_depth = max(configured_depths) if configured_depths else 0.24
+    max_target_depth = max(0.24, float(max_configured_depth) + float(AUTO_DIG_TARGET_EXTRA_BITE_M))
+    target_depth = max(0.0, min(float(max_target_depth), float(surface_z) - float(target[2])))
     inward = dig_direction_unit(target)
     if float(np.linalg.norm(inward)) < 1e-6:
         inward = np.array([-1.0, 0.0], dtype=np.float32)
@@ -21908,22 +22933,42 @@ def dig_plan_specs_from_candidate(target_xyz, candidate):
         depth = max(0.0, float(depth))
         return max(GROUND_TOP_Z + float(min_clearance), float(surface_z) - depth)
 
-    cut_depth = max(0.08, min(0.22, target_depth))
-    insert_depth = max(0.035, min(float(candidate.get("insert_depth", 0.08)), cut_depth * 0.55))
-    mid_depth = max(insert_depth + 0.025, min(float(candidate.get("mid_depth", 0.14)), cut_depth))
-    exit_depth = max(0.015, min(float(candidate.get("exit_depth", 0.04)), insert_depth))
+    cut_depth = max(0.08, min(float(max_target_depth), target_depth))
+    # Enter the pile deeply before curling. If insert stays shallow, the tooth
+    # touches sand but the bucket cavity remains above the material, so the
+    # later carry curl closes on air.
+    insert_goal = max(float(candidate.get("insert_depth", 0.08)), cut_depth * 0.82)
+    insert_depth = max(0.08, min(insert_goal, cut_depth * 0.90))
+    mid_goal = max(float(candidate.get("mid_depth", 0.14)), cut_depth * 0.98)
+    mid_depth = max(insert_depth + 0.025, min(mid_goal, cut_depth))
+    exit_goal = max(float(candidate.get("exit_depth", 0.04)), cut_depth * 0.30)
+    exit_depth = max(0.015, min(exit_goal, max(insert_depth, cut_depth * 0.48)))
+    # Keep the loading cavity involved. Earlier plans targeted only the tooth
+    # tip through the cut, which made the front edge enter sand while the actual
+    # bucket volume stayed above it. Mid/exit targets use the load proxy so the
+    # authored bucket_cut volume has a chance to intersect particles before
+    # secure/lift.
+    load_mid_depth = max(0.12, min(cut_depth * 1.00, max(mid_depth * 0.95, insert_depth + 0.080)))
+    load_exit_depth = max(0.08, min(cut_depth * 0.62, max(exit_depth, cut_depth * 0.38)))
 
-    pre_clearance = max(0.26, float(candidate.get("pre_z", 0.46)) - min(0.24, target_depth))
+    pre_clearance = max(0.24, float(candidate.get("pre_z", 0.46)) - min(0.36, target_depth))
     contact_clearance = max(0.015, min(0.08, float(candidate.get("contact_z", 0.03))))
     pre = offset_xy(target, outward, float(candidate.get("approach_offset", 0.25)), float(surface_z) + pre_clearance)
     contact = offset_xy(target, outward, max(0.16, float(candidate.get("approach_offset", 0.25)) * 0.70), float(surface_z) + contact_clearance)
     insert = offset_xy(target, outward, max(0.10, float(candidate.get("approach_offset", 0.25)) * 0.42), cut_z(insert_depth))
-    mid_cut = offset_xy(target, inward, float(candidate.get("mid_pull", 0.35)), cut_z(mid_depth))
+    mid_pull = float(candidate.get("mid_pull", 0.35))
+    exit_pull = float(candidate.get("exit_pull", 0.55))
+    mid_cut = offset_xy(target, inward, mid_pull, cut_z(load_mid_depth))
     exit_lift_z = max(0.03, float(candidate.get("exit_lift_z", 0.08)))
-    exit_cut_z = max(cut_z(exit_depth), float(surface_z) + exit_lift_z)
-    exit_cut = offset_xy(target, inward, float(candidate.get("exit_pull", 0.55)), exit_cut_z)
-    curl = offset_xy(exit_cut, inward, 0.02, max(float(surface_z) + 0.22, float(exit_cut[2]) + float(candidate.get("curl_z", 0.18))))
-    secure = offset_xy(curl, inward, 0.02, max(float(curl[2]) + 0.18, float(surface_z) + 0.52))
+    # Curl before exiting. The current failure mode is a deep pull-mid followed
+    # by an exit pose whose bucket body is still buried. Seal the bucket near the
+    # pile surface first, then make pull_exit a closed-bucket escape.
+    low_curl_pull = max(mid_pull + 0.06, min(exit_pull - 0.06, (mid_pull + exit_pull) * 0.5))
+    low_curl_z = max(float(surface_z) + 0.06, cut_z(load_exit_depth * 0.45) + 0.08)
+    curl = offset_xy(target, inward, low_curl_pull, low_curl_z)
+    exit_cut_z = max(float(surface_z) + max(exit_lift_z, 0.12), float(curl[2]) + 0.04)
+    exit_cut = offset_xy(target, inward, exit_pull, exit_cut_z)
+    secure = offset_xy(exit_cut, inward, 0.02, max(float(exit_cut[2]) + 0.18, float(surface_z) + 0.52))
     lift_z = float(exit_cut[2]) + float(candidate.get("lift_height", 0.70))
     lift_z = max(lift_z, float(target[2]) + float(candidate.get("lift_above_target", 0.50)))
     lift_z = max(lift_z, float(candidate.get("min_lift_z", GROUND_TOP_Z + 1.05)))
@@ -21932,20 +22977,43 @@ def dig_plan_specs_from_candidate(target_xyz, candidate):
         height_delta=float(candidate.get("unload_height_delta", 0.0)),
         xy_offset=candidate.get("unload_xy_offset", None),
     )
-    bucket_cut_deg = float(candidate.get("bucket_cut", -60.0))
-    bucket_mid_cut_deg = max(bucket_cut_deg, float(candidate.get("bucket_mid_cut", -54.0)))
+    bucket_cut_deg = max(-112.0, min(-62.0, float(candidate.get("bucket_cut", BUCKET_DIG_INSERT_JOINT_DEG))))
+    bucket_mid_cut_deg = max(-118.0, min(bucket_cut_deg - 6.0, float(candidate.get("bucket_mid_cut", BUCKET_DIG_PULL_JOINT_DEG))))
+    bucket_exit_cut_deg = max(-118.0, min(bucket_mid_cut_deg - 4.0, float(candidate.get("bucket_exit", BUCKET_DIG_EXIT_JOINT_DEG))))
     bucket_approach_world = float(candidate.get("bucket_attack_world", BUCKET_DIG_APPROACH_WORLD_DEG))
     bucket_insert_world = float(candidate.get("bucket_cut_world", BUCKET_DIG_INSERT_WORLD_DEG))
-    bucket_mid_world = float(candidate.get("bucket_mid_cut_world", BUCKET_DIG_PULL_WORLD_DEG))
-    bucket_exit_world = float(candidate.get("bucket_exit_world", BUCKET_DIG_EXIT_WORLD_DEG))
+    try:
+        candidate["dig_stage_profile"] = "load_volume_continuous"
+        candidate["computed_center_surface_z"] = center_surface_z
+        candidate["computed_plan_surface_z"] = float(surface_z)
+        candidate["computed_surface_z"] = float(surface_z)
+        candidate["computed_target_z"] = float(target[2])
+        candidate["computed_target_depth"] = float(target_depth)
+        candidate["computed_cut_depth"] = float(cut_depth)
+        candidate["computed_insert_depth"] = float(insert_depth)
+        candidate["computed_mid_depth"] = float(mid_depth)
+        candidate["computed_exit_depth"] = float(exit_depth)
+        candidate["computed_load_mid_depth"] = float(load_mid_depth)
+        candidate["computed_load_exit_depth"] = float(load_exit_depth)
+        candidate["computed_curl_z"] = float(curl[2])
+        candidate["computed_exit_cut_z"] = float(exit_cut_z)
+        candidate["computed_low_curl_before_exit"] = True
+        candidate["computed_max_target_depth"] = float(max_target_depth)
+        candidate["computed_bucket_cut_joint_deg"] = float(bucket_cut_deg)
+        candidate["computed_bucket_mid_joint_deg"] = float(bucket_mid_cut_deg)
+        candidate["computed_bucket_exit_joint_deg"] = float(bucket_exit_cut_deg)
+        candidate["computed_mid_effector"] = "load"
+        candidate["computed_exit_effector"] = "load"
+    except Exception:
+        pass
 
     return [
         ("pre_dig", pre, float(candidate.get("bucket_travel", -25.0)), None, "tip", 1.1, True),
         ("approach_contact", contact, float(candidate.get("bucket_attack", -50.0)), bucket_approach_world, "tip", 1.0, True),
-        ("insert_cut", insert, bucket_cut_deg, bucket_insert_world, "tip", 0.9, True),
-        ("pull_mid_cut", mid_cut, bucket_mid_cut_deg, bucket_mid_world, "tip", 2.0, True),
-        ("pull_exit_cut", exit_cut, float(candidate.get("bucket_exit", -70.0)), bucket_exit_world, "tip", 1.5, True),
-        ("curl_to_hold_material", curl, float(candidate.get("bucket_curl", CURL_HOLD_TARGET_DEG)), None, "tip", 0.9, True),
+        ("insert_cut", insert, bucket_cut_deg, bucket_insert_world, "tip", 1.15, True),
+        ("pull_mid_cut", mid_cut, bucket_mid_cut_deg, None, "load", 2.20, True),
+        ("curl_to_hold_material", curl, float(candidate.get("bucket_curl", CURL_HOLD_TARGET_DEG)), None, "load", 1.10, True),
+        ("pull_exit_cut", exit_cut, bucket_exit_cut_deg, None, "load", 1.45, True),
         ("secure_load", secure, None, "hold", "load", 0.85, True),
         ("lift_carry", lift, None, "hold", "load", 1.2, True),
         ("unload_to_bin", unload, None, "carry", "load", 1.35, True),
@@ -22559,7 +23627,7 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                         route_stages = []
                         routed_ok = bool(phase_ok and obstacle_ok)
                     else:
-                        routed, route_reason = routed_stage_components(q_seed, q_candidate, label, duration, point, "tip")
+                        routed, route_reason = routed_stage_components(q_seed, q_candidate, label, duration, point, ik_effector)
                         if routed is None:
                             motion = plan_joint_motion_metrics(q_candidate, q_seed, duration)
                             path_penalty = float(DIG_PLAN_OBSTACLE_SOFT_PENALTY + DIG_PLAN_PATH_SOFT_PENALTY)
@@ -22597,9 +23665,9 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                     retain_penalty = 0.0 if curl_retains else 10.0
                     closed_penalty = 0.0 if curl_retains else 80.0 * closed_deficit
                     ground_penalty = 0.0 if curl_ok else 120.0
-                    tip_point = predicted_end_world_point(q_candidate, end_effector="tip", reference_q=q_seed)
-                    if tip_point is None:
-                        tip_point = np.array(point, dtype=np.float32).copy()
+                    target_effector_point = predicted_end_world_point(q_candidate, end_effector=ik_effector, reference_q=q_seed)
+                    if target_effector_point is None:
+                        target_effector_point = np.array(point, dtype=np.float32).copy()
                     curl_candidates.append(
                         {
                             "q": q_candidate.copy(),
@@ -22627,7 +23695,7 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                             "retain_penalty": float(retain_penalty),
                             "closed_penalty": float(closed_penalty),
                             "ground_penalty": float(ground_penalty),
-                            "target_point": np.array(tip_point, dtype=np.float32).copy(),
+                            "target_point": np.array(target_effector_point, dtype=np.float32).copy(),
                             "score": float(route_cost + motion["cost"] + path_penalty + retain_penalty + closed_penalty + ground_penalty),
                         }
                     )
@@ -22649,7 +23717,7 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                         duration,
                         q_seed,
                         bucket_world_deg=None,
-                        ik_effector="tip",
+                        ik_effector=ik_effector,
                         accept_err=0.62,
                         soft_accept_err=0.90,
                         bucket_motion_weight=0.50,
@@ -22665,13 +23733,18 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                         break
                     q_row = np.array(row.get("q_goal"), dtype=np.float32).copy()
                     row_info = dict(row.get("info", {}) or {})
-                    row_info["source"] = "curl_tip_ik_bucket_forced_closed"
+                    row_info["source"] = f"curl_{ik_effector}_ik_bucket_forced_closed"
                     row_info["raw_ik_bucket_deg"] = float(rad_to_deg(q_row[bucket_idx]))
-                    add_curl_candidate(q_row, "curl_tip_ik_bucket_forced_closed", str(curl_reason), pose_info=row_info)
+                    add_curl_candidate(q_row, row_info["source"], str(curl_reason), pose_info=row_info)
 
+                # The retention geometry check is useful as a ranking signal,
+                # but it is too brittle to be a hard planning gate while the
+                # bucket is still partly in the cut. Let secure/lift use the
+                # real bucket-load signal later; here we only require a
+                # collision-safe closed-bucket curl candidate.
                 valid_curl_candidates = [
                     row for row in curl_candidates
-                    if row["ground_ok"] and row["retains"]
+                    if row["ground_ok"]
                 ]
                 if not valid_curl_candidates:
                     if planning_deadline_exceeded(deadline):
@@ -22680,7 +23753,7 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                     if curl_candidates:
                         best_diag = sorted(curl_candidates, key=lambda row: row["score"])[0]
                         fail_reasons.append(
-                            f"{label}: no geometrically retaining safe curl pose; "
+                            f"{label}: no ground-safe closed curl pose; "
                             f"best_source={best_diag['source']} bucket={best_diag['bucket_deg']:.2f}deg "
                             f"joint_closed={best_diag.get('joint_closed_ok_deprecated')} retains={best_diag['retains']} ground={best_diag['ground_ok']} "
                             f"ground_reason={best_diag['ground_reason']}"
@@ -22699,12 +23772,12 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                 )[0]
                 q_goal = best_curl["q"].copy()
                 curl_bucket_deg = float(best_curl["bucket_deg"])
-                curl_closed_ok = bool(best_curl["retains"])
+                curl_closed_ok = bool(best_curl.get("joint_closed_ok_deprecated", True))
                 curl_hold_report = best_curl["hold_report"]
                 curl_retains = bool(best_curl["retains"])
                 if not curl_closed_ok:
                     fail_reasons.append(
-                        f"{label}: bucket geometry does not retain material; bucket={curl_bucket_deg:.2f}deg "
+                        f"{label}: bucket did not reach closed curl command; bucket={curl_bucket_deg:.2f}deg "
                         f"pour_above_load_z={fmt_optional((curl_hold_report or {}).get('pour_above_load_z'))}"
                     )
                     continue
@@ -22734,12 +23807,14 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                     "q_goal_rad": vec_list(q_goal, 4),
                     "q_goal_deg": q_deg_values(q_goal, wrap_swing_for_display=True),
                     "duration": float(duration),
-                    "effector": "bucket_closure_primary",
+                    "effector": f"bucket_closure_primary:{ik_effector}",
                     "seal_bucket_first": True,
                     "bucket_target_deg": curl_bucket_deg,
                     "material_hold": {
                         "bucket_closed_ok": bool(curl_closed_ok),
                         "carry_retains_material": bool(curl_retains),
+                        "retention_hard_gate": False,
+                        "retention_gate_silent": True,
                         "carry_report": curl_hold_report,
                         "penalty": float(retain_penalty),
                     },
@@ -29118,11 +30193,11 @@ def build_ui():
                         model.add_value_changed_fn(on_manual_joint_slider_changed)
 
                     with ui.HStack(spacing=6, height=26):
-                        ui.Label("Manual joints", width=126)
-                        ui.Button("Home", width=70, clicked_fn=home)
-                        ui.Button("Print State", width=92, clicked_fn=print_state)
-                        ui.Button("Render Mode", width=100, clicked_fn=toggle_render_mode_from_ui)
-                        ui.Button("Calc Viz", width=76, clicked_fn=toggle_calc_viz_from_ui)
+                        ui.Label("Manual joints", width=104)
+                        ui.Button("Home", width=58, clicked_fn=home)
+                        ui.Button("Print State", width=82, clicked_fn=print_state)
+                        ui.Button("Render Mode", width=92, clicked_fn=toggle_render_mode_from_ui)
+                        ui.Button("Calc Viz", width=68, clicked_fn=toggle_calc_viz_from_ui)
 
                     ui.Separator()
                     ui.Label("Auto Dataset (primary pipeline)")

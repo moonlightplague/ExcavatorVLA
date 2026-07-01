@@ -1881,6 +1881,8 @@ def dashboard_scene_from_episode(row: dict) -> Dict[str, object]:
         or vector_xy(candidate.get("unload_xy"))
         or vector_xy(row.get("unload_landing_xyz"))
     )
+    unload_landing_xy = vector_xy(row.get("unload_landing_xyz"))
+    unload_point_xy = vector_xy(row.get("unload_point_xyz")) or vector_xy(row.get("unload_release_xyz"))
     return {
         "episode_index": row.get("episode_index"),
         "episode_id": row.get("episode_id"),
@@ -1889,6 +1891,8 @@ def dashboard_scene_from_episode(row: dict) -> Dict[str, object]:
         "sand_xy": sand_xy,
         "truck_xy": truck_xy,
         "unload_xy": unload_xy,
+        "unload_landing_xy": unload_landing_xy,
+        "unload_point_xy": unload_point_xy,
         "sand_amount_multiplier": safe_float_value(
             applied.get("sand_amount_multiplier", candidate.get("sand_amount_multiplier"))
         ),
@@ -2295,8 +2299,8 @@ function renderRun(data){
   );
   drawScatter(
     "unloadScatter",
-    pts.map(p=>({x:p.unload_xy&&p.unload_xy[0], y:p.unload_xy&&p.unload_xy[1], status:p.status, label:p.episode_index, polygon:(p.unload_polygon_xy&&p.unload_polygon_xy.length?p.unload_polygon_xy:p.unload_hull_xy)})),
-    "unload mesh x", "unload mesh y", {polygons:true, rangeFromPolygons:true}
+    canonicalUnloadPoints(pts),
+    "bin local x", "bin local y", {canonicalPolygon:true, origin:true}
   );
   drawHistogram("robotYawHist", pts.map(p=>p.robot_body_yaw_deg), "deg");
   drawHistogram("truckYawHist", pts.map(p=>p.truck_yaw_deg), "deg");
@@ -2435,6 +2439,46 @@ function cleanPolygon(poly){
   }
   return out;
 }
+function polygonCenter(poly){
+  const clean=cleanPolygon(poly);
+  if(!clean.length) return null;
+  let sx=0, sy=0;
+  for(const p of clean){sx+=p[0]; sy+=p[1];}
+  return [sx/clean.length, sy/clean.length];
+}
+function polygonPrincipalAngle(poly){
+  const clean=cleanPolygon(poly);
+  if(clean.length < 2) return 0;
+  let bestA=0, bestD=-1;
+  for(let i=0;i<clean.length;i++){
+    for(let j=i+1;j<clean.length;j++){
+      const dx=clean[j][0]-clean[i][0], dy=clean[j][1]-clean[i][1];
+      const d=dx*dx+dy*dy;
+      if(d>bestD){bestD=d; bestA=Math.atan2(dy,dx);}
+    }
+  }
+  return bestA;
+}
+function transformToLocal(pt, center, angle){
+  const dx=Number(pt[0])-center[0], dy=Number(pt[1])-center[1];
+  const c=Math.cos(-angle), s=Math.sin(-angle);
+  return [dx*c - dy*s, dx*s + dy*c];
+}
+function canonicalUnloadPoints(scenePoints){
+  const out=[];
+  for(const p of scenePoints||[]){
+    const poly=cleanPolygon((p.unload_polygon_xy&&p.unload_polygon_xy.length)?p.unload_polygon_xy:p.unload_hull_xy);
+    const center=polygonCenter(poly) || p.unload_xy;
+    if(!center) continue;
+    const angle=polygonPrincipalAngle(poly);
+    const source=p.unload_point_xy || p.unload_landing_xy || p.unload_xy;
+    if(!source) continue;
+    const local=transformToLocal(source, center, angle);
+    const localPoly=poly.map(pt=>transformToLocal(pt, center, angle));
+    out.push({x:local[0], y:local[1], status:p.status, label:p.episode_index, polygon:localPoly});
+  }
+  return out;
+}
 function drawScatter(targetId, pts, xLabel, yLabel, opts={}){
   const f=chartFrame(430,320);
   const rows=(pts||[]).map(p=>Object.assign({}, p, {poly:cleanPolygon(p.polygon)}));
@@ -2442,7 +2486,7 @@ function drawScatter(targetId, pts, xLabel, yLabel, opts={}){
   const xs=[], ys=[];
   for(const p of rows){
     if(finite(Number(p.x))&&finite(Number(p.y))){ xs.push(Number(p.x)); ys.push(Number(p.y)); }
-    if((opts.polygons || opts.rangeFromPolygons) && p.poly.length){
+    if((opts.polygons || opts.rangeFromPolygons || opts.canonicalPolygon) && p.poly.length){
       for(const pt of p.poly){ xs.push(pt[0]); ys.push(pt[1]); }
     }
   }
@@ -2455,6 +2499,21 @@ function drawScatter(targetId, pts, xLabel, yLabel, opts={}){
     parts.push(`<line x1="${sx(0).toFixed(1)}" y1="${f.t}" x2="${sx(0).toFixed(1)}" y2="${f.t+f.ph}" stroke="#111827" stroke-width="1.2" stroke-dasharray="4 4" opacity="0.45"/>`);
     parts.push(`<line x1="${f.l}" y1="${sy(0).toFixed(1)}" x2="${f.l+f.pw}" y2="${sy(0).toFixed(1)}" stroke="#111827" stroke-width="1.2" stroke-dasharray="4 4" opacity="0.45"/>`);
     parts.push(`<circle cx="${sx(0).toFixed(1)}" cy="${sy(0).toFixed(1)}" r="5" fill="#111827"><title>excavator origin</title></circle>`);
+  }
+  if(opts.canonicalPolygon){
+    let bestPoly=[];
+    let bestArea=-1;
+    for(const p of rows){
+      if(!p.poly.length) continue;
+      let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+      for(const pt of p.poly){minX=Math.min(minX,pt[0]);maxX=Math.max(maxX,pt[0]);minY=Math.min(minY,pt[1]);maxY=Math.max(maxY,pt[1]);}
+      const area=(maxX-minX)*(maxY-minY);
+      if(area>bestArea){bestArea=area;bestPoly=p.poly;}
+    }
+    if(bestPoly.length){
+      const d=bestPoly.map(pt=>`${sx(pt[0]).toFixed(1)},${sy(pt[1]).toFixed(1)}`).join(" ");
+      parts.push(`<polygon points="${d}" fill="#64748b" fill-opacity="0.055" stroke="#0f172a" stroke-width="1.7" stroke-opacity="0.82"><title>canonical unload bin projection</title></polygon>`);
+    }
   }
   if(opts.polygons){
     for(const p of rows){

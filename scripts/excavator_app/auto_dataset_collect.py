@@ -30,6 +30,25 @@ def _restore_plan_state(rt, snapshot):
         rt.STATE[key] = copy.deepcopy(value)
 
 
+def _clear_executable_plan_state(rt):
+    for key in (
+        "current_dig_plan",
+        "dig_plan_sequence",
+        "dig_plan_candidate",
+        "dig_plan_points",
+        "dig_plan_trace_points",
+        "dig_plan_trace_stage_breaks",
+        "trace_planned_bucket_points",
+        "trace_plan_source",
+        "trace_render_signature",
+        "dig_plan_target",
+        "dig_plan_start_q",
+        "dig_plan_step_index",
+    ):
+        rt.STATE[key] = None
+    rt.STATE["trace_render_dirty"] = True
+
+
 def _group_targets_by_ring(rows):
     groups = []
     current_ring = None
@@ -157,6 +176,7 @@ async def find_plan(rt, attempt_index):
         for row in ring_rows:
             if rt.STATE.get("auto_collect_stop_requested", False) or not rt.STATE.get("running", False):
                 rt.info_print("[AUTO DIG TARGET PLAN STOP]", "reason=stop_requested_or_runtime_stopped")
+                _clear_executable_plan_state(rt)
                 return target, None, plan_attempts
             if rt.time.time() > find_plan_deadline:
                 best_result = _return_best_ring_success("find_plan_budget_reached_after_success")
@@ -168,6 +188,7 @@ async def find_plan(rt, attempt_index):
                     f"attempts={retry}",
                     "reason=find_plan_budget_exceeded",
                 )
+                _clear_executable_plan_state(rt)
                 return target, None, plan_attempts
             if retry >= max_full_plan_attempts:
                 best_result = _return_best_ring_success("full_plan_attempt_limit_after_success")
@@ -179,6 +200,7 @@ async def find_plan(rt, attempt_index):
                     f"limit={max_full_plan_attempts}",
                     "reason=max_full_plan_attempts",
                 )
+                _clear_executable_plan_state(rt)
                 return target, None, plan_attempts
             target = rt.np.array(row.get("target_xyz"), dtype=rt.np.float32).reshape(-1)[:3]
             rt.STATE["active_unload_landing_point"] = rt.np.array(unload_landing, dtype=rt.np.float32).reshape(-1)[:3]
@@ -211,10 +233,41 @@ async def find_plan(rt, attempt_index):
             shared_plan = rt.STATE.get("current_dig_plan")
             chosen_plan = rt.STATE.get("dig_plan_candidate")
             best_failure = rt.STATE.get("dig_plan_best_failure")
+            pre_sample_ok = True
+            pre_sample_reason = "ok"
+            pre_sample_detail = {}
+            if seq:
+                gate = getattr(rt, "auto_collect_plan_pre_sample_gate", None)
+                if callable(gate):
+                    pre_sample_ok, pre_sample_reason, pre_sample_detail = gate(seq, target=target)
+                if not pre_sample_ok:
+                    rt.info_print(
+                        "[AUTO PRE-SAMPLE GATE]",
+                        f"retry={retry}",
+                        f"ring_index={row.get('ring_index')}",
+                        "result=reject_plan_before_recording",
+                        f"reason={pre_sample_reason}",
+                    )
+                    seq = None
+                    row["pre_sample_gate"] = {
+                        "ok": False,
+                        "reason": str(pre_sample_reason),
+                        "detail": pre_sample_detail,
+                    }
+                    row["failed_stage"] = "pre_sample_gate"
+                    row["failure_reason"] = str(pre_sample_reason)
+                    rt.STATE["dig_plan_best_failure"] = dict(row)
+                    rt.STATE["dig_plan_sequence"] = None
+                    rt.STATE["current_dig_plan"] = None
             row["full_plan_ok"] = bool(seq)
             if seq:
                 row["failed_stage"] = ""
                 row["failure_reason"] = "ok"
+                row["pre_sample_gate"] = {
+                    "ok": True,
+                    "reason": str(pre_sample_reason),
+                    "detail": pre_sample_detail,
+                }
                 plan_cost = (
                     shared_plan.get("total_plan_cost")
                     if isinstance(shared_plan, dict) and shared_plan.get("total_plan_cost") is not None
@@ -222,7 +275,10 @@ async def find_plan(rt, attempt_index):
                 )
                 row["full_plan_cost"] = float(plan_cost)
             else:
-                if isinstance(best_failure, dict):
+                if str(row.get("failed_stage", "")) == "pre_sample_gate":
+                    row["failed_stage"] = "pre_sample_gate"
+                    row["failure_reason"] = str(row.get("failure_reason", pre_sample_reason))
+                elif isinstance(best_failure, dict):
                     row["failed_stage"] = str(best_failure.get("failed_stage", "unknown"))
                     row["failure_reason"] = str(best_failure.get("failure_reason", "planning_failed"))
                 else:
@@ -317,6 +373,7 @@ async def find_plan(rt, attempt_index):
                     f"grace={hard_grace_s:.2f}s",
                     "reason=single_candidate_over_budget_stop_more_planning",
                 )
+                _clear_executable_plan_state(rt)
                 return target, None, plan_attempts
             if not seq:
                 signature = _planning_failure_signature(row)
@@ -350,6 +407,7 @@ async def find_plan(rt, attempt_index):
                         f"limit={signature_global_limit}",
                         "stop_planning_attempts=True",
                     )
+                    _clear_executable_plan_state(rt)
                     return target, None, plan_attempts
                 if repeated_failure_count >= signature_ring_limit:
                     rt.info_print(
@@ -386,6 +444,7 @@ async def find_plan(rt, attempt_index):
             f"attempts={len(ring_rows)}",
             "moving_to_next_ring=True",
         )
+    _clear_executable_plan_state(rt)
     return target, None, plan_attempts
 
 

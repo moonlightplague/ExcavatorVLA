@@ -54,6 +54,16 @@ from . import ik_movement
 from . import trace_showing
 
 
+def env_bool(name, default=False):
+    value = os.environ.get(str(name), "")
+    if value == "":
+        return bool(default)
+    return str(value).strip().lower() not in ("0", "false", "no", "off", "none")
+
+
+NO_UI = env_bool("EXCAVATOR_NO_UI", False) or env_bool("EXCAVATOR_HEADLESS", False)
+
+
 def _load_optional_joint_space_planner():
     errors = []
     candidates = []
@@ -15569,6 +15579,8 @@ def check_freeze_state(label="loop"):
 
 
 def notify_sand_site_tool_sample(stage_name):
+    # Reserved hook for future sand-site tool sampling instrumentation.
+    # Kept as a no-op so existing motion code can call it safely.
     return
 
 
@@ -17217,6 +17229,8 @@ def dig_plan_target_matches_current(tol=0.05):
 
 
 def ensure_trace_dig_plan_current():
+    # Reserved hook for lazy trace-plan refresh. Current trace generation is
+    # handled eagerly by cache_dig_plan_trace_points() and active-motion traces.
     return
 
 
@@ -30484,7 +30498,6 @@ async def main():
     if not STATE["robot_state_reads_enabled"]:
         info_print("[WARN] robot joint reads disabled: JOINT_INDICES not ready")
 
-    # 关键：这里必须创建 UI
     update_q_cmd_from_real()
     CTRL.q_safe = CTRL.q_cmd.copy()
     STATE["manual_joint_active"] = False
@@ -30493,22 +30506,24 @@ async def main():
     STATE["last_action_q"] = None
     STATE["last_action_unclipped_q"] = None
     STATE["last_action_time"] = 0.0
-    build_ui()
+    if NO_UI:
+        update_status("Ready. Real joint state synced. UI disabled.", force=True)
+        info_print("[NO UI] EXCAVATOR_NO_UI/EXCAVATOR_HEADLESS enabled; control loop is running without windows.")
+    else:
+        build_ui()
+        try:
+            sync_sliders_from_real_q()
+        except Exception as e:
+            info_print("[WARN] initial slider sync failed:", e)
 
-    # 初始化 UI 上的 joint 显示为真实关节值
-    try:
-        sync_sliders_from_real_q()
-    except Exception as e:
-        info_print("[WARN] initial slider sync failed:", e)
+        try:
+            builtins._EXCAVATOR_UI_WINDOW = WINDOW
+            WINDOW.visible = True
+            WINDOW.focus()
+        except Exception:
+            pass
 
-    try:
-        builtins._EXCAVATOR_UI_WINDOW = WINDOW
-        WINDOW.visible = True
-        WINDOW.focus()
-    except Exception:
-        pass
-
-    update_status("Ready. Real joint state synced. UI opened.", force=True)
+        update_status("Ready. Real joint state synced. UI opened.", force=True)
     print_motion_constraint_diagnostics("ready")
     if sand_site_active() and AUTO_RESET_SAND_AFTER_UI_READY:
         register_async_task("startup_sand_reset", delayed_startup_sand_reset(), replace=True)
@@ -30522,13 +30537,14 @@ async def main():
             STATE["request_calibrate"] = False
             await calibrate_ik()
 
-        sync_target_from_sliders_live(force=False)
-        sync_unload_from_sliders_live(force=False)
+        if not NO_UI:
+            sync_target_from_sliders_live(force=False)
+            sync_unload_from_sliders_live(force=False)
 
         apply_manual_joint_target_step()
 
-        # 实时同步真实 joint 值到 UI
-        sync_sliders_from_real_q()
+        if not NO_UI:
+            sync_sliders_from_real_q()
 
         if STATE["follow"]:
             follow_step()
@@ -30555,6 +30571,8 @@ async def main():
     STATE["robot_state_reads_enabled"] = False
     STATE["robot_state_shutdown"] = True
     cancel_registered_tasks(reason="main_loop_exit", keep={"main_loop"})
-    update_status("Slider UI exited.", force=True)
+    update_status("Runtime loop exited.", force=True)
 
+# Isaac Sim Script Editor workflow imports/reloads this module as the runtime
+# entrypoint, so startup is intentionally triggered at import time.
 register_async_task("main_loop", main(), replace=True)

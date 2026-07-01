@@ -3,26 +3,34 @@
 Scene Diagnostic Script - Check USD scene content without SimulationApp
 """
 
+import argparse
 import os
 import sys
 
-SCENE_USD_PATH = "/isaac-sim/ExcavatorVLA/assets/usd/excavator_scene.usd"
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-def diagnose_scene():
+from excavator_common.paths import default_scene_path, resolve_existing_path
+
+
+def diagnose_scene(scene_path=None):
     # Use pure USD API without SimulationApp
     from pxr import Usd, UsdGeom, UsdPhysics
-    
+
+    scene_path = resolve_existing_path(scene_path or default_scene_path(PROJECT_ROOT), root=PROJECT_ROOT)
+
     # Open USD stage directly
-    stage = Usd.Stage.Open(SCENE_USD_PATH)
-    
+    stage = Usd.Stage.Open(scene_path)
+
     if not stage:
-        print(f"[ERROR] Cannot open USD file: {SCENE_USD_PATH}")
+        print(f"[ERROR] Cannot open USD file: {scene_path}")
         return
-    
+
     print("=" * 60)
     print("Scene Diagnostic Report")
     print("=" * 60)
-    print(f"USD File: {SCENE_USD_PATH}")
+    print(f"USD File: {scene_path}")
     print(f"Root Layer: {stage.GetRootLayer().identifier}")
     print("=" * 60)
     
@@ -107,4 +115,7 @@ def diagnose_scene():
     print("=" * 60)
 
 if __name__ == "__main__":
-    diagnose_scene()
+    parser = argparse.ArgumentParser(description="Diagnose an ExcavatorVLA USD scene.")
+    parser.add_argument("--scene", default=default_scene_path(PROJECT_ROOT), help="USD scene path.")
+    args = parser.parse_args()
+    diagnose_scene(args.scene)

@@ -1,7 +1,22 @@
 #!/usr/bin/env python3
+import argparse
+import os
+import sys
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from excavator_common.paths import default_scene_path, resolve_existing_path
+
+parser = argparse.ArgumentParser(description="Print a compact USD scene prim listing.")
+parser.add_argument("--scene", default=default_scene_path(PROJECT_ROOT), help="USD scene path.")
+args = parser.parse_args()
+
 from pxr import Usd, UsdGeom
 
-stage = Usd.Stage.Open('/isaac-sim/ExcavatorVLA/assets/usd/excavator_scene.usd')
+scene_path = resolve_existing_path(args.scene, root=PROJECT_ROOT)
+stage = Usd.Stage.Open(scene_path)
 print('Stage opened:', stage.GetRootLayer().identifier)
 print('=' * 60)
 

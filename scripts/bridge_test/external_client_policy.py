@@ -9,48 +9,25 @@
 #   python 03_external_client_policy.py --host <windows_host_ip> --port 5555
 
 import argparse
-import base64
-import json
+import os
 import socket
-import struct
+import sys
 import time
-import zlib
 
 import numpy as np
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from excavator_common.bridge_protocol import (
+    decode_rgb_payload as decode_rgb,
+    read_json as recv_json,
+    write_json as send_json,
+)
+
 
 JOINT_ORDER_HINT = ["swing", "boom", "arm", "bucket"]
-
-
-def send_json(sock, obj):
-    data = json.dumps(obj).encode("utf-8")
-    sock.sendall(struct.pack("!I", len(data)))
-    sock.sendall(data)
-
-
-def recv_exact(sock, n):
-    chunks = []
-    remaining = n
-    while remaining > 0:
-        chunk = sock.recv(remaining)
-        if not chunk:
-            raise ConnectionError("Socket closed")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
-
-
-def recv_json(sock):
-    header = recv_exact(sock, 4)
-    n = struct.unpack("!I", header)[0]
-    data = recv_exact(sock, n)
-    return json.loads(data.decode("utf-8"))
-
-
-def decode_rgb(reply):
-    raw = zlib.decompress(base64.b64decode(reply["rgb_zlib_b64"]))
-    arr = np.frombuffer(raw, dtype=np.uint8)
-    return arr.reshape(reply["rgb_shape"])
 
 
 def main():

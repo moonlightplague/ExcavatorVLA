@@ -17,12 +17,26 @@ import sys
 import os
 import ctypes
 
+from excavator_common.bridge_protocol import (
+    async_read_json,
+    async_write_json,
+    encode_rgb_payload,
+    make_articulation_action,
+    validate_bridge_command,
+)
+from excavator_common.paths import (
+    default_scene_path,
+    default_truck_usd_path,
+    env_path,
+    resolve_existing_path,
+)
+
 # Add the project path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = SCRIPT_DIR
 
 # Scene and robot paths
-SCENE_USD_PATH = os.path.join(PROJECT_DIR, "assets/usd/excavator_scene.usd")
+SCENE_USD_PATH = default_scene_path(PROJECT_DIR)
 ROBOT_PRIM_PATH = "/World/URDF_real3"
 
 # Use the three existing robot-mounted dataset cameras in the USD scene.
@@ -185,8 +199,15 @@ def capture_rgb_from_cameras(viewport, camera_paths, world, simulation_app, capt
     return rgb_by_camera
 
 
-def main():
+def main(args=None):
     """Main entry point for standalone launch."""
+    if args is None:
+        args = argparse.Namespace(
+            scene=SCENE_USD_PATH,
+            truck_usd=env_path("EXCAVATOR_TRUCK_USD", default_truck_usd_path(PROJECT_DIR)),
+            truck_glb=env_path("EXCAVATOR_TRUCK_GLB", ""),
+            force_test_pose=False,
+        )
 
     # Import Isaac Sim modules after Isaac Sim Python env is set up.
     from isaacsim import SimulationApp
@@ -216,10 +237,6 @@ def main():
 
     # Import bridge server components.
     import asyncio
-    import base64
-    import json
-    import struct
-    import zlib
     import numpy as np
     import queue
 
@@ -230,8 +247,13 @@ def main():
     print("=" * 60)
     print("ExcavatorVLA Standalone Launcher")
     print("=" * 60)
-    print(f"Scene USD: {SCENE_USD_PATH}")
+    scene_usd_path = resolve_existing_path(args.scene, root=PROJECT_DIR)
+    truck_usd_path = resolve_existing_path(args.truck_usd, root=PROJECT_DIR) if args.truck_usd else ""
+    truck_glb_path = resolve_existing_path(args.truck_glb, root=PROJECT_DIR) if args.truck_glb else ""
+    print(f"Scene USD: {scene_usd_path}")
     print(f"Robot Prim: {ROBOT_PRIM_PATH}")
+    print(f"Truck USD: {truck_usd_path or '[disabled]'}")
+    print(f"Truck GLB: {truck_glb_path or '[not set]'}")
     print("Camera Prims for Viewport Capture:")
     for camera_name, camera_path in CAMERA_PRIM_PATHS.items():
         print(f"  {camera_name}: {camera_path}")
@@ -242,15 +264,15 @@ def main():
     stage = get_current_stage()
 
     # Check if scene file exists.
-    if not os.path.exists(SCENE_USD_PATH):
-        print(f"[ERROR] Scene file not found: {SCENE_USD_PATH}")
+    if not os.path.exists(scene_usd_path):
+        print(f"[ERROR] Scene file not found: {scene_usd_path}")
         print("Please ensure the excavator_scene.usd file exists.")
         simulation_app.close()
         return
 
     # Load the USD scene.
-    add_reference_to_stage(usd_path=SCENE_USD_PATH, prim_path="/World")
-    print(f"[INFO] Loaded scene from: {SCENE_USD_PATH}")
+    add_reference_to_stage(usd_path=scene_usd_path, prim_path="/World")
+    print(f"[INFO] Loaded scene from: {scene_usd_path}")
 
     # Check if robot prim exists.
     if not stage.GetPrimAtPath(ROBOT_PRIM_PATH).IsValid():
@@ -299,82 +321,69 @@ def main():
     )
     world.scene.add(robot)
 
-    # Load dump truck using GLB converter.
-    TRUCK_GLB_PATH = "/root/Documents/trae_projects/vla_test/assets/glb/no-brand_dump_truck.glb"
-    TRUCK_USD_PATH = "/root/Documents/trae_projects/vla_test/assets/glb/no-brand_dump_truck.usd"
+    # Load dump truck from checked-in USD by default. External GLB conversion is optional.
+    truck_prim_path = "/World/DumpTruck"
+    if truck_glb_path and truck_usd_path and os.path.exists(truck_glb_path) and not os.path.exists(truck_usd_path):
+        print(f"[INFO] Converting GLB to USD: {truck_glb_path}")
 
-    if os.path.exists(TRUCK_GLB_PATH):
-        truck_prim_path = "/World/DumpTruck"
+        context = asset_converter.AssetConverterContext()
+        context.ignore_materials = False
+        context.export_preview_surface = True
+        context.use_meter_as_world_unit = True
 
-        # Convert GLB to USD if USD doesn't exist.
-        if not os.path.exists(TRUCK_USD_PATH):
-            print(f"[INFO] Converting GLB to USD: {TRUCK_GLB_PATH}")
+        converter_instance = asset_converter.get_instance()
+        task = converter_instance.create_converter_task(
+            truck_glb_path,
+            truck_usd_path,
+            None,
+            context,
+        )
 
-            context = asset_converter.AssetConverterContext()
-            context.ignore_materials = False
-            context.export_preview_surface = True
-            context.use_meter_as_world_unit = True
+        while not task.is_finished():
+            omni.kit.app.get_app().update()
 
-            converter_instance = asset_converter.get_instance()
-            task = converter_instance.create_converter_task(
-                TRUCK_GLB_PATH,
-                TRUCK_USD_PATH,
-                None,
-                context,
-            )
-
-            while not task.is_finished():
-                omni.kit.app.get_app().update()
-
-            if task.get_status() != asset_converter.Status.SUCCESS:
-                print(f"[ERROR] Failed to convert GLB: {task.get_status()}")
-            else:
-                print(f"[INFO] GLB converted successfully to: {TRUCK_USD_PATH}")
-
-        # Load converted USD file.
-        if os.path.exists(TRUCK_USD_PATH):
-            if not stage.GetPrimAtPath(truck_prim_path).IsValid():
-                truck_prim = stage.DefinePrim(truck_prim_path, "Xform")
-
-                xform = UsdGeom.Xformable(truck_prim)
-                xform.AddTranslateOp().Set(Gf.Vec3d(4.14439, 6.72012, 1.0))
-                xform.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, 0.0))
-                xform.AddScaleOp().Set(Gf.Vec3f(100.0, 100.0, 100.0))
-
-                refs = truck_prim.GetReferences()
-                refs.AddReference(assetPath=TRUCK_USD_PATH)
-
-                print(f"[INFO] Loaded truck model at: {truck_prim_path}")
-            else:
-                print(f"[INFO] Truck already exists at: {truck_prim_path}")
+        if task.get_status() != asset_converter.Status.SUCCESS:
+            print(f"[ERROR] Failed to convert GLB: {task.get_status()}")
         else:
-            print(f"[WARN] Truck USD file not found: {TRUCK_USD_PATH}")
+            print(f"[INFO] GLB converted successfully to: {truck_usd_path}")
+
+    if truck_usd_path and os.path.exists(truck_usd_path):
+        if not stage.GetPrimAtPath(truck_prim_path).IsValid():
+            truck_prim = stage.DefinePrim(truck_prim_path, "Xform")
+
+            xform = UsdGeom.Xformable(truck_prim)
+            xform.AddTranslateOp().Set(Gf.Vec3d(4.14439, 6.72012, 1.0))
+            xform.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+            xform.AddScaleOp().Set(Gf.Vec3f(100.0, 100.0, 100.0))
+
+            refs = truck_prim.GetReferences()
+            refs.AddReference(assetPath=truck_usd_path)
+
+            print(f"[INFO] Loaded truck model at: {truck_prim_path}")
+        else:
+            print(f"[INFO] Truck already exists at: {truck_prim_path}")
     else:
-        print(f"[WARN] Truck GLB file not found: {TRUCK_GLB_PATH}")
+        print(f"[WARN] Truck USD file not found or disabled: {truck_usd_path or '[disabled]'}")
 
     # Reset world and initialize robot.
     world.reset()
     robot.initialize()
 
-    # -----------------------------------------------------------------
-    # TEMP TEST: force move excavator after world.reset() and robot.initialize()
-    # Sand center is around (0.0, 6.7). This puts the bucket near the sand.
-    # -----------------------------------------------------------------
-    ROBOT_INITIAL_POS_AFTER_RESET = np.array([-9.2, 6.7, 1.243], dtype=np.float32)
-    ROBOT_INITIAL_ORI_AFTER_RESET = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)  # wxyz quaternion
+    if args.force_test_pose:
+        robot_initial_pos_after_reset = np.array([-9.2, 6.7, 1.243], dtype=np.float32)
+        robot_initial_ori_after_reset = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        try:
+            robot.set_world_pose(
+                position=robot_initial_pos_after_reset,
+                orientation=robot_initial_ori_after_reset,
+            )
+            for _ in range(10):
+                world.step(render=True)
+                simulation_app.update()
 
-    try:
-        robot.set_world_pose(
-            position=ROBOT_INITIAL_POS_AFTER_RESET,
-            orientation=ROBOT_INITIAL_ORI_AFTER_RESET,
-        )
-        for _ in range(10):
-            world.step(render=True)
-            simulation_app.update()
-
-        print("[INFO] FORCE robot world pose after reset:", robot.get_world_pose(), flush=True)
-    except Exception as e:
-        print("[ERROR] Failed to force robot pose after reset:", repr(e), flush=True)
+            print("[INFO] FORCE robot world pose after reset:", robot.get_world_pose(), flush=True)
+        except Exception as e:
+            print("[ERROR] Failed to force robot pose after reset:", repr(e), flush=True)
 
 
     print("[INFO] World initialized")
@@ -462,42 +471,8 @@ def main():
     command_queue = queue.Queue()
     response_queue = queue.Queue()
 
-    async def read_json(reader):
-        header = await reader.readexactly(4)
-        n = struct.unpack("!I", header)[0]
-        data = await reader.readexactly(n)
-        return json.loads(data.decode("utf-8"))
-
-    async def write_json(writer, obj):
-        data = json.dumps(obj).encode("utf-8")
-        writer.write(struct.pack("!I", len(data)))
-        writer.write(data)
-        await writer.drain()
-
     def make_action_from_command(cmd):
-        has_pos = "joint_positions" in cmd and cmd["joint_positions"] is not None
-        has_vel = "joint_velocities" in cmd and cmd["joint_velocities"] is not None
-        has_eff = "joint_efforts" in cmd and cmd["joint_efforts"] is not None
-
-        if sum([has_pos, has_vel, has_eff]) > 1:
-            raise ValueError("Send only one of joint_positions, joint_velocities, joint_efforts per command.")
-
-        if has_pos:
-            return ArticulationAction(
-                joint_positions=np.asarray(cmd["joint_positions"], dtype=np.float32)
-            )
-
-        if has_vel:
-            return ArticulationAction(
-                joint_velocities=np.asarray(cmd["joint_velocities"], dtype=np.float32)
-            )
-
-        if has_eff:
-            return ArticulationAction(
-                joint_efforts=np.asarray(cmd["joint_efforts"], dtype=np.float32)
-            )
-
-        return None
+        return make_articulation_action(cmd, ArticulationAction, np)
 
     async def handle_client(reader, writer):
         peer = writer.get_extra_info("peername")
@@ -505,7 +480,7 @@ def main():
 
         try:
             while True:
-                cmd = await read_json(reader)
+                cmd = await async_read_json(reader)
 
                 command_queue.put(cmd)
 
@@ -513,7 +488,7 @@ def main():
                     await asyncio.sleep(0.001)
 
                 reply = response_queue.get()
-                await write_json(writer, reply)
+                await async_write_json(writer, reply)
 
         except asyncio.IncompleteReadError:
             print(f"[bridge] Client disconnected: {peer}")
@@ -545,6 +520,7 @@ def main():
     while simulation_app.is_running():
         if not command_queue.empty():
             cmd = command_queue.get()
+            validate_bridge_command(cmd)
 
             action = make_action_from_command(cmd)
             if action is not None:
@@ -574,21 +550,11 @@ def main():
 
             encoded_cameras = {}
             for camera_name, rgb in rgb_by_camera.items():
-                rgb = np.asarray(rgb)
-
-                if rgb.dtype != np.uint8:
-                    rgb = np.clip(rgb, 0, 255).astype(np.uint8)
-
-                if rgb.ndim == 3 and rgb.shape[-1] == 4:
-                    rgb = rgb[:, :, :3]
-
-                rgb_compressed = zlib.compress(rgb.tobytes(), level=1)
-                encoded_cameras[camera_name] = {
-                    "camera_path": active_camera_paths[camera_name],
-                    "rgb_shape": list(rgb.shape),
-                    "rgb_dtype": str(rgb.dtype),
-                    "rgb_zlib_b64": base64.b64encode(rgb_compressed).decode("ascii"),
-                }
+                encoded_cameras[camera_name] = encode_rgb_payload(
+                    rgb,
+                    np_module=np,
+                    camera_path=active_camera_paths[camera_name],
+                )
 
             primary_camera = (
                 "front" if "front" in encoded_cameras else next(iter(encoded_cameras))
@@ -618,9 +584,25 @@ def main():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ExcavatorVLA Standalone Launcher")
     parser.add_argument("--headless", action="store_true", help="Run in headless mode")
+    parser.add_argument("--scene", default=SCENE_USD_PATH, help="USD scene path. Defaults to the repo original scene.")
+    parser.add_argument(
+        "--truck-usd",
+        default=env_path("EXCAVATOR_TRUCK_USD", default_truck_usd_path(PROJECT_DIR)),
+        help="Dump truck USD path. Defaults to EXCAVATOR_TRUCK_USD or assets/fbx/truck/truck.usd.",
+    )
+    parser.add_argument(
+        "--truck-glb",
+        default=env_path("EXCAVATOR_TRUCK_GLB", ""),
+        help="Optional dump truck GLB path to convert when --truck-usd does not exist.",
+    )
+    parser.add_argument(
+        "--force-test-pose",
+        action="store_true",
+        help="Force the old debug robot pose after reset. Off by default.",
+    )
     args = parser.parse_args()
 
     if args.headless:
         print("[WARN] --headless was passed, but this version uses viewport capture and needs headless=False.")
 
-    main()
+    main(args)

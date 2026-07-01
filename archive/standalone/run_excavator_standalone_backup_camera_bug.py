@@ -16,12 +16,35 @@ import argparse
 import sys
 import os
 
-# Add the project path
+
+def find_project_root(start):
+    current = os.path.abspath(start)
+    while True:
+        if (
+            os.path.exists(os.path.join(current, "excavator_config.json"))
+            and os.path.isdir(os.path.join(current, "excavator_common"))
+        ):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            raise FileNotFoundError("Could not locate ExcavatorVLA project root from archived standalone launcher.")
+        current = parent
+
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_DIR = SCRIPT_DIR
+PROJECT_DIR = find_project_root(SCRIPT_DIR)
+if PROJECT_DIR not in sys.path:
+    sys.path.insert(0, PROJECT_DIR)
+
+from excavator_common.paths import (
+    default_scene_path,
+    default_truck_usd_path,
+    env_path,
+    resolve_existing_path,
+)
 
 # Scene and robot paths
-SCENE_USD_PATH = os.path.join(PROJECT_DIR, "assets/usd/excavator_scene.usd")
+SCENE_USD_PATH = default_scene_path(PROJECT_DIR)
 ROBOT_PRIM_PATH = "/World/URDF_real3"
 CAMERA_PARENT_PATH = "/World/URDF_real3/swing_link"
 CAMERA_PRIM_PATH = CAMERA_PARENT_PATH + "/Camera"
@@ -31,8 +54,14 @@ HOST = "0.0.0.0"
 PORT = 5555
 
 
-def main():
+def main(args=None):
     """Main entry point for standalone launch."""
+    if args is None:
+        args = argparse.Namespace(
+            scene=SCENE_USD_PATH,
+            truck_usd=env_path("EXCAVATOR_TRUCK_USD", default_truck_usd_path(PROJECT_DIR)),
+            truck_glb=env_path("EXCAVATOR_TRUCK_GLB", ""),
+        )
     
     # Import Isaac Sim modules (must be done after Isaac Sim Python env is set up)
     from isaacsim import SimulationApp
@@ -70,8 +99,13 @@ def main():
     print("=" * 60)
     print("ExcavatorVLA Standalone Launcher")
     print("=" * 60)
-    print(f"Scene USD: {SCENE_USD_PATH}")
+    scene_usd_path = resolve_existing_path(args.scene, root=PROJECT_DIR)
+    truck_usd_path = resolve_existing_path(args.truck_usd, root=PROJECT_DIR) if args.truck_usd else ""
+    truck_glb_path = resolve_existing_path(args.truck_glb, root=PROJECT_DIR) if args.truck_glb else ""
+    print(f"Scene USD: {scene_usd_path}")
     print(f"Robot Prim: {ROBOT_PRIM_PATH}")
+    print(f"Truck USD: {truck_usd_path or '[disabled]'}")
+    print(f"Truck GLB: {truck_glb_path or '[not set]'}")
     print(f"TCP Server: {HOST}:{PORT}")
     print("=" * 60)
     
@@ -79,15 +113,15 @@ def main():
     stage = get_current_stage()
     
     # Check if scene file exists
-    if not os.path.exists(SCENE_USD_PATH):
-        print(f"[ERROR] Scene file not found: {SCENE_USD_PATH}")
+    if not os.path.exists(scene_usd_path):
+        print(f"[ERROR] Scene file not found: {scene_usd_path}")
         print("Please ensure the excavator_scene.usd file exists.")
         simulation_app.close()
         return
     
     # Load the USD scene
-    add_reference_to_stage(usd_path=SCENE_USD_PATH, prim_path="/World")
-    print(f"[INFO] Loaded scene from: {SCENE_USD_PATH}")
+    add_reference_to_stage(usd_path=scene_usd_path, prim_path="/World")
+    print(f"[INFO] Loaded scene from: {scene_usd_path}")
     
     # Check if robot prim exists
     if not stage.GetPrimAtPath(ROBOT_PRIM_PATH).IsValid():
@@ -148,60 +182,51 @@ def main():
     )
     world.scene.add(robot)
     
-    # Load dump truck using GLB converter
-    TRUCK_GLB_PATH = "/root/Documents/trae_projects/vla_test/assets/glb/no-brand_dump_truck.glb"
-    TRUCK_USD_PATH = "/root/Documents/trae_projects/vla_test/assets/glb/no-brand_dump_truck.usd"
-    
-    if os.path.exists(TRUCK_GLB_PATH):
-        truck_prim_path = "/World/DumpTruck"
-        
-        # Convert GLB to USD if USD doesn't exist
-        if not os.path.exists(TRUCK_USD_PATH):
-            print(f"[INFO] Converting GLB to USD: {TRUCK_GLB_PATH}")
-            
-            # Create converter context
-            context = asset_converter.AssetConverterContext()
-            context.ignore_materials = False
-            context.export_preview_surface = True
-            context.use_meter_as_world_unit = True
-            
-            # Create converter task
-            converter_instance = asset_converter.get_instance()
-            task = converter_instance.create_converter_task(TRUCK_GLB_PATH, TRUCK_USD_PATH, None, context)
-            
-            # Wait for conversion to complete
-            import omni.kit.app
-            while not task.is_finished():
-                omni.kit.app.get_app().update()
-            
-            if task.get_status() != asset_converter.Status.SUCCESS:
-                print(f"[ERROR] Failed to convert GLB: {task.get_status()}")
-            else:
-                print(f"[INFO] GLB converted successfully to: {TRUCK_USD_PATH}")
-        
-        # Load the converted USD file
-        if os.path.exists(TRUCK_USD_PATH):
-            if not stage.GetPrimAtPath(truck_prim_path).IsValid():
-                # Define a new Xform prim for the truck
-                truck_prim = stage.DefinePrim(truck_prim_path, "Xform")
-                
-                # Set transform for the truck
-                xform = UsdGeom.Xformable(truck_prim)
-                xform.AddTranslateOp().Set(Gf.Vec3d(4.14439, 6.72012, 1.0))
-                xform.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, 0.0))
-                xform.AddScaleOp().Set(Gf.Vec3f(100.0, 100.0, 100.0))
-                
-                # Reference the converted USD file
-                refs = truck_prim.GetReferences()
-                refs.AddReference(assetPath=TRUCK_USD_PATH)
-                
-                print(f"[INFO] Loaded truck model at: {truck_prim_path}")
-            else:
-                print(f"[INFO] Truck already exists at: {truck_prim_path}")
+    # Load dump truck from checked-in USD by default. External GLB conversion is optional.
+    truck_prim_path = "/World/DumpTruck"
+    if truck_glb_path and truck_usd_path and os.path.exists(truck_glb_path) and not os.path.exists(truck_usd_path):
+        print(f"[INFO] Converting GLB to USD: {truck_glb_path}")
+
+        # Create converter context
+        context = asset_converter.AssetConverterContext()
+        context.ignore_materials = False
+        context.export_preview_surface = True
+        context.use_meter_as_world_unit = True
+
+        # Create converter task
+        converter_instance = asset_converter.get_instance()
+        task = converter_instance.create_converter_task(truck_glb_path, truck_usd_path, None, context)
+
+        # Wait for conversion to complete
+        import omni.kit.app
+        while not task.is_finished():
+            omni.kit.app.get_app().update()
+
+        if task.get_status() != asset_converter.Status.SUCCESS:
+            print(f"[ERROR] Failed to convert GLB: {task.get_status()}")
         else:
-            print(f"[WARN] Truck USD file not found: {TRUCK_USD_PATH}")
+            print(f"[INFO] GLB converted successfully to: {truck_usd_path}")
+
+    if truck_usd_path and os.path.exists(truck_usd_path):
+        if not stage.GetPrimAtPath(truck_prim_path).IsValid():
+            # Define a new Xform prim for the truck
+            truck_prim = stage.DefinePrim(truck_prim_path, "Xform")
+
+            # Set transform for the truck
+            xform = UsdGeom.Xformable(truck_prim)
+            xform.AddTranslateOp().Set(Gf.Vec3d(4.14439, 6.72012, 1.0))
+            xform.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+            xform.AddScaleOp().Set(Gf.Vec3f(100.0, 100.0, 100.0))
+
+            # Reference the converted USD file
+            refs = truck_prim.GetReferences()
+            refs.AddReference(assetPath=truck_usd_path)
+
+            print(f"[INFO] Loaded truck model at: {truck_prim_path}")
+        else:
+            print(f"[INFO] Truck already exists at: {truck_prim_path}")
     else:
-        print(f"[WARN] Truck GLB file not found: {TRUCK_GLB_PATH}")
+        print(f"[WARN] Truck USD file not found or disabled: {truck_usd_path or '[disabled]'}")
     
     # Ensure camera exists
     def ensure_camera_prim(stage, camera_path):
@@ -398,9 +423,20 @@ def main():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ExcavatorVLA Standalone Launcher")
     parser.add_argument("--headless", action="store_true", help="Run in headless mode")
+    parser.add_argument("--scene", default=SCENE_USD_PATH, help="USD scene path.")
+    parser.add_argument(
+        "--truck-usd",
+        default=env_path("EXCAVATOR_TRUCK_USD", default_truck_usd_path(PROJECT_DIR)),
+        help="Dump truck USD path. Defaults to EXCAVATOR_TRUCK_USD or assets/fbx/truck/truck.usd.",
+    )
+    parser.add_argument(
+        "--truck-glb",
+        default=env_path("EXCAVATOR_TRUCK_GLB", ""),
+        help="Optional dump truck GLB path to convert when --truck-usd does not exist.",
+    )
     args = parser.parse_args()
     
     if args.headless:
         print("[INFO] Running in headless mode")
     
-    main()
+    main(args)

@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 import argparse
-import base64
-import json
+import os
 import socket
-import struct
+import sys
 import time
-import zlib
 
 import numpy as np
 import torch
@@ -14,47 +12,29 @@ from transformers import AutoProcessor
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
 
-def recv_exact(sock, n):
-    chunks = []
-    remaining = n
-
-    while remaining > 0:
-        chunk = sock.recv(remaining)
-        if not chunk:
-            raise ConnectionError("Socket closed while receiving data")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-
-    return b"".join(chunks)
-
-
-def read_json(sock):
-    header = recv_exact(sock, 4)
-    n = struct.unpack("!I", header)[0]
-    data = recv_exact(sock, n)
-    return json.loads(data.decode("utf-8"))
+def find_project_root(start):
+    current = os.path.abspath(start)
+    while True:
+        if (
+            os.path.exists(os.path.join(current, "excavator_config.json"))
+            and os.path.isdir(os.path.join(current, "excavator_common"))
+        ):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        current = parent
 
 
-def write_json(sock, obj):
-    data = json.dumps(obj).encode("utf-8")
-    sock.sendall(struct.pack("!I", len(data)) + data)
+PROJECT_ROOT = find_project_root(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-
-def decode_rgb(reply):
-    shape = reply["rgb_shape"]
-    dtype = np.dtype(reply["rgb_dtype"])
-
-    raw = base64.b64decode(reply["rgb_zlib_b64"])
-    data = zlib.decompress(raw)
-    rgb = np.frombuffer(data, dtype=dtype).reshape(shape)
-
-    if rgb.ndim == 3 and rgb.shape[-1] == 4:
-        rgb = rgb[:, :, :3]
-
-    if rgb.dtype != np.uint8:
-        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
-
-    return rgb
+from excavator_common.bridge_protocol import (
+    decode_rgb_payload as decode_rgb,
+    read_json,
+    write_json,
+)
 
 
 def rgb_to_tensor(rgb, device):
@@ -215,8 +195,8 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5555)
 
-    parser.add_argument("--ckpt", default="/root/gpufree-data/checkpoints/smolvla_base")
-    parser.add_argument("--vlm", default="HuggingFaceTB/SmolVLM2-500M-Video-Instruct")
+    parser.add_argument("--ckpt", default=os.environ.get("SMOLVLA_CKPT", ""))
+    parser.add_argument("--vlm", default=os.environ.get("SMOLVLA_VLM", "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"))
 
     parser.add_argument("--task", default="dig the soil and load it into the truck")
 
@@ -253,6 +233,8 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("[INFO] device:", device)
+    if not args.ckpt:
+        raise SystemExit("--ckpt is required, or set SMOLVLA_CKPT.")
 
     print("[INFO] loading SmolVLA from:", args.ckpt)
     policy = SmolVLAPolicy.from_pretrained(args.ckpt)
@@ -421,4 +403,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

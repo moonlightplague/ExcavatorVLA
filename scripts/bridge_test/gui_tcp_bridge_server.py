@@ -13,10 +13,8 @@
 #   joint_positions, joint_velocities, rgb_shape, rgb_zlib_b64
 
 import asyncio
-import base64
-import json
-import struct
-import zlib
+import os
+import sys
 
 import numpy as np
 import omni.usd
@@ -27,6 +25,21 @@ from isaacsim.core.api.world import World
 from isaacsim.core.prims import SingleArticulation
 from isaacsim.core.utils.types import ArticulationAction
 from isaacsim.sensors.camera import Camera
+
+for _candidate in [
+    os.environ.get("EXCAVATOR_PROJECT_ROOT", ""),
+    "/isaac-sim/ExcavatorVLA",
+    os.getcwd(),
+]:
+    if _candidate and os.path.isdir(_candidate) and _candidate not in sys.path:
+        sys.path.insert(0, _candidate)
+
+from excavator_common.bridge_protocol import (
+    async_read_json,
+    async_write_json,
+    encode_rgb_payload,
+    make_articulation_action,
+)
 
 
 ROBOT_PRIM_PATH = "/World/URDF_real3"
@@ -63,43 +76,8 @@ def ensure_camera_prim(stage, camera_path):
     xform.AddRotateXYZOp().Set(Gf.Vec3f(90.0, 0.0, -90.0))
 
 
-async def read_json(reader):
-    header = await reader.readexactly(4)
-    n = struct.unpack("!I", header)[0]
-    data = await reader.readexactly(n)
-    return json.loads(data.decode("utf-8"))
-
-
-async def write_json(writer, obj):
-    data = json.dumps(obj).encode("utf-8")
-    writer.write(struct.pack("!I", len(data)))
-    writer.write(data)
-    await writer.drain()
-
-
 def make_action_from_command(cmd):
-    has_pos = "joint_positions" in cmd and cmd["joint_positions"] is not None
-    has_vel = "joint_velocities" in cmd and cmd["joint_velocities"] is not None
-    has_eff = "joint_efforts" in cmd and cmd["joint_efforts"] is not None
-
-    # Do not mix methods for the same command.
-    if sum([has_pos, has_vel, has_eff]) > 1:
-        raise ValueError("Send only one of joint_positions, joint_velocities, joint_efforts per command.")
-
-    if has_pos:
-        return ArticulationAction(
-            joint_positions=np.asarray(cmd["joint_positions"], dtype=np.float32)
-        )
-    if has_vel:
-        return ArticulationAction(
-            joint_velocities=np.asarray(cmd["joint_velocities"], dtype=np.float32)
-        )
-    if has_eff:
-        return ArticulationAction(
-            joint_efforts=np.asarray(cmd["joint_efforts"], dtype=np.float32)
-        )
-
-    return None
+    return make_articulation_action(cmd, ArticulationAction, np)
 
 
 async def handle_client(reader, writer):
@@ -110,7 +88,7 @@ async def handle_client(reader, writer):
 
     try:
         while True:
-            cmd = await read_json(reader)
+            cmd = await async_read_json(reader)
 
             action = make_action_from_command(cmd)
             if action is not None:
@@ -135,17 +113,13 @@ async def handle_client(reader, writer):
             if rgb.ndim == 3 and rgb.shape[-1] == 4:
                 rgb = rgb[:, :, :3]
 
-            rgb_compressed = zlib.compress(rgb.tobytes(), level=1)
-
             reply = {
                 "joint_positions": q.tolist(),
                 "joint_velocities": qd.tolist(),
-                "rgb_shape": list(rgb.shape),
-                "rgb_dtype": str(rgb.dtype),
-                "rgb_zlib_b64": base64.b64encode(rgb_compressed).decode("ascii"),
             }
+            reply.update(encode_rgb_payload(rgb, np_module=np, camera_path=CAMERA_PRIM_PATH))
 
-            await write_json(writer, reply)
+            await async_write_json(writer, reply)
 
     except asyncio.IncompleteReadError:
         print("[bridge] client disconnected:", peer)

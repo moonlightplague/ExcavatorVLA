@@ -7,14 +7,22 @@
 #   python 04_gui_client.py --host 127.0.0.1 --port 5555
 
 import argparse
-import base64
-import json
+import os
 import socket
-import struct
-import zlib
+import sys
 
 import numpy as np
 import pygame
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from excavator_common.bridge_protocol import (
+    decode_camera_images,
+    read_json as recv_json,
+    write_json as send_json,
+)
 
 JOINT_NAMES = ["swing", "boom", "arm", "bucket"]
 JOINT_LIMITS = {
@@ -27,6 +35,11 @@ DEFAULT_JOINTS = [0.0, 0.3, -0.2, 0.3]
 STEP = 0.05
 
 CAMERA_NAMES = ["left", "front", "right"]
+CAMERA_ALIASES = {
+    "left": ("left", "0"),
+    "front": ("front", "1"),
+    "right": ("right", "2"),
+}
 CAMERA_W, CAMERA_H = 320, 240
 RGB_W, RGB_H = CAMERA_W * len(CAMERA_NAMES), CAMERA_H
 PANEL_H = 180
@@ -43,52 +56,6 @@ BTN = (60, 60, 70)
 BTN_HOVER = (90, 90, 105)
 ACCENT = (80, 160, 255)
 ERR = (220, 80, 80)
-
-
-def send_json(sock, obj):
-    data = json.dumps(obj).encode("utf-8")
-    sock.sendall(struct.pack("!I", len(data)))
-    sock.sendall(data)
-
-
-def recv_exact(sock, n):
-    chunks = []
-    remaining = n
-    while remaining > 0:
-        chunk = sock.recv(remaining)
-        if not chunk:
-            raise ConnectionError("Socket closed")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
-
-
-def recv_json(sock):
-    header = recv_exact(sock, 4)
-    n = struct.unpack("!I", header)[0]
-    data = recv_exact(sock, n)
-    return json.loads(data.decode("utf-8"))
-
-
-def decode_camera_rgb(camera_payload):
-    raw = zlib.decompress(base64.b64decode(camera_payload["rgb_zlib_b64"]))
-    arr = np.frombuffer(raw, dtype=np.uint8)
-    return arr.reshape(camera_payload["rgb_shape"])
-
-
-def decode_rgb(reply):
-    return decode_camera_rgb(reply)
-
-
-def decode_camera_images(reply):
-    cameras = reply.get("cameras")
-    if not isinstance(cameras, dict):
-        return {"front": decode_rgb(reply)}
-
-    decoded = {}
-    for camera_name, camera_payload in cameras.items():
-        decoded[camera_name] = decode_camera_rgb(camera_payload)
-    return decoded
 
 
 def clamp_joint(name, value):
@@ -219,7 +186,11 @@ class GuiClient:
             rect = pygame.Rect(x, 0, CAMERA_W, CAMERA_H)
             pygame.draw.rect(surf, (12, 12, 16), rect)
 
-            camera_surface = self.camera_surfaces.get(camera_name)
+            camera_surface = None
+            for key in CAMERA_ALIASES.get(camera_name, (camera_name,)):
+                camera_surface = self.camera_surfaces.get(key)
+                if camera_surface is not None:
+                    break
             if camera_surface is not None:
                 surf.blit(camera_surface, rect.topleft)
             else:

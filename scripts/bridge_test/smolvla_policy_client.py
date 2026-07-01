@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 import argparse
-import base64
 import json
+import os
 import socket
-import struct
+import sys
 import time
-import zlib
 from pathlib import Path
 
 import numpy as np
@@ -14,55 +13,16 @@ import torch.nn.functional as F
 from transformers import AutoProcessor
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-def recv_exact(sock, n):
-    chunks = []
-    remaining = n
-    while remaining > 0:
-        chunk = sock.recv(remaining)
-        if not chunk:
-            raise ConnectionError("Socket closed while receiving data")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
-
-
-def read_json(sock):
-    header = recv_exact(sock, 4)
-    n = struct.unpack("!I", header)[0]
-    data = recv_exact(sock, n)
-    return json.loads(data.decode("utf-8"))
-
-
-def write_json(sock, obj):
-    data = json.dumps(obj).encode("utf-8")
-    sock.sendall(struct.pack("!I", len(data)))
-    sock.sendall(data)
-
-
-def decode_rgb(reply):
-    """
-    Decode RGB image from bridge reply.
-
-    Expected reply fields:
-      rgb_shape
-      rgb_dtype
-      rgb_zlib_b64
-    """
-    shape = reply["rgb_shape"]
-    dtype = np.dtype(reply["rgb_dtype"])
-
-    raw = base64.b64decode(reply["rgb_zlib_b64"])
-    data = zlib.decompress(raw)
-    rgb = np.frombuffer(data, dtype=dtype).reshape(shape)
-
-    if rgb.ndim == 3 and rgb.shape[-1] == 4:
-        rgb = rgb[:, :, :3]
-
-    if rgb.dtype != np.uint8:
-        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
-
-    return rgb
+from excavator_common.bridge_protocol import (
+    decode_camera_images,
+    decode_rgb_payload as decode_rgb,
+    read_json,
+    write_json,
+)
 
 
 def rgb_to_tensor(rgb, device):
@@ -227,11 +187,11 @@ def main():
 
     parser.add_argument(
         "--ckpt",
-        default="/root/gpufree-data/outputs/train/excavator_smolvla_debug/checkpoints/000005/pretrained_model",
+        default=os.environ.get("SMOLVLA_CKPT", ""),
     )
     parser.add_argument(
         "--vlm",
-        default="/root/gpufree-data/checkpoints/SmolVLM2-500M-Video-Instruct",
+        default=os.environ.get("SMOLVLA_VLM", ""),
     )
 
     parser.add_argument(
@@ -248,6 +208,10 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("[INFO] device:", device)
+    if not args.ckpt:
+        raise SystemExit("--ckpt is required, or set SMOLVLA_CKPT.")
+    if not args.vlm:
+        raise SystemExit("--vlm is required, or set SMOLVLA_VLM.")
 
     print("[INFO] checkpoint:", args.ckpt)
     print("[INFO] local VLM:", args.vlm)
@@ -279,14 +243,18 @@ def main():
             reply = read_json(sock)
 
             rgb = decode_rgb(reply)
-            image = rgb_to_tensor(rgb, device)
+            camera_rgbs = decode_camera_images(reply, np_module=np)
+            rgb0 = camera_rgbs.get("0", rgb)
+            rgb1 = camera_rgbs.get("1", rgb)
+            image0 = rgb_to_tensor(rgb0, device)
+            image1 = rgb_to_tensor(rgb1, device)
             state = make_state(reply, device)
 
             batch = {
                 # Match training dataset keys
                 "observation.state": state,
-                "observation.images.0": image,
-                "observation.images.1": image,
+                "observation.images.0": image0,
+                "observation.images.1": image1,
                 # "observation.images.2": image,
 
                 # Raw task string used by LeRobot preprocessor-style pipelines
@@ -319,7 +287,8 @@ def main():
                 f"action={action.detach().cpu().numpy().round(4).tolist()} "
                 f"vel={vel.round(4).tolist()} "
                 f"state={state.detach().cpu().numpy().round(3).tolist()} "
-                f"rgb_mean={float(rgb.mean()):.2f}"
+                f"rgb_mean={float(rgb.mean()):.2f} "
+                f"cameras={sorted(camera_rgbs.keys())}"
             )
 
             time.sleep(args.sleep)

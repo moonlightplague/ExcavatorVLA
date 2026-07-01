@@ -1,4 +1,5 @@
 import math
+import os
 import random
 import time
 import builtins
@@ -268,6 +269,16 @@ Y_VALUES = None
 CELL_AREA = None
 
 
+def env_bool(name, default=False):
+    value = os.environ.get(str(name), "")
+    if value == "":
+        return bool(default)
+    return str(value).strip().lower() not in ("0", "false", "no", "off", "none")
+
+
+NO_UI = env_bool("EXCAVATOR_NO_UI", False) or env_bool("EXCAVATOR_HEADLESS", False)
+
+
 def info(*args):
     print("[INFO]", *args)
 
@@ -454,6 +465,26 @@ def recompute_derived_scene_params():
     UNLOAD_BIN_WALL_THICKNESS = clamp_value(UNLOAD_BIN_WALL_THICKNESS, 0.02, 0.40)
     UNLOAD_BIN_WALL_HEIGHT = clamp_value(UNLOAD_BIN_WALL_HEIGHT, 0.10, 2.50)
     UNLOAD_BIN_FLOOR_THICKNESS = clamp_value(UNLOAD_BIN_FLOOR_THICKNESS, 0.04, 0.50)
+
+
+def apply_initial_env_parameters():
+    global SAND_AMOUNT_MULTIPLIER, SANDBOX_FILL_HEIGHT
+
+    raw_amount = os.environ.get("EXCAVATOR_SAND_AMOUNT", "")
+    if raw_amount:
+        try:
+            SAND_AMOUNT_MULTIPLIER = clamp_sand_amount(float(raw_amount))
+            SANDBOX_FILL_HEIGHT = sand_height_from_amount(SAND_AMOUNT_MULTIPLIER)
+            info(
+                "[SAND CONFIG]",
+                f"amount={SAND_AMOUNT_MULTIPLIER:.3f}x",
+                f"fill_height={SANDBOX_FILL_HEIGHT:.3f}",
+                "source=EXCAVATOR_SAND_AMOUNT",
+            )
+        except Exception as exc:
+            info("[WARN] invalid EXCAVATOR_SAND_AMOUNT:", raw_amount, type(exc).__name__, exc)
+
+    recompute_derived_scene_params()
 
 
 def derive_stable_particle_params(layer_spacing_z=None):
@@ -2881,6 +2912,7 @@ def apply_auto_scene_parameters(
     rebuild=False,
 ):
     global SAND_CENTER_X, SAND_CENTER_Y, PILE_CENTER_X, PILE_CENTER_Y
+    global SANDBOX_FILL_HEIGHT
     global WALL_CENTER_X, WALL_CENTER_Y, SAND_SOURCE_SELECTED_PATH, SAND_SOURCE_SELECTED_FACE_COUNT
     global SAND_SOURCE_TOTAL_PROJECTED_FACE_COUNT, SAND_SOURCE_RAW_FACE_POLYGONS_XY, SAND_SOURCE_FACE_POLYGONS_XY
     global SAND_SOURCE_SELECTED_HULL_XY, SAND_SOURCE_POLYGON_XY, SAND_AMOUNT_MULTIPLIER
@@ -2913,6 +2945,7 @@ def apply_auto_scene_parameters(
         if abs(amount - float(SAND_AMOUNT_MULTIPLIER)) > 1.0e-4:
             changed = True
         SAND_AMOUNT_MULTIPLIER = amount
+        SANDBOX_FILL_HEIGHT = sand_height_from_amount(SAND_AMOUNT_MULTIPLIER)
 
     if unload_center_xy is not None:
         arr = np.array(unload_center_xy, dtype=np.float32).reshape(-1)[:2]
@@ -3798,6 +3831,13 @@ def build_ui():
         pass
 
 
+# Isaac Sim Script Editor workflow imports/reloads this module as the sand-site
+# entrypoint, so scene construction and UI startup intentionally happen at
+# import time.
+apply_initial_env_parameters()
 apply_sand_fidelity_to_particle_globals(SAND_FIDELITY, announce=False)
 build_sand_site()
-build_ui()
+if NO_UI:
+    info("[SAND SITE] UI disabled by EXCAVATOR_NO_UI/EXCAVATOR_HEADLESS")
+else:
+    build_ui()

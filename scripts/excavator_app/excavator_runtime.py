@@ -9842,6 +9842,9 @@ def sand_carry_runtime_recovery_target(stage_name, q_real, q_goal, recovery_coun
     best_q = None
     best_detail = None
     best_score = -1.0e9
+    best_closing_q = None
+    best_closing_detail = None
+    best_closing_score = -1.0e9
     for boom_step_deg, arm_step_deg, bucket_step_deg, source in candidates:
         q = q_real.copy()
         q[boom_idx] = float(q[boom_idx]) + deg_to_rad(float(boom_step_deg) * scale)
@@ -9900,6 +9903,14 @@ def sand_carry_runtime_recovery_target(stage_name, q_real, q_goal, recovery_coun
         }
         if bool((carry_report or {}).get("gravity_carry_closed_ok", False)):
             return q, detail
+        closes_bucket = bool(
+            float(detail.get("bucket_step_deg", 0.0) or 0.0) > 0.25
+            and not bucket_is_dump_branch_for_carry(float(detail.get("bucket_target_deg", 999.0) or 999.0))
+        )
+        if closes_bucket and score > best_closing_score:
+            best_closing_q = q
+            best_closing_detail = detail
+            best_closing_score = score
         if score > best_score:
             best_q = q
             best_detail = detail
@@ -9910,6 +9921,11 @@ def sand_carry_runtime_recovery_target(stage_name, q_real, q_goal, recovery_coun
                 best_detail["accepted_despite_score_drop"] = True
                 best_detail["accept_reason"] = "carry_recovery_unblock_score_override"
                 return best_q, best_detail
+            if best_closing_q is not None:
+                best_closing_detail["accepted_despite_score_drop"] = True
+                best_closing_detail["accept_reason"] = "bucket_close_priority_score_warning"
+                best_closing_detail["carry_score_best_nonworse_candidate"] = float(best_score)
+                return best_closing_q, best_closing_detail
             else:
                 failures.append({
                     "source": str(best_detail.get("source", "best_safe_candidate")),
@@ -22311,6 +22327,8 @@ def carry_hold_adjusted_q(q_pose, q_reference=None, end_effector="load", max_buc
             "score": float(score),
         }
         rows.append(row)
+        if dump_branch:
+            continue
         if bucket_flip_rejected:
             continue
         if best is None or row["score"] < best["score"]:
@@ -26243,9 +26261,11 @@ def force_loaded_carry_bucket_q(q_pose, reference=None, label=""):
             return q_adjusted.copy()
     except Exception:
         pass
-    q = clip_command_near(q, reference=q_ref)
-    q, _limited, _old_bucket_deg = apply_loaded_bucket_closed_limit(q, label=label)
-    return q
+    # Fallback must still be a carrying pose. The old clamp only limited angles
+    # beyond -120deg and could leave a +dump-branch bucket untouched, which could
+    # empty the bucket during secure_carry_safe before lift/unload.
+    q = set_bucket_loaded_carry_joint(q, reference=q_ref)
+    return CTRL.clip_limits(q)
 
 
 def mode_requires_loaded_carry_bucket(mode, label=""):
@@ -26652,6 +26672,15 @@ def staged_carry_safe_projection_candidates(q_start):
             carry_report = dict(carry_report)
             carry_report["forced_loaded_carry_report"] = forced_report
         actual_report = carry_material_report_for_q(q, end_effector="load")
+        bucket_deg = rad_to_deg(float(q[CTRL.name_to_idx.get("bucket", 3)]))
+        if bucket_is_dump_branch_for_carry(bucket_deg):
+            rows.append({
+                "ok": False,
+                "reason": f"carry_projection_dump_branch_rejected:bucket={bucket_deg:.2f}deg",
+                "carry_report": carry_report,
+                "actual_report": actual_report,
+            })
+            continue
         retains_material = bool((carry_report or {}).get("retains_material", False)) and bool(
             actual_report.get("retains_material", False)
         )
@@ -26768,6 +26797,16 @@ def staged_lift_candidates(q_start):
             carry_report = dict(carry_report)
             carry_report["forced_loaded_carry_report"] = forced_report
             carry_report["adjusted_actual_report"] = adjusted_report
+        bucket_deg = rad_to_deg(float(q[bucket_idx]))
+        if bucket_is_dump_branch_for_carry(bucket_deg):
+            rows.append({
+                "ok": False,
+                "q": q,
+                "reason": f"lift_candidate_dump_branch_rejected:bucket={bucket_deg:.2f}deg",
+                "carry_report": carry_report,
+                "loaded_now": int(loaded_now),
+            })
+            continue
         if not bool((carry_report or {}).get("ok", False)):
             continue
         retains_material = bool((carry_report or {}).get("retains_material", False))

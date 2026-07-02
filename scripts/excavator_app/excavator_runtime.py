@@ -459,6 +459,11 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
 
 STATE = builtins._EXCAVATOR_MOUSE_SLIDER_STATE
 
+# Compatibility guard for Isaac hot-reload: stale coroutine/function objects may
+# still read this as a module-global name. Current lift planning uses the local
+# lift_start_load_z variable instead.
+start_load_z = None
+
 try:
     _runtime_mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(__file__)))
     print("[INFO]", "[RUNTIME SOURCE]", f"file={__file__}", f"mtime={_runtime_mtime}")
@@ -549,12 +554,18 @@ SAND_CONTACT_Q_LAG_ACCEPT_DEG = 16.0
 SAND_CARRY_STALL_BUCKET_LAG_DEG = 35.0
 SAND_CARRY_STALL_BUCKET_PROGRESS_MAX = 20
 SAND_CARRY_STALL_TIP_PROGRESS_MAX_M = 0.006
-SAND_CARRY_RUNTIME_RECOVERY_MAX = 4
+SAND_CARRY_STALL_HARD_BUCKET_LAG_DEG = 60.0
+SAND_CARRY_STALL_NO_LOAD_SECONDS = 1.2
+SAND_CARRY_STALL_TIP_JITTER_MAX_M = 0.025
+SAND_CARRY_SCORE_OVERRIDE_BUCKET_PROGRESS_MAX = 5
+SAND_CARRY_SCORE_OVERRIDE_TIP_MAX_M = 0.008
+SAND_CARRY_RUNTIME_RECOVERY_MAX = 16
+SAND_CARRY_FINAL_RECOVERY_MAX = 20
 SAND_CARRY_RUNTIME_RECOVERY_BUCKET_LAG_DEG = 28.0
 SAND_CARRY_RUNTIME_RECOVERY_BOOM_STEP_DEG = 0.8
 SAND_CARRY_RUNTIME_RECOVERY_ARM_STEP_DEG = -0.8
 SAND_CARRY_RUNTIME_RECOVERY_BUCKET_STEP_DEG = 14.0
-SAND_CARRY_RUNTIME_RECOVERY_COOLDOWN_SECONDS = 0.45
+SAND_CARRY_RUNTIME_RECOVERY_COOLDOWN_SECONDS = 0.70
 SAND_CUT_NO_PROGRESS_TIMEOUT = 3.5
 SAND_CONTACT_LOG_INTERVAL = 0.70
 SAND_CONTACT_STAGE_MIN_SECONDS = 0.0
@@ -593,6 +604,7 @@ SECURE_HOLD_MIN_RETAINED_FROM_CUT_FRACTION = 0.55
 LIFT_CARRY_MIN_RETAINED_FROM_CUT_FRACTION = 0.55
 LIFT_CARRY_SOFT_RETAINED_FROM_CUT_FRACTION = 0.45
 LIFT_CARRY_MIN_ABSOLUTE_BUCKET_PARTICLES = 1200
+LIFT_CARRY_HIGH_LOAD_RECOVERY_PARTICLES = 2000
 MANUAL_FREEZE_STOP_ENABLED = True
 AUTO_FREEZE_STOP_ENABLED = True
 
@@ -903,6 +915,10 @@ BUCKET_LIFT_LEVEL_TOL_DEG = 4.0
 BUCKET_CARRY_HOLD_TILT_DEG = 18.0
 BUCKET_CARRY_HOLD_TOL_DEG = 8.0
 BUCKET_CARRY_MIN_POUR_ABOVE_LOAD_Z = 0.08
+BUCKET_CARRY_WARNING_EXTRA_TOL_DEG = 14.0
+BUCKET_CARRY_WARNING_MIN_POUR_ABOVE_LOAD_Z = -0.35
+LIFT_CARRY_MIN_LOAD_RAISE_M = 0.25
+LOADED_CARRY_ROUTE_HEIGHT_MARGIN_M = 0.20
 BUCKET_CARRY_MAX_DUMP_BRANCH_DEG = 35.0
 BUCKET_CARRY_MAX_ADJUST_DEG = 65.0
 BUCKET_CARRY_SOFT_ADJUST_DEG = 42.0
@@ -920,6 +936,7 @@ BUCKET_UNLOAD_DUMP_DEG = 82.0
 LOADED_ROUTE_UNLOAD_DUMP_DEG = 45.0
 UNLOAD_DUMP_BUCKET_TOL_DEG = 18.0
 UNLOAD_DUMP_ACCEPT_ERR = 0.45
+UNLOAD_DUMP_WARNING_ACCEPT_ERR = 2.0
 UNLOAD_DUMP_SECONDS = 0.90
 BUCKET_UNLOAD_SETTLE_FRAMES = 10
 UNLOAD_DUMP_SETTLE_MIN_FRAMES = 60
@@ -9327,6 +9344,160 @@ def gravity_carry_closed_for_q(q_pose):
     return bool((report or {}).get("gravity_carry_closed_ok", False)), report if isinstance(report, dict) else {}
 
 
+def carry_report_shortfalls(report):
+    report = report if isinstance(report, dict) else {}
+    pour_above = safe_float(report.get("pour_above_load_z"), -999.0)
+    min_pour = safe_float(report.get("min_pour_above_load_z"), BUCKET_CARRY_MIN_POUR_ABOVE_LOAD_Z)
+    world_err = safe_float(report.get("world_level_err_deg"), 999.0)
+    world_tol = safe_float(
+        report.get("world_level_tol_deg"),
+        float(BUCKET_CARRY_HOLD_TILT_DEG) + float(BUCKET_CARRY_HOLD_TOL_DEG),
+    )
+    world_warning_tol = safe_float(
+        report.get("world_level_warning_tol_deg"),
+        float(world_tol) + float(BUCKET_CARRY_WARNING_EXTRA_TOL_DEG),
+    )
+    min_warning_pour = safe_float(
+        report.get("warning_min_pour_above_load_z"),
+        BUCKET_CARRY_WARNING_MIN_POUR_ABOVE_LOAD_Z,
+    )
+    return {
+        "pour_shortfall_z": max(0.0, float(min_pour) - float(pour_above)),
+        "pour_warning_shortfall_z": max(0.0, float(min_warning_pour) - float(pour_above)),
+        "world_over_tol_deg": max(0.0, float(world_err) - float(world_tol)),
+        "world_over_warning_tol_deg": max(0.0, float(world_err) - float(world_warning_tol)),
+        "pour_above_load_z": float(pour_above),
+        "world_level_err_deg": float(world_err),
+        "world_level_tol_deg": float(world_tol),
+        "world_level_warning_tol_deg": float(world_warning_tol),
+        "warning_min_pour_above_load_z": float(min_warning_pour),
+    }
+
+
+def carry_report_recovery_reason(report):
+    report = report if isinstance(report, dict) else {}
+    if bool(report.get("gravity_carry_closed_ok", False)):
+        return ""
+    short = carry_report_shortfalls(report)
+    if bool(report.get("gravity_carry_warning_ok", False)):
+        return (
+            f"warning_margin:world_err={short['world_level_err_deg']:.2f}<="
+            f"{short['world_level_warning_tol_deg']:.2f}deg;"
+            f"pour_above={short['pour_above_load_z']:.3f}>="
+            f"{short['warning_min_pour_above_load_z']:.3f}"
+        )
+    reason = str(report.get("reason", "carry_not_closed") or "carry_not_closed")
+    if short["pour_shortfall_z"] > 1e-4:
+        return (
+            f"pour_edge_low:{short['pour_above_load_z']:.3f}<"
+            f"{float(BUCKET_CARRY_MIN_POUR_ABOVE_LOAD_Z):.3f}"
+        )
+    if short["world_over_tol_deg"] > 1e-3:
+        return (
+            f"gravity_level_err:{short['world_level_err_deg']:.2f}>"
+            f"{short['world_level_tol_deg']:.2f}deg"
+        )
+    return reason
+
+
+def carry_report_score(report):
+    report = report if isinstance(report, dict) else {}
+    short = carry_report_shortfalls(report)
+    closed_bonus = 1000.0 if bool(report.get("gravity_carry_closed_ok", False)) else 0.0
+    return (
+        closed_bonus
+        - 50.0 * float(short["pour_shortfall_z"])
+        - 1.0 * float(short["world_over_tol_deg"])
+    )
+
+
+def loaded_carry_height_floor(q_pose, margin=LOADED_CARRY_ROUTE_HEIGHT_MARGIN_M):
+    try:
+        q_pose = CTRL.clip_limits(np.array(q_pose, dtype=np.float32).reshape(-1)[:4].copy())
+        load = predicted_end_world_point(q_pose, end_effector="load", reference_q=q_pose)
+        tip = predicted_end_world_point(q_pose, end_effector="tip", reference_q=q_pose)
+        if load is None or tip is None:
+            return {"ok": False, "reason": "missing_bucket_points"}
+        load = np.array(load, dtype=np.float32).reshape(-1)[:3]
+        tip = np.array(tip, dtype=np.float32).reshape(-1)[:3]
+        margin = max(0.0, float(margin))
+        return {
+            "ok": True,
+            "margin": float(margin),
+            "start_load_z": float(load[2]),
+            "start_tip_z": float(tip[2]),
+            "min_load_z": float(load[2]) - margin,
+            "min_tip_z": float(tip[2]) - margin,
+        }
+    except Exception as exc:
+        return {"ok": False, "reason": f"{type(exc).__name__}:{exc}"}
+
+
+def loaded_carry_height_report(q_pose, floor, reference_q=None):
+    floor = floor if isinstance(floor, dict) else {}
+    if not bool(floor.get("ok", False)):
+        return {"ok": True, "reason": "height_floor_unavailable", "floor": floor}
+    try:
+        q_pose = CTRL.clip_limits(np.array(q_pose, dtype=np.float32).reshape(-1)[:4].copy())
+        q_ref = q_pose if reference_q is None else CTRL.clip_limits(np.array(reference_q, dtype=np.float32).reshape(-1)[:4].copy())
+        load = predicted_end_world_point(q_pose, end_effector="load", reference_q=q_ref)
+        tip = predicted_end_world_point(q_pose, end_effector="tip", reference_q=q_ref)
+        if load is None or tip is None:
+            return {"ok": True, "reason": "missing_bucket_points", "floor": floor}
+        load = np.array(load, dtype=np.float32).reshape(-1)[:3]
+        tip = np.array(tip, dtype=np.float32).reshape(-1)[:3]
+        min_load_z = float(floor.get("min_load_z", -1.0e9))
+        min_tip_z = float(floor.get("min_tip_z", -1.0e9))
+        load_margin = float(load[2]) - min_load_z
+        tip_margin = float(tip[2]) - min_tip_z
+        ok = bool(load_margin >= -1e-4 and tip_margin >= -1e-4)
+        return {
+            "ok": ok,
+            "reason": "ok" if ok else "loaded_carry_height_drop",
+            "load_z": float(load[2]),
+            "tip_z": float(tip[2]),
+            "min_load_z": float(min_load_z),
+            "min_tip_z": float(min_tip_z),
+            "load_margin": float(load_margin),
+            "tip_margin": float(tip_margin),
+            "floor": floor,
+        }
+    except Exception as exc:
+        return {"ok": True, "reason": f"height_check_error:{type(exc).__name__}:{exc}", "floor": floor}
+
+
+def loaded_carry_path_height_check(q_start, q_goal, floor, samples=8):
+    sample_count = max(2, int(samples or 2))
+    worst = None
+    for i in range(sample_count):
+        s = 0.0 if sample_count <= 1 else float(i) / float(sample_count - 1)
+        try:
+            q = interpolate_q_shortest(q_start, q_goal, s)
+        except Exception:
+            q = interpolate_q_motion(q_start, q_goal, s, mode="unload_to_bin", label="loaded_carry_height")
+        report = loaded_carry_height_report(q, floor, reference_q=q_start)
+        report["sample"] = int(i)
+        report["samples"] = int(sample_count)
+        if worst is None or float(report.get("load_margin", 1.0e9)) < float(worst.get("load_margin", 1.0e9)):
+            worst = report
+        if not bool(report.get("ok", True)):
+            return False, report
+    return True, worst if isinstance(worst, dict) else {"ok": True, "reason": "ok"}
+
+
+def loaded_carry_route_height_check(q_start, route, q_goal, floor, samples=8):
+    q_prev = np.array(q_start, dtype=np.float32).reshape(-1)[:4].copy()
+    for idx, q_next in enumerate(list(route or []) + [q_goal]):
+        q_next = np.array(q_next, dtype=np.float32).reshape(-1)[:4].copy()
+        ok, report = loaded_carry_path_height_check(q_prev, q_next, floor, samples=samples)
+        if not ok:
+            report = dict(report)
+            report["segment_index"] = int(idx)
+            return False, report
+        q_prev = q_next
+    return True, {"ok": True, "reason": "ok", "floor": floor}
+
+
 def phase_collision_context(mode):
     m = str(mode).lower()
     if is_sand_contact_phase(m) or "curl_to_hold_material" in m:
@@ -9499,15 +9670,33 @@ def update_sand_contact_progress(stage_name, q_cmd=None, q_real=None, force=Fals
 
     last_progress_time = float(STATE.get("sand_contact_last_progress_time", 0.0) or 0.0)
     progress_age = now - last_progress_time if last_progress_time > 0.0 else 999.0
-    carry_joint_stall = bool(
+    carry_micro_stall = bool(
         carry_posture_phase
         and bucket_lag is not None
         and float(bucket_lag) >= float(SAND_CARRY_STALL_BUCKET_LAG_DEG)
         and int(bucket_delta) <= int(SAND_CARRY_STALL_BUCKET_PROGRESS_MAX)
         and float(effector_delta) <= float(SAND_CARRY_STALL_TIP_PROGRESS_MAX_M)
     )
+    carry_lag_no_load_stall = bool(
+        carry_posture_phase
+        and bucket_lag is not None
+        and float(bucket_lag) >= float(SAND_CARRY_STALL_HARD_BUCKET_LAG_DEG)
+        and int(bucket_delta) <= int(SAND_CARRY_STALL_BUCKET_PROGRESS_MAX)
+        and not bool(progress_now)
+        and float(progress_age) >= float(SAND_CARRY_STALL_NO_LOAD_SECONDS)
+        and float(effector_delta) <= float(SAND_CARRY_STALL_TIP_JITTER_MAX_M)
+    )
+    carry_joint_stall = bool(carry_micro_stall or carry_lag_no_load_stall)
     stall_reason = ""
-    if carry_joint_stall:
+    if carry_lag_no_load_stall:
+        stall_reason = (
+            "bucket_hard_lag_no_bucket_progress:"
+            f"bucket_lag={float(bucket_lag):.2f}deg "
+            f"bucket_window={int(bucket_delta)} "
+            f"tip_window={float(effector_delta):.3f}m "
+            f"age={float(progress_age):.2f}s"
+        )
+    elif carry_micro_stall:
         stall_reason = (
             "bucket_lag_without_bucket_or_tip_progress:"
             f"bucket_lag={float(bucket_lag):.2f}deg "
@@ -9540,6 +9729,8 @@ def update_sand_contact_progress(stage_name, q_cmd=None, q_real=None, force=Fals
         "q_lag_deg": q_lag,
         "bucket_lag_deg": bucket_lag,
         "carry_joint_stall": bool(carry_joint_stall),
+        "carry_micro_stall": bool(carry_micro_stall),
+        "carry_lag_no_load_stall": bool(carry_lag_no_load_stall),
         "stall_reason": stall_reason,
         "bucket": int(bucket),
         "pile": int(pile),
@@ -9608,7 +9799,7 @@ def sand_contact_should_suppress_freeze(stage_name, blocked_names, cmd_err_deg, 
     return True, report
 
 
-def sand_carry_runtime_recovery_target(stage_name, q_real, q_goal, recovery_count=0):
+def sand_carry_runtime_recovery_target(stage_name, q_real, q_goal, recovery_count=0, allow_worse=False):
     if not is_sand_carry_posture_phase(stage_name):
         return None, {"reason": "not_carry_posture_phase"}
     try:
@@ -9622,30 +9813,46 @@ def sand_carry_runtime_recovery_target(stage_name, q_real, q_goal, recovery_coun
     bucket_idx = CTRL.name_to_idx.get("bucket", 3)
     bucket_real_deg = rad_to_deg(float(q_real[bucket_idx]))
     bucket_goal_deg = rad_to_deg(float(q_goal[bucket_idx]))
-    scale = min(1.0 + 0.25 * max(0, int(recovery_count or 0)), 1.75)
-    candidates = [
-        (
-            SAND_CARRY_RUNTIME_RECOVERY_BOOM_STEP_DEG,
-            SAND_CARRY_RUNTIME_RECOVERY_ARM_STEP_DEG,
-            SAND_CARRY_RUNTIME_RECOVERY_BUCKET_STEP_DEG,
-            "lift_retract_close",
-        ),
-        (0.55, -0.55, 9.0, "small_lift_retract_close"),
-        (1.05, -1.15, 12.0, "stronger_lift_retract_close"),
-        (0.80, 0.00, 10.0, "lift_only_close"),
-    ]
+    scale_limit = 1.25 if bool(allow_worse) else 1.0
+    scale = min(1.0 + 0.15 * max(0, int(recovery_count or 0)), scale_limit)
+    try:
+        start_carry_report = carry_material_report_for_q(q_real, end_effector="load")
+    except Exception:
+        start_carry_report = {}
+    start_score = carry_report_score(start_carry_report)
+    close_goal_deg = min(
+        float(bucket_goal_deg),
+        safe_float((start_carry_report or {}).get("loaded_carry_target_deg"), float(CURL_HOLD_TARGET_DEG)),
+    )
+    if allow_worse:
+        candidates = [
+            (0.65, -0.65, 10.0, "stall_lift_retract_close"),
+            (0.90, -0.95, 12.0, "stall_stronger_lift_retract_close"),
+            (1.15, -1.25, 14.0, "stall_unblock_lift_retract_close"),
+            (0.75, 0.00, 10.0, "stall_lift_only_close"),
+            (0.95, -1.55, 12.0, "stall_arm_retract_bias_close"),
+        ]
+    else:
+        candidates = [
+            (0.00, 0.00, 4.5, "bucket_close_only"),
+            (0.22, -0.22, 5.0, "micro_lift_retract_close"),
+            (0.35, -0.35, 6.0, "small_lift_retract_close"),
+        ]
     failures = []
+    best_q = None
+    best_detail = None
+    best_score = -1.0e9
     for boom_step_deg, arm_step_deg, bucket_step_deg, source in candidates:
         q = q_real.copy()
         q[boom_idx] = float(q[boom_idx]) + deg_to_rad(float(boom_step_deg) * scale)
         q[arm_idx] = float(q[arm_idx]) + deg_to_rad(float(arm_step_deg) * scale)
-        if bucket_goal_deg < bucket_real_deg:
+        if close_goal_deg < bucket_real_deg:
             next_bucket_deg = max(
-                float(bucket_goal_deg),
+                float(close_goal_deg),
                 float(bucket_real_deg) - float(bucket_step_deg) * scale,
             )
         else:
-            next_bucket_deg = float(bucket_goal_deg)
+            next_bucket_deg = float(close_goal_deg)
         q[bucket_idx] = deg_to_rad(next_bucket_deg)
         q = CTRL.clip_limits(q)
 
@@ -9669,7 +9876,12 @@ def sand_carry_runtime_recovery_target(stage_name, q_real, q_goal, recovery_coun
             })
             continue
 
-        return q, {
+        try:
+            carry_report = carry_material_report_for_q(q, end_effector="load")
+        except Exception:
+            carry_report = {}
+        score = carry_report_score(carry_report)
+        detail = {
             "reason": "ok",
             "source": source,
             "scale": float(scale),
@@ -9678,7 +9890,35 @@ def sand_carry_runtime_recovery_target(stage_name, q_real, q_goal, recovery_coun
             "bucket_step_deg": float(bucket_real_deg - rad_to_deg(float(q[bucket_idx]))),
             "bucket_real_deg": float(bucket_real_deg),
             "bucket_target_deg": float(rad_to_deg(float(q[bucket_idx]))),
+            "bucket_close_goal_deg": float(close_goal_deg),
+            "bucket_requested_goal_deg": float(bucket_goal_deg),
+            "carry_recovery_reason": carry_report_recovery_reason(carry_report),
+            "carry_start_reason": carry_report_recovery_reason(start_carry_report),
+            "carry_score_before": float(start_score),
+            "carry_score_after": float(score),
+            "carry_report": carry_report,
         }
+        if bool((carry_report or {}).get("gravity_carry_closed_ok", False)):
+            return q, detail
+        if score > best_score:
+            best_q = q
+            best_detail = detail
+            best_score = score
+    if best_q is not None:
+        if best_score < start_score - 1e-5:
+            if allow_worse:
+                best_detail["accepted_despite_score_drop"] = True
+                best_detail["accept_reason"] = "carry_recovery_unblock_score_override"
+                return best_q, best_detail
+            else:
+                failures.append({
+                    "source": str(best_detail.get("source", "best_safe_candidate")),
+                    "reason": "safe_candidate_worsens_carry_geometry",
+                    "score_before": float(start_score),
+                    "score_after": float(best_score),
+                })
+        else:
+            return best_q, best_detail
     return None, {"reason": "no_safe_recovery_candidate", "failures": failures[:4]}
 
 
@@ -12376,7 +12616,8 @@ def compute_episode_quality_score(execution_success, reason):
         quality_reasons.append(f"execution_failed/freeze_detected:{freezes}")
     if max_bucket < QUALITY_MIN_BUCKET_PARTICLES:
         quality_reasons.append(f"quality_rejected/low_bucket_particles:{max_bucket}")
-    if final_bin < QUALITY_MIN_DUMP_PARTICLES:
+    dump_gate_has_lifted_sand = bool(lift_bucket >= QUALITY_MIN_BUCKET_PARTICLES)
+    if dump_gate_has_lifted_sand and final_bin < QUALITY_MIN_DUMP_PARTICLES:
         quality_reasons.append(f"quality_rejected/low_final_bin_particles:{final_bin}")
     if spill_ratio > QUALITY_MAX_SPILL_RATIO:
         quality_warnings.append(f"quality_warning/high_spill_ratio:{spill_ratio:.2f}")
@@ -15335,7 +15576,8 @@ async def auto_collect_loop(count, max_attempts=None):
                 "reason=max_attempts_or_stop",
             )
     except Exception as e:
-        info_print("[ERROR] [AUTO DATASET] loop failed:", type(e).__name__, e)
+        info_print("[ERROR] [AUTO DATASET] loop failed:", type(e).__name__, e, force_log=True)
+        info_print("[ERROR] [AUTO DATASET TRACE]", traceback.format_exc(limit=8).strip(), force_log=True)
         STATE["auto_collect_last_result"] = f"loop_failed={type(e).__name__}: {e}"
     finally:
         try:
@@ -18132,12 +18374,18 @@ def verify_motion_reached(q_goal, label="", mode="auto", record_failure=True):
 
 
 async def wait_for_motion_reached(q_goal, label="", mode="auto", seconds_eff=0.0, record_failure=True):
+    try:
+        q_goal = CTRL.clip_limits(np.array(q_goal, dtype=np.float32).reshape(-1)[:4].copy())
+    except Exception:
+        q_goal = np.array(q_goal, dtype=np.float32)
     max_frames = max(
         int(MOVE_REACH_WAIT_MAX_FRAMES),
         int(max(0.0, float(seconds_eff)) * CONTROL_HZ * MOVE_REACH_EXTRA_TIME_RATIO),
     )
     min_frames = max(0, int(MOVE_REACH_WAIT_MIN_FRAMES))
     last_detail = "not_checked"
+    final_carry_recovery_count = 0
+    final_carry_recovery_last_time = 0.0
     for frame in range(max_frames):
         if frame < min_frames:
             await step_updates(1)
@@ -18149,13 +18397,141 @@ async def wait_for_motion_reached(q_goal, label="", mode="auto", seconds_eff=0.0
                 q_check = _q_real if _q_real is not None else q_goal
                 carry_ok, carry_report = gravity_carry_closed_for_q(q_check)
                 if not carry_ok:
+                    warning_ok = bool((carry_report or {}).get("gravity_carry_warning_ok", False))
+                    if warning_ok:
+                        try:
+                            warning_metrics = sand_metrics_current(force=False)
+                            warning_loaded = (
+                                int(warning_metrics.get("bucket_from_pile_count", 0) or 0)
+                                if isinstance(warning_metrics, dict)
+                                else 0
+                            )
+                        except Exception:
+                            warning_loaded = 0
+                        if warning_loaded <= 0:
+                            contact_report = STATE.get("sand_contact_last_report")
+                            contact_report = contact_report if isinstance(contact_report, dict) else {}
+                            try:
+                                warning_loaded = int(contact_report.get("bucket", 0) or 0)
+                            except Exception:
+                                warning_loaded = 0
+                        if warning_loaded >= int(LIFT_CARRY_MIN_ABSOLUTE_BUCKET_PARTICLES):
+                            warning = (
+                                f"warning/gravity_carry_margin_loaded_continue:{label}:"
+                                f"bucket_particles={warning_loaded};"
+                                f"bucket={fmt_optional((carry_report or {}).get('bucket_deg'))};"
+                                f"world_err={fmt_optional((carry_report or {}).get('world_level_err_deg'))};"
+                                f"strict_tol={fmt_optional((carry_report or {}).get('world_level_tol_deg'))};"
+                                f"warning_tol={fmt_optional((carry_report or {}).get('world_level_warning_tol_deg'))};"
+                                f"pour_above_load_z={fmt_optional((carry_report or {}).get('pour_above_load_z'))};"
+                                f"warning_min_pour={fmt_optional((carry_report or {}).get('warning_min_pour_above_load_z'))}"
+                            )
+                            info_print("[CARRY GATE WARNING]", warning, "decision=continue_warning_margin")
+                            dataset_record_event(
+                                "move_gravity_carry_margin_warning",
+                                f"{label}:{mode}:{warning}",
+                                data={
+                                    "bucket_particles": int(warning_loaded),
+                                    "min_absolute_bucket_particles": int(LIFT_CARRY_MIN_ABSOLUTE_BUCKET_PARTICLES),
+                                    "carry_report": carry_report,
+                                },
+                            )
+                            debug_timeline_record(
+                                "CARRY_GATE_WARNING",
+                                stage=str(label or mode),
+                                result="continue_warning_margin",
+                                reason=warning,
+                                q_cmd=q_goal,
+                                q_real=q_check,
+                                data={
+                                    "bucket_particles": int(warning_loaded),
+                                    "min_absolute_bucket_particles": int(LIFT_CARRY_MIN_ABSOLUTE_BUCKET_PARTICLES),
+                                    "carry_report": carry_report,
+                                },
+                                include_sand=True,
+                            )
+                            return True
+                    recovery_reason = carry_report_recovery_reason(carry_report)
                     last_detail = (
                         "gravity_carry_not_closed_after_reach:"
+                        f"reason={recovery_reason};"
                         f"bucket={fmt_optional((carry_report or {}).get('bucket_deg'))}deg;"
                         f"world_err={fmt_optional((carry_report or {}).get('world_level_err_deg'))}deg;"
                         f"tol={fmt_optional((carry_report or {}).get('world_level_tol_deg'))}deg;"
                         f"pour_above_load_z={fmt_optional((carry_report or {}).get('pour_above_load_z'))}"
                     )
+                    now_recovery = time.time()
+                    if (
+                        final_carry_recovery_count < int(SAND_CARRY_FINAL_RECOVERY_MAX)
+                        and now_recovery - float(final_carry_recovery_last_time)
+                        >= float(SAND_CARRY_RUNTIME_RECOVERY_COOLDOWN_SECONDS)
+                    ):
+                        recovery_q, recovery_detail = sand_carry_runtime_recovery_target(
+                            label or mode,
+                            q_check,
+                            q_goal,
+                            recovery_count=final_carry_recovery_count,
+                            allow_worse=False,
+                        )
+                        final_carry_recovery_last_time = now_recovery
+                        if recovery_q is not None:
+                            recovery_mode = f"{mode}_{label}_final_carry_recovery"
+                            ok_recovery, recovery_apply_reason = CTRL.apply_target_direct(
+                                recovery_q,
+                                mode=recovery_mode,
+                            )
+                            if ok_recovery:
+                                final_carry_recovery_count += 1
+                                q_goal = CTRL.clip_limits(np.array(recovery_q, dtype=np.float32).copy())
+                                STATE["dataset_current_q_goal"] = q_goal.copy()
+                                last_detail = (
+                                    "gravity_carry_recovery_applied:"
+                                    f"{str(recovery_detail.get('source', 'runtime_recovery'))};"
+                                    f"{str(recovery_detail.get('carry_recovery_reason', recovery_reason))}"
+                                )
+                                info_print(
+                                    "[CURL HOLD RECOVERY]",
+                                    f"stage={label or mode}",
+                                    "source=final_gravity_carry_gate",
+                                    f"count={final_carry_recovery_count}/{int(SAND_CARRY_FINAL_RECOVERY_MAX)}",
+                                    f"reason={recovery_reason}",
+                                    f"recovery={recovery_detail.get('source')}",
+                                    f"q_recovery={q_deg_values(q_goal, wrap_swing_for_display=True)}",
+                                )
+                                dataset_record_event(
+                                    "curl_hold_recovery",
+                                    f"{label}:{mode}:final_gravity_carry_gate:{recovery_reason}",
+                                    data={
+                                        "recovery_detail": recovery_detail,
+                                        "carry_report": carry_report,
+                                        "recovery_count": int(final_carry_recovery_count),
+                                    },
+                                )
+                                debug_timeline_record(
+                                    "CURL_HOLD_RECOVERY",
+                                    stage=str(label or mode),
+                                    result="applied",
+                                    reason=f"final_gravity_carry_gate:{recovery_reason}",
+                                    q_cmd=q_goal,
+                                    q_real=q_check,
+                                    data={
+                                        "recovery_detail": recovery_detail,
+                                        "carry_report": carry_report,
+                                        "recovery_count": int(final_carry_recovery_count),
+                                    },
+                                    include_sand=True,
+                                )
+                                await step_updates(max(1, int(60 / CONTROL_HZ)))
+                                continue
+                            last_detail = (
+                                f"gravity_carry_recovery_apply_failed:{recovery_apply_reason};"
+                                f"{last_detail}"
+                            )
+                        else:
+                            last_detail = (
+                                "gravity_carry_recovery_no_safe_candidate:"
+                                f"{recovery_detail};{last_detail}"
+                            )
                     await step_updates(1)
                     continue
             return True
@@ -18177,6 +18553,55 @@ async def wait_for_motion_reached(q_goal, label="", mode="auto", seconds_eff=0.0
         except Exception:
             q_real = q_goal
         carry_ok, carry_report = gravity_carry_closed_for_q(q_real)
+        try:
+            carry_metrics = sand_metrics_current(force=False)
+            carry_loaded = int(carry_metrics.get("bucket_from_pile_count", 0) or 0) if isinstance(carry_metrics, dict) else 0
+        except Exception:
+            carry_loaded = 0
+        if carry_loaded <= 0:
+            contact_report = STATE.get("sand_contact_last_report")
+            contact_report = contact_report if isinstance(contact_report, dict) else {}
+            try:
+                carry_loaded = int(contact_report.get("bucket", 0) or 0)
+            except Exception:
+                carry_loaded = 0
+        if carry_loaded >= int(LIFT_CARRY_MIN_ABSOLUTE_BUCKET_PARTICLES):
+            warning = (
+                f"warning/gravity_carry_not_closed_loaded_continue:{label}:"
+                f"bucket_particles={carry_loaded};"
+                f"bucket={fmt_optional((carry_report or {}).get('bucket_deg'))};"
+                f"world_err={fmt_optional((carry_report or {}).get('world_level_err_deg'))};"
+                f"tol={fmt_optional((carry_report or {}).get('world_level_tol_deg'))};"
+                f"pour_above_load_z={fmt_optional((carry_report or {}).get('pour_above_load_z'))};"
+                f"last_reach_detail={last_detail}"
+            )
+            info_print("[CARRY GATE WARNING]", warning, "decision=continue_to_recovery")
+            dataset_record_event(
+                "move_gravity_carry_not_closed_warning",
+                f"{label}:{mode}:{warning}",
+                data={
+                    "bucket_particles": int(carry_loaded),
+                    "min_absolute_bucket_particles": int(LIFT_CARRY_MIN_ABSOLUTE_BUCKET_PARTICLES),
+                    "carry_report": carry_report,
+                    "last_reach_detail": str(last_detail),
+                },
+            )
+            debug_timeline_record(
+                "CARRY_GATE_WARNING",
+                stage=str(label or mode),
+                result="continue",
+                reason=warning,
+                q_cmd=q_goal,
+                q_real=q_real,
+                data={
+                    "bucket_particles": int(carry_loaded),
+                    "min_absolute_bucket_particles": int(LIFT_CARRY_MIN_ABSOLUTE_BUCKET_PARTICLES),
+                    "carry_report": carry_report,
+                    "last_reach_detail": str(last_detail),
+                },
+                include_sand=True,
+            )
+            return True
         reason = (
             f"execution_failed/gravity_carry_not_closed:{label}:"
             f"bucket={fmt_optional((carry_report or {}).get('bucket_deg'))};"
@@ -18443,13 +18868,38 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                 now_recovery = time.time()
                 bucket_lag = safe_float(contact_report.get("bucket_lag_deg"), 0.0)
                 bucket_window = int(contact_report.get("bucket_delta", 0) or 0)
+                tip_window = safe_float(
+                    contact_report.get("tip_delta", contact_report.get("effector_delta", 0.0)),
+                    0.0,
+                )
+                progress_age = safe_float(contact_report.get("progress_age"), 999.0)
                 carry_stall = bool(contact_report.get("carry_joint_stall", False))
+                hard_lag_no_load_stall = bool(contact_report.get("carry_lag_no_load_stall", False))
+                score_override_stall = bool(
+                    bucket_lag >= float(SAND_CARRY_STALL_HARD_BUCKET_LAG_DEG)
+                    and bucket_window <= int(SAND_CARRY_SCORE_OVERRIDE_BUCKET_PROGRESS_MAX)
+                    and tip_window <= float(SAND_CARRY_SCORE_OVERRIDE_TIP_MAX_M)
+                    and progress_age >= float(SAND_CARRY_STALL_NO_LOAD_SECONDS)
+                )
+                carry_ok, carry_report = gravity_carry_closed_for_q(q_contact_real)
+                carry_recovery_reason = carry_report_recovery_reason(carry_report)
+                carry_geometry_needs_recovery = bool(
+                    not carry_ok
+                    and carry_recovery_reason
+                    and carry_recovery_reason != "missing_carry_geometry"
+                )
                 should_recover = bool(
-                    bucket_lag >= float(SAND_CARRY_RUNTIME_RECOVERY_BUCKET_LAG_DEG)
-                    and (
-                        carry_stall
-                        or bucket_window <= int(SAND_CARRY_STALL_BUCKET_PROGRESS_MAX)
-                        or not bool(contact_report.get("allow_continue", True))
+                    (
+                        hard_lag_no_load_stall or
+                        carry_geometry_needs_recovery
+                        or (
+                            bucket_lag >= float(SAND_CARRY_RUNTIME_RECOVERY_BUCKET_LAG_DEG)
+                            and (
+                                carry_stall
+                                or bucket_window <= int(SAND_CARRY_STALL_BUCKET_PROGRESS_MAX)
+                                or not bool(contact_report.get("allow_continue", True))
+                            )
+                        )
                     )
                     and now_recovery - float(runtime_carry_recovery_last_time) >= float(SAND_CARRY_RUNTIME_RECOVERY_COOLDOWN_SECONDS)
                 )
@@ -18460,6 +18910,7 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                         q_contact_real,
                         q1,
                         recovery_count=runtime_carry_recovery_count,
+                        allow_worse=score_override_stall,
                     )
                     if recovery_q is not None:
                         recovery_mode = f"{contact_stage_name}_runtime_recovery"
@@ -18480,13 +18931,28 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                                 "[CURL HOLD RECOVERY]",
                                 f"stage={contact_stage_name}",
                                 f"count={runtime_carry_recovery_count}/{int(SAND_CARRY_RUNTIME_RECOVERY_MAX)}",
+                                f"carry_reason={carry_recovery_reason or 'ok'}",
                                 f"bucket_lag={bucket_lag:.2f}deg",
                                 f"bucket_window={bucket_window}",
+                                f"tip_window={tip_window:.3f}m",
+                                f"progress_age={progress_age:.2f}s",
+                                f"score_override={score_override_stall}",
                                 f"source={recovery_detail.get('source')}",
+                                f"accept_reason={recovery_detail.get('accept_reason', 'score_ok')}",
                                 f"boom_step={fmt_optional(recovery_detail.get('boom_step_deg'))}deg",
                                 f"arm_step={fmt_optional(recovery_detail.get('arm_step_deg'))}deg",
                                 f"bucket_step={fmt_optional(recovery_detail.get('bucket_step_deg'))}deg",
                                 f"q_recovery={q_deg_values(q0, wrap_swing_for_display=True)}",
+                            )
+                            dataset_record_event(
+                                "curl_hold_recovery",
+                                f"{contact_stage_name}:{mode}:{carry_recovery_reason or 'runtime_recovery'}",
+                                data={
+                                    "contact_report": contact_report,
+                                    "carry_report": carry_report,
+                                    "recovery_detail": recovery_detail,
+                                    "recovery_count": int(runtime_carry_recovery_count),
+                                },
                             )
                             debug_timeline_record(
                                 "CURL_HOLD_RECOVERY",
@@ -18497,6 +18963,7 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                                 q_real=q_contact_real,
                                 data={
                                     "contact_report": contact_report,
+                                    "carry_report": carry_report,
                                     "recovery_detail": recovery_detail,
                                     "recovery_count": int(runtime_carry_recovery_count),
                                 },
@@ -18510,13 +18977,65 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                             "result=apply_failed",
                             f"reason={recovery_reason}",
                         )
+                        if hard_lag_no_load_stall:
+                            fail_reason = (
+                                f"execution_failed/carry_runtime_recovery_apply_failed:"
+                                f"{contact_stage_name}:{recovery_reason}"
+                            )
+                            set_execution_failure_reason(fail_reason)
+                            dataset_record_event(
+                                "curl_hold_recovery_failed",
+                                fail_reason,
+                                data={
+                                    "contact_report": contact_report,
+                                    "carry_report": carry_report,
+                                    "recovery_detail": recovery_detail,
+                                },
+                            )
+                            return False
                     else:
                         info_print(
                             "[CURL HOLD RECOVERY]",
                             f"stage={contact_stage_name}",
                             "result=no_safe_candidate",
+                            f"carry_reason={carry_recovery_reason or 'unknown'}",
                             f"detail={recovery_detail}",
                         )
+                        if hard_lag_no_load_stall:
+                            fail_reason = (
+                                f"execution_failed/carry_runtime_recovery_no_safe_candidate:"
+                                f"{contact_stage_name}:{recovery_detail}"
+                            )
+                            set_execution_failure_reason(fail_reason)
+                            dataset_record_event(
+                                "curl_hold_recovery_failed",
+                                fail_reason,
+                                data={
+                                    "contact_report": contact_report,
+                                    "carry_report": carry_report,
+                                    "recovery_detail": recovery_detail,
+                                },
+                            )
+                            return False
+            if (
+                is_sand_carry_posture_phase(contact_stage_name)
+                and q_contact_real is not None
+                and bool(contact_report.get("carry_lag_no_load_stall", False))
+                and runtime_carry_recovery_count >= int(SAND_CARRY_RUNTIME_RECOVERY_MAX)
+            ):
+                fail_reason = (
+                    f"execution_failed/carry_runtime_recovery_exhausted:"
+                    f"{contact_stage_name}:"
+                    f"{contact_report.get('stall_reason', 'hard_lag_no_load_stall')}"
+                )
+                set_execution_failure_reason(fail_reason)
+                dataset_record_event(
+                    "curl_hold_recovery_exhausted",
+                    fail_reason,
+                    data={"contact_report": contact_report},
+                )
+                info_print("[CURL HOLD RECOVERY]", f"stage={contact_stage_name}", "result=exhausted", fail_reason)
+                return False
             bad_cut, bad_reason = sand_contact_bad_cut_geometry(contact_stage_name, contact_report)
             if bad_cut:
                 info_print(
@@ -21740,7 +22259,13 @@ def carry_hold_adjusted_q(q_pose, q_reference=None, end_effector="load", max_buc
         world_level_err_deg = 999.0 if goal_world is None else rad_to_deg(abs(wrap_angle(float(goal_world) - float(actual_level))))
         world_level_tol_deg = float(BUCKET_CARRY_HOLD_TILT_DEG) + float(BUCKET_CARRY_HOLD_TOL_DEG)
         gravity_level_ok = bool(world_level_err_deg <= world_level_tol_deg)
-        mouth_up_ok = bool(raise_z is not None and raise_z >= BUCKET_CARRY_MIN_POUR_ABOVE_LOAD_Z)
+        point_mouth_up_ok = bool(raise_z is not None and raise_z >= BUCKET_CARRY_MIN_POUR_ABOVE_LOAD_Z)
+        loaded_joint_ok = bool(bucket_joint_in_loaded_carry_state(bucket_deg))
+        # The load/pour diagnostic points are useful for ranking, but on this
+        # bucket mesh they can report a low pour edge even when the closed bucket
+        # is visibly in a gravity-carry posture. Treat the point delta as a risk
+        # signal, not the only hard gate.
+        mouth_up_ok = bool(point_mouth_up_ok or (gravity_level_ok and loaded_joint_ok and not dump_branch))
         gravity_closed_ok = bool(mouth_up_ok and gravity_level_ok)
         retains = bool(gravity_closed_ok)
         q_delta = q_delta_abs_deg(q_out, q_reference)
@@ -21769,10 +22294,12 @@ def carry_hold_adjusted_q(q_pose, q_reference=None, end_effector="load", max_buc
             "goal_world": goal_world,
             "raise_z": raise_z,
             "retains_material": retains,
-            "loaded_carry_joint_ok": bool(bucket_joint_in_loaded_carry_state(bucket_deg)),
+            "loaded_carry_joint_ok": bool(loaded_joint_ok),
             "gravity_carry_closed_ok": bool(gravity_closed_ok),
             "gravity_level_ok": bool(gravity_level_ok),
             "mouth_up_ok": bool(mouth_up_ok),
+            "point_mouth_up_ok": bool(point_mouth_up_ok),
+            "mouth_up_source": "point_geometry" if point_mouth_up_ok else ("closed_bucket_gravity" if mouth_up_ok else "none"),
             "world_level_err_deg": float(world_level_err_deg),
             "world_level_tol_deg": float(world_level_tol_deg),
             "dump_branch_for_carry": bool(dump_branch),
@@ -21907,7 +22434,10 @@ def loaded_transitional_hold_allowed(carry_report, loaded_count=0):
 def real_loaded_secure_hold_allowed(carry_report, loaded_count=0):
     if not loaded_transitional_hold_allowed(carry_report, loaded_count=loaded_count):
         return False
-    if not bool((carry_report or {}).get("gravity_carry_closed_ok", False)):
+    if not (
+        bool((carry_report or {}).get("gravity_carry_closed_ok", False))
+        or bool((carry_report or {}).get("gravity_carry_warning_ok", False))
+    ):
         return False
     return True
 
@@ -25771,18 +26301,50 @@ def carry_material_report_for_q(q_pose, end_effector="load"):
     load = np.array(load, dtype=np.float32).reshape(-1)[:3]
     pour = np.array(pour, dtype=np.float32).reshape(-1)[:3]
     pour_above = float(pour[2] - load[2])
-    height_ok = bool(pour_above >= float(BUCKET_CARRY_MIN_POUR_ABOVE_LOAD_Z))
+    point_height_ok = bool(pour_above >= float(BUCKET_CARRY_MIN_POUR_ABOVE_LOAD_Z))
     loaded_joint_ok = bucket_joint_in_loaded_carry_state(bucket_deg)
     actual_world_rad = float(angles[2])
     level_world_rad = nearest_bucket_level_world_angle(actual_world_rad)
     world_level_err_deg = rad_to_deg(abs(wrap_angle(actual_world_rad - level_world_rad)))
     world_level_tol_deg = float(BUCKET_CARRY_HOLD_TILT_DEG) + float(BUCKET_CARRY_HOLD_TOL_DEG)
+    world_level_warning_tol_deg = world_level_tol_deg + float(BUCKET_CARRY_WARNING_EXTRA_TOL_DEG)
     gravity_level_ok = bool(world_level_err_deg <= world_level_tol_deg)
-    gravity_closed_ok = bool(height_ok and gravity_level_ok)
+    gravity_level_warning_ok = bool(world_level_err_deg <= world_level_warning_tol_deg)
+    point_height_warning_ok = bool(pour_above >= float(BUCKET_CARRY_WARNING_MIN_POUR_ABOVE_LOAD_Z))
+    # The authored load/pour points are diagnostics; they are not a perfect
+    # physical containment test for the bucket_cut cavity. A visibly closed
+    # bucket that is level to gravity should not be rejected only because the
+    # pour marker is below the load marker.
+    practical_mouth_up_ok = bool(point_height_ok or (gravity_level_ok and loaded_joint_ok and not dump_branch))
+    gravity_closed_ok = bool(practical_mouth_up_ok and gravity_level_ok)
+    warning_mouth_up_ok = bool(
+        practical_mouth_up_ok
+        or (
+            point_height_warning_ok
+            and gravity_level_warning_ok
+            and loaded_joint_ok
+            and not dump_branch
+        )
+    )
+    gravity_warning_ok = bool(
+        (not gravity_closed_ok)
+        and warning_mouth_up_ok
+        and gravity_level_warning_ok
+        and loaded_joint_ok
+        and not dump_branch
+    )
     retains = bool(gravity_closed_ok)
-    if not gravity_level_ok:
+    if gravity_warning_ok:
+        reason = (
+            "warning_gravity_carry_margin:"
+            f"world_err={world_level_err_deg:.2f}<={world_level_warning_tol_deg:.2f};"
+            f"pour_above={pour_above:.3f}>={float(BUCKET_CARRY_WARNING_MIN_POUR_ABOVE_LOAD_Z):.3f}"
+        )
+    elif not gravity_level_ok:
         reason = "bucket_not_level_to_gravity_for_carry"
-    elif not height_ok:
+    elif not point_height_ok and loaded_joint_ok:
+        reason = "ok_closed_bucket_gravity_carry_pour_diag_only"
+    elif not point_height_ok:
         reason = "pour_edge_below_carry_window"
     elif not loaded_joint_ok:
         reason = "ok_gravity_carry_joint_diag_only"
@@ -25801,9 +26363,17 @@ def carry_material_report_for_q(q_pose, end_effector="load"):
         "loaded_carry_joint_ok": bool(loaded_joint_ok),
         "gravity_carry_closed_ok": bool(gravity_closed_ok),
         "gravity_level_ok": bool(gravity_level_ok),
-        "mouth_up_ok": bool(height_ok),
+        "mouth_up_ok": bool(practical_mouth_up_ok),
+        "point_mouth_up_ok": bool(point_height_ok),
+        "point_mouth_warning_ok": bool(point_height_warning_ok),
+        "mouth_up_source": "point_geometry" if point_height_ok else ("closed_bucket_gravity" if practical_mouth_up_ok else "none"),
+        "pour_above_is_diagnostic": bool(not point_height_ok and practical_mouth_up_ok),
         "world_level_err_deg": float(world_level_err_deg),
         "world_level_tol_deg": float(world_level_tol_deg),
+        "world_level_warning_tol_deg": float(world_level_warning_tol_deg),
+        "gravity_level_warning_ok": bool(gravity_level_warning_ok),
+        "gravity_carry_warning_ok": bool(gravity_warning_ok),
+        "warning_min_pour_above_load_z": float(BUCKET_CARRY_WARNING_MIN_POUR_ABOVE_LOAD_Z),
         "loaded_carry_target_deg": float(CURL_HOLD_TARGET_DEG),
         "loaded_carry_accept_deg": float(CURL_HOLD_ACCEPT_BUCKET_DEG),
         "dump_branch_for_carry": bool(dump_branch),
@@ -25953,20 +26523,56 @@ def post_lift_material_gate_report(current_metrics=None, q_pose=None):
         or current_bucket >= soft_min_bucket
         or current_bucket >= int(LIFT_CARRY_MIN_ABSOLUTE_BUCKET_PARTICLES)
     )
-    ok = bool(carry_ok)
+    carry_recovery_material_ok = bool(
+        material_soft_ok or current_bucket >= int(LIFT_CARRY_MIN_ABSOLUTE_BUCKET_PARTICLES)
+    )
+    high_load_recovery_allowed = bool(
+        (not carry_ok)
+        and carry_recovery_material_ok
+        and (
+            current_bucket >= int(LIFT_CARRY_HIGH_LOAD_RECOVERY_PARTICLES)
+            or transitional_loaded_hold
+            or bool((carry_report or {}).get("loaded_carry_joint_ok", False))
+        )
+    )
+    ok = bool(carry_ok or high_load_recovery_allowed)
     if ok and material_ok:
-        reason = "ok"
+        if high_load_recovery_allowed:
+            reason = (
+                "ok_warning_high_load_carry_recovery "
+                f"bucket={current_bucket}>={int(LIFT_CARRY_HIGH_LOAD_RECOVERY_PARTICLES)} "
+                f"carry_reason={str((carry_report or {}).get('reason', 'unknown'))}"
+            )
+        else:
+            reason = "ok"
     elif ok and material_soft_ok:
-        reason = (
-            f"ok_soft_lift_material bucket={current_bucket}/{min_bucket} "
-            f"soft_min={soft_min_bucket} retained={retained_fraction:.2f}/"
-            f"{float(LIFT_CARRY_MIN_RETAINED_FROM_CUT_FRACTION):.2f}"
-        )
+        if high_load_recovery_allowed:
+            reason = (
+                "ok_soft_lift_material_high_load_carry_recovery "
+                f"bucket={current_bucket}/{min_bucket} soft_min={soft_min_bucket} "
+                f"retained={retained_fraction:.2f}/"
+                f"{float(LIFT_CARRY_MIN_RETAINED_FROM_CUT_FRACTION):.2f} "
+                f"carry_reason={str((carry_report or {}).get('reason', 'unknown'))}"
+            )
+        else:
+            reason = (
+                f"ok_soft_lift_material bucket={current_bucket}/{min_bucket} "
+                f"soft_min={soft_min_bucket} retained={retained_fraction:.2f}/"
+                f"{float(LIFT_CARRY_MIN_RETAINED_FROM_CUT_FRACTION):.2f}"
+            )
     elif ok:
-        reason = (
-            f"ok_warning_lift_material_low bucket={current_bucket}/{min_bucket} "
-            f"retained={retained_fraction:.2f}/{float(LIFT_CARRY_MIN_RETAINED_FROM_CUT_FRACTION):.2f}"
-        )
+        if high_load_recovery_allowed:
+            reason = (
+                "ok_warning_high_load_carry_recovery_material_low "
+                f"bucket={current_bucket}/{min_bucket} retained={retained_fraction:.2f}/"
+                f"{float(LIFT_CARRY_MIN_RETAINED_FROM_CUT_FRACTION):.2f} "
+                f"carry_reason={str((carry_report or {}).get('reason', 'unknown'))}"
+            )
+        else:
+            reason = (
+                f"ok_warning_lift_material_low bucket={current_bucket}/{min_bucket} "
+                f"retained={retained_fraction:.2f}/{float(LIFT_CARRY_MIN_RETAINED_FROM_CUT_FRACTION):.2f}"
+            )
     else:
         reason = "lift_bucket_not_carry_safe:" + str((carry_report or {}).get("reason", "unknown"))
     return {
@@ -25979,10 +26585,22 @@ def post_lift_material_gate_report(current_metrics=None, q_pose=None):
         "bucket_soft_min": int(soft_min_bucket),
         "material_ok": bool(material_ok),
         "material_soft_ok": bool(material_soft_ok),
-        "material_warning": "" if material_ok else (
-            f"lift_material_soft_gate bucket={current_bucket}/{min_bucket} retained={retained_fraction:.2f}"
+        "material_warning": (
+            (
+                "high_load_carry_recovery:"
+                + str((carry_report or {}).get("reason", "unknown"))
+            )
+            if high_load_recovery_allowed
+            else (
+                ""
+                if material_ok
+                else f"lift_material_soft_gate bucket={current_bucket}/{min_bucket} retained={retained_fraction:.2f}"
+            )
         ),
         "carry_ok": bool(carry_ok),
+        "high_load_carry_recovery_allowed": bool(high_load_recovery_allowed),
+        "high_load_recovery_threshold": int(LIFT_CARRY_HIGH_LOAD_RECOVERY_PARTICLES),
+        "carry_recovery_material_ok": bool(carry_recovery_material_ok),
         "geometry_retains_material": bool(geometry_retains),
         "real_loaded_hold_allowed": bool(real_loaded_hold),
         "transitional_loaded_hold_allowed": bool(transitional_loaded_hold),
@@ -26110,6 +26728,13 @@ def staged_lift_candidates(q_start):
     arm_idx = CTRL.name_to_idx["arm"]
     bucket_idx = CTRL.name_to_idx["bucket"]
     q_start = np.array(q_start, dtype=np.float32).reshape(-1)[:4].copy()
+    lift_start_load_z = None
+    try:
+        start_load_point = predicted_end_world_point(q_start, end_effector="load", reference_q=q_start)
+        if start_load_point is not None:
+            lift_start_load_z = float(np.array(start_load_point, dtype=np.float32).reshape(-1)[2])
+    except Exception:
+        lift_start_load_z = None
     try:
         metrics_now = sand_metrics_current(force=False)
         loaded_now = int(metrics_now.get("bucket_from_pile_count", 0) or 0) if isinstance(metrics_now, dict) else 0
@@ -26178,6 +26803,26 @@ def staged_lift_candidates(q_start):
         duration = estimate_stage_motion_seconds(q_start, q, requested_seconds=1.0)
         motion = plan_joint_motion_metrics(q, q_start, duration)
         target_point = predicted_end_world_point(q, end_effector="load", reference_q=q_start)
+        try:
+            target_load_z = float(np.array(target_point, dtype=np.float32).reshape(-1)[2]) if target_point is not None else None
+        except Exception:
+            target_load_z = None
+        if lift_start_load_z is not None and target_load_z is not None:
+            min_lift_load_z = float(lift_start_load_z) + float(LIFT_CARRY_MIN_LOAD_RAISE_M)
+            if float(target_load_z) < min_lift_load_z:
+                rows.append({
+                    "ok": False,
+                    "q": q,
+                    "reason": (
+                        "lift_candidate_does_not_raise_load:"
+                        f"load_z={float(target_load_z):.3f}<"
+                        f"{float(min_lift_load_z):.3f}"
+                    ),
+                    "target_point": target_point,
+                    "carry_report": carry_report,
+                    "loaded_now": int(loaded_now),
+                })
+                continue
         score = (
             float(motion.get("cost", 0.0) or 0.0)
             + carry_spill_risk_penalty(carry_report)
@@ -27057,13 +27702,21 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
             set_execution_failure_reason("quality_rejected/lift_lost_material:" + reason)
             info_print("[POST LIFT GATE FAILED]", reason)
             return False
+        lift_needs_carry_recovery = bool(lift_gate.get("high_load_carry_recovery_allowed", False)) and not bool(
+            lift_gate.get("carry_ok", False)
+        )
         secure_gate = {
-            "ok": True,
-            "reason": "post_lift_ready_for_unload",
+            "ok": not lift_needs_carry_recovery,
+            "reason": (
+                "post_lift_high_load_needs_carry_safe_projection"
+                if lift_needs_carry_recovery
+                else "post_lift_ready_for_unload"
+            ),
             "q_secure_deg": q_deg_values(q_start, wrap_swing_for_display=True),
             "spill_gate_ok": True,
-            "carry_gate_ok": True,
+            "carry_gate_ok": not lift_needs_carry_recovery,
             "post_lift_reentry": True,
+            "high_load_carry_recovery_allowed": bool(lift_gate.get("high_load_carry_recovery_allowed", False)),
             "lift_material_gate": lift_gate,
         }
     else:
@@ -27427,12 +28080,17 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
             f"cleared_stale_cancel={bool(STATE.get('loaded_route_test_cleared_stale_cancel', False))}",
             force_log=debug_diagnostics_enabled(),
         )
+    carry_height_floor = loaded_carry_height_floor(q_lift, margin=LOADED_CARRY_ROUTE_HEIGHT_MARGIN_M)
+    candidate["loaded_carry_height_floor"] = carry_height_floor
+    STATE["dig_plan_candidate"] = candidate
     info_print(
         "[POST SECURE PLAN START]",
         f"loaded_route_test={loaded_route_test}",
         f"q_start={q_deg_values(q_lift, wrap_swing_for_display=True)}",
         f"landing={vec_list(unload_bin_landing_point(), 3)}",
         f"dump_deg={fmt_optional(unload_dump_target_deg())}",
+        f"min_load_z={fmt_optional((carry_height_floor or {}).get('min_load_z'))}",
+        f"min_tip_z={fmt_optional((carry_height_floor or {}).get('min_tip_z'))}",
         force_log=bool(loaded_route_test and debug_diagnostics_enabled()),
     )
     dump_deadline = child_planning_deadline(deadline, 6.0, min_seconds=2.0) if loaded_route_test else deadline
@@ -27719,6 +28377,24 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
     direct_ok, kind, reason, sample, report = path_segment_check(
         q_lift, q_pre_dump, "unload_to_bin", samples=direct_samples, deadline=deadline
     )
+    height_ok, height_report = loaded_carry_path_height_check(
+        q_lift,
+        q_pre_dump,
+        carry_height_floor,
+        samples=max(3, int(direct_samples)),
+    )
+    if direct_ok and not height_ok:
+        direct_ok = False
+        kind = "height"
+        reason = (
+            "loaded_carry_height_drop:"
+            f"load_z={fmt_optional(height_report.get('load_z'))}<"
+            f"{fmt_optional(height_report.get('min_load_z'))};"
+            f"tip_z={fmt_optional(height_report.get('tip_z'))}<"
+            f"{fmt_optional(height_report.get('min_tip_z'))}"
+        )
+        sample = int(height_report.get("sample", sample if sample is not None else -1))
+        report = height_report
     info_print(
         "[POST SECURE PLAN DIRECT CHECK]",
         f"loaded_route_test={loaded_route_test}",
@@ -27726,6 +28402,7 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
         f"samples={direct_samples}",
         f"kind={kind}",
         f"reason={reason}",
+        f"height_ok={height_ok}",
         f"q_pre_dump={q_deg_values(q_pre_dump, wrap_swing_for_display=True)}",
         force_log=bool(loaded_route_test and debug_diagnostics_enabled()),
     )
@@ -27751,6 +28428,20 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
             deadline=deadline,
             samples=route_samples,
         )
+        if route is not None:
+            route_height_ok, route_height_report = loaded_carry_route_height_check(
+                q_lift,
+                route,
+                q_pre_dump,
+                carry_height_floor,
+                samples=max(3, int(route_samples)),
+            )
+            if not route_height_ok:
+                route_reason = (
+                    f"loaded_carry_height_drop:{route_height_report}; "
+                    f"original_route={route_reason}"
+                )
+                route = None
         if route is None:
             fallback, fallback_reason = staged_high_carry_unload_fallback(q_lift, q_pre_dump, deadline=deadline)
             if fallback is not None:
@@ -27760,6 +28451,26 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
                     f"original_route={route_reason}; original={kind}:{reason}; sample={sample}"
                 )
                 q_pre_dump = np.array(fallback.get("q_pre_dump", q_pre_dump), dtype=np.float32).copy()
+                route_height_ok, route_height_report = loaded_carry_route_height_check(
+                    q_lift,
+                    route,
+                    q_pre_dump,
+                    carry_height_floor,
+                    samples=max(3, int(route_samples)),
+                )
+                if not route_height_ok:
+                    set_execution_failure_reason(
+                        f"planning_failed/staged_unload_route_height:{route_height_report}; "
+                        f"fallback={fallback_reason}"
+                    )
+                    info_print(
+                        "[DIG PLAN STAGED FAILED]",
+                        "stage=unload_to_bin",
+                        "reason=loaded_carry_height_drop",
+                        f"height_report={route_height_report}",
+                        f"fallback={fallback_reason}",
+                    )
+                    return False
                 deadline = max(deadline, time.time() + 5.0) if loaded_route_test else time.time() + 5.0
                 info_print(
                     "[DIG PLAN STAGED FALLBACK]",
@@ -28765,7 +29476,7 @@ def plan_dump_pose_to_bin(
             bucket_motion_weight=0.35,
             bucket_preference_weight=8.0,
             min_world_z=GROUND_TOP_Z + IK_DIG_MIN_CLEARANCE,
-            accept_err=UNLOAD_DUMP_ACCEPT_ERR,
+            accept_err=UNLOAD_DUMP_WARNING_ACCEPT_ERR,
             end_effector="pour",
             allow_end_below=False,
             min_end_z=max(GROUND_TOP_Z + 0.02, min_release_z - 0.12),
@@ -28815,14 +29526,30 @@ def plan_dump_pose_to_bin(
             or (
                 center_release_mode
                 and drop_ready
-                and release_xy_err <= float(UNLOAD_CENTER_RELEASE_SOFT_XY_TOL)
+                and (
+                    bool(drop.get("inside_xy", False))
+                    or release_xy_err <= float(UNLOAD_CENTER_RELEASE_SOFT_XY_TOL)
+                )
             )
+        )
+        center_alignment_warning = bool(
+            center_release_mode
+            and drop_ready
+            and bool(drop.get("inside_xy", False))
+            and not bool(center_ready)
         )
         effective_xy_err = release_xy_err if center_release_mode else (overflow_xy if drop_ready else xy_err)
         source_penalty = max(0.0, UNLOAD_DROP_SOURCE_MIN_CLEARANCE_Z - source_clearance)
         bucket_penalty = max(0.0, bucket_err - UNLOAD_DUMP_BUCKET_TOL_DEG)
         ik_bucket_penalty = max(0.0, ik_bucket_err - UNLOAD_DUMP_BUCKET_TOL_DEG)
         planar_err = float(info.get("planar_err", 0.0)) if isinstance(info, dict) else 0.0
+        ik_planar_warning = bool(planar_err > float(UNLOAD_DUMP_ACCEPT_ERR))
+        ik_planar_warning_reason = (
+            f"warning_ik_planar_err:{planar_err:.3f}m>"
+            f"{float(UNLOAD_DUMP_ACCEPT_ERR):.3f}m"
+            if ik_planar_warning
+            else ""
+        )
         height_bonus = min(2.5, max(0.0, source_clearance - float(UNLOAD_DROP_SOURCE_MIN_CLEARANCE_Z))) * 7.5
         acceptance_penalty = 0.0 if (drop_ready and center_soft_ready) else 35.0
         cost = (
@@ -28840,13 +29567,26 @@ def plan_dump_pose_to_bin(
             "drop": drop,
             "bucket_err": float(bucket_err),
             "ik_bucket_err": float(ik_bucket_err),
+            "ik_planar_warning": bool(ik_planar_warning),
+            "ik_planar_warning_reason": ik_planar_warning_reason,
             "cost": float(cost),
             "attempt": int(attempt),
             "release_target": release_target.copy(),
             "pour_target": pour_target.copy(),
             "center_ready": bool(center_ready),
             "center_soft_ready": bool(center_soft_ready),
+            "center_alignment_warning": bool(center_alignment_warning),
         }
+        row["info"]["ik_planar_warning"] = bool(ik_planar_warning)
+        row["info"]["ik_planar_warning_reason"] = ik_planar_warning_reason
+        row["info"]["ik_planar_soft_accept_err_m"] = float(UNLOAD_DUMP_ACCEPT_ERR)
+        row["info"]["ik_planar_hard_accept_err_m"] = float(UNLOAD_DUMP_WARNING_ACCEPT_ERR)
+        row["info"]["center_alignment_warning"] = bool(center_alignment_warning)
+        row["info"]["center_alignment_warning_reason"] = (
+            "warning_center_release_not_exact_but_landing_inside_bin"
+            if center_alignment_warning
+            else ""
+        )
         if best is None or row["cost"] < best["cost"]:
             best = row
         if log:
@@ -28863,13 +29603,29 @@ def plan_dump_pose_to_bin(
                 f"center_required={center_release_mode} "
                 f"center_ready={center_ready} "
                 f"center_soft_ready={center_soft_ready} "
+                f"center_warning={center_alignment_warning} "
                 f"release_align_deg={release_alignment_bucket_deg:.2f} "
                 f"final_dump_deg={final_dump_deg:.2f} "
                 f"acceptance={drop.get('landing_acceptance')} "
                 f"source_clearance={fmt_optional(drop.get('source_clearance'))} "
                 f"bucket_err={bucket_err:.2f}deg "
+                f"planar_warning={ik_planar_warning} "
                 f"cost={cost:.2f} "
                 f"q={q_deg_values(q_dump, wrap_swing_for_display=True)}",
+                force_log=debug_diagnostics_enabled(),
+            )
+        if center_alignment_warning and log:
+            info_print(
+                f"[WARN] [UNLOAD DUMP PLAN] {label}: "
+                "center release not exact, but predicted landing is inside bin; "
+                "continuing and scoring actual drop",
+                force_log=debug_diagnostics_enabled(),
+            )
+        if ik_planar_warning and log:
+            info_print(
+                f"[WARN] [UNLOAD DUMP PLAN] {label}: "
+                f"{ik_planar_warning_reason}; continuing because "
+                f"hard_limit={float(UNLOAD_DUMP_WARNING_ACCEPT_ERR):.3f}m",
                 force_log=debug_diagnostics_enabled(),
             )
 

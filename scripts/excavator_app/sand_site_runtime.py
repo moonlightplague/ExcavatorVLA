@@ -42,10 +42,11 @@ SANDBOX_FLOOR_THICKNESS = 0.16
 SANDBOX_WALL_COLOR = (0.34, 0.32, 0.28)
 SANDBOX_FLOOR_COLOR = (0.24, 0.23, 0.20)
 SAND_AMOUNT_BASE_HEIGHT = 3.00
-SAND_AMOUNT_MULTIPLIER = 3.00
-SAND_AMOUNT_MIN_MULTIPLIER = 0.25
-SAND_AMOUNT_MAX_MULTIPLIER = 10.00
-SAND_AMOUNT_HEIGHT_EXPONENT = 0.75
+SAND_AMOUNT_MAX_FILL_HEIGHT = 6.50
+SAND_AMOUNT_MULTIPLIER = 5.00
+SAND_AMOUNT_MIN_MULTIPLIER = 1.00
+SAND_AMOUNT_MAX_MULTIPLIER = 30.00
+SAND_AMOUNT_HEIGHT_EXPONENT = 0.35
 
 SAND_SIZE_X = SANDBOX_INNER_SIZE_X
 SAND_SIZE_Y = SANDBOX_INNER_SIZE_Y
@@ -100,11 +101,11 @@ PARTICLE_CONTACT_OFFSET = 0.024
 PARTICLE_REST_OFFSET = 0.017
 PARTICLE_SOLID_REST_OFFSET = 0.018
 PARTICLE_FLUID_REST_OFFSET = 0.0
-PARTICLE_MASS = 0.135
+PARTICLE_MASS = 0.065
 PARTICLE_JITTER = 0.004
 PARTICLE_MAX_COUNT = 465000
 PARTICLE_SOLVER_POSITION_ITERATIONS = 16
-PARTICLE_MAX_VELOCITY = 9.0
+PARTICLE_MAX_VELOCITY = 12.0
 SAND_FIDELITY = 0.0
 SAND_FIDELITY_EFFICIENCY_SPACING = 0.085
 SAND_FIDELITY_REALISTIC_SPACING = 0.034
@@ -114,7 +115,7 @@ SAND_FIDELITY_EFFICIENCY_MAX_COUNT = 120000
 SAND_FIDELITY_REALISTIC_MAX_COUNT = 900000
 SAND_FIDELITY_EFFICIENCY_SOLVER_ITERS = 16
 SAND_FIDELITY_REALISTIC_SOLVER_ITERS = 24
-SAND_FIDELITY_MAX_VELOCITY = 9.0
+SAND_FIDELITY_MAX_VELOCITY = 12.0
 SAND_FIDELITY_REFERENCE_SPACING = 0.044
 SAND_BULK_DENSITY_KG_M3 = 1600.0
 SAND_FIDELITY_REFERENCE_MASS = SAND_BULK_DENSITY_KG_M3 * (SAND_FIDELITY_REFERENCE_SPACING ** 3)
@@ -124,17 +125,17 @@ PARTICLE_LAYER_SPACING_RATIO = 0.95
 PARTICLE_CENTER_SPACING_SAFETY = 2.12
 PARTICLE_JITTER_RATIO = 0.08
 PARTICLE_JITTER_MAX = 0.004
-PARTICLE_MATERIAL_FRICTION = 1.10
-PARTICLE_MATERIAL_FRICTION_SCALE = 1.20
-PARTICLE_MATERIAL_DAMPING = 0.70
-PARTICLE_MATERIAL_VISCOSITY = 1.80
-PARTICLE_MATERIAL_COHESION = 0.15
-PARTICLE_MATERIAL_ADHESION = 0.08
-PARTICLE_MATERIAL_GRAVITY_SCALE = 0.90
-PARTICLE_MATERIAL_STATIC_FRICTION = 1.10
-PARTICLE_MATERIAL_DYNAMIC_FRICTION = 1.10
+PARTICLE_MATERIAL_FRICTION = 0.82
+PARTICLE_MATERIAL_FRICTION_SCALE = 0.90
+PARTICLE_MATERIAL_DAMPING = 0.45
+PARTICLE_MATERIAL_VISCOSITY = 0.85
+PARTICLE_MATERIAL_COHESION = 0.035
+PARTICLE_MATERIAL_ADHESION = 0.015
+PARTICLE_MATERIAL_GRAVITY_SCALE = 1.00
+PARTICLE_MATERIAL_STATIC_FRICTION = 0.85
+PARTICLE_MATERIAL_DYNAMIC_FRICTION = 0.82
 PARTICLE_MATERIAL_RESTITUTION = 0.0
-SAND_PARAMETER_MODE = "legacy"
+SAND_PARAMETER_MODE = "soft_dig"
 SAND_PARAMETER_MODES = ("legacy", "soft_dig")
 SAND_PARAMETER_PRESETS = {
     "legacy": {
@@ -406,6 +407,8 @@ def sand_mode_label(fidelity=None):
 
 def normalize_sand_parameter_mode(mode):
     text = str(mode).strip().lower()
+    if text in ("softdig", "soft-dig", "soft dig"):
+        text = "soft_dig"
     return text if text in SAND_PARAMETER_MODES else "legacy"
 
 
@@ -430,7 +433,8 @@ def clamp_sand_amount(amount=None):
 
 def sand_height_from_amount(amount=None):
     amount = clamp_sand_amount(amount)
-    return float(SAND_AMOUNT_BASE_HEIGHT) * (float(amount) ** float(SAND_AMOUNT_HEIGHT_EXPONENT))
+    uncapped = float(SAND_AMOUNT_BASE_HEIGHT) * (float(amount) ** float(SAND_AMOUNT_HEIGHT_EXPONENT))
+    return min(float(SAND_AMOUNT_MAX_FILL_HEIGHT), float(uncapped))
 
 
 def sand_amount_from_height(height=None):
@@ -639,6 +643,7 @@ def update_particle_runtime_state():
     STATE["sand_parameter_mode_label"] = sand_parameter_mode_label()
     STATE["sand_amount_x"] = float(SAND_AMOUNT_MULTIPLIER)
     STATE["sand_fill_height"] = float(SANDBOX_FILL_HEIGHT)
+    STATE["sand_fill_height_cap"] = float(SAND_AMOUNT_MAX_FILL_HEIGHT)
     STATE["sand_fidelity"] = float(SAND_FIDELITY)
     STATE["sand_mode_label"] = sand_mode_label(SAND_FIDELITY)
     STATE["particle_mass"] = float(PARTICLE_MASS)
@@ -706,6 +711,7 @@ def apply_sand_fidelity_to_particle_globals(fidelity=None, announce=False):
             f"mode={sand_mode_label(SAND_FIDELITY)}",
             f"amount={SAND_AMOUNT_MULTIPLIER:.2f}x",
             f"height={SANDBOX_FILL_HEIGHT:.2f}",
+            f"height_cap={SAND_AMOUNT_MAX_FILL_HEIGHT:.2f}",
             f"spacing={PARTICLE_DIGGABLE_SPACING:.4f}",
             f"radius={PARTICLE_RADIUS:.4f}",
             f"max_count={PARTICLE_MAX_COUNT}",
@@ -2917,6 +2923,7 @@ def apply_auto_scene_parameters(
     global SAND_SOURCE_TOTAL_PROJECTED_FACE_COUNT, SAND_SOURCE_RAW_FACE_POLYGONS_XY, SAND_SOURCE_FACE_POLYGONS_XY
     global SAND_SOURCE_SELECTED_HULL_XY, SAND_SOURCE_POLYGON_XY, SAND_AMOUNT_MULTIPLIER
     global UNLOAD_BIN_CENTER
+    global PARTICLE_MAX_VELOCITY, PARTICLE_SOLVER_POSITION_ITERATIONS
 
     changed = False
     if sand_center_xy is not None:
@@ -2960,7 +2967,11 @@ def apply_auto_scene_parameters(
             UNLOAD_BIN_CENTER = np.array([x, y, 0.0], dtype=np.float32)
 
     recompute_derived_scene_params()
+    current_max_velocity = float(PARTICLE_MAX_VELOCITY)
+    current_solver_iters = int(PARTICLE_SOLVER_POSITION_ITERATIONS)
     apply_sand_fidelity_to_particle_globals(SAND_FIDELITY, announce=False)
+    PARTICLE_MAX_VELOCITY = clamp_value(current_max_velocity, 1.0, 20.0)
+    PARTICLE_SOLVER_POSITION_ITERATIONS = int(round(clamp_value(current_solver_iters, 4.0, 32.0)))
     update_particle_runtime_state()
 
     if rebuild:
@@ -2981,6 +2992,8 @@ def apply_auto_scene_parameters(
         "changed": bool(changed),
         "sand_center": [float(SAND_CENTER_X), float(SAND_CENTER_Y)],
         "sand_amount_multiplier": float(SAND_AMOUNT_MULTIPLIER),
+        "sand_fill_height": float(SANDBOX_FILL_HEIGHT),
+        "sand_fill_height_cap": float(SAND_AMOUNT_MAX_FILL_HEIGHT),
         "estimated_particle_count": int(STATE.get("estimated_particle_count", 0)),
         "unload_bin_center": [float(UNLOAD_BIN_CENTER[0]), float(UNLOAD_BIN_CENTER[1])],
         "rebuild": bool(rebuild),
@@ -3045,6 +3058,14 @@ def make_sand_retaining_walls(root):
         SANDBOX_WALL_THICKNESS,
     )
     return wall_root
+
+
+def create_sand_retaining_walls_for_generation(root=None):
+    root = root_path() if root is None else str(root)
+    make_sand_retaining_walls(root)
+    ok = apply_default_sand_source_mesh()
+    update_status("Sand walls ready for reset")
+    return bool(ok)
 
 
 def clean_sand_retaining_walls(root=None):
@@ -3154,6 +3175,8 @@ def print_status():
         SAND_AMOUNT_MULTIPLIER,
         "actual_fill_height:",
         SANDBOX_FILL_HEIGHT,
+        "height_cap:",
+        SAND_AMOUNT_MAX_FILL_HEIGHT,
         "sand_floor_z:",
         SAND_FLOOR_Z,
         "sand_surface_base_z:",
@@ -3355,6 +3378,8 @@ def store_runtime_api():
         "reset": reset_sand_surface,
         "request_reset": request_sand_reset,
         "reset_stably": reset_sand_surface_stably,
+        "create_sand_retaining_walls": create_sand_retaining_walls_for_generation,
+        "clean_sand_retaining_walls": clean_sand_retaining_walls,
         "reset_health_stats": sand_reset_health_stats,
         "last_reset_healthy": bool(STATE.get("last_reset_healthy", False)),
         "last_reset_time": float(STATE.get("last_reset_time", 0.0) or 0.0),
@@ -3649,7 +3674,7 @@ def build_ui():
                 ui.FloatField(model=PARAM_MODELS[key], width=66)
             ui.Label(
                 ui_short_text(
-                    "1x equals old 3m. Up to 10x uses compressed height, denser spacing, and a larger particle budget.",
+                    "1x equals old 3m. Higher amount uses capped height plus denser spacing to reduce air gaps.",
                     112,
                 ),
                 width=610,

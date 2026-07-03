@@ -1400,15 +1400,15 @@ def generate_plots(
             scene = {}
         status = str(row.get("status") or "unknown")
         ep = row.get("episode_index")
-        sand_xy = scene.get("sand_xy") if isinstance(scene, dict) else None
-        truck_xy = scene.get("truck_xy") if isinstance(scene, dict) else None
-        unload_xy = (scene.get("unload_point_xy") or scene.get("unload_landing_xy") or scene.get("unload_xy")) if isinstance(scene, dict) else None
+        sand_xy = (scene.get("sand_body_xy") or scene.get("sand_xy")) if isinstance(scene, dict) else None
+        truck_xy = (scene.get("truck_body_xy") or scene.get("truck_xy")) if isinstance(scene, dict) else None
+        unload_xy = (scene.get("unload_point_body_xy") or scene.get("unload_landing_body_xy") or scene.get("unload_body_xy") or scene.get("unload_point_xy") or scene.get("unload_landing_xy") or scene.get("unload_xy")) if isinstance(scene, dict) else None
         if isinstance(sand_xy, list) and len(sand_xy) >= 2:
-            scene_sand_points.append({"x": sand_xy[0], "y": sand_xy[1], "status": status, "episode": ep, "title": f"ep {ep} {status}: sand=({sand_xy[0]:.3g},{sand_xy[1]:.3g})"})
+            scene_sand_points.append({"x": sand_xy[0], "y": sand_xy[1], "status": status, "episode": ep, "title": f"ep {ep} {status}: sand_body=({sand_xy[0]:.3g},{sand_xy[1]:.3g})"})
         if isinstance(truck_xy, list) and len(truck_xy) >= 2:
-            scene_truck_points.append({"x": truck_xy[0], "y": truck_xy[1], "status": status, "episode": ep, "title": f"ep {ep} {status}: truck=({truck_xy[0]:.3g},{truck_xy[1]:.3g})"})
+            scene_truck_points.append({"x": truck_xy[0], "y": truck_xy[1], "status": status, "episode": ep, "title": f"ep {ep} {status}: truck_body=({truck_xy[0]:.3g},{truck_xy[1]:.3g})"})
         if isinstance(unload_xy, list) and len(unload_xy) >= 2:
-            scene_unload_points.append({"x": unload_xy[0], "y": unload_xy[1], "status": status, "episode": ep, "title": f"ep {ep} {status}: unload=({unload_xy[0]:.3g},{unload_xy[1]:.3g})"})
+            scene_unload_points.append({"x": unload_xy[0], "y": unload_xy[1], "status": status, "episode": ep, "title": f"ep {ep} {status}: unload_body=({unload_xy[0]:.3g},{unload_xy[1]:.3g})"})
 
     files = []
     files.append(
@@ -1523,8 +1523,8 @@ def generate_plots(
             os.path.join(output_dir, "sand_xy_scatter.svg"),
             "Sand XY Coverage",
             scene_sand_points,
-            "sand x from excavator origin (m)",
-            "sand y from excavator origin (m)",
+            "sand body-frame x / forward (m)",
+            "sand body-frame y / left (m)",
             include_origin=True,
         )
     )
@@ -1533,8 +1533,8 @@ def generate_plots(
             os.path.join(output_dir, "truck_xy_scatter.svg"),
             "Truck XY Coverage",
             scene_truck_points,
-            "truck x from excavator origin (m)",
-            "truck y from excavator origin (m)",
+            "truck body-frame x / forward (m)",
+            "truck body-frame y / left (m)",
             include_origin=True,
         )
     )
@@ -1543,8 +1543,8 @@ def generate_plots(
             os.path.join(output_dir, "unload_xy_scatter.svg"),
             "Unload XY Coverage",
             scene_unload_points,
-            "unload x from excavator origin (m)",
-            "unload y from excavator origin (m)",
+            "unload body-frame x / forward (m)",
+            "unload body-frame y / left (m)",
             include_origin=True,
         )
     )
@@ -2516,19 +2516,85 @@ def vector_xyz(value: object) -> Optional[List[float]]:
     return [float(vec[0]), float(vec[1]), float(vec[2])]
 
 
+def first_vector_xy(*values: object) -> Optional[List[float]]:
+    for value in values:
+        xy = vector_xy(value)
+        if xy is not None:
+            return xy
+    return None
+
+
+def polygon_xy_or_empty(value: object) -> List[List[float]]:
+    if not isinstance(value, list):
+        return []
+    out: List[List[float]] = []
+    for item in value:
+        xy = vector_xy(item)
+        if xy is not None:
+            out.append(xy)
+    return out
+
+
+def normalize_degrees(value: object) -> Optional[float]:
+    number = safe_float_value(value)
+    if number is None:
+        return None
+    while number <= -180.0:
+        number += 360.0
+    while number > 180.0:
+        number -= 360.0
+    return number
+
+
+def xy_to_body_frame(
+    point_xy: object,
+    robot_origin_xy: object = None,
+    robot_body_yaw_deg: object = 0.0,
+) -> Optional[List[float]]:
+    point = vector_xy(point_xy)
+    if point is None:
+        return None
+    origin = vector_xy(robot_origin_xy) or [0.0, 0.0]
+    yaw = safe_float_value(robot_body_yaw_deg, 0.0) or 0.0
+    angle = math.radians(yaw)
+    dx = float(point[0]) - float(origin[0])
+    dy = float(point[1]) - float(origin[1])
+    c = math.cos(-angle)
+    s = math.sin(-angle)
+    return [dx * c - dy * s, dx * s + dy * c]
+
+
+def polygon_to_body_frame(
+    polygon_xy: object,
+    robot_origin_xy: object = None,
+    robot_body_yaw_deg: object = 0.0,
+) -> List[List[float]]:
+    polygon = polygon_xy_or_empty(polygon_xy)
+    out: List[List[float]] = []
+    for point in polygon:
+        local = xy_to_body_frame(point, robot_origin_xy, robot_body_yaw_deg)
+        if local is not None:
+            out.append(local)
+    return out
+
+
 def dashboard_scene_from_episode(row: dict) -> Dict[str, object]:
     scene = row.get("scene_randomization") if isinstance(row.get("scene_randomization"), dict) else {}
     candidate = scene.get("candidate") if isinstance(scene.get("candidate"), dict) else {}
     applied = scene.get("applied") if isinstance(scene.get("applied"), dict) else {}
     scene_context = applied.get("scene_context") if isinstance(applied.get("scene_context"), dict) else {}
+
+    # Raw XY values here are world-frame values from the simulator/randomizer.
+    # The dashboard additionally exposes excavator body-frame XY values so plots remain
+    # meaningful when robot_body_yaw_deg is randomized at init/reset time.
     sand_xy = (
         vector_xy(applied.get("sand_center"))
         or vector_xy(candidate.get("sand_xy"))
         or vector_xy(row.get("target_xyz"))
     )
     truck_xy = (
-        vector_xy(candidate.get("truck_center_xy"))
-        or vector_xy(applied.get("truck_translation_xyz"))
+        vector_xy(applied.get("truck_translation_xyz"))
+        or vector_xy(candidate.get("truck_center_xy"))
     )
     unload_xy = (
         vector_xy(scene_context.get("unload_bin_center"))
@@ -2537,35 +2603,80 @@ def dashboard_scene_from_episode(row: dict) -> Dict[str, object]:
     )
     unload_landing_xy = vector_xy(row.get("unload_landing_xyz"))
     unload_point_xy = vector_xy(row.get("unload_point_xyz")) or vector_xy(row.get("unload_release_xyz"))
+
+    robot_origin_xy = (
+        first_vector_xy(
+            applied.get("robot_origin_xy"),
+            applied.get("robot_body_xy"),
+            applied.get("robot_body_xyz"),
+            applied.get("robot_translation_xyz"),
+            applied.get("robot_base_xy"),
+            applied.get("robot_base_xyz"),
+            applied.get("excavator_origin_xy"),
+            applied.get("excavator_translation_xyz"),
+            scene_context.get("robot_origin_xy"),
+            scene_context.get("excavator_origin_xy"),
+            candidate.get("robot_origin_xy"),
+            candidate.get("robot_xy"),
+            candidate.get("robot_xyz"),
+            row.get("robot_origin_xy"),
+            row.get("robot_origin_xyz"),
+            row.get("base_xy"),
+            row.get("base_xyz"),
+        )
+        or [0.0, 0.0]
+    )
+    robot_body_yaw_deg = safe_float_value(
+        applied.get("robot_body_yaw_deg", candidate.get("robot_body_yaw_deg")), 0.0
+    )
+    truck_yaw_deg = safe_float_value(applied.get("truck_yaw_deg", candidate.get("truck_yaw_deg")))
+    truck_yaw_body_deg = normalize_degrees(
+        (truck_yaw_deg if truck_yaw_deg is not None else 0.0)
+        - (robot_body_yaw_deg if robot_body_yaw_deg is not None else 0.0)
+    ) if truck_yaw_deg is not None else None
+
+    unload_polygon_xy = polygon_xy_or_empty(scene_context.get("unload_polygon_xy"))
+    unload_hull_xy = polygon_xy_or_empty(scene_context.get("unload_hull_xy"))
+
     return {
         "episode_index": row.get("episode_index"),
         "episode_id": row.get("episode_id"),
         "status": row.get("status"),
         "score": row.get("score"),
+        "scene_xy_frame": "world_xy",
+        "body_xy_frame": "excavator_body_xy",
+        "body_x_axis": "excavator forward after init yaw",
+        "body_y_axis": "excavator left after init yaw",
+        "robot_origin_xy": robot_origin_xy,
+        "robot_body_yaw_deg": robot_body_yaw_deg,
         "sand_xy": sand_xy,
         "truck_xy": truck_xy,
         "unload_xy": unload_xy,
         "unload_landing_xy": unload_landing_xy,
         "unload_point_xy": unload_point_xy,
+        "sand_body_xy": xy_to_body_frame(sand_xy, robot_origin_xy, robot_body_yaw_deg),
+        "truck_body_xy": xy_to_body_frame(truck_xy, robot_origin_xy, robot_body_yaw_deg),
+        "unload_body_xy": xy_to_body_frame(unload_xy, robot_origin_xy, robot_body_yaw_deg),
+        "unload_landing_body_xy": xy_to_body_frame(unload_landing_xy, robot_origin_xy, robot_body_yaw_deg),
+        "unload_point_body_xy": xy_to_body_frame(unload_point_xy, robot_origin_xy, robot_body_yaw_deg),
         "sand_amount_multiplier": safe_float_value(
             applied.get("sand_amount_multiplier", candidate.get("sand_amount_multiplier"))
         ),
         "estimated_particle_count": safe_float_value(
             applied.get("estimated_particle_count", candidate.get("estimated_particle_count"))
         ),
-        "truck_yaw_deg": safe_float_value(applied.get("truck_yaw_deg", candidate.get("truck_yaw_deg"))),
-        "robot_body_yaw_deg": safe_float_value(
-            applied.get("robot_body_yaw_deg", candidate.get("robot_body_yaw_deg"))
-        ),
+        "truck_yaw_deg": truck_yaw_deg,
+        "truck_yaw_body_deg": truck_yaw_body_deg,
         "truck_radius_m": safe_float_value(candidate.get("truck_radius_m")),
         "unload_radius_m": safe_float_value(candidate.get("unload_radius_m")),
         "sand_radius_m": safe_float_value(candidate.get("sand_radius_m")),
-        "unload_polygon_xy": scene_context.get("unload_polygon_xy") if isinstance(scene_context.get("unload_polygon_xy"), list) else [],
-        "unload_hull_xy": scene_context.get("unload_hull_xy") if isinstance(scene_context.get("unload_hull_xy"), list) else [],
+        "unload_polygon_xy": unload_polygon_xy,
+        "unload_hull_xy": unload_hull_xy,
+        "unload_polygon_body_xy": polygon_to_body_frame(unload_polygon_xy, robot_origin_xy, robot_body_yaw_deg),
+        "unload_hull_body_xy": polygon_to_body_frame(unload_hull_xy, robot_origin_xy, robot_body_yaw_deg),
         "unload_shape": scene_context.get("manual_unload_range_shape"),
         "unload_mesh": scene_context.get("manual_unload_selected_path"),
     }
-
 
 def dashboard_episode_summary(row: dict) -> Dict[str, object]:
     scene = dashboard_scene_from_episode(row)
@@ -2858,12 +2969,12 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
     <section class="panel span3"><div class="panelHeader"><h2>Segment completion</h2><span class="panelHint">jsonl counts</span></div><div id="segmentBars" class="barRows"></div></section>
     <section class="panel span3"><div class="panelHeader"><h2>Trajectory schema</h2><span class="panelHint">field coverage</span></div><div id="schemaTables" class="schemaGrid"></div></section>
 
-    <section class="panel span4"><div class="panelHeader"><h2>Sand XY coverage</h2><span class="panelHint">world XY, meters</span></div><div id="sandScatter" class="chartBox"></div></section>
-    <section class="panel span8"><div class="panelHeader"><h2>Truck XY coverage</h2><span class="panelHint">selected truck dump-bed mesh in world XY; 1:1 X/Y scale; density mode when samples overlap</span></div><div id="truckScatter" class="chartBox"></div></section>
+    <section class="panel span4"><div class="panelHeader"><h2>Sand XY coverage</h2><span class="panelHint">excavator body-frame XY after init yaw; 1:1 X/Y scale</span></div><div id="sandScatter" class="chartBox"></div></section>
+    <section class="panel span8"><div class="panelHeader"><h2>Truck XY coverage</h2><span class="panelHint">truck center + selected dump-bed mesh transformed into excavator body frame; 1:1 X/Y scale</span></div><div id="truckScatter" class="chartBox"></div></section>
     <section class="panel span8"><div class="panelHeader"><h2>Unload local XY</h2><span class="panelHint">selected unload mesh local frame; mesh is edge-aligned to X/Y</span></div><div id="unloadScatter" class="chartBox"></div></section>
     <section class="panel span4"><div class="panelHeader"><h2>Scene distributions</h2><span class="panelHint">secondary variables</span></div><div class="miniChartGrid">
       <div class="miniChart"><h3>Sand amount multiplier</h3><div id="sandAmountHist" class="smallChartBox"></div></div>
-      <div class="miniChart"><h3>Truck yaw</h3><div id="truckYawHist" class="smallChartBox"></div></div>
+      <div class="miniChart"><h3>Truck yaw relative to body</h3><div id="truckYawHist" class="smallChartBox"></div></div>
       <div class="miniChart"><h3>Robot initial yaw</h3><div id="robotYawHist" class="smallChartBox"></div></div>
     </div></section>
     <section class="panel span6"><div class="panelHeader"><h2>Score vs spill</h2><span class="panelHint">quality trade-off</span></div><div id="scoreSpillScatter" class="chartBox"></div></section>
@@ -3047,12 +3158,48 @@ function refreshFilteredViews(){
   renderScenePlots(pts, eps);
   renderEpisodes(eps);
 }
+function validXY(v){return Array.isArray(v)&&finite(Number(v[0]))&&finite(Number(v[1]))}
+function normalizeDegJS(v){let n=Number(v); if(!Number.isFinite(n))return null; while(n<=-180)n+=360; while(n>180)n-=360; return n}
+function transformWorldToBodyXY(pt, scene){
+  if(!validXY(pt)) return null;
+  const origin=validXY(scene.robot_origin_xy)?scene.robot_origin_xy:[0,0];
+  const yaw=Number(scene.robot_body_yaw_deg||0)*Math.PI/180;
+  const dx=Number(pt[0])-Number(origin[0]), dy=Number(pt[1])-Number(origin[1]);
+  const c=Math.cos(-yaw), s=Math.sin(-yaw);
+  return [dx*c-dy*s, dx*s+dy*c];
+}
+function sceneBodyXY(scene, bodyKey, worldKey){
+  if(validXY(scene[bodyKey])) return scene[bodyKey];
+  return transformWorldToBodyXY(scene[worldKey], scene);
+}
+function sceneBodyPoly(scene){
+  const body=(Array.isArray(scene.unload_polygon_body_xy)&&scene.unload_polygon_body_xy.length)?scene.unload_polygon_body_xy:scene.unload_hull_body_xy;
+  if(Array.isArray(body)&&body.length) return body;
+  const world=(Array.isArray(scene.unload_polygon_xy)&&scene.unload_polygon_xy.length)?scene.unload_polygon_xy:scene.unload_hull_xy;
+  if(!Array.isArray(world)) return [];
+  return world.map(pt=>transformWorldToBodyXY(pt, scene)).filter(validXY);
+}
+function sceneTruckYawBody(scene){
+  if(Number.isFinite(Number(scene.truck_yaw_body_deg))) return Number(scene.truck_yaw_body_deg);
+  const truck=Number(scene.truck_yaw_deg), robot=Number(scene.robot_body_yaw_deg||0);
+  return Number.isFinite(truck)?normalizeDegJS(truck-robot):null;
+}
 function renderScenePlots(pts, eps){
-  drawScatter("sandScatter", pts.map(p=>({x:p.sand_xy&&p.sand_xy[0], y:p.sand_xy&&p.sand_xy[1], status:p.status, label:p.episode_index})), "world x from excavator origin", "world y from excavator origin", {origin:true, unit:"m", width:640, height:420, equalAspect:true});
-  drawScatter("truckScatter", pts.map(p=>({x:p.truck_xy&&p.truck_xy[0], y:p.truck_xy&&p.truck_xy[1], status:p.status, label:p.episode_index, yaw:p.truck_yaw_deg, polygon:(p.unload_polygon_xy&&p.unload_polygon_xy.length?p.unload_polygon_xy:p.unload_hull_xy)})), "world x from excavator origin", "world y from excavator origin", {origin:true, unit:"m", polygons:true, heading:true, aggregate:true, densityThreshold:70, maxPolygons:24, width:900, height:520, equalAspect:true, truckMeshOverlay:true});
+  drawScatter(
+    "sandScatter",
+    pts.map(p=>{const xy=sceneBodyXY(p,"sand_body_xy","sand_xy"); return {x:xy&&xy[0], y:xy&&xy[1], status:p.status, label:p.episode_index, yaw:p.robot_body_yaw_deg};}),
+    "body x / forward from excavator", "body y / left from excavator",
+    {origin:true, unit:"m", width:640, height:420, equalAspect:true, bodyFrame:true}
+  );
+  drawScatter(
+    "truckScatter",
+    pts.map(p=>{const xy=sceneBodyXY(p,"truck_body_xy","truck_xy"); return {x:xy&&xy[0], y:xy&&xy[1], status:p.status, label:p.episode_index, yaw:sceneTruckYawBody(p), polygon:sceneBodyPoly(p), robotYaw:p.robot_body_yaw_deg};}),
+    "body x / forward from excavator", "body y / left from excavator",
+    {origin:true, unit:"m", polygons:true, heading:true, aggregate:true, densityThreshold:70, maxPolygons:24, width:900, height:520, equalAspect:true, truckMeshOverlay:true, bodyFrame:true}
+  );
   drawScatter("unloadScatter", canonicalUnloadPoints(pts), "selected mesh local x", "selected mesh local y", {origin:true, unit:"m", polygons:true, meshLocal:true, aggregate:true, densityThreshold:180, maxPolygons:140, width:900, height:520, equalAspect:true});
   drawHistogram("sandAmountHist", pts.map(p=>p.sand_amount_multiplier), "x", {mini:true, bins:10});
-  drawHistogram("truckYawHist", pts.map(p=>p.truck_yaw_deg), "deg", {mini:true, bins:12});
+  drawHistogram("truckYawHist", pts.map(p=>p.truck_yaw_body_deg ?? p.truck_yaw_deg), "deg", {mini:true, bins:12});
   drawHistogram("robotYawHist", pts.map(p=>p.robot_body_yaw_deg), "deg", {mini:true, bins:12});
   drawScatter("scoreSpillScatter", eps.map(ep=>({x:ep.final_spill, y:ep.score, status:ep.status, label:ep.episode_index})), "final spill particles", "score", {unit:"", aggregate:true, densityThreshold:120, width:720, height:420});
   drawScatter("binSpillScatter", eps.map(ep=>({x:ep.final_spill, y:ep.final_bin, status:ep.status, label:ep.episode_index})), "final spill particles", "final bin particles", {unit:"particles", aggregate:true, densityThreshold:120, width:720, height:420});
@@ -3131,7 +3278,7 @@ function drawScatter(targetId, pts, xLabel, yLabel, opts={}){
   if(opts.origin){
     parts.push(`<line x1="${sx(0).toFixed(1)}" y1="${f.t}" x2="${sx(0).toFixed(1)}" y2="${f.t+f.ph}" stroke="#101828" stroke-width="1.1" stroke-dasharray="4 4" opacity="0.38"/>`);
     parts.push(`<line x1="${f.l}" y1="${sy(0).toFixed(1)}" x2="${f.l+f.pw}" y2="${sy(0).toFixed(1)}" stroke="#101828" stroke-width="1.1" stroke-dasharray="4 4" opacity="0.38"/>`);
-    parts.push(`<circle cx="${sx(0).toFixed(1)}" cy="${sy(0).toFixed(1)}" r="4.2" fill="#101828"><title>mesh/world origin</title></circle>`)
+    parts.push(`<circle cx="${sx(0).toFixed(1)}" cy="${sy(0).toFixed(1)}" r="4.2" fill="#101828"><title>${opts.bodyFrame?"excavator body origin":"mesh/world origin"}</title></circle>`)
   }
   const maxPolygons=opts.maxPolygons ?? 80;
   if(opts.polygons || opts.meshLocal || opts.truckMeshOverlay){
@@ -3142,7 +3289,7 @@ function drawScatter(targetId, pts, xLabel, yLabel, opts={}){
       const opacity=opts.meshLocal?0.18:0.50;
       const fill=opts.meshLocal?"#667085":color;
       const polyTitle=opts.truckMeshOverlay
-        ? `ep ${esc(p.label)} selected truck dump-bed mesh in world XY; no dashboard rotation/projection`
+        ? `ep ${esc(p.label)} selected truck dump-bed mesh transformed into excavator body frame`
         : `ep ${esc(p.label)} selected unload mesh, local angle ${fmt(p.angleDeg,1)} deg`;
       parts.push(`<polygon points="${p.poly.map(pt=>`${sx(pt[0]).toFixed(1)},${sy(pt[1]).toFixed(1)}`).join(" ")}" fill="${fill}" fill-opacity="${opts.meshLocal?0.035:0.04}" stroke="${color}" stroke-width="${opts.meshLocal?1.15:1.15}" stroke-opacity="${opacity}"><title>${polyTitle}</title></polygon>`)
     }
@@ -3174,7 +3321,7 @@ function drawScatter(targetId, pts, xLabel, yLabel, opts={}){
   const aspectBadge=opts.equalAspect?`<span class="legendItem unitLegend">XY scale: 1:1${pxPerUnit?` · ${fmt(pxPerUnit,1)} px/${esc(opts.unit||'unit')}`:""}</span>`:"";
   const legend=`<div class="chartLegend">${unitBadge}${aspectBadge}${statuses.map(s=>`<span class="legendItem"><span class="legendDot" style="background:${statusColor(s)}"></span>${esc(s)}</span>`).join("")}${useDensity?'<span class="densityBadge">density + sampled points</span>':''}</div>`;
   const densityNote=densityInfo?`<div class="plotNote">${densityInfo}</div>`:"";
-  const truckNote=opts.truckMeshOverlay?`<div class="plotNote"><span class="meshFrameBadge">World XY mesh overlay</span> The selected truck dump-bed mesh uses the projected polygon/hull supplied by scene_context. The dashboard applies no extra rotation or local-frame transform here; only the display scale is locked to 1:1.</div>`:"";
+  const truckNote=opts.truckMeshOverlay?`<div class="plotNote"><span class="meshFrameBadge">Excavator body frame</span> Coordinates use body_xy = R(-robot_body_yaw) · (world_xy - robot_origin_xy). Truck center, selected dump-bed mesh, and yaw arrows are transformed with the same frame; display scale is locked to 1:1.</div>`:"";
   const meshNote=opts.meshLocal?`<div class="plotNote"><span class="meshFrameBadge">Mesh-local frame</span> origin = selected unload mesh center when available; X-axis = longest consecutive mesh edge; each unload point is transformed with the same frame as its own mesh polygon. Hollow rings mean the projected point is outside that polygon.</div>`:"";
   $(targetId).innerHTML=parts.join("")+legend+densityNote+truckNote+meshNote;
 }

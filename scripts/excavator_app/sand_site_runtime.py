@@ -3856,13 +3856,126 @@ def build_ui():
         pass
 
 
-# Isaac Sim Script Editor workflow imports/reloads this module as the sand-site
-# entrypoint, so scene construction and UI startup intentionally happen at
-# import time.
-apply_initial_env_parameters()
-apply_sand_fidelity_to_particle_globals(SAND_FIDELITY, announce=False)
-build_sand_site()
-if NO_UI:
-    info("[SAND SITE] UI disabled by EXCAVATOR_NO_UI/EXCAVATOR_HEADLESS")
+# ============================================================
+# Optional external startup interface
+#
+# External launcher may set:
+#
+# builtins._SAND_SITE_STARTUP_CONFIG = {
+#     "amount": 1,          # 0-10
+#     "show_ui": False,
+#     "auto_create": True,
+# }
+#
+# If this config is absent, preserve the original behavior:
+#     build_sand_site()
+#     build_ui()
+# ============================================================
+
+def configure_startup_sand(
+    amount=1,
+    show_ui=False,
+    auto_create=True,
+    rebuild=False,
+):
+    global SAND_AMOUNT_MULTIPLIER
+    global SANDBOX_FILL_HEIGHT
+    global AUTO_CREATE_INITIAL_SAND
+
+    try:
+        amount = int(amount)
+    except Exception:
+        amount = 1
+
+    amount = max(0, min(10, amount))
+
+    if amount > 0:
+        SAND_AMOUNT_MULTIPLIER = float(amount)
+        SANDBOX_FILL_HEIGHT = sand_height_from_amount(
+            SAND_AMOUNT_MULTIPLIER
+        )
+        AUTO_CREATE_INITIAL_SAND = bool(auto_create)
+
+        recompute_derived_scene_params()
+        apply_sand_fidelity_to_particle_globals(
+            SAND_FIDELITY,
+            announce=False,
+        )
+        update_particle_runtime_state()
+    else:
+        AUTO_CREATE_INITIAL_SAND = False
+
+    STATE["startup_sand_amount"] = amount
+    STATE["startup_show_ui"] = bool(show_ui)
+    STATE["startup_auto_create"] = bool(
+        AUTO_CREATE_INITIAL_SAND
+    )
+
+    if rebuild:
+        build_sand_site()
+
+    return {
+        "amount": amount,
+        "show_ui": bool(show_ui),
+        "auto_create": bool(AUTO_CREATE_INITIAL_SAND),
+        "fill_height": float(SANDBOX_FILL_HEIGHT),
+        "particle_estimate": int(
+            STATE.get("estimated_particle_count", 0)
+        ),
+    }
+
+
+builtins._CONFIGURE_SAND_STARTUP = configure_startup_sand
+
+
+_startup_config = getattr(
+    builtins,
+    "_SAND_SITE_STARTUP_CONFIG",
+    None,
+)
+
+apply_sand_fidelity_to_particle_globals(
+    SAND_FIDELITY,
+    announce=False,
+)
+
+if isinstance(_startup_config, dict):
+    # New external-launcher behavior.
+    _startup_result = configure_startup_sand(
+        amount=_startup_config.get("amount", 1),
+        show_ui=_startup_config.get("show_ui", False),
+        auto_create=_startup_config.get("auto_create", True),
+        rebuild=False,
+    )
+
+    print(
+        "[INFO] External sand startup config:",
+        _startup_result,
+        flush=True,
+    )
+
+    build_sand_site()
+
+    if bool(_startup_config.get("show_ui", False)):
+        build_ui()
+    else:
+        old_window = getattr(
+            builtins,
+            "_SAND_SITE_UI_WINDOW",
+            None,
+        )
+        if old_window is not None:
+            try:
+                old_window.visible = False
+            except Exception:
+                pass
+
+        print(
+            "[INFO] Sand Site Control UI disabled",
+            flush=True,
+        )
+
 else:
+    # Preserve the original standalone/script-editor behavior exactly.
+    build_sand_site()
     build_ui()

@@ -10,10 +10,16 @@ Headless auto collect:
 """
 
 import argparse
+import importlib
 import os
 import runpy
 import sys
 import time
+
+try:
+    importlib.import_module("nest_asyncio").apply()
+except Exception:
+    pass
 
 from excavator_common import paths
 
@@ -100,6 +106,7 @@ def wait_runtime_ready(simulation_app, rt, timeout_s):
     while simulation_app.is_running():
         simulation_app.update()
         if runtime_is_ready(rt):
+            suppress_headless_log_noise()
             print("[INFO] Runtime ready: robot articulation and joint indices are initialized.", flush=True)
             return
 
@@ -136,7 +143,78 @@ def wait_task_done(simulation_app, task, label):
             raise RuntimeError(f"{label} failed: {type(exc).__name__}: {exc}")
 
 
+def suppress_headless_log_noise():
+    try:
+        import carb
+        import carb.logging
+
+        logging = carb.logging.acquire_logging()
+        for source in [
+            "isaacsim.core.simulation_manager",
+            "isaacsim.core.simulation_manager.plugin",
+            "isaacsim.core.simulation_manager.impl.simulation_manager",
+        ]:
+            logging.set_log_enabled_for_source(source, False)
+            logging.set_level_threshold_for_source(source, carb.logging.LEVEL_ERROR)
+    except Exception:
+        pass
+
+
+def request_runtime_shutdown(simulation_app, rt, timeout_s=10.0):
+    if rt is None:
+        return
+    try:
+        rt.STATE["running"] = False
+        rt.STATE["auto_collect_stop_requested"] = True
+    except Exception:
+        pass
+
+    started = time.time()
+    timeout_s = min(float(timeout_s), 3.0)
+    while simulation_app.is_running():
+        tasks = getattr(rt, "STATE", {}).get("async_tasks", {}) or {}
+        main_task = tasks.get("main_loop")
+        if main_task is None or not hasattr(main_task, "done") or main_task.done():
+            break
+        simulation_app.update()
+        if time.time() - started > float(timeout_s):
+            try:
+                main_task.cancel()
+            except Exception:
+                pass
+            break
+
+    try:
+        world = getattr(rt, "World", None)
+        world_instance = world.instance() if world is not None else None
+        if world_instance is not None:
+            stop = getattr(world_instance, "stop", None)
+            if callable(stop):
+                stop()
+    except Exception:
+        pass
+    try:
+        import omni.timeline
+
+        omni.timeline.get_timeline_interface().stop()
+    except Exception:
+        pass
+    try:
+        cancel_tasks = getattr(rt, "cancel_registered_tasks", None)
+        if callable(cancel_tasks):
+            cancel_tasks(reason="launcher_shutdown", keep={"main_loop"})
+    except Exception:
+        pass
+
+    for _ in range(2):
+        try:
+            simulation_app.update()
+        except Exception:
+            break
+
+
 def run_auto_collect(simulation_app, rt, success_count, max_attempts, wait_export):
+    suppress_headless_log_noise()
     success_count = max(1, int(success_count))
     max_attempts_arg = None if int(max_attempts or 0) <= 0 else int(max_attempts)
     print(
@@ -190,6 +268,7 @@ def run_auto_collect(simulation_app, rt, success_count, max_attempts, wait_expor
 def main():
     args = parse_args()
     add_import_roots(PROJECT_ROOT)
+    rt = None
 
     bridge_enabled = args.bridge if args.bridge is not None else (not args.auto_collect and not args.headless)
     if args.headless and bridge_enabled:
@@ -219,6 +298,8 @@ def main():
         "height": int(args.height),
         "renderer": str(args.renderer),
     })
+    if args.headless and args.auto_collect:
+        suppress_headless_log_noise()
 
     try:
         open_stage(simulation_app, args.scene)
@@ -243,9 +324,7 @@ def main():
                 wait_export=args.wait_export,
             )
             if not args.keep_running_after_auto_collect:
-                rt.STATE["running"] = False
-                for _ in range(5):
-                    simulation_app.update()
+                request_runtime_shutdown(simulation_app, rt)
                 return
 
         print("[INFO] Runtime is running. Press Ctrl+C to exit.", flush=True)
@@ -255,8 +334,12 @@ def main():
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted.", flush=True)
     finally:
+        request_runtime_shutdown(simulation_app, rt)
         try:
-            simulation_app.close()
+            simulation_app.close(
+                wait_for_replicator=False,
+                skip_cleanup=bool(args.headless and args.auto_collect),
+            )
         except Exception:
             pass
 

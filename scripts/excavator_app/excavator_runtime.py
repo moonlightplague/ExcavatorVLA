@@ -3,6 +3,7 @@ import copy
 import hashlib
 import importlib
 import importlib.util
+import inspect
 import json
 import math
 import os
@@ -14,6 +15,11 @@ import time
 import traceback
 import numpy as np
 import builtins
+
+try:
+    importlib.import_module("nest_asyncio").apply()
+except Exception:
+    pass
 
 import omni.usd
 import omni.kit.app
@@ -6450,25 +6456,74 @@ def dataset_camera_resolution():
     return [max(32, width), max(32, height)]
 
 
+def asyncio_task_active():
+    try:
+        return asyncio.current_task() is not None
+    except Exception:
+        return False
+
+
+def _replicator_step_async(rt_subframes=1):
+    if rep is None:
+        return None
+    step_async = getattr(rep.orchestrator, "step_async", None)
+    if not callable(step_async):
+        return None
+    return step_async(
+        rt_subframes=int(rt_subframes),
+        delta_time=CONTROL_DT,
+        pause_timeline=False,
+    )
+
+
 def camera_global_tick():
     """
     Uniformly drive all Isaac camera / replicator graph reads.
     Dataset capture must follow this clock: world step -> replicator step -> annotator read.
+
+    This synchronous entrypoint is intentionally non-blocking while an asyncio task
+    is active. Kit's async engine is not re-entrant; calling blocking orchestrator
+    or app/world updates from a running coroutine can corrupt the loop with
+    "Cannot enter into task ... while another task ... is being executed".
     """
     if rep is None:
         info_print("[WARN] camera tick failed:", "replicator_unavailable")
         return False
     install_replicator_simtime_guard()
     try:
+        if asyncio_task_active():
+            # Do not schedule fire-and-forget Replicator tasks from synchronous
+            # dataset code running inside a coroutine. Those tasks can survive
+            # shutdown and trigger Kit/SimulationManager pending-task warnings.
+            # Coroutine paths that need a hard camera tick must await
+            # camera_global_tick_async() directly.
+            STATE["dataset_camera_deferred_ticks"] = int(STATE.get("dataset_camera_deferred_ticks", 0) or 0) + 1
+            return True
         step = getattr(rep.orchestrator, "step", None)
         if callable(step):
-            step(rt_subframes=2, delta_time=0.0, pause_timeline=False, wait_for_render=True)
+            step(rt_subframes=1, delta_time=CONTROL_DT, pause_timeline=False, wait_for_render=True)
         else:
-            rep.orchestrator.step_async(
-                rt_subframes=2,
-                delta_time=0.0,
-                pause_timeline=False,
-            )
+            pending = _replicator_step_async(rt_subframes=1)
+            if inspect.isawaitable(pending):
+                asyncio.ensure_future(pending)
+        return True
+    except Exception as e:
+        info_print("[WARN] camera tick failed:", type(e).__name__, e)
+        return False
+
+
+async def camera_global_tick_async():
+    """Async-safe Replicator camera tick for coroutine-driven runtime paths."""
+    if rep is None:
+        info_print("[WARN] camera tick failed:", "replicator_unavailable")
+        return False
+    install_replicator_simtime_guard()
+    try:
+        pending = _replicator_step_async(rt_subframes=1)
+        if inspect.isawaitable(pending):
+            await pending
+        elif pending is None:
+            await step_updates(1)
         return True
     except Exception as e:
         info_print("[WARN] camera tick failed:", type(e).__name__, e)
@@ -6522,29 +6577,11 @@ def install_replicator_simtime_guard():
 
 
 def camera_warmup_graph(frames=5):
-    world = None
-    try:
-        world = World.instance()
-    except Exception:
-        world = None
-    app = None
-    try:
-        app = omni.kit.app.get_app()
-    except Exception:
-        app = None
+    # Synchronous warmup must not call world.step() or app.update() from inside
+    # Kit coroutines. Those calls re-enter the async engine. Coroutine callers use
+    # dataset_camera_warmup_for_episode(), which awaits step_updates() and
+    # camera_global_tick_async() explicitly.
     for _ in range(max(1, int(frames))):
-        stepped = False
-        if world is not None:
-            try:
-                world.step(render=True)
-                stepped = True
-            except Exception as e:
-                info_print("[WARN] camera warmup world step failed:", type(e).__name__, e)
-        if not stepped and app is not None:
-            try:
-                app.update()
-            except Exception:
-                pass
         camera_global_tick()
 
 
@@ -6982,7 +7019,7 @@ async def dataset_camera_warmup_for_episode(label="episode"):
         max_frames = max(min_frames, ready_required)
     for frame in range(max_frames):
         await step_updates(1)
-        camera_global_tick()
+        await camera_global_tick_async()
         ready, reason = dataset_camera_rgb_ready()
         last_reason = reason
         if ready:
@@ -32767,6 +32804,8 @@ async def main():
         ensure_sand_site_bucket_colliders(force=True)
         rebind_sand_particles_to_physics_scene("before_world")
     print_ground_contact_diagnostics("before_world")
+    if NO_UI:
+        await step_updates(3)
 
     world = World(stage_units_in_meters=1.0)
     if sand_site_active():

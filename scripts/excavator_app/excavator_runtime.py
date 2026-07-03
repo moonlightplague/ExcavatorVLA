@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import ctypes
 import hashlib
 import importlib
 import importlib.util
@@ -43,6 +44,13 @@ try:
 except Exception:
     IsaacCamera = None
     HAS_ISAAC_CAMERA = False
+try:
+    from omni.kit.viewport.utility import get_active_viewport, capture_viewport_to_buffer
+    HAS_VIEWPORT_CAPTURE = True
+except Exception:
+    get_active_viewport = None
+    capture_viewport_to_buffer = None
+    HAS_VIEWPORT_CAPTURE = False
 try:
     from PIL import Image
 except Exception:
@@ -300,6 +308,7 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_last_ddq_real": None,
     "dataset_current_q_goal": None,
     "dataset_camera_enabled": True,
+    "dataset_camera_backend": str(os.environ.get("EXCAVATOR_DATASET_CAMERA_BACKEND", "viewport") or "viewport").strip().lower(),
     "dataset_camera_objects": {},
     "dataset_camera_initialized": False,
     "dataset_camera_init_attempted": False,
@@ -6446,6 +6455,131 @@ def dataset_camera_resolution():
     return [max(32, width), max(32, height)]
 
 
+PENDING_VIEWPORT_CAPTURE_HELPERS = []
+PyCapsule_GetPointer = ctypes.pythonapi.PyCapsule_GetPointer
+PyCapsule_GetPointer.restype = ctypes.c_void_p
+PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+
+PyCapsule_GetName = ctypes.pythonapi.PyCapsule_GetName
+PyCapsule_GetName.restype = ctypes.c_char_p
+PyCapsule_GetName.argtypes = [ctypes.py_object]
+
+
+def dataset_camera_backend():
+    backend = str(STATE.get("dataset_camera_backend", "viewport") or "viewport").strip().lower()
+    if backend not in ("viewport", "isaac", "auto"):
+        backend = "viewport"
+    if backend == "auto":
+        viewport_ok, _ = viewport_capture_available()
+        if viewport_ok:
+            return "viewport"
+        if bool(NO_UI) or env_bool("EXCAVATOR_HEADLESS", False):
+            return "viewport"
+        return "isaac" if bool(HAS_ISAAC_CAMERA) else "viewport"
+    return backend
+
+
+def viewport_capture_available():
+    if not bool(HAS_VIEWPORT_CAPTURE) or get_active_viewport is None or capture_viewport_to_buffer is None:
+        return False, "viewport_capture_api_unavailable"
+    try:
+        viewport = get_active_viewport()
+    except Exception as exc:
+        return False, f"viewport_query_failed:{type(exc).__name__}:{exc}"
+    if viewport is None:
+        return False, "viewport_missing"
+    return True, "ok"
+
+
+def _capsule_to_numpy_rgba(capsule, buffer_size, width, height):
+    name = PyCapsule_GetName(capsule)
+    ptr = PyCapsule_GetPointer(capsule, name)
+    if ptr is None or ptr == 0:
+        raise RuntimeError("capture_viewport_to_buffer returned an empty buffer pointer")
+    array_type = ctypes.c_uint8 * int(buffer_size)
+    arr = np.ctypeslib.as_array(array_type.from_address(ptr))
+    channels = int(buffer_size) // max(1, int(width) * int(height))
+    rgba = arr.reshape((int(height), int(width), int(channels))).copy()
+    return rgba
+
+
+def resize_rgb_nearest(rgb, width, height):
+    rgb = np.asarray(rgb)
+    src_h, src_w = int(rgb.shape[0]), int(rgb.shape[1])
+    dst_w = max(1, int(width))
+    dst_h = max(1, int(height))
+    if src_w == dst_w and src_h == dst_h:
+        return rgb
+    x_idx = np.clip(np.round(np.linspace(0, src_w - 1, dst_w)).astype(np.int32), 0, src_w - 1)
+    y_idx = np.clip(np.round(np.linspace(0, src_h - 1, dst_h)).astype(np.int32), 0, src_h - 1)
+    return rgb[y_idx][:, x_idx]
+
+
+def capture_rgb_from_viewport_camera(camera_path, width=None, height=None):
+    ok, reason = viewport_capture_available()
+    if not ok:
+        return None, reason
+    viewport = get_active_viewport()
+    if viewport is None:
+        return None, "viewport_missing"
+    camera_path = str(camera_path or "")
+    if not camera_path:
+        return None, "camera_path_missing"
+    result = {"done": False, "rgb": None, "error": ""}
+    helper_holder = {"done": False, "helper": None}
+    original_camera_path = None
+    try:
+        original_camera_path = str(getattr(viewport, "camera_path", "") or "")
+    except Exception:
+        original_camera_path = None
+
+    def _on_capture(capsule, buffer_size, w, h, _fmt):
+        try:
+            rgba = _capsule_to_numpy_rgba(capsule, buffer_size, w, h)
+            if rgba.ndim != 3 or rgba.shape[-1] < 3:
+                raise RuntimeError(f"unexpected_viewport_shape:{list(rgba.shape)}")
+            result["rgb"] = rgba[:, :, :3].copy()
+        except Exception as exc:
+            result["error"] = f"{type(exc).__name__}:{exc}"
+        finally:
+            result["done"] = True
+            helper_holder["done"] = True
+
+    try:
+        viewport.camera_path = camera_path
+        helper_holder["helper"] = capture_viewport_to_buffer(viewport, _on_capture)
+        PENDING_VIEWPORT_CAPTURE_HELPERS.append(helper_holder)
+        app = omni.kit.app.get_app()
+        settle_frames = max(1, int(os.environ.get("EXCAVATOR_VIEWPORT_CAPTURE_SETTLE_FRAMES", "2") or 2))
+        wait_frames = max(2, int(os.environ.get("EXCAVATOR_VIEWPORT_CAPTURE_WAIT_FRAMES", "8") or 8))
+        for _ in range(settle_frames + wait_frames):
+            app.update()
+            if result["done"]:
+                break
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}:{exc}"
+    finally:
+        if original_camera_path is not None:
+            try:
+                viewport.camera_path = original_camera_path
+            except Exception:
+                pass
+        kept = []
+        for holder in PENDING_VIEWPORT_CAPTURE_HELPERS:
+            if not holder.get("done"):
+                kept.append(holder)
+        PENDING_VIEWPORT_CAPTURE_HELPERS[:] = kept
+
+    if result["rgb"] is None:
+        return None, result["error"] or "viewport_capture_no_result"
+    rgb = result["rgb"]
+    if width is not None and height is not None:
+        rgb = resize_rgb_nearest(rgb, int(width), int(height))
+    if rgb.dtype != np.uint8:
+        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+    return rgb, "ok"
+
+
 def dataset_camera_specs():
     swing_parent = LINK_PATHS.get("swing_link") or (f"{ROBOT_BASE}/swing_link" if ROBOT_BASE else "")
     arm_parent = LINK_PATHS.get("arm_link") or (f"{ROBOT_BASE}/arm_link" if ROBOT_BASE else "")
@@ -6615,21 +6749,31 @@ def dataset_camera_initialize(force=False):
     if not bool(STATE.get("dataset_camera_enabled", True)):
         STATE["dataset_camera_last_status"] = {"enabled": False, "reason": "disabled"}
         return False
-    if not HAS_ISAAC_CAMERA or IsaacCamera is None:
-        STATE["dataset_camera_last_status"] = {"enabled": True, "available": False, "reason": "isaac_camera_api_unavailable"}
+    backend = dataset_camera_backend()
+    if backend == "isaac" and (not HAS_ISAAC_CAMERA or IsaacCamera is None):
+        STATE["dataset_camera_last_status"] = {"enabled": True, "available": False, "reason": "isaac_camera_api_unavailable", "backend": backend}
         return False
+    if backend == "viewport":
+        viewport_ok, viewport_reason = viewport_capture_available()
+        if not viewport_ok:
+            STATE["dataset_camera_last_status"] = {"enabled": True, "available": False, "reason": viewport_reason, "backend": backend}
+            return False
     now = time.time()
     retry_after = float(STATE.get("dataset_camera_retry_after_time", 0.0) or 0.0)
     if not force and now < retry_after:
-        STATE["dataset_camera_last_status"] = {"enabled": True, "available": False, "reason": "camera_init_backoff"}
+        STATE["dataset_camera_last_status"] = {"enabled": True, "available": False, "reason": "camera_init_backoff", "backend": backend}
         return False
     ready, ready_reason = dataset_camera_runtime_ready()
     if not ready:
         STATE["dataset_camera_retry_after_time"] = now + 0.5
-        STATE["dataset_camera_last_status"] = {"enabled": True, "available": False, "reason": ready_reason}
+        STATE["dataset_camera_last_status"] = {"enabled": True, "available": False, "reason": ready_reason, "backend": backend}
         return False
     if bool(STATE.get("dataset_camera_initialized", False)) and not force:
         objects = STATE.get("dataset_camera_objects")
+        if backend == "viewport":
+            status = STATE.get("dataset_camera_last_status", {})
+            if isinstance(status, dict) and status.get("backend") == "viewport":
+                return True
         if isinstance(objects, dict) and objects:
             return True
 
@@ -6640,6 +6784,7 @@ def dataset_camera_initialize(force=False):
     status = {
         "enabled": True,
         "schema": DATASET_CAMERA_SCHEMA,
+        "backend": backend,
         "resolution": resolution,
         "image_format": dataset_camera_image_extension(),
         "views": {},
@@ -6656,9 +6801,10 @@ def dataset_camera_initialize(force=False):
                 view_status.update({"available": False, "reason": reason})
                 status["views"][name] = view_status
                 continue
-            cam = IsaacCamera(prim_path=path, resolution=(int(resolution[0]), int(resolution[1])), frequency=frequency)
-            cam.initialize()
-            objects[name] = cam
+            if backend == "isaac":
+                cam = IsaacCamera(prim_path=path, resolution=(int(resolution[0]), int(resolution[1])), frequency=frequency)
+                cam.initialize()
+                objects[name] = cam
             view_status.update(dataset_camera_prim_metadata(path))
             view_status.update({"available": True, "reason": "ok"})
         except Exception as exc:
@@ -6667,12 +6813,21 @@ def dataset_camera_initialize(force=False):
         status["views"][name] = view_status
 
     STATE["dataset_camera_objects"] = objects
-    STATE["dataset_camera_initialized"] = bool(objects)
+    STATE["dataset_camera_initialized"] = bool(objects) if backend == "isaac" else bool(status["views"])
     STATE["dataset_camera_init_attempted"] = True
     STATE["dataset_camera_last_status"] = status
-    if objects:
+    if backend == "viewport":
         info_print(
             "[DATASET CAMERA]",
+            "backend=viewport",
+            f"views={list(status['views'].keys())}",
+            f"resolution={resolution}",
+            f"format={dataset_camera_image_extension()}",
+        )
+    elif objects:
+        info_print(
+            "[DATASET CAMERA]",
+            "backend=isaac",
             f"views={list(objects.keys())}",
             f"resolution={resolution}",
             f"format={dataset_camera_image_extension()}",
@@ -6801,10 +6956,26 @@ def dataset_camera_payload_complete(payload, sample_index):
 def dataset_camera_rgb_ready():
     if not bool(STATE.get("dataset_camera_enabled", True)):
         return True, "disabled"
+    backend = dataset_camera_backend()
     if not dataset_camera_initialize(force=False):
         status = STATE.get("dataset_camera_last_status", {})
         reason = status.get("reason", "camera_unavailable") if isinstance(status, dict) else "camera_unavailable"
         return False, str(reason)
+    if backend == "viewport":
+        resolution = dataset_camera_resolution()
+        missing = []
+        for spec in dataset_camera_specs():
+            name = str(spec.get("name", ""))
+            rgb, reason = capture_rgb_from_viewport_camera(spec.get("path", ""), width=resolution[0], height=resolution[1])
+            if rgb is None:
+                missing.append(f"{name}:{reason}")
+                continue
+            arr = np.asarray(rgb)
+            if arr.ndim != 3 or arr.shape[0] <= 0 or arr.shape[1] <= 0 or arr.shape[-1] < 3:
+                missing.append(f"{name}:bad_shape:{list(arr.shape)}")
+        if missing:
+            return False, ",".join(missing)
+        return True, "ok"
     objects = STATE.get("dataset_camera_objects")
     if not isinstance(objects, dict):
         return False, "camera_objects_missing"
@@ -6907,10 +7078,12 @@ def dataset_capture_camera_observations(sample_index):
     if int(sample_index) % stride != 0:
         payload["observation.camera"]["reason"] = "stride_skipped"
         return payload
+    backend = dataset_camera_backend()
     if not dataset_camera_initialize(force=False):
         status = STATE.get("dataset_camera_last_status", {})
         payload["observation.camera"]["reason"] = status.get("reason", "camera_unavailable") if isinstance(status, dict) else "camera_unavailable"
         return payload
+    payload["observation.camera"]["backend"] = backend
 
     episode_dir = str(STATE.get("dataset_episode_dir", "") or "")
     image_dir = str(STATE.get("dataset_image_dir", "") or "")
@@ -6923,6 +7096,7 @@ def dataset_capture_camera_observations(sample_index):
         objects = {}
     camera_cache = dataset_camera_episode_cache(reset=False)
     extension = str(camera_cache.get("extension", dataset_camera_image_extension()))
+    resolution = dataset_camera_resolution()
     any_available = False
     view_cache = camera_cache.get("views", {}) if isinstance(camera_cache, dict) else {}
     for name in DATASET_CAMERA_NAMES:
@@ -6939,14 +7113,22 @@ def dataset_capture_camera_observations(sample_index):
         view_payload["prim_path"] = prim_path
         view_payload["pose"] = dataset_camera_world_pose(prim_path)
         try:
-            if cam is None:
+            if backend == "isaac" and cam is None:
                 view_payload["reason"] = "camera_object_missing"
             else:
-                rgb = cam.get_rgb()
+                if backend == "isaac":
+                    rgb = cam.get_rgb()
+                    reason = "ok" if rgb is not None else "rgb_none"
+                else:
+                    rgb, reason = capture_rgb_from_viewport_camera(prim_path, width=resolution[0], height=resolution[1])
                 if rgb is None:
-                    view_payload["reason"] = "rgb_none"
+                    view_payload["reason"] = reason
                 else:
                     rgb = np.asarray(rgb)
+                    if rgb.ndim != 3 or rgb.shape[-1] < 3:
+                        view_payload["reason"] = f"bad_shape:{list(rgb.shape)}"
+                        payload["observation.camera"]["views"][name] = view_payload
+                        continue
                     if rgb.ndim == 3 and rgb.shape[-1] == 4:
                         rgb = rgb[:, :, :3]
                     if rgb.dtype != np.uint8:
@@ -6973,6 +7155,7 @@ def dataset_capture_camera_observations(sample_index):
                             "shape": [int(x) for x in rgb.shape],
                             "dtype": str(rgb.dtype),
                             "format": fmt,
+                            "capture_backend": backend,
                         }
                     )
                     any_available = True
@@ -7268,10 +7451,18 @@ def auto_dataset_config_snapshot():
 
 
 def camera_config_snapshot():
+    backend = dataset_camera_backend()
+    viewport_ok, viewport_reason = viewport_capture_available()
     return {
         "schema": DATASET_CAMERA_SCHEMA,
         "enabled": bool(STATE.get("dataset_camera_enabled", True)),
-        "available": bool(HAS_ISAAC_CAMERA),
+        "available": bool(HAS_ISAAC_CAMERA) if backend == "isaac" else bool(viewport_ok),
+        "backend": backend,
+        "backend_available": {
+            "isaac_camera": bool(HAS_ISAAC_CAMERA),
+            "viewport_capture": bool(viewport_ok),
+            "viewport_reason": str(viewport_reason),
+        },
         "resolution": dataset_camera_resolution(),
         "frequency": int(STATE.get("dataset_camera_frequency", 10) or 10),
         "sample_stride": max(1, int(STATE.get("dataset_camera_sample_stride", 1) or 1)),

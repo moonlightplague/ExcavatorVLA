@@ -149,6 +149,7 @@ def suppress_headless_log_noise():
         import carb.logging
 
         logging = carb.logging.acquire_logging()
+        logging.set_level_threshold(carb.logging.LEVEL_ERROR)
         for source in [
             "isaacsim.core.simulation_manager",
             "isaacsim.core.simulation_manager.plugin",

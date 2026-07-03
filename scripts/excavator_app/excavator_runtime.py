@@ -14162,6 +14162,154 @@ def polygons_overlap_with_margin_xy(a, b, margin=0.0):
     return False
 
 
+def aabb_overlap_detail(min_a, max_a, min_b, max_b, margin_xy=0.0, margin_z=0.0):
+    try:
+        a0 = np.array(min_a, dtype=np.float32).reshape(-1)[:3]
+        a1 = np.array(max_a, dtype=np.float32).reshape(-1)[:3]
+        b0 = np.array(min_b, dtype=np.float32).reshape(-1)[:3]
+        b1 = np.array(max_b, dtype=np.float32).reshape(-1)[:3]
+    except Exception:
+        return {"ok": False, "reason": "bad_aabb"}
+    if len(a0) < 3 or len(a1) < 3 or len(b0) < 3 or len(b1) < 3:
+        return {"ok": False, "reason": "bad_aabb_shape"}
+    mxy = max(0.0, float(margin_xy))
+    mz = max(0.0, float(margin_z))
+    overlap_x = bool(float(a1[0]) + mxy >= float(b0[0]) and float(b1[0]) + mxy >= float(a0[0]))
+    overlap_y = bool(float(a1[1]) + mxy >= float(b0[1]) and float(b1[1]) + mxy >= float(a0[1]))
+    overlap_z = bool(float(a1[2]) + mz >= float(b0[2]) and float(b1[2]) + mz >= float(a0[2]))
+    return {
+        "ok": True,
+        "overlap": bool(overlap_x and overlap_y and overlap_z),
+        "overlap_xy": bool(overlap_x and overlap_y),
+        "overlap_z": bool(overlap_z),
+        "margin_xy": float(mxy),
+        "margin_z": float(mz),
+        "a_min": vec_list(a0, 3),
+        "a_max": vec_list(a1, 3),
+        "b_min": vec_list(b0, 3),
+        "b_max": vec_list(b1, 3),
+    }
+
+
+def z_ranges_overlap(min_a, max_a, min_b, max_b, margin_z=0.0):
+    try:
+        a0 = float(np.array(min_a, dtype=np.float32).reshape(-1)[2])
+        a1 = float(np.array(max_a, dtype=np.float32).reshape(-1)[2])
+        b0 = float(np.array(min_b, dtype=np.float32).reshape(-1)[2])
+        b1 = float(np.array(max_b, dtype=np.float32).reshape(-1)[2])
+    except Exception:
+        return True
+    mz = max(0.0, float(margin_z))
+    return bool(a1 + mz >= b0 and b1 + mz >= a0)
+
+
+def auto_scene_robot_link_footprint_rows():
+    rows = []
+    for link_name in ("base_link", "swing_link", "boom_link", "arm_link", "bucket_link"):
+        path = LINK_PATHS.get(link_name, "")
+        if not path:
+            continue
+        prim = get_prim(path)
+        if not prim or not prim.IsValid():
+            continue
+        poly = None
+        try:
+            pts = mesh_world_xy_points_under(prim)
+            poly = convex_hull_xy(pts) if pts is not None and len(pts) >= 3 else None
+        except Exception:
+            poly = None
+        mn = mx = None
+        source = ""
+        try:
+            mn, mx, source = collision_bbox_for_subtree(path)
+        except Exception:
+            mn, mx, source = None, None, "bbox_exception"
+        if poly is None and mn is not None and mx is not None:
+            center = 0.5 * (np.array(mn, dtype=np.float32)[:2] + np.array(mx, dtype=np.float32)[:2])
+            size = np.maximum(np.array(mx, dtype=np.float32)[:2] - np.array(mn, dtype=np.float32)[:2], 0.05)
+            poly = obb_polygon_xy(center, size, 0.0)
+            source = f"{source}_aabb_fallback"
+        if poly is None:
+            continue
+        rows.append({
+            "link": str(link_name),
+            "path": str(path),
+            "poly": poly,
+            "vertices": int(len(poly)),
+            "min": mn,
+            "max": mx,
+            "bbox_source": str(source),
+        })
+    return rows
+
+
+def auto_scene_current_robot_truck_overlap_detail():
+    detail = {"gate": "current_robot_truck_overlap"}
+    truck_poly = None
+    try:
+        truck_poly = auto_scene_current_truck_polygon_xy()
+        detail["truck_footprint_source"] = "mesh_world_hull_or_obb"
+        detail["truck_polygon_vertices"] = 0 if truck_poly is None else int(len(truck_poly))
+    except Exception as exc:
+        detail["truck_footprint_exception"] = f"{type(exc).__name__}: {exc}"
+        truck_poly = None
+
+    robot_min = robot_max = truck_min = truck_max = None
+    robot_source = truck_source = ""
+    try:
+        robot_min, robot_max, robot_source = robot_full_collision_bbox()
+        detail["robot_bbox_source"] = str(robot_source)
+    except Exception as exc:
+        detail["robot_bbox_exception"] = f"{type(exc).__name__}: {exc}"
+    try:
+        truck_min, truck_max, truck_source = collision_bbox_for_subtree(AUTO_SCENE_TRUCK_ROOT_PATH)
+        detail["truck_bbox_source"] = str(truck_source)
+    except Exception as exc:
+        detail["truck_bbox_exception"] = f"{type(exc).__name__}: {exc}"
+
+    bbox_detail = None
+    if robot_min is not None and robot_max is not None and truck_min is not None and truck_max is not None:
+        bbox_detail = aabb_overlap_detail(
+            robot_min,
+            robot_max,
+            truck_min,
+            truck_max,
+            margin_xy=0.0,
+            margin_z=0.0,
+        )
+        detail["bbox"] = bbox_detail
+    else:
+        detail["bbox"] = {"ok": False, "reason": "missing_bbox"}
+
+    link_hits = []
+    if truck_poly is not None:
+        for row in auto_scene_robot_link_footprint_rows():
+            try:
+                xy_overlap = polygons_overlap_with_margin_xy(row.get("poly"), truck_poly, margin=0.0)
+            except Exception:
+                xy_overlap = False
+            z_overlap = z_ranges_overlap(row.get("min"), row.get("max"), truck_min, truck_max, margin_z=0.0)
+            if xy_overlap and z_overlap:
+                link_hits.append({
+                    "link": row.get("link"),
+                    "path": row.get("path"),
+                    "vertices": int(row.get("vertices", 0) or 0),
+                    "bbox_source": row.get("bbox_source", ""),
+                    "z_overlap": bool(z_overlap),
+                })
+        detail["robot_link_footprint_hits"] = link_hits
+        detail["robot_link_footprint_gate"] = "mesh_world_hull_zero_margin"
+
+    bbox_available = bool(isinstance(bbox_detail, dict) and bbox_detail.get("ok", False))
+    bbox_overlap = bool(bbox_available and bbox_detail.get("overlap", False))
+    mesh_overlap = bool(link_hits)
+    detail["aabb_overlap_diagnostic_only"] = bool(bbox_overlap)
+    detail["overlap_source"] = "mesh_link_footprint" if truck_poly is not None else "collision_bbox_fallback"
+    detail["overlap"] = bool(mesh_overlap or (truck_poly is None and bbox_overlap))
+    detail["decision"] = "fail_fast_before_sand_reset" if detail["overlap"] else "ok"
+    return bool(detail["overlap"]), detail
+
+
 def polygon_radius_range(poly):
     p = valid_polygon_xy(poly)
     if p is None:
@@ -14867,12 +15015,14 @@ def auto_collect_prepare_home_needed(policy=None, ready_reset_done=None):
     return False, "safe_for_direct_initial_pose"
 
 
-async def auto_collect_prepare_environment():
+async def auto_collect_prepare_environment(initial_info=None, attempt_index=None):
     was_recording = bool(STATE.get("dataset_recording", False))
     STATE["dataset_recording"] = False
     STATE["auto_collect_prepare_failure_reason"] = ""
     gate_report = {"started_at": time.time(), "gates": []}
     STATE["auto_collect_prepare_gate_report"] = gate_report
+    initial_info = initial_info if isinstance(initial_info, dict) else None
+    attempt_index = int(attempt_index or STATE.get("auto_collect_attempts", 0) or 0)
 
     def record_gate(name, ok, reason="ok", detail=None):
         row = {
@@ -15043,6 +15193,54 @@ async def auto_collect_prepare_environment():
     await step_updates(AUTO_COLLECT_PRE_RESET_SETTLE_FRAMES)
     if handle_timeline_stop_if_needed("auto_collect_prepare_after_home"):
         return fail_prepare("prepare_failed/timeline_stopped_after_home", gate="timeline")
+
+    if initial_info is not None:
+        q_initial = initial_info.get("q")
+        STATE["auto_collect_initial_pose"] = initial_info
+        STATE["auto_collect_initial_pose_id"] = str(initial_info.get("id", ""))
+        update_status(
+            f"[AUTO DATASET] initial pose {initial_info.get('id', '')} before sand reset q={initial_info.get('q_deg', [])}",
+            force=True,
+        )
+        initial_ok = await set_joint_pose_direct_and_settle(
+            q_initial,
+            label=f"auto_collect_initial_pre_reset_{initial_info.get('id', '')}",
+            mode="auto_collect_initial_pre_reset_direct",
+            settle_frames=DIRECT_INITIAL_POSE_SETTLE_FRAMES,
+            task_id=task_id,
+        )
+        record_gate(
+            "initial_pose_pre_reset",
+            bool(initial_ok),
+            "ok" if initial_ok else "prepare_failed/initial_pose_pre_reset_failed",
+            detail={
+                "initial_pose_id": str(initial_info.get("id", "")),
+                "q_initial_deg": initial_info.get("q_deg", []),
+            },
+        )
+        if not initial_ok:
+            return fail_prepare(
+                "prepare_failed/initial_pose_pre_reset_failed",
+                gate="initial_pose_pre_reset",
+                detail={"initial_pose": initial_info},
+                q_cmd=q_initial,
+            )
+        STATE["auto_collect_initial_pose_prepared_attempt"] = int(attempt_index)
+        await step_updates(2)
+
+    overlap, overlap_detail = auto_scene_current_robot_truck_overlap_detail()
+    record_gate(
+        "robot_truck_overlap_before_sand_reset",
+        not overlap,
+        "ok" if not overlap else "prepare_failed/initial_robot_truck_overlap",
+        detail=overlap_detail,
+    )
+    if overlap:
+        return fail_prepare(
+            "prepare_failed/initial_robot_truck_overlap",
+            gate="robot_truck_overlap_before_sand_reset",
+            detail=overlap_detail,
+        )
 
     should_reset_sand = (
         home_ok
@@ -15245,7 +15443,42 @@ async def auto_collect_one_episode():
         )
         return False
 
-    prepared = await auto_collect_prepare_environment()
+    planned_initial_info = auto_collect_initial_pose_for_attempt(attempt)
+    initial_gate_ok, initial_gate_reason, initial_gate_detail = auto_collect_initial_pose_pre_sample_gate(planned_initial_info)
+    if not initial_gate_ok:
+        target = None
+        plan_attempts = [{
+            "prepared": False,
+            "initial_pose_ok": False,
+            "initial_pose_id": planned_initial_info.get("id", ""),
+            "pre_sample_gate": {
+                "ok": False,
+                "reason": initial_gate_reason,
+                "detail": initial_gate_detail,
+            },
+            "failure_reason": initial_gate_reason,
+        }]
+        info_print(
+            "[AUTO DATASET ATTEMPT]",
+            f"attempt={attempt}",
+            "result=pre_sample_initial_pose_failed",
+            "executed=False",
+            f"initial_pose_id={planned_initial_info.get('id', '')}",
+            f"reason={initial_gate_reason}",
+        )
+        auto_collect_record_planning_diagnostic(
+            attempt,
+            target,
+            plan_attempts,
+            initial_gate_reason,
+            initial_info=planned_initial_info,
+        )
+        return False
+
+    prepared = await auto_collect_prepare_environment(
+        initial_info=planned_initial_info,
+        attempt_index=attempt,
+    )
     if not prepared:
         prepare_reason = str(
             STATE.pop("auto_collect_prepare_failure_reason", "")
@@ -15274,39 +15507,16 @@ async def auto_collect_one_episode():
         )
         return False
 
-    planned_initial_info = auto_collect_initial_pose_for_attempt(attempt)
-    initial_gate_ok, initial_gate_reason, initial_gate_detail = auto_collect_initial_pose_pre_sample_gate(planned_initial_info)
-    if not initial_gate_ok:
-        target = None
-        plan_attempts = [{
-            "prepared": True,
-            "initial_pose_ok": False,
-            "initial_pose_id": planned_initial_info.get("id", ""),
-            "pre_sample_gate": {
-                "ok": False,
-                "reason": initial_gate_reason,
-                "detail": initial_gate_detail,
-            },
-            "failure_reason": initial_gate_reason,
-        }]
+    prepared_initial_attempt = int(STATE.get("auto_collect_initial_pose_prepared_attempt", 0) or 0)
+    if prepared_initial_attempt == int(attempt):
+        initial_ok = True
+        initial_info = planned_initial_info
         info_print(
-            "[AUTO DATASET ATTEMPT]",
-            f"attempt={attempt}",
-            "result=pre_sample_initial_pose_failed",
-            "executed=False",
-            f"initial_pose_id={planned_initial_info.get('id', '')}",
-            f"reason={initial_gate_reason}",
+            "[AUTO DATASET]",
+            f"initial pose {initial_info.get('id', '')} already prepared before sand reset",
         )
-        auto_collect_record_planning_diagnostic(
-            attempt,
-            target,
-            plan_attempts,
-            initial_gate_reason,
-            initial_info=planned_initial_info,
-        )
-        return False
-
-    initial_ok, initial_info = await auto_collect_move_to_initial_pose(attempt)
+    else:
+        initial_ok, initial_info = await auto_collect_move_to_initial_pose(attempt)
     if not initial_ok:
         target = None
         plan_attempts = [{

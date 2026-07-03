@@ -656,6 +656,8 @@ AUTO_SCENE_SAND_MIN_REACH_RADIUS = 5.60
 AUTO_SCENE_SAND_MAX_REACH_RADIUS = 7.45
 AUTO_SCENE_UNLOAD_MIN_REACH_RADIUS = 7.80
 AUTO_SCENE_UNLOAD_MAX_REACH_RADIUS = 11.00
+AUTO_SCENE_UNLOAD_DYNAMIC_MIN_RADIUS_FLOOR = 5.50
+AUTO_SCENE_UNLOAD_DYNAMIC_MIN_WINDOW = 0.75
 AUTO_SCENE_MIN_SAND_UNLOAD_DIST = 6.00
 AUTO_SCENE_MIN_ROBOT_TRUCK_DIST = 3.50
 AUTO_SCENE_MIN_SAND_PARTICLE_ESTIMATE = 3000
@@ -704,7 +706,8 @@ AUTO_COLLECT_LEROBOT_V3_EXPORT_TIMEOUT_S = float(
     os.environ.get("EXCAVATOR_LEROBOT_V3_EXPORT_TIMEOUT_S", "1200") or 1200.0
 )
 PLANNER_VERSION = "dig_plan_v4_joint_space_world_debug"
-QUALITY_GATE_VERSION = "quality_gate_v2_particles_no_freeze"
+QUALITY_GATE_VERSION = "quality_gate_v3_low_bin_warning_scatter_accept"
+RUNTIME_PATCH_TAG = "20260703_reject_trainable_lowbin_scatter_recovery"
 AUTO_PREFLIGHT_MIN_PARTICLES = 1000
 AUTO_DIG_GRID_SIZE = 7
 AUTO_DIG_TOPK_TARGETS = 8
@@ -12634,7 +12637,7 @@ def compute_episode_quality_score(execution_success, reason):
         quality_reasons.append(f"quality_rejected/low_bucket_particles:{max_bucket}")
     dump_gate_has_lifted_sand = bool(lift_bucket >= QUALITY_MIN_BUCKET_PARTICLES)
     if dump_gate_has_lifted_sand and final_bin < QUALITY_MIN_DUMP_PARTICLES:
-        quality_reasons.append(f"quality_rejected/low_final_bin_particles:{final_bin}")
+        quality_warnings.append(f"quality_warning/low_final_bin_particles:{final_bin}")
     if spill_ratio > QUALITY_MAX_SPILL_RATIO:
         quality_warnings.append(f"quality_warning/high_spill_ratio:{spill_ratio:.2f}")
     if score < QUALITY_MIN_SCORE:
@@ -13212,9 +13215,17 @@ def auto_collect_finalize_active_episode_if_needed(reason):
     phase_metrics = STATE.get("dataset_phase_metrics", {})
     has_dump_settle = isinstance(phase_metrics, dict) and "after_dump_settle" in phase_metrics
     final_bin = int(STATE.get("dataset_final_bin_from_pile_particles", 0) or 0)
+    lift_bucket = int(STATE.get("dataset_lift_bucket_from_pile_particles", 0) or 0)
     freezes = int(STATE.get("dataset_episode_freezes", 0) or 0)
-    execution_success = bool(has_dump_settle and final_bin >= int(QUALITY_MIN_DUMP_PARTICLES) and freezes <= 0)
-    finish_reason = "ok" if execution_success else f"execution_failed/{reason}"
+    dump_count_ok = bool(final_bin >= int(QUALITY_MIN_DUMP_PARTICLES))
+    useful_lifted_load = bool(lift_bucket >= int(QUALITY_MIN_BUCKET_PARTICLES))
+    execution_success = bool(has_dump_settle and freezes <= 0 and (dump_count_ok or useful_lifted_load))
+    low_bin_warning = bool(execution_success and useful_lifted_load and not dump_count_ok)
+    finish_reason = (
+        f"ok_warning_low_final_bin_particles:{final_bin}"
+        if low_bin_warning else
+        ("ok" if execution_success else f"execution_failed/{reason}")
+    )
     info_print(
         "[AUTO DATASET FINALIZE]",
         f"episode={meta.get('episode_id', '')}",
@@ -13222,6 +13233,8 @@ def auto_collect_finalize_active_episode_if_needed(reason):
         f"execution_success={execution_success}",
         f"after_dump_settle={has_dump_settle}",
         f"final_bin={final_bin}",
+        f"lift_bucket={lift_bucket}",
+        f"low_bin_warning={low_bin_warning}",
         f"freezes={freezes}",
     )
     return auto_collect_finish_episode(meta, execution_success, finish_reason)
@@ -14198,9 +14211,20 @@ def auto_scene_geometry_legal(candidate=None, ctx=None, applied=False):
         detail["unload_mesh_centroid"] = vec_list(unload_centroid, 2)
         detail["unload_mesh_centroid_radius"] = float(unload_r)
         detail["unload_mesh_radius_gate"] = "random_truck_workspace" if enforce_random_unload_radius else "skipped_fixed_or_yaw_only"
+        workspace = auto_scene_random_workspace_bounds() if enforce_random_unload_radius else {}
+        workspace_unload_radius = (workspace.get("truck_unload_polar", {}) or {}).get("radius", None) if isinstance(workspace, dict) else None
+        if isinstance(workspace_unload_radius, (list, tuple)) and len(workspace_unload_radius) >= 2:
+            mesh_min_radius = float(workspace_unload_radius[0])
+            mesh_max_radius = float(workspace_unload_radius[1])
+            detail["unload_mesh_radius_source"] = "dynamic_workspace"
+        else:
+            mesh_min_radius = float(AUTO_SCENE_UNLOAD_MESH_MIN_RADIUS)
+            mesh_max_radius = float(AUTO_SCENE_UNLOAD_MESH_MAX_RADIUS)
+            detail["unload_mesh_radius_source"] = "configured"
+        detail["unload_mesh_radius_limit"] = [float(mesh_min_radius), float(mesh_max_radius)]
         if enforce_random_unload_radius and (
-            unload_r < float(AUTO_SCENE_UNLOAD_MESH_MIN_RADIUS)
-            or unload_r > float(AUTO_SCENE_UNLOAD_MESH_MAX_RADIUS)
+            unload_r < float(mesh_min_radius)
+            or unload_r > float(mesh_max_radius)
         ):
             return False, f"unload_mesh_centroid_radius:{unload_r:.2f}", detail
     return True, "ok", detail
@@ -14214,8 +14238,18 @@ def auto_scene_random_workspace_bounds():
     sand_amount_range = auto_scene_sand_amount_range()
     sand_r_min = max(float(AUTO_SCENE_SAND_MIN_REACH_RADIUS), float(min(AUTO_SCENE_SAND_RANDOM_RADIUS_RANGE)))
     sand_r_max = min(float(AUTO_SCENE_SAND_MAX_REACH_RADIUS), float(max(AUTO_SCENE_SAND_RANDOM_RADIUS_RANGE)), dynamic_reach - 0.25)
-    unload_r_min = max(float(AUTO_SCENE_UNLOAD_MIN_REACH_RADIUS), float(min(AUTO_SCENE_TRUCK_RANDOM_RADIUS_RANGE)))
-    unload_r_max = min(float(AUTO_SCENE_UNLOAD_MAX_REACH_RADIUS), float(max(AUTO_SCENE_TRUCK_RANDOM_RADIUS_RANGE)), dynamic_reach + 0.15)
+    configured_unload_r_min = max(float(AUTO_SCENE_UNLOAD_MIN_REACH_RADIUS), float(min(AUTO_SCENE_TRUCK_RANDOM_RADIUS_RANGE)))
+    configured_unload_r_max = min(float(AUTO_SCENE_UNLOAD_MAX_REACH_RADIUS), float(max(AUTO_SCENE_TRUCK_RANDOM_RADIUS_RANGE)))
+    unload_r_max = min(configured_unload_r_max, dynamic_reach + 0.15)
+    unload_r_min_policy = "configured"
+    if unload_r_max < configured_unload_r_min + 0.05:
+        unload_r_min = max(
+            float(AUTO_SCENE_UNLOAD_DYNAMIC_MIN_RADIUS_FLOOR),
+            float(unload_r_max) - float(AUTO_SCENE_UNLOAD_DYNAMIC_MIN_WINDOW),
+        )
+        unload_r_min_policy = "dynamic_reach_relaxed"
+    else:
+        unload_r_min = configured_unload_r_min
     valid = bool(sand_r_max >= sand_r_min + 0.05 and unload_r_max >= unload_r_min + 0.05)
     key = (
         tuple(round(float(v), 4) for v in AUTO_SCENE_SAND_RANDOM_X_RANGE),
@@ -14254,6 +14288,8 @@ def auto_scene_random_workspace_bounds():
             "allowed_deg": list(AUTO_SCENE_TRUCK_RANDOM_YAW_DEG_RANGE),
         },
         "unload_radius_limit": [float(unload_r_min), float(unload_r_max)],
+        "configured_unload_radius_limit": [float(configured_unload_r_min), float(configured_unload_r_max)],
+        "unload_radius_min_policy": str(unload_r_min_policy),
         "sand_amount": amount,
         "min_sand_unload_xy_dist": float(AUTO_SCENE_MIN_SAND_UNLOAD_DIST),
         "reason": "ok" if valid else "dynamic_reach_workspace_empty",
@@ -14266,6 +14302,7 @@ def auto_scene_random_workspace_bounds():
         f"sand_radius={sand_r}",
         f"sand_angle={sand_a}",
         f"truck_unload_radius={truck_r}",
+        f"unload_min_policy={unload_r_min_policy}",
         f"truck_unload_angle={truck_a}",
         f"truck_yaw=rear_or_side_to_excavator error<= {AUTO_SCENE_TRUCK_REAR_TO_ROBOT_YAW_RANGE_DEG:.1f}deg",
         f"min_sand_unload_dist={AUTO_SCENE_MIN_SAND_UNLOAD_DIST:.2f}",
@@ -29780,10 +29817,22 @@ def plan_dump_pose_to_bin(
             f"bucket_err={bucket_err:.2f}deg source_clearance={source_clearance:.3f}"
         )
 
+    if best is not None:
+        best_drop = best.get("drop", {})
+        best_center_ready = bool(
+            (not center_release_mode)
+            or best.get("center_soft_ready", False)
+            or (best_drop or {}).get("scatter_xy_ok", False)
+            or (best_drop or {}).get("inside_xy", False)
+        )
+    else:
+        best_drop = {}
+        best_center_ready = False
+
     if (
         best is not None
-        and unload_drop_execution_ready(best.get("drop", {}))
-        and (not center_release_mode or bool(best.get("center_soft_ready", False)))
+        and unload_drop_execution_ready(best_drop)
+        and best_center_ready
     ):
         drop = best["drop"]
         best["info"]["drop"] = drop
@@ -29823,7 +29872,13 @@ def plan_dump_pose_to_bin(
             f"scatter_xy_ok={drop.get('scatter_xy_ok')} acceptance={drop.get('landing_acceptance')} "
             f"source_clearance={fmt_optional(drop.get('source_clearance'))}"
         )
-        if allow_unaligned and unload_drop_execution_ready(drop) and (not center_release_mode or bool(best.get("center_soft_ready", False))):
+        drop_center_ready = bool(
+            (not center_release_mode)
+            or best.get("center_soft_ready", False)
+            or drop.get("scatter_xy_ok", False)
+            or drop.get("inside_xy", False)
+        )
+        if allow_unaligned and unload_drop_execution_ready(drop) and drop_center_ready:
             best["info"]["drop"] = drop
             best["info"]["drop_target"] = vec_list(drop_target, 3)
             best["info"]["pour_target"] = vec_list(best.get("pour_target"), 3)
@@ -32320,6 +32375,12 @@ def build_ui():
 async def main():
     STATE["robot_state_reads_enabled"] = False
     STATE["robot_state_shutdown"] = False
+    info_print(
+        "[RUNTIME PATCH]",
+        f"tag={RUNTIME_PATCH_TAG}",
+        f"planner_version={PLANNER_VERSION}",
+        f"quality_gate_version={QUALITY_GATE_VERSION}",
+    )
     disable_usd_audio_extension()
     enable_physx_gpu_runtime_settings()
     old_world = World.instance()

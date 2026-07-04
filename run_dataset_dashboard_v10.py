@@ -2934,11 +2934,143 @@ def dashboard_episode_summary(row: dict, dataset_tag: Optional[str] = None, data
     }
 
 
+RUN_ACTIVITY_ACTIVE_SECONDS = 180.0
+RUN_ACTIVITY_RECENT_SECONDS = 900.0
+RUN_ACTIVITY_EPISODE_DIR_LIMIT = 32
+RUN_ACTIVITY_ROOT_FILES = set(INDEX_FILES.values()) | set(SEGMENT_FILES.values()) | {
+    "summary.json",
+    "run_meta.json",
+    "camera_config.json",
+    "debug_timeline.jsonl",
+    "lerobot_v3_export.json",
+}
+
+
+def _update_latest_mtime(latest: Tuple[float, str], path: str) -> Tuple[float, str]:
+    try:
+        mtime = os.path.getmtime(path)
+    except Exception:
+        return latest
+    if mtime > latest[0]:
+        return float(mtime), path
+    return latest
+
+
+def run_activity_snapshot(
+    run_dir: Union[str, os.PathLike],
+    now: Optional[float] = None,
+    active_seconds: float = RUN_ACTIVITY_ACTIVE_SECONDS,
+    recent_seconds: float = RUN_ACTIVITY_RECENT_SECONDS,
+) -> Dict[str, object]:
+    """Return a cheap filesystem-based write monitor for a run folder.
+
+    We intentionally do not try to inspect Isaac Sim internals. For this training
+    data generator, the robust signal is whether run jsonl/summary/trajectory
+    files are still being modified. The scan is bounded so a dashboard refresh
+    does not walk image folders or huge exports.
+    """
+    run_dir = os.path.abspath(str(run_dir))
+    now = float(time.time() if now is None else now)
+    latest: Tuple[float, str] = (0.0, "")
+    if not os.path.isdir(run_dir):
+        return {
+            "state": "missing",
+            "active": False,
+            "recent": False,
+            "age_s": None,
+            "latest_mtime": 0.0,
+            "latest_file": "",
+            "active_window_s": float(active_seconds),
+        }
+    latest = _update_latest_mtime(latest, run_dir)
+    try:
+        entries = list(os.scandir(run_dir))
+    except Exception:
+        entries = []
+
+    episode_dirs = []
+    for entry in entries:
+        try:
+            if entry.is_file():
+                name = entry.name
+                if name in RUN_ACTIVITY_ROOT_FILES or name.endswith((".json", ".jsonl", ".log")):
+                    latest = _update_latest_mtime(latest, entry.path)
+            elif entry.is_dir():
+                dir_mtime = entry.stat().st_mtime
+                latest = _update_latest_mtime(latest, entry.path)
+                if entry.name.startswith(("episode_", "attempt_")):
+                    episode_dirs.append((float(dir_mtime), entry.path))
+        except Exception:
+            continue
+
+    # Only inspect the newest episode/attempt folders. Those are the ones that
+    # can contain a trajectory jsonl currently being appended by Isaac Sim.
+    episode_dirs.sort(reverse=True)
+    for _, ep_dir in episode_dirs[:RUN_ACTIVITY_EPISODE_DIR_LIMIT]:
+        try:
+            for child in os.scandir(ep_dir):
+                try:
+                    if child.is_file() and child.name.endswith((".json", ".jsonl", ".log", ".txt")):
+                        latest = _update_latest_mtime(latest, child.path)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    latest_mtime, latest_path = latest
+    if latest_mtime <= 0:
+        age_s = None
+        state = "unknown"
+        active = False
+        recent = False
+    else:
+        age_s = max(0.0, now - float(latest_mtime))
+        active = age_s <= float(active_seconds)
+        recent = age_s <= float(recent_seconds)
+        state = "active" if active else ("recent" if recent else "idle")
+    try:
+        latest_file = relpath_posix(latest_path, run_dir) if latest_path else ""
+    except Exception:
+        latest_file = latest_path
+    return {
+        "state": state,
+        "active": bool(active),
+        "recent": bool(recent),
+        "age_s": age_s,
+        "latest_mtime": float(latest_mtime or 0.0),
+        "latest_file": latest_file,
+        "active_window_s": float(active_seconds),
+    }
+
+
+def summarize_run_activity(runs: Sequence[dict]) -> Dict[str, object]:
+    active = [run for run in runs if isinstance(run.get("activity"), dict) and run["activity"].get("active")]
+    recent = [run for run in runs if isinstance(run.get("activity"), dict) and run["activity"].get("state") == "recent"]
+    return {
+        "active_count": len(active),
+        "recent_count": len(recent),
+        "idle_count": max(0, len(runs) - len(active) - len(recent)),
+        "active_window_s": RUN_ACTIVITY_ACTIVE_SECONDS,
+        "recent_window_s": RUN_ACTIVITY_RECENT_SECONDS,
+        "active_runs": [
+            {
+                "name": run.get("name"),
+                "path": run.get("path"),
+                "age_s": (run.get("activity") or {}).get("age_s"),
+                "latest_file": (run.get("activity") or {}).get("latest_file"),
+                "attempts": run.get("attempts"),
+                "trainable": run.get("trainable"),
+            }
+            for run in active[:8]
+        ],
+    }
+
 def list_dashboard_runs(dataset_root: Union[str, os.PathLike], limit: int = 80) -> List[dict]:
     root = os.path.abspath(str(dataset_root or "excavator_auto_dataset"))
     if not os.path.isdir(root):
         return []
     runs = []
+    now = time.time()
     for name in os.listdir(root):
         path = os.path.join(root, name)
         if not os.path.isdir(path):
@@ -2946,17 +3078,28 @@ def list_dashboard_runs(dataset_root: Union[str, os.PathLike], limit: int = 80) 
         if not name.startswith("run_"):
             continue
         summary = read_json(os.path.join(path, "summary.json"), default={}) or {}
+        activity = run_activity_snapshot(path, now=now)
+        latest_mtime = float(activity.get("latest_mtime") or 0.0)
         runs.append(
             {
                 "name": name,
                 "path": path,
-                "mtime": os.path.getmtime(path),
+                "mtime": max(float(os.path.getmtime(path)), latest_mtime),
                 "attempts": summary.get("attempts"),
                 "trainable": summary.get("trainable"),
                 "requested": summary.get("requested"),
+                "activity": activity,
             }
         )
-    runs.sort(key=lambda item: float(item.get("mtime", 0.0)), reverse=True)
+    # Active writers stay visible at the top; within each state, sort by latest write time.
+    runs.sort(
+        key=lambda item: (
+            1 if ((item.get("activity") or {}).get("active")) else 0,
+            1 if ((item.get("activity") or {}).get("state") == "recent") else 0,
+            float(item.get("mtime", 0.0)),
+        ),
+        reverse=True,
+    )
     return runs[: max(1, int(limit))]
 
 
@@ -3000,6 +3143,7 @@ def dashboard_run_payload(run_dir: Union[str, os.PathLike]) -> Dict[str, object]
         "diagnosis": diagnosis,
         "dataset_metrics": dataset_metrics,
         "tag_runtime_seconds": dataset_metrics.get("tag_runtime_seconds", {}),
+        "run_activity": run_activity_snapshot(run_dir),
         "status_counts": dict(status_counts),
         "episodes": episodes,
         "scene_points": scene_points,
@@ -3170,7 +3314,7 @@ input,select,button{min-height:34px;border:1px solid #cbd5e1;border-radius:8px;b
 input.path{width:100%}select{width:100%}
 button{background:#1f2937;color:#fff;border-color:#1f2937;cursor:pointer;font-weight:600}
 button.secondary{background:#fff;color:#111827;border-color:#cbd5e1}
-.statusLine{margin-top:8px;display:flex;gap:10px;align-items:center;min-height:18px}.ok{color:#047857}.error{color:#b91c1c}.muted{color:var(--muted);font-size:12px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.small{font-size:12px}.nowrap{white-space:nowrap}
+.statusLine{margin-top:8px;display:flex;gap:10px;align-items:center;min-height:18px}.runMonitor{margin-top:9px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;color:#475467}.runMonitorTitle{font-weight:800;color:#101828}.runBadge{display:inline-flex;align-items:center;gap:6px;border:1px solid #d0d5dd;border-radius:999px;background:#fff;color:#344054;padding:4px 9px;min-height:26px;font-size:12px;cursor:pointer}.runBadge.active{border-color:#12b76a;background:#ecfdf3;color:#027a48}.runBadge.recent{border-color:#fdb022;background:#fffaeb;color:#b54708}.activityDot{width:9px;height:9px;border-radius:999px;display:inline-block;background:#98a2b3;box-shadow:0 0 0 2px rgba(152,162,179,.14)}.activityDot.active{background:#12b76a;box-shadow:0 0 0 3px rgba(18,183,106,.18)}.activityDot.recent{background:#fdb022;box-shadow:0 0 0 3px rgba(253,176,34,.18)}.activityDot.idle{background:#f04438;box-shadow:0 0 0 3px rgba(240,68,56,.14)}.activityDot.missing,.activityDot.unknown{background:#98a2b3}.ok{color:#047857}.error{color:#b91c1c}.muted{color:var(--muted);font-size:12px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.small{font-size:12px}.nowrap{white-space:nowrap}
 .grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:14px;align-items:start}
 .panel{background:var(--panel);border:1px solid var(--border);border-radius:14px;box-shadow:0 1px 2px rgba(16,24,40,.04);padding:14px;min-width:0;overflow:hidden}
 .panelHeader{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:10px}.panelHint{font-size:12px;color:#667085;line-height:1.35}
@@ -3217,6 +3361,7 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
       <button class="secondary" id="copyPathBtn">Copy path</button>
       <span id="status" class="muted"></span>
     </div>
+    <div id="runMonitor" class="runMonitor"><span class="runMonitorTitle">Active writers:</span><span class="muted">loading...</span></div>
     <div class="statusFilterBar">
       <div><span class="statusFilterTitle">Status filter</span><span id="statusFilter" class="statusFilter"></span></div>
       <span id="filterCount" class="filterCount">All statuses</span>
@@ -3313,6 +3458,7 @@ let currentRun = null;
 let currentEpisodeIndex = null;
 let episodeSort = {key:"episode_index", dir:1};
 let selectedStatuses = new Set();
+let runMonitorTimer = null;
 let availableStatuses = [];
 
 function $(id){return document.getElementById(id)}
@@ -3331,17 +3477,60 @@ function pct(v){const n=Number(v); return Number.isFinite(n)?`${(n*100).toFixed(
 function shortText(s,n){s=String(s||""); return s.length>n?s.slice(0,n-1)+"…":s}
 function basename(path){return String(path||"").split(/[\\/]/).pop()}
 
-async function loadRuns(){
-  setStatus("Loading runs...");
+async function loadRuns(opts={}){
+  const silent = !!opts.silent;
+  if(!silent) setStatus("Loading runs...");
+  const previous = $("runSelect").value || $("runInput").value || "";
   const data = await api("/api/runs", {root:$("rootInput").value});
+  const runs = data.runs || [];
   const sel = $("runSelect"); sel.innerHTML = "";
-  for(const run of data.runs||[]){
+  let selectedPath = "";
+  for(const run of runs){
     const opt=document.createElement("option"); opt.value=run.path;
-    opt.textContent=`${run.name}  attempts=${run.attempts ?? "-"} trainable=${run.trainable ?? "-"}`;
+    const activity=run.activity || {};
+    const state=activity.state || "unknown";
+    const dot=state==="active" ? "🟢" : (state==="recent" ? "🟡" : "🔴");
+    const age=activity.age_s==null ? "unknown" : ageText(activity.age_s);
+    const label=state==="active" ? `active ${age}` : (state==="recent" ? `recent ${age}` : `idle ${age}`);
+    opt.textContent=`${dot} ${run.name}  attempts=${run.attempts ?? "-"} trainable=${run.trainable ?? "-"}  ${label}`;
+    if(previous && run.path === previous){opt.selected=true; selectedPath=run.path;}
     sel.appendChild(opt);
   }
-  if((data.runs||[]).length){$("runInput").value=data.runs[0].path; setStatus(`Loaded ${data.runs.length} runs`, "ok");}
-  else setStatus("No run_* folders found", "error");
+  if(!selectedPath && runs.length){selectedPath=runs[0].path; sel.value=selectedPath;}
+  if(selectedPath) $("runInput").value=selectedPath;
+  renderRunMonitor(data);
+  if(runs.length){ if(!silent) setStatus(`Loaded ${runs.length} runs; active writers=${(data.activity_summary||{}).active_count||0}`, "ok"); }
+  else if(!silent) setStatus("No run_* folders found", "error");
+}
+function ageText(seconds){
+  const s=Number(seconds);
+  if(!Number.isFinite(s)) return "unknown";
+  if(s<60) return `${Math.round(s)}s`;
+  if(s<3600) return `${Math.round(s/60)}m`;
+  return `${(s/3600).toFixed(1)}h`;
+}
+function renderRunMonitor(data){
+  const el=$("runMonitor"); if(!el) return;
+  const summary=data.activity_summary || {};
+  const activeRuns=summary.active_runs || [];
+  const activeCount=Number(summary.active_count || 0);
+  const recentCount=Number(summary.recent_count || 0);
+  const idleCount=Number(summary.idle_count || 0);
+  const windowS=Number(summary.active_window_s || 180);
+  const title=`<span class="runMonitorTitle"><span class="activityDot ${activeCount?"active":"idle"}"></span> Active writers: ${activeCount}</span>`;
+  const subtitle=`<span class="muted">green = updated within ${ageText(windowS)}; recent=${recentCount}; idle=${idleCount}</span>`;
+  const badges=activeRuns.map(run=>{
+    const latest=run.latest_file ? ` · ${shortText(run.latest_file,42)}` : "";
+    return `<button type="button" class="runBadge active" onclick="chooseRun(${esc(JSON.stringify(run.path))})" title="${esc(run.path||"")}"><span class="activityDot active"></span>${esc(run.name||"")} <span class="muted">${esc(ageText(run.age_s))} · attempts=${esc(run.attempts ?? "-")} trainable=${esc(run.trainable ?? "-")}${esc(latest)}</span></button>`;
+  }).join("");
+  el.innerHTML=title + subtitle + (badges || `<span class="runBadge"><span class="activityDot idle"></span>no run folder updated recently</span>`);
+}
+function chooseRun(path){
+  if(!path) return;
+  $("runInput").value=path;
+  const sel=$("runSelect");
+  for(const opt of Array.from(sel.options)){ if(opt.value===path){sel.value=path; break;} }
+  loadRun().catch(e=>setStatus(e.message,"error"));
 }
 async function loadRun(){
   const runDir=$("runInput").value || $("runSelect").value;
@@ -3384,7 +3573,10 @@ function renderRun(data){
   renderBarList("qualityBars", qualityRows, {quality:true});
   renderBarList("warningBars", warningRows, {warn:true});
   renderBarList("segmentBars", Object.entries(segments).map(([key,count])=>({key,count})), {info:true});
-  $("reportHint").textContent = data.run_dir ? "Static report: analysis_plots/report.html  |  generate with --plots" : "";
+  const act=data.run_activity || {};
+  const actState=act.state || "unknown";
+  const actText=act.age_s==null ? "write state unknown" : `${actState} · last write ${ageText(act.age_s)} ago`;
+  $("reportHint").innerHTML = data.run_dir ? `<span class="activityDot ${esc(actState)}"></span> ${esc(actText)} &nbsp;|&nbsp; Static report: analysis_plots/report.html  |  generate with --plots` : "";
   setupStatusFilter(data.episodes||[]);
   refreshFilteredViews();
 }
@@ -3696,7 +3888,11 @@ const episodeSortSelect=$("episodeSortSelect"); if(episodeSortSelect) episodeSor
 $("rootInput").addEventListener("keydown", e=>{if(e.key==="Enter") loadRuns().then(()=>loadRun()).catch(err=>setStatus(err.message,"error"))});
 $("runInput").addEventListener("keydown", e=>{if(e.key==="Enter") loadRun().catch(err=>setStatus(err.message,"error"))});
 window.addEventListener("resize",()=>syncEpisodeInspectorHeight());
-loadRuns().then(()=>loadRun()).catch(e=>setStatus(e.message,"error"));
+loadRuns().then(()=>{
+  loadRun();
+  if(runMonitorTimer) clearInterval(runMonitorTimer);
+  runMonitorTimer=setInterval(()=>loadRuns({silent:true}).catch(()=>{}), 30000);
+}).catch(e=>setStatus(e.message,"error"));
 
 </script>
 </body>
@@ -3741,7 +3937,8 @@ def serve_dashboard(
                     return
                 if parsed.path == "/api/runs":
                     root = os.path.abspath(unquote(params.get("root") or default_root))
-                    self.send_json({"root": root, "runs": list_dashboard_runs(root)})
+                    runs = list_dashboard_runs(root)
+                    self.send_json({"root": root, "runs": runs, "activity_summary": summarize_run_activity(runs)})
                     return
                 if parsed.path == "/api/run":
                     run_dir = os.path.abspath(unquote(params.get("run_dir") or latest_run(default_root)))

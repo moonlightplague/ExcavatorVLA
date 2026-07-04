@@ -654,6 +654,7 @@ AUTO_SCENE_UNLOAD_MIN_REACH_RADIUS = 7.80
 AUTO_SCENE_UNLOAD_MAX_REACH_RADIUS = 11.00
 AUTO_SCENE_UNLOAD_DYNAMIC_MIN_RADIUS_FLOOR = 5.50
 AUTO_SCENE_UNLOAD_DYNAMIC_MIN_WINDOW = 0.75
+AUTO_SCENE_UNLOAD_LANDING_RADIUS_SOFT_MARGIN = 0.35
 AUTO_SCENE_MIN_SAND_UNLOAD_DIST = 6.00
 AUTO_SCENE_MIN_ROBOT_TRUCK_DIST = 3.50
 AUTO_SCENE_MIN_SAND_PARTICLE_ESTIMATE = 3000
@@ -4045,10 +4046,22 @@ def choose_unload_landing_point_for_flat_fill():
                 cell_height = float(np.percentile(cell_points[:, 2], 90.0)) if cell_count > 0 else float(AUTO_UNLOAD_EMPTY_CELL_HEIGHT)
             center_dist = float(np.linalg.norm(np.array([x - bin_center[0], y - bin_center[1]], dtype=np.float32) / np.maximum(safe_half, 1e-4)))
             motion_dist = float(np.linalg.norm(np.array([x, y], dtype=np.float32) - bucket_xy))
+            radius_status = unload_landing_radius_status(
+                [x, y],
+                random_truck=None,
+                soft_margin=AUTO_SCENE_UNLOAD_LANDING_RADIUS_SOFT_MARGIN,
+            )
+            radius_outside = 0.0
+            if not bool(radius_status.get("ok", False)):
+                radius_outside = min(
+                    abs(float(radius_status.get("radius_m", 0.0)) - float(radius_status.get("min_m", 0.0))),
+                    abs(float(radius_status.get("radius_m", 0.0)) - float(radius_status.get("max_m", 0.0))),
+                )
             score = (
                 float(AUTO_UNLOAD_FILL_HEIGHT_WEIGHT) * cell_height
                 + float(AUTO_UNLOAD_CENTER_WEIGHT) * center_dist
                 + float(AUTO_UNLOAD_MOTION_WEIGHT) * motion_dist
+                + 10.0 * float(radius_outside)
             )
             rows.append(
                 {
@@ -4057,11 +4070,18 @@ def choose_unload_landing_point_for_flat_fill():
                     "cell_count": cell_count,
                     "center_norm": float(center_dist),
                     "motion_dist": float(motion_dist),
+                    "radius_m": float(radius_status.get("radius_m", 0.0)),
+                    "radius_ok": bool(radius_status.get("ok", False)),
+                    "radius_window": [
+                        float(radius_status.get("min_m", 0.0)),
+                        float(radius_status.get("max_m", 0.0)),
+                    ],
+                    "radius_window_source": str(radius_status.get("source", "")),
                     "score": float(score),
                 }
             )
 
-    rows.sort(key=lambda row: float(row.get("score", 1.0e9)))
+    rows.sort(key=lambda row: (0 if bool(row.get("radius_ok", True)) else 1, float(row.get("score", 1.0e9))))
     chosen = rows[0] if rows else {"landing": vec_list(unload_bin_landing_point(ctx=ctx), 3), "score": 0.0}
     landing = np.array(chosen["landing"], dtype=np.float32)
     STATE["active_unload_landing_point"] = landing.copy()
@@ -4071,6 +4091,9 @@ def choose_unload_landing_point_for_flat_fill():
         f"landing={vec_list(landing, 3)}",
         f"cell_height={fmt_optional(chosen.get('cell_height'))}",
         f"cell_count={chosen.get('cell_count')}",
+        f"radius={fmt_optional(chosen.get('radius_m'))}",
+        f"radius_ok={chosen.get('radius_ok')}",
+        f"radius_window={chosen.get('radius_window')}",
         f"score={fmt_optional(chosen.get('score'))}",
     )
     return landing, rows
@@ -11777,7 +11800,11 @@ def auto_collect_scene_pre_sample_gate(attempt_index):
             unload_r < float(AUTO_SCENE_UNLOAD_MIN_REACH_RADIUS)
             or unload_r > float(AUTO_SCENE_UNLOAD_MAX_REACH_RADIUS)
         ):
-            return False, f"planning_failed/pre_sample_unload_reach_radius:{unload_r:.2f}", detail
+            detail["unload_radius_gate"] = "warning_center_only_actual_landing_checked_later"
+            detail["unload_radius_warning"] = True
+            detail["unload_radius_warning_reason"] = (
+                f"center_radius_outside_configured_range:{unload_r:.2f}"
+            )
         detail["sand_unload_distance_gate"] = (
             "diagnostic_warning_only"
         )
@@ -11940,11 +11967,44 @@ def auto_collect_plan_pre_sample_gate(seq, target=None):
         cfg = cfg if isinstance(cfg, dict) else {}
         random_truck = bool(cfg.get("random_truck", False))
         detail["unload_plan_radius_gate"] = "random_truck_workspace" if random_truck else "skipped_fixed_or_yaw_only"
-        if random_truck and (
-            unload_r < float(AUTO_SCENE_UNLOAD_MIN_REACH_RADIUS)
-            or unload_r > float(AUTO_SCENE_UNLOAD_MAX_REACH_RADIUS)
-        ):
-            return False, f"planning_failed/pre_sample_unload_plan_radius:{unload_r:.2f}", detail
+        radius_status = unload_landing_radius_status(
+            np.array(landing, dtype=np.float32).reshape(-1)[:2],
+            random_truck=random_truck,
+            soft_margin=AUTO_SCENE_UNLOAD_LANDING_RADIUS_SOFT_MARGIN,
+        )
+        detail["unload_landing_radius_status"] = radius_status
+        if random_truck and not bool(radius_status.get("ok", False)):
+            replacement = prefer_unload_landing_from_scores(
+                random_truck=random_truck,
+                soft_margin=AUTO_SCENE_UNLOAD_LANDING_RADIUS_SOFT_MARGIN,
+            )
+            if isinstance(replacement, dict) and replacement.get("landing") is not None:
+                replacement_landing = np.array(replacement.get("landing"), dtype=np.float32).reshape(-1)[:3]
+                if len(replacement_landing) >= 3:
+                    STATE["active_unload_landing_point"] = replacement_landing.copy()
+                    detail["unload_landing_reselected"] = True
+                    detail["unload_landing_reselected_from"] = vec_list(landing, 3)
+                    detail["unload_landing_reselected_to"] = vec_list(replacement_landing, 3)
+                    detail["unload_landing_reselected_radius"] = float(replacement.get("radius_m", auto_scene_xy_radius(replacement_landing[:2])))
+                    detail["unload_landing_reselected_radius_window"] = replacement.get("radius_window")
+                    detail["unload_landing_reselected_radius_outside_m"] = float(replacement.get("radius_outside_m", 0.0))
+                    landing = replacement_landing.copy()
+                    unload_r = auto_scene_xy_radius(landing[:2])
+                    detail["unload_landing_xyz"] = vec_list(landing, 3)
+                    detail["unload_release_xyz"] = vec_list(unload_bin_dump_point(), 3)
+                    detail["unload_landing_radius_m"] = float(unload_r)
+                    radius_status = unload_landing_radius_status(
+                        landing[:2],
+                        random_truck=random_truck,
+                        soft_margin=AUTO_SCENE_UNLOAD_LANDING_RADIUS_SOFT_MARGIN,
+                    )
+                    detail["unload_landing_radius_status"] = radius_status
+            if not bool(radius_status.get("ok", False)):
+                detail["unload_plan_radius_gate"] = "warning_actual_landing_outside_soft_window"
+                detail["unload_plan_radius_warning"] = True
+                detail["unload_plan_radius_warning_reason"] = (
+                    f"landing_radius_outside_soft_window:{unload_r:.2f}"
+                )
     except Exception as exc:
         detail["unload_exception"] = f"{type(exc).__name__}: {exc}"
         return False, "planning_failed/pre_sample_unload_plan_exception:" + type(exc).__name__, detail
@@ -13450,6 +13510,79 @@ def auto_scene_sample_polar_xy(rng, radius_range, angle_deg_range):
     angle = math.radians(angle_deg)
     xy = np.array([radius * math.cos(angle), radius * math.sin(angle)], dtype=np.float32)
     return xy, radius, angle_deg
+
+
+def auto_scene_unload_radius_window(random_truck=None, soft_margin=0.0):
+    workspace = auto_scene_random_workspace_bounds()
+    cfg = auto_scene_randomization_config()
+    if random_truck is None:
+        random_truck = bool(cfg.get("random_truck", False))
+    if bool(random_truck):
+        radius_range = (workspace.get("truck_unload_polar", {}) or {}).get(
+            "radius",
+            (AUTO_SCENE_UNLOAD_MIN_REACH_RADIUS, AUTO_SCENE_UNLOAD_MAX_REACH_RADIUS),
+        )
+        source = "dynamic_workspace"
+    else:
+        radius_range = (
+            float(AUTO_SCENE_UNLOAD_DYNAMIC_MIN_RADIUS_FLOOR),
+            float(AUTO_SCENE_UNLOAD_MAX_REACH_RADIUS),
+        )
+        source = "fixed_scene_soft"
+    r0 = float(radius_range[0])
+    r1 = float(radius_range[1])
+    margin = max(0.0, float(soft_margin))
+    lo = max(0.0, min(r0, r1) - margin)
+    hi = max(lo, max(r0, r1) + margin)
+    return lo, hi, source
+
+
+def unload_landing_radius_status(xy, random_truck=None, soft_margin=0.0):
+    arr = np.array(xy, dtype=np.float32).reshape(-1)[:2]
+    radius = auto_scene_xy_radius(arr)
+    lo, hi, source = auto_scene_unload_radius_window(random_truck=random_truck, soft_margin=soft_margin)
+    return {
+        "radius_m": float(radius),
+        "min_m": float(lo),
+        "max_m": float(hi),
+        "ok": bool(float(lo) <= float(radius) <= float(hi)),
+        "source": source,
+    }
+
+
+def prefer_unload_landing_from_scores(random_truck=None, soft_margin=0.0):
+    rows = STATE.get("last_auto_unload_scores", []) or []
+    if not rows:
+        return None
+    best = None
+    best_key = None
+    lo, hi, source = auto_scene_unload_radius_window(random_truck=random_truck, soft_margin=soft_margin)
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        landing = row.get("landing")
+        if landing is None:
+            continue
+        arr = np.array(landing, dtype=np.float32).reshape(-1)
+        if len(arr) < 2:
+            continue
+        radius = auto_scene_xy_radius(arr[:2])
+        outside = max(float(lo) - radius, 0.0, radius - float(hi))
+        # Prefer legal cells. If none exists, choose the least-outside cell while
+        # preserving the original fill/center/motion score as a secondary key.
+        key = (
+            1 if outside > 1.0e-4 else 0,
+            float(outside),
+            float(row.get("score", 1.0e9)),
+        )
+        if best is None or key < best_key:
+            best = dict(row)
+            best["radius_m"] = float(radius)
+            best["radius_window"] = [float(lo), float(hi)]
+            best["radius_window_source"] = source
+            best["radius_outside_m"] = float(outside)
+            best_key = key
+    return best
 
 
 def angle_in_deg_range(angle_deg, range_pair):

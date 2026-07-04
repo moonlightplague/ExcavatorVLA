@@ -172,13 +172,75 @@ def classify_reason(reason: object) -> str:
         return "quality/secure_not_retaining_material"
     if "low_final_bin_particles" in text:
         return "quality/low_final_bin_particles"
+    if "execution_failed/" in text:
+        first = text.split(";", 1)[0].split(":", 1)[0].strip()
+        return first.replace("execution_failed/", "execution/")[:96]
+    if "quality_rejected/" in text:
+        first = text.split(";", 1)[0].split(":", 1)[0].strip()
+        return first.replace("quality_rejected/", "quality/")[:96]
     if "planning_failed" in text:
         return "planning/failed"
     if "preflight_failed" in text or "prepare_failed" in text:
         return "prepare/failed"
     if "score_low" in text:
         return "quality/score_low"
-    return text.split(":", 1)[0][:80]
+    return text.split(";", 1)[0].split(":", 1)[0][:96]
+
+
+def normalized_status_name(status: object) -> str:
+    text = str(status or "unknown").strip().lower()
+    if text in {"fail", "failure", "failed"}:
+        return "failed"
+    if text in {"successful", "success"}:
+        return "success"
+    if not text:
+        return "unknown"
+    return text
+
+
+def is_problem_status(status: object) -> bool:
+    return normalized_status_name(status) in {"rejected", "failed", "diagnostic", "planning"}
+
+
+def normalize_failure_reason_for_triage(reason: object, status: object = None) -> Optional[str]:
+    """Return one stable blocker key for failure triage.
+
+    Successful/trainable rows with an empty reason should not become the top failure.
+    Empty reasons on rejected/failed rows are still counted as unclassified blockers.
+    """
+    text = str(reason or "").strip()
+    status_key = normalized_status_name(status)
+    if not text:
+        if is_problem_status(status_key):
+            return f"{status_key}/unclassified"
+        return None
+    key = classify_reason(text).strip()
+    if not key or key == "ok":
+        return f"{status_key}/unclassified" if is_problem_status(status_key) else None
+    return key
+
+
+def normalize_warning_fragment(fragment: object) -> Optional[str]:
+    text = str(fragment or "").strip()
+    if not text:
+        return None
+    head, sep, tail = text.partition(":")
+    head = head.strip()
+    tail = tail.strip()
+    # Numeric suffixes such as score_low:35.0 or high_spill_ratio:0.99 are values,
+    # not categories. Group them so they do not create one noisy warning per score.
+    if sep and re.fullmatch(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", tail):
+        text = head
+    else:
+        text = head if head.startswith("quality_warning/") else text
+    if text.startswith("quality_warning/"):
+        text = "quality/" + text.split("/", 1)[1]
+    return text[:120]
+
+
+def is_quality_signal_key(key: object) -> bool:
+    text = str(key or "").lower()
+    return text.startswith("quality/") or "score_low" in text or "spill" in text or "low_final_bin" in text
 
 
 def numeric_stats(values: Sequence[object]) -> Dict[str, object]:
@@ -389,19 +451,32 @@ def analyze_run(run_dir: Union[str, os.PathLike], include_timeline: bool = True)
     planning_rows = load_index(run_dir, "planning")
 
     reason_parts = Counter()
+    # Failure triage is deliberately problem-only. Empty reason on a trainable/success
+    # episode is not a failure category and must not appear as "ok" in Pareto charts.
     primary_reasons = Counter()
+    failure_reasons = Counter()
     warning_parts = Counter()
+    quality_alerts = Counter()
     initial_by_status = Counter()
     plan_by_status = Counter()
     for row in all_rows:
-        status = str(row.get("status", "unknown"))
+        status = normalized_status_name(row.get("status", "unknown"))
         initial_by_status[f"{row.get('initial_pose_id', 'unknown')}:{status}"] += 1
         plan_by_status[f"{row.get('chosen_plan_id', 'unknown')}:{status}"] += 1
-        primary_reasons[classify_reason(row.get("reason", ""))] += 1
+        failure_key = normalize_failure_reason_for_triage(row.get("reason", ""), status)
+        if failure_key and is_problem_status(status):
+            primary_reasons[failure_key] += 1
+            failure_reasons[failure_key] += 1
         for part in split_reason(row.get("reason", "")):
             reason_parts[part] += 1
         for part in split_reason(row.get("warning_reason", "")):
-            warning_parts[part] += 1
+            grouped_warning = normalize_warning_fragment(part)
+            if not grouped_warning:
+                continue
+            if is_quality_signal_key(grouped_warning):
+                quality_alerts[grouped_warning] += 1
+            else:
+                warning_parts[grouped_warning] += 1
 
     material_fields = {
         "max_bucket": [row.get("max_bucket_from_pile_particles") for row in all_rows],
@@ -433,8 +508,10 @@ def analyze_run(run_dir: Union[str, os.PathLike], include_timeline: bool = True)
             for name, count in summary.get("segments", {}).items()
         },
         "primary_reasons": top_counter(primary_reasons, 12),
+        "failure_reasons": top_counter(failure_reasons, 12),
         "reason_fragments": top_counter(reason_parts, 16),
         "warning_fragments": top_counter(warning_parts, 16),
+        "quality_alerts": top_counter(quality_alerts, 16),
         "initial_pose_by_status": top_counter(initial_by_status, 18),
         "chosen_plan_by_status": top_counter(plan_by_status, 12),
         "material_stats_all": {key: numeric_stats(values) for key, values in material_fields.items()},
@@ -462,8 +539,10 @@ def compact_analysis(report: Dict[str, object]) -> Dict[str, object]:
         "rejection_rate": summary.get("rejection_rate"),
         "segment_rates_vs_attempts": report.get("segment_rates_vs_attempts", {}),
         "primary_reasons": report.get("primary_reasons", []),
+        "failure_reasons": report.get("failure_reasons", report.get("primary_reasons", [])),
         "top_reason_fragments": report.get("reason_fragments", [])[:8],
         "top_warnings": report.get("warning_fragments", [])[:8],
+        "top_quality_alerts": report.get("quality_alerts", [])[:8],
         "initial_pose_by_status": report.get("initial_pose_by_status", [])[:10],
         "chosen_plan_by_status": report.get("chosen_plan_by_status", [])[:8],
         "material_stats_all": report.get("material_stats_all", {}),
@@ -1068,11 +1147,18 @@ def build_report_context(
     score += sum(max(0, row["weight"] // 2) for row in gates if row["status"] == "warn")
     score = min(100, int(score))
 
-    top_reasons = compact.get("primary_reasons", []) if isinstance(compact.get("primary_reasons"), list) else []
+    top_reasons = compact.get("failure_reasons", compact.get("primary_reasons", []))
+    if not isinstance(top_reasons, list):
+        top_reasons = []
     top_reason = top_reasons[0] if top_reasons else {}
     top_reason_key = str(top_reason.get("key", "")) if isinstance(top_reason, dict) else ""
     top_reason_count = int(safe_float_value(top_reason.get("count") if isinstance(top_reason, dict) else 0, 0.0) or 0)
+    problem_attempts = max(0, rejected + failed + diagnostic)
     warnings = compact.get("top_warnings", []) if isinstance(compact.get("top_warnings"), list) else []
+    quality_alerts = compact.get("top_quality_alerts", []) if isinstance(compact.get("top_quality_alerts"), list) else []
+    top_quality = quality_alerts[0] if quality_alerts else {}
+    top_quality_key = str(top_quality.get("key", "")) if isinstance(top_quality, dict) else ""
+    top_quality_count = int(safe_float_value(top_quality.get("count") if isinstance(top_quality, dict) else 0, 0.0) or 0)
 
     findings = []
     if attempts <= 0:
@@ -1080,29 +1166,44 @@ def build_report_context(
     if attempts > 0 and trainable <= 0:
         findings.append({"severity": "critical", "title": "当前 run 无可训练样本", "detail": "不要直接导出训练；先修复 rejection / planning / execution 主因。"})
     if top_reason_key:
-        findings.append({"severity": "high" if top_reason_count >= max(1, attempts // 2) else "medium", "title": "最大失败类目", "detail": f"{top_reason_key} · {top_reason_count}/{attempts or top_reason_count}"})
+        denominator = problem_attempts or attempts or top_reason_count
+        findings.append({
+            "severity": "high" if top_reason_count >= max(1, denominator // 2) else "medium",
+            "title": "主阻塞类目",
+            "detail": f"{top_reason_key} · {top_reason_count}/{denominator} problem episodes",
+        })
+    elif problem_attempts > 0:
+        findings.append({"severity": "medium", "title": "存在问题 episode 但未分类", "detail": f"problem episodes={problem_attempts}; reason 字段为空或格式未被归类。"})
+    else:
+        findings.append({"severity": "info", "title": "没有失败阻塞类目", "detail": "failure Pareto 只统计 rejected/failed/diagnostic，不再把成功 episode 的空 reason 记为 ok。"})
+    if top_quality_key:
+        findings.append({"severity": "medium", "title": "主要质量信号", "detail": f"{top_quality_key} · {top_quality_count} episode(s)"})
     if final_spill_median > 0 and final_bin_median <= 0:
         findings.append({"severity": "high", "title": "物料没有进入目标容器", "detail": f"median spill={format_report_number(final_spill_median, 1)}, median bin={format_report_number(final_bin_median, 1)}"})
     if not camera_ok:
         findings.append({"severity": "medium", "title": "相机字段覆盖不足", "detail": "LeRobot/VLA 训练前需要检查 observation.images.* 或 observation.camera。"})
-    if not findings:
-        findings.append({"severity": "info", "title": "未发现明显结构性阻塞", "detail": "继续查看 score、bin/spill 和姿态覆盖分布。"})
 
     recommendations = []
-    if trainable <= 0:
-        recommendations.append("先把目标从训练改为数据采集修复：选择最新 run 中出现频率最高的 failure/rejection 类目，单独复现 3-5 条 episode。")
+    if trainable <= 0 and top_reason_key:
+        recommendations.append("先修复主阻塞类目：按该 reason 筛选 episode，固定 seed 复现 3-5 次，确认是规划、执行还是质量阈值问题。")
+    elif trainable > 0 and problem_attempts > 0 and top_reason_key:
+        recommendations.append("保留可训练样本，同时针对主阻塞类目做小范围 ablation；不要把成功样本的 ok 当成失败类目。")
+    elif trainable > 0 and problem_attempts == 0:
+        recommendations.append("当前没有明显失败阻塞；可以先生成 --plots 静态报告，再做 LeRobot 导出 smoke test。")
     if "planning" in top_reason_key:
-        recommendations.append("优先拆解 planning failure：按 initial_pose、truck yaw、unload point 和 IK planar error 分组，找出是否是采样空间或 unload pose 约束过窄。")
+        recommendations.append("优先拆解 planning：按 initial_pose、truck body-frame XY/yaw、unload local XY 和 IK planar error 分组。")
     if "low_final_bin" in top_reason_key or final_bin_median <= 0:
-        recommendations.append("把 unload landing 与车斗局部坐标分布画出来；若点落在 canonical bin 外，先修 unload target，再调倾倒动作。")
+        recommendations.append("检查 unload local XY：确认 unload point 是否落在 selected dump-bed mesh 的有效区域内。")
     if final_spill_median > max(1.0, final_bin_median * 2.0):
-        recommendations.append("洒料显著高于入斗量：检查 lift/carry 阶段的 bucket 姿态保持，以及 swing 过程中的速度和加速度峰值。")
+        recommendations.append("洒料显著高于入斗量：检查 lift/carry 阶段 bucket 姿态保持和 swing 速度/加速度峰值。")
+    if top_quality_key and "score_low" in top_quality_key:
+        recommendations.append("score_low 作为质量信号聚合展示，不作为 failure Pareto；需要结合 bin/spill 判断是否调阈值或调动作。")
     if not state_ok or not action_ok:
-        recommendations.append("补齐 trajectory schema 检查：训练前必须稳定记录 observation.state/obs.state 和 action。")
+        recommendations.append("补齐 trajectory schema：训练前必须稳定记录 observation.state/obs.state 和 action。")
     if not camera_ok:
-        recommendations.append("补齐三路相机样本覆盖统计；VLA 导出前确认 observation.images.0/1/2 都能解析到真实图片。")
-    if len(recommendations) < 3:
-        recommendations.append("在报告中固定保留 outcome、reason Pareto、scene coverage、bin-vs-spill、episode table 五个视图，便于每次采集后做横向比较。")
+        recommendations.append("补齐三路相机样本覆盖；VLA 导出前确认 observation.images.0/1/2 都能解析到真实图片。")
+    if not recommendations:
+        recommendations.append("继续扩大采样量，并用同一套 status / blocker / quality 指标横向比较 run。")
 
     material_table = [report_material_row(material_source, key) for key in ["score", "max_bucket", "lift_bucket", "final_bin", "final_spill", "samples"]]
     status_counts = status_counter_from_rows(all_rows, counts)
@@ -1123,9 +1224,15 @@ def build_report_context(
         "readiness_gates": gates,
         "findings": findings,
         "recommendations": recommendations[:6],
+        "problem_attempts": problem_attempts,
         "top_reason": top_reason,
+        "top_problem_reason": top_reason,
         "top_reasons": top_reasons,
+        "failure_reasons": top_reasons,
         "top_warnings": warnings,
+        "general_warnings": warnings,
+        "quality_alerts": quality_alerts,
+        "top_quality_signal": top_quality,
         "material_table": material_table,
         "score_median": score_median,
         "final_bin_median": final_bin_median,
@@ -2578,6 +2685,126 @@ def polygon_to_body_frame(
     return out
 
 
+
+
+# v10: training-dataset status semantics.
+# This dashboard is a dataset-generation control surface, not only a runtime log viewer.
+# Rows that cannot become complete training episodes are surfaced as tag:skip instead
+# of silently disappearing from the dataset-quality view.
+def trajectory_runtime_s(trajectory: Sequence[dict]) -> float:
+    if not trajectory:
+        return 0.0
+    t0 = safe_float_value(trajectory[0].get("t"), None)
+    t1 = safe_float_value(trajectory[-1].get("t"), None)
+    if t0 is not None and t1 is not None:
+        return max(0.0, float(t1) - float(t0))
+    return 0.0
+
+
+def sample_has_state_action(sample: dict) -> bool:
+    if not isinstance(sample, dict):
+        return False
+    state = sample.get("observation.state") if sample.get("observation.state") is not None else sample.get("obs.state")
+    action = sample.get("action")
+    return vector_or_none(state) is not None and vector_or_none(action) is not None
+
+
+def sample_has_required_cameras(sample: dict) -> bool:
+    if not isinstance(sample, dict):
+        return False
+    # For dashboard-level triage we check whether camera fields are present; export still
+    # does the stricter file-exists check in collect_lerobot_rows().
+    return all(bool(sample_image_value(sample, key)) for key in LEROBOT_IMAGE_KEYS)
+
+
+def dataset_training_tag_for_row(row: dict, trajectory: Optional[Sequence[dict]] = None) -> Tuple[str, str]:
+    raw_status = normalized_status_name(row.get("status", "unknown"))
+    if trajectory is None:
+        trajectory = load_trajectory(row)
+    if not trajectory:
+        return "skip", "trajectory_empty"
+    # Scan a bounded prefix: enough to catch missing schema/camera without loading every
+    # frame twice for large runs. The full export path remains the final authority.
+    probe = list(trajectory[: min(len(trajectory), 32)])
+    has_state_action = any(sample_has_state_action(sample) for sample in probe)
+    has_camera_fields = any(sample_has_required_cameras(sample) for sample in probe)
+    if raw_status in {"trainable", "success"} and not has_state_action:
+        return "skip", "missing_state_or_action"
+    if raw_status in {"trainable", "success"} and not has_camera_fields:
+        return "skip", "missing_camera_fields"
+    return raw_status, "ok"
+
+
+def estimate_row_runtime_s(row: dict, trajectory: Optional[Sequence[dict]] = None) -> float:
+    if trajectory is None:
+        trajectory = load_trajectory(row)
+    runtime = trajectory_runtime_s(trajectory or [])
+    if runtime > 0:
+        return runtime
+    for key in ["duration_s", "wall_duration_s", "elapsed_s", "runtime_s", "episode_duration_s"]:
+        value = safe_float_value(row.get(key), None)
+        if value is not None and value > 0:
+            return float(value)
+    samples = safe_float_value(row.get("samples"), None)
+    if samples is not None and samples > 0:
+        # Camera/default collection frequency is commonly 10 Hz in this project.
+        return float(samples) / 10.0
+    return 0.0
+
+
+def compute_dataset_generation_metrics(rows: Sequence[dict]) -> Dict[str, object]:
+    tag_counts: Counter = Counter()
+    raw_status_counts: Counter = Counter()
+    skip_reasons: Counter = Counter()
+    tag_runtime: Counter = Counter()
+    total_frames = 0
+    usable_frames = 0
+    skip_examples: List[dict] = []
+    for row in rows:
+        trajectory = load_trajectory(row)
+        tag, reason = dataset_training_tag_for_row(row, trajectory)
+        raw_status = normalized_status_name(row.get("status", "unknown"))
+        runtime = estimate_row_runtime_s(row, trajectory)
+        frames = len(trajectory) if trajectory else int(safe_float_value(row.get("samples"), 0.0) or 0)
+        tag_counts[tag] += 1
+        raw_status_counts[raw_status] += 1
+        tag_runtime[tag] += float(runtime)
+        total_frames += int(max(0, frames))
+        if tag in {"trainable", "success"}:
+            usable_frames += int(max(0, frames))
+        if tag == "skip":
+            skip_reasons[reason] += 1
+            if len(skip_examples) < 12:
+                skip_examples.append({
+                    "episode_index": row.get("episode_index"),
+                    "episode_id": row.get("episode_id", ""),
+                    "raw_status": raw_status,
+                    "skip_reason": reason,
+                    "trajectory": row.get("trajectory", ""),
+                    "samples": row.get("samples"),
+                })
+    attempts = len(rows)
+    usable_episodes = int(tag_counts.get("trainable", 0) + tag_counts.get("success", 0))
+    skipped_episodes = int(tag_counts.get("skip", 0))
+    total_runtime = sum(float(v) for v in tag_runtime.values())
+    efficiency = float(usable_frames) / float(max(1, total_frames))
+    stability = 1.0 - (float(skipped_episodes) / float(max(1, attempts)))
+    return {
+        "tag_counts": dict(tag_counts),
+        "raw_status_counts": dict(raw_status_counts),
+        "tag_runtime_seconds": {key: float(value) for key, value in tag_runtime.items()},
+        "tag_runtime_total_seconds": float(total_runtime),
+        "skip_reasons": top_counter(skip_reasons, 12),
+        "skip_examples": skip_examples,
+        "attempts": attempts,
+        "usable_episodes": usable_episodes,
+        "skipped_episodes": skipped_episodes,
+        "total_frames": total_frames,
+        "usable_frames": usable_frames,
+        "data_efficiency_score": int(round(max(0.0, min(1.0, efficiency)) * 100.0)),
+        "stability_score": int(round(max(0.0, min(1.0, stability)) * 100.0)),
+    }
+
 def dashboard_scene_from_episode(row: dict) -> Dict[str, object]:
     scene = row.get("scene_randomization") if isinstance(row.get("scene_randomization"), dict) else {}
     candidate = scene.get("candidate") if isinstance(scene.get("candidate"), dict) else {}
@@ -2678,12 +2905,18 @@ def dashboard_scene_from_episode(row: dict) -> Dict[str, object]:
         "unload_mesh": scene_context.get("manual_unload_selected_path"),
     }
 
-def dashboard_episode_summary(row: dict) -> Dict[str, object]:
+def dashboard_episode_summary(row: dict, dataset_tag: Optional[str] = None, dataset_skip_reason: str = "") -> Dict[str, object]:
     scene = dashboard_scene_from_episode(row)
+    tag = dataset_tag or normalized_status_name(row.get("status", "unknown"))
+    scene["raw_status"] = row.get("status")
+    scene["status"] = tag
+    scene["dataset_skip_reason"] = dataset_skip_reason
     return {
         "episode_index": row.get("episode_index"),
         "episode_id": row.get("episode_id"),
-        "status": row.get("status"),
+        "status": tag,
+        "raw_status": row.get("status"),
+        "dataset_skip_reason": dataset_skip_reason,
         "score": row.get("score"),
         "reason": row.get("reason", ""),
         "warning_reason": row.get("warning_reason", ""),
@@ -2732,14 +2965,41 @@ def dashboard_run_payload(run_dir: Union[str, os.PathLike]) -> Dict[str, object]
     report = analyze_run(run_dir, include_timeline=False)
     compact = compact_analysis(report)
     rows = load_index(run_dir, "all")
-    episodes = [dashboard_episode_summary(row) for row in rows]
+    dataset_metrics = compute_dataset_generation_metrics(rows)
+    tag_by_episode = {}
+    skip_reason_by_episode = {}
+    for row in rows:
+        trajectory = load_trajectory(row)
+        tag, reason = dataset_training_tag_for_row(row, trajectory)
+        tag_by_episode[str(row.get("episode_index"))] = tag
+        skip_reason_by_episode[str(row.get("episode_index"))] = reason if tag == "skip" else ""
+    episodes = [
+        dashboard_episode_summary(
+            row,
+            dataset_tag=tag_by_episode.get(str(row.get("episode_index"))),
+            dataset_skip_reason=skip_reason_by_episode.get(str(row.get("episode_index")), ""),
+        )
+        for row in rows
+    ]
     scene_points = [episode["scene"] for episode in episodes]
-    status_counts = Counter(str(row.get("status", "unknown")) for row in rows)
+    status_counts = Counter(str(episode.get("status", "unknown")) for episode in episodes)
     diagnosis = build_report_context(compact, report=report, all_rows=rows)
+    diagnosis["dataset_metrics"] = dataset_metrics
+    diagnosis["skip_reasons"] = dataset_metrics.get("skip_reasons", [])
+    diagnosis["skipped_episodes"] = dataset_metrics.get("skipped_episodes", 0)
+    diagnosis["usable_frames"] = dataset_metrics.get("usable_frames", 0)
+    diagnosis["total_frames"] = dataset_metrics.get("total_frames", 0)
+    diagnosis["data_efficiency_score"] = dataset_metrics.get("data_efficiency_score", 0)
+    compact = dict(compact)
+    compact_counts = dict(compact.get("counts", {}) if isinstance(compact.get("counts"), dict) else {})
+    compact_counts["skip"] = int(status_counts.get("skip", 0))
+    compact["counts"] = compact_counts
     return {
         "run_dir": run_dir,
         "compact": compact,
         "diagnosis": diagnosis,
+        "dataset_metrics": dataset_metrics,
+        "tag_runtime_seconds": dataset_metrics.get("tag_runtime_seconds", {}),
         "status_counts": dict(status_counts),
         "episodes": episodes,
         "scene_points": scene_points,
@@ -2819,11 +3079,22 @@ def dashboard_episode_payload(
         return {"ok": False, "reason": f"episode_not_found:{episode_index}", "run_dir": run_dir}
     trajectory = load_trajectory(selected)
     if not trajectory:
+        episode = dashboard_episode_summary(selected, dataset_tag="skip", dataset_skip_reason="trajectory_empty")
+        empty_series = {
+            "t": [], "phase": [], "bucket_from_pile": [], "bucket_total": [], "bucket_mass": [],
+            "q_deg": [], "dq_deg_s": [], "ddq_deg_s2": [], "cmd_q_deg": [], "q_err_deg": [],
+            "action_deg_s": [], "action_accel_deg_s2": [], "effort": [],
+        }
         return {
-            "ok": False,
+            "ok": True,
             "reason": "trajectory_empty",
-            "episode": dashboard_episode_summary(selected),
             "run_dir": run_dir,
+            "episode": episode,
+            "sample_count": 0,
+            "returned_points": 0,
+            "stage_spans": [],
+            "joint_names": ["swing", "boom", "arm", "bucket"],
+            "series": empty_series,
         }
     first_t = safe_float_value(trajectory[0].get("t"), 0.0) or 0.0
     indices = downsample_indices(len(trajectory), max_points)
@@ -2878,7 +3149,7 @@ def dashboard_html() -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Excavator Dataset Quality Dashboard</title>
+<title>Excavator Training Dataset Generation Dashboard</title>
 <style>
 :root{
   font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, "Microsoft YaHei", sans-serif;
@@ -2915,16 +3186,23 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
 
 /* v4 layout fixes */
 .statusFilterBar{margin-top:10px;border-top:1px solid #eaecf0;padding-top:10px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
-.statusFilterTitle{font-size:12px;color:#475467;font-weight:700;margin-right:4px}.statusFilter{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.filterBtn{min-height:28px;border:1px solid #d0d5dd;border-radius:999px;background:#fff;color:#344054;padding:0 10px;font-size:12px;font-weight:700;cursor:pointer}.filterBtn.active{color:#fff;border-color:transparent}.filterBtn.all.active{background:#344054}.filterBtn.trainable.active,.filterBtn.success.active{background:#067647}.filterBtn.rejected.active{background:#d92d20}.filterBtn.failed.active,.filterBtn.fail.active{background:#f79009;color:#111827}.filterBtn.diagnostic.active{background:#6941c6}.filterBtn.planning.active{background:#175cd3}.filterBtn.unknown.active{background:#667085}.filterCount{font-size:12px;color:#667085;white-space:nowrap}.chartMeta{font-size:11px;color:#667085;line-height:1.35;margin-top:6px}.miniChartGrid{display:grid;grid-template-columns:1fr;gap:10px}.miniChart{border:1px solid #eaecf0;border-radius:12px;background:#fcfcfd;padding:10px;min-width:0}.miniChart h3{margin:0 0 6px;font-size:12px;color:#344054;text-transform:none;letter-spacing:0}.miniChart .chart{max-height:165px}.smallChartBox{min-height:0}.pill.failed,.pill.fail{background:#fff7ed;color:#c2410c}.pill.rejected{background:#fef3f2;color:#b42318}.pill.diagnostic{background:#f4f3ff;color:#5925dc}.episodeInspector{display:grid;grid-template-columns:minmax(560px,42%) minmax(0,1fr);gap:14px;align-items:start;min-height:0}.episodeSide{background:#f8fafc;border:1px solid #eaecf0;border-radius:12px;padding:10px;display:flex;flex-direction:column;min-height:0;height:var(--episodeAsideHeight,640px);max-height:var(--episodeAsideHeight,640px);overflow:hidden;align-self:start}.sideTabsToolbar{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:8px}.sideSortHint{font-size:11px;color:#667085;line-height:1.35;text-align:right;max-width:190px}.episodeTabsList{flex:1;min-height:0;overflow:auto;scrollbar-width:none;-ms-overflow-style:none;border:1px solid #eaecf0;border-radius:10px;background:#fff}.episodeTabsList::-webkit-scrollbar{display:none;width:0;height:0}.episodeDataSheet{min-width:980px;width:100%;border-collapse:separate;border-spacing:0;font-size:11.5px;line-height:1.25}.episodeDataSheet th,.episodeDataSheet td{padding:7px 8px;border-bottom:1px solid #eef2f6;white-space:nowrap;vertical-align:middle}.episodeDataSheet th{position:sticky;top:0;z-index:4;background:#f8fafc;color:#475467;text-transform:uppercase;letter-spacing:.04em;font-size:10.5px}.episodeDataSheet th.sortable{cursor:pointer;color:#175cd3;user-select:none}.episodeDataSheet th.sortable:hover{background:#eff8ff}.episodeDataSheet tbody tr{cursor:pointer}.episodeDataSheet tbody tr:hover td{background:#f8fafc}.episodeDataSheet tbody tr.selected td{background:#e0f2fe}.episodeDataSheet .epCol{position:sticky;left:0;z-index:3;background:#fff;font-weight:800;color:#101828}.episodeDataSheet th.epCol{z-index:5;background:#f8fafc}.episodeDataSheet tbody tr:hover .epCol{background:#f8fafc}.episodeDataSheet tbody tr.selected .epCol{background:#e0f2fe}.episodeDataSheet .num{text-align:right;font-variant-numeric:tabular-nums}.episodeDataSheet .reasonCell{max-width:360px;overflow:hidden;text-overflow:ellipsis}.sideFooter{font-size:11px;color:#98a2b3;margin-top:7px;line-height:1.35}.timelinePane{min-width:0;display:flex;flex-direction:column;height:auto;align-self:start}.timelinePaneHeader{position:sticky;top:86px;z-index:5;background:#fff;border:1px solid #eaecf0;border-radius:12px;padding:10px 12px;margin-bottom:10px}.timelineGrid{gap:12px;min-width:0}.timelineChart .chart{min-height:230px}.unitLegend{border:1px solid #d0d5dd;border-radius:999px;padding:2px 7px;background:#fff;color:#475467;font-weight:700}.plotNote{font-size:11px;color:#667085;margin-top:6px;line-height:1.35}.densityBadge{display:inline-block;margin-left:6px;border:1px solid #d0d5dd;border-radius:999px;padding:1px 6px;font-size:10px;color:#475467;background:#fff}.meshFrameBadge{display:inline-block;border:1px solid #d0d5dd;border-radius:999px;padding:2px 7px;background:#fff;color:#475467;font-size:11px;margin-top:6px}
+.statusFilterTitle{font-size:12px;color:#475467;font-weight:700;margin-right:4px}.statusFilter{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.filterBtn{min-height:28px;border:1px solid #d0d5dd;border-radius:999px;background:#fff;color:#344054;padding:0 10px;font-size:12px;font-weight:700;cursor:pointer}.filterBtn.active{color:#fff;border-color:transparent}.filterBtn.all.active{background:#344054}.filterBtn.trainable.active,.filterBtn.success.active{background:#067647}.filterBtn.rejected.active{background:#d92d20}.filterBtn.failed.active,.filterBtn.fail.active{background:#f79009;color:#111827}.filterBtn.diagnostic.active{background:#6941c6}.filterBtn.planning.active{background:#175cd3}.filterBtn.skip.active{background:#475467}.filterBtn.unknown.active{background:#667085}.filterCount{font-size:12px;color:#667085;white-space:nowrap}.chartMeta{font-size:11px;color:#667085;line-height:1.35;margin-top:6px}.miniChartGrid{display:grid;grid-template-columns:1fr;gap:10px}.miniChart{border:1px solid #eaecf0;border-radius:12px;background:#fcfcfd;padding:10px;min-width:0}.miniChart h3{margin:0 0 6px;font-size:12px;color:#344054;text-transform:none;letter-spacing:0}.miniChart .chart{max-height:165px}.smallChartBox{min-height:0}.pill.failed,.pill.fail{background:#fff7ed;color:#c2410c}.pill.rejected{background:#fef3f2;color:#b42318}.pill.diagnostic{background:#f4f3ff;color:#5925dc}.pill.skip{background:#f2f4f7;color:#344054}.episodeInspector{display:grid;grid-template-columns:minmax(560px,42%) minmax(0,1fr);gap:14px;align-items:start;min-height:0}.episodeSide{background:#f8fafc;border:1px solid #eaecf0;border-radius:12px;padding:10px;display:flex;flex-direction:column;min-height:0;height:var(--episodeAsideHeight,640px);max-height:var(--episodeAsideHeight,640px);overflow:hidden;align-self:start}.sideTabsToolbar{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:8px}.sideSortHint{font-size:11px;color:#667085;line-height:1.35;text-align:right;max-width:190px}.episodeTabsList{flex:1;min-height:0;overflow:auto;scrollbar-width:none;-ms-overflow-style:none;border:1px solid #eaecf0;border-radius:10px;background:#fff}.episodeTabsList::-webkit-scrollbar{display:none;width:0;height:0}.episodeDataSheet{min-width:980px;width:100%;border-collapse:separate;border-spacing:0;font-size:11.5px;line-height:1.25}.episodeDataSheet th,.episodeDataSheet td{padding:7px 8px;border-bottom:1px solid #eef2f6;white-space:nowrap;vertical-align:middle}.episodeDataSheet th{position:sticky;top:0;z-index:4;background:#f8fafc;color:#475467;text-transform:uppercase;letter-spacing:.04em;font-size:10.5px}.episodeDataSheet th.sortable{cursor:pointer;color:#175cd3;user-select:none}.episodeDataSheet th.sortable:hover{background:#eff8ff}.episodeDataSheet tbody tr{cursor:pointer}.episodeDataSheet tbody tr:hover td{background:#f8fafc}.episodeDataSheet tbody tr.selected td{background:#e0f2fe}.episodeDataSheet .epCol{position:sticky;left:0;z-index:3;background:#fff;font-weight:800;color:#101828}.episodeDataSheet th.epCol{z-index:5;background:#f8fafc}.episodeDataSheet tbody tr:hover .epCol{background:#f8fafc}.episodeDataSheet tbody tr.selected .epCol{background:#e0f2fe}.episodeDataSheet .num{text-align:right;font-variant-numeric:tabular-nums}.episodeDataSheet .reasonCell{max-width:360px;overflow:hidden;text-overflow:ellipsis}.sideFooter{font-size:11px;color:#98a2b3;margin-top:7px;line-height:1.35}.timelinePane{min-width:0;display:flex;flex-direction:column;height:auto;align-self:start}.timelinePaneHeader{position:relative;top:auto;z-index:2;background:#fff;border:1px solid #eaecf0;border-radius:12px;padding:10px 12px;margin-bottom:16px}.timelinePaneHeader + .timelineGrid{margin-top:0}#bucketChart{margin-top:0}.timelineChart svg{display:block}.timelineGrid{gap:12px;min-width:0}.timelineChart .chart{min-height:230px}.unitLegend{border:1px solid #d0d5dd;border-radius:999px;padding:2px 7px;background:#fff;color:#475467;font-weight:700}.plotNote{font-size:11px;color:#667085;margin-top:6px;line-height:1.35}.densityBadge{display:inline-block;margin-left:6px;border:1px solid #d0d5dd;border-radius:999px;padding:1px 6px;font-size:10px;color:#475467;background:#fff}.meshFrameBadge{display:inline-block;border:1px solid #d0d5dd;border-radius:999px;padding:2px 7px;background:#fff;color:#475467;font-size:11px;margin-top:6px}
 @media(max-width:1280px){.episodeInspector{grid-template-columns:1fr;min-height:0}.episodeSide{height:min(560px,var(--episodeAsideHeight,560px));max-height:min(560px,var(--episodeAsideHeight,560px))}.timelinePaneHeader{position:static}.miniChartGrid{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:760px){.miniChartGrid{grid-template-columns:1fr}.statusFilterBar{align-items:flex-start}.episodeTabMetrics{grid-template-columns:repeat(2,1fr)}}
+
+
+/* v8 diagnosis refactor */
+.triageGrid{display:grid;grid-template-columns:minmax(380px,1.35fr) minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:stretch}
+.compactScore{min-height:132px}.runtimePieCard{min-height:132px}.runtimePieCard .diagStats{grid-template-columns:repeat(4,minmax(0,1fr));margin-top:4px}.runtimePieCard .diagStatValue{font-size:15px}.pieWrap{display:grid;grid-template-columns:130px 1fr;gap:10px;align-items:center}.pieLegend{display:grid;gap:5px;font-size:11px;color:#475467}.pieLegendRow{display:flex;align-items:center;justify-content:space-between;gap:8px}.pieSwatch{width:9px;height:9px;border-radius:99px;display:inline-block;margin-right:5px}.pieSvg{width:130px;height:130px;display:block}.datasetScore{font-size:12px;color:#667085;margin-top:6px}.compactScore{min-height:132px}.compactScore .scoreNumber{font-size:46px}.diagCard{border:1px solid #e5e7eb;border-radius:14px;background:#fff;padding:13px;min-width:0;display:flex;flex-direction:column;gap:8px}.diagCardTitle{font-size:11px;color:#667085;text-transform:uppercase;letter-spacing:.05em;font-weight:800}.diagCardValue{font-size:20px;line-height:1.15;font-weight:850;color:#101828;overflow-wrap:anywhere}.diagCardDetail{font-size:12px;line-height:1.4;color:#667085}.diagCard.bad{border-left:4px solid #d92d20}.diagCard.warn{border-left:4px solid #f79009}.diagCard.good{border-left:4px solid #067647}.diagCard.info{border-left:4px solid #175cd3}.diagStats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-top:auto}.diagStat{border:1px solid #eef2f6;border-radius:10px;background:#f8fafc;padding:7px}.diagStatLabel{font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.04em}.diagStatValue{font-size:17px;font-weight:800;color:#101828}.actionsStrip{margin-top:12px;border-top:1px solid #eaecf0;padding-top:10px;display:grid;grid-template-columns:130px 1fr;gap:12px;align-items:start}.actionsStrip h3{margin-top:4px}.actionsInline{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.actionsInline .action{margin:0;min-height:52px;background:#fcfcfd}.detailsPanel{padding:0}.detailsPanel>summary{cursor:pointer;list-style:none;padding:14px 16px;font-weight:850;color:#101828;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #eaecf0}.detailsPanel>summary::-webkit-details-marker{display:none}.detailsPanel>summary:after{content:"展开";font-size:12px;color:#667085;border:1px solid #d0d5dd;border-radius:999px;padding:3px 9px;background:#fff}.detailsPanel[open]>summary:after{content:"收起"}.diagDetailsGrid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:14px;padding:14px}.diagDetailsGrid>.span3{grid-column:span 3}.diagDetailsGrid>.span4{grid-column:span 4}.diagDetailsGrid>.span6{grid-column:span 6}.diagDetailsGrid>.span12{grid-column:span 12}.subPanel{border:1px solid #eaecf0;border-radius:12px;background:#fff;padding:12px;min-width:0;overflow:hidden}.subPanel h2{font-size:14px;margin:0}.qualityNote{font-size:11px;color:#667085;line-height:1.35;margin-top:6px}
+@media(max-width:1280px){.triageGrid{grid-template-columns:1fr 1fr}.actionsInline{grid-template-columns:1fr}.actionsStrip{grid-template-columns:1fr}.diagDetailsGrid>.span3,.diagDetailsGrid>.span4,.diagDetailsGrid>.span6{grid-column:span 12}}
+@media(max-width:720px){.triageGrid{grid-template-columns:1fr}.diagStats{grid-template-columns:1fr}}
 
 </style>
 </head>
 <body>
 <header class="topbar">
   <div class="shell">
-    <h1>Excavator Dataset Quality Dashboard</h1>
+    <h1>Excavator Training Dataset Generation Dashboard</h1>
     <div class="controls">
       <label for="rootInput">Dataset root</label>
       <input id="rootInput" class="path" value="excavator_auto_dataset">
@@ -2946,28 +3224,37 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
   </div>
 </header>
 <main class="shell">
-  <div id="kpiCards" class="kpis"></div>
   <section class="panel hero">
     <div class="panelHeader">
-      <div><h2>Run diagnosis</h2><div class="panelHint">先看 readiness、主失败类目、下一步动作；下面再查具体分布和 episode 曲线。</div></div>
+      <div><h2>Run diagnosis</h2><div class="panelHint">面向训练数据生成：先看可训练数据量、skip/无效样本、真正阻塞和质量信号。成功样本的空 reason 不再显示为 ok 失败。</div></div>
       <div id="reportHint" class="reportHint"></div>
     </div>
-    <div class="heroGrid">
-      <div id="readinessCard" class="scoreBox"></div>
-      <div><h3>Key findings</h3><div id="findingsList"></div></div>
-      <div><h3>Recommended next actions</h3><div id="actionsList"></div></div>
+    <div class="triageGrid">
+      <div id="runtimePieCard" class="diagCard runtimePieCard"></div>
+      <div id="topBlockerCard" class="diagCard"></div>
+      <div id="qualitySignalCard" class="diagCard"></div>
+    </div>
+    <div class="actionsStrip">
+      <h3>Next actions</h3>
+      <div id="actionsList" class="actionsInline"></div>
     </div>
   </section>
 
   <section class="grid">
-    <section class="panel span4"><div class="panelHeader"><h2>Outcome mix</h2><span class="panelHint">status counts</span></div><div id="outcomeBars" class="barRows"></div></section>
-    <section class="panel span4"><div class="panelHeader"><h2>Failure reason Pareto</h2><span class="panelHint">primary reasons</span></div><div id="reasonBars" class="barRows"></div></section>
-    <section class="panel span4"><div class="panelHeader"><h2>Warnings</h2><span class="panelHint">quality warnings</span></div><div id="warningBars" class="barRows"></div></section>
-    <section class="panel span6"><div class="panelHeader"><h2>Readiness gates</h2><span class="panelHint">training export blockers</span></div><div class="tableWrap"><table id="gatesTable"></table></div></section>
-    <section class="panel span6"><div class="panelHeader"><h2>Material / score statistics</h2><span class="panelHint">median and range</span></div><div class="tableWrap"><table id="materialTable" class="metricsTable"></table></div></section>
-    <section class="panel span6"><div class="panelHeader"><h2>Initial pose × status</h2><span class="panelHint">pose triage matrix</span></div><div class="tableWrap"><table id="initialPoseTable" class="metricsTable"></table></div></section>
-    <section class="panel span3"><div class="panelHeader"><h2>Segment completion</h2><span class="panelHint">jsonl counts</span></div><div id="segmentBars" class="barRows"></div></section>
-    <section class="panel span3"><div class="panelHeader"><h2>Trajectory schema</h2><span class="panelHint">field coverage</span></div><div id="schemaTables" class="schemaGrid"></div></section>
+    <section class="panel span3"><div class="panelHeader"><h2>Outcome mix</h2><span class="panelHint">status counts</span></div><div id="outcomeBars" class="barRows"></div></section>
+    <section class="panel span5"><div class="panelHeader"><h2>Blocker reason Pareto</h2><span class="panelHint">only rejected / failed / diagnostic; excludes ok</span></div><div id="reasonBars" class="barRows"></div></section>
+    <section class="panel span4"><div class="panelHeader"><h2>Quality signals</h2><span class="panelHint">score_low / spill / low bin grouped</span></div><div id="qualityBars" class="barRows"></div><div class="qualityNote">带数值的 warning 会按类别聚合，例如 score_low:35.0 → quality/score_low。</div></section>
+    <details class="panel span12 detailsPanel">
+      <summary>Training/export diagnostics <span class="panelHint">readiness gates, material stats, schema, non-quality warnings</span></summary>
+      <div class="diagDetailsGrid">
+        <section class="subPanel span6"><div class="panelHeader"><h2>Readiness gates</h2><span class="panelHint">training export blockers</span></div><div class="tableWrap"><table id="gatesTable"></table></div></section>
+        <section class="subPanel span6"><div class="panelHeader"><h2>Material / score statistics</h2><span class="panelHint">median and range</span></div><div class="tableWrap"><table id="materialTable" class="metricsTable"></table></div></section>
+        <section class="subPanel span4"><div class="panelHeader"><h2>Initial pose × status</h2><span class="panelHint">pose triage matrix</span></div><div class="tableWrap"><table id="initialPoseTable" class="metricsTable"></table></div></section>
+        <section class="subPanel span4"><div class="panelHeader"><h2>Segment completion</h2><span class="panelHint">jsonl counts</span></div><div id="segmentBars" class="barRows"></div></section>
+        <section class="subPanel span4"><div class="panelHeader"><h2>General warnings</h2><span class="panelHint">non-quality warnings only</span></div><div id="warningBars" class="barRows"></div></section>
+        <section class="subPanel span12"><div class="panelHeader"><h2>Trajectory schema</h2><span class="panelHint">field coverage</span></div><div id="schemaTables" class="schemaGrid"></div></section>
+      </div>
+    </details>
 
     <section class="panel span4"><div class="panelHeader"><h2>Sand XY coverage</h2><span class="panelHint">excavator body-frame XY after init yaw; 1:1 X/Y scale</span></div><div id="sandScatter" class="chartBox"></div></section>
     <section class="panel span8"><div class="panelHeader"><h2>Truck XY coverage</h2><span class="panelHint">truck center + selected dump-bed mesh transformed into excavator body frame; 1:1 X/Y scale</span></div><div id="truckScatter" class="chartBox"></div></section>
@@ -3018,7 +3305,7 @@ const jointNames = ["swing","boom","arm","bucket"];
 const statusPalette = {
   trainable:"#067647", success:"#067647", rejected:"#d92d20",
   failed:"#f79009", fail:"#f79009", diagnostic:"#6941c6",
-  planning:"#175cd3", unknown:"#667085", all:"#344054"
+  planning:"#175cd3", skip:"#475467", unknown:"#667085", all:"#344054"
 };
 const lineColors = ["#175cd3","#067647","#b54708","#d92d20","#6941c6","#0086c9"];
 const stagePalette = ["#dbeafe","#dcfce7","#fef3c7","#fee2e2","#ede9fe","#cffafe","#fce7f3","#e2e8f0"];
@@ -3042,7 +3329,7 @@ function fmt(v,d=1){const n=Number(v); if(!Number.isFinite(n)) return ""; if(Mat
 function fmtAxis(v){const n=Number(v); if(!Number.isFinite(n)) return ""; if(Math.abs(n)>=10000) return n.toFixed(0); if(Math.abs(n)>=1000) return n.toFixed(0); if(Math.abs(n)>=10) return n.toFixed(1); return n.toFixed(2)}
 function pct(v){const n=Number(v); return Number.isFinite(n)?`${(n*100).toFixed(1)}%`:""}
 function shortText(s,n){s=String(s||""); return s.length>n?s.slice(0,n-1)+"…":s}
-function basename(path){return String(path||"").split(/[\/]/).pop()}
+function basename(path){return String(path||"").split(/[\\/]/).pop()}
 
 async function loadRuns(){
   setStatus("Loading runs...");
@@ -3077,39 +3364,98 @@ async function loadEpisode(index){
 
 function renderRun(data){
   const compact=data.compact||{}; const diagnosis=data.diagnosis||{}; const counts=compact.counts||{}; const segments=compact.segments||{};
-  const attempts=Number(counts.all||0), trainable=Number(counts.trainable||0), rejected=Number(counts.rejected||0), failed=Number(counts.failed||counts.fail||0);
-  const topReason=(diagnosis.top_reason&&diagnosis.top_reason.key)||((compact.primary_reasons||[])[0]||{}).key||"ok";
-  renderKPIs([
-    {label:"Readiness", value:`${diagnosis.readiness_score ?? 0}/100`, sub:"training gate score", cls:(diagnosis.readiness_score>=70?"good":diagnosis.readiness_score>=40?"warn":"bad")},
-    {label:"Attempts", value:attempts, sub:basename(data.run_dir)},
-    {label:"Trainable", value:trainable, sub:pct(trainable/Math.max(1,attempts)), cls:trainable>0?"good":"bad"},
-    {label:"Rejected", value:rejected, sub:pct(rejected/Math.max(1,attempts)), cls:rejected>0?"warn":"good"},
-    {label:"Failed", value:failed, sub:pct(failed/Math.max(1,attempts)), cls:failed>0?"bad":"good"},
-    {label:"Median score", value:fmt(diagnosis.score_median,1)||"—", sub:"material source"},
-    {label:"Median bin", value:fmt(diagnosis.final_bin_median,0)||"0", sub:"particles", cls:(Number(diagnosis.final_bin_median||0)>0?"good":"warn")},
-    {label:"Median spill", value:fmt(diagnosis.final_spill_median,0)||"0", sub:"particles", cls:(Number(diagnosis.final_spill_median||0)>0?"warn":"good")},
-  ]);
-  renderReadiness(diagnosis, topReason);
-  renderFindings("findingsList", diagnosis.findings||[]);
-  renderActions("actionsList", diagnosis.recommendations||[]);
+  const attempts=Number(counts.all||0), trainable=Number(counts.trainable||0), rejected=Number(counts.rejected||0), failed=Number(counts.failed||counts.fail||0), diagnostic=Number(counts.diagnostic||0), skip=Number(counts.skip||0);
+  const datasetMetrics=data.dataset_metrics || diagnosis.dataset_metrics || {};
+  const blockerRows=diagnosis.failure_reasons || compact.failure_reasons || compact.primary_reasons || [];
+  const qualityRows=diagnosis.quality_alerts || compact.top_quality_alerts || [];
+  const warningRows=diagnosis.general_warnings || compact.top_warnings || [];
+  const topBlocker=(diagnosis.top_problem_reason&&diagnosis.top_problem_reason.key)||((blockerRows||[])[0]||{}).key||"";
+  // KPI strip removed: counts/readiness/efficiency are consolidated into Runtime distribution.
+  renderTopBlocker(diagnosis, blockerRows);
+  renderQualitySignal(diagnosis, qualityRows);
+  renderRuntimePie("runtimePieCard", data.tag_runtime_seconds || datasetMetrics.tag_runtime_seconds || {}, datasetMetrics, diagnosis, {attempts, trainable, rejected, failed, diagnostic, skip});
+  renderActions("actionsList", (diagnosis.recommendations||[]).slice(0,3));
   renderGates(diagnosis.readiness_gates||[]);
   renderMaterialTable(diagnosis.material_table||[]);
   renderSchemaTables(diagnosis.field_coverage||{}, diagnosis.camera_coverage||{});
   renderInitialPoseTable(compact.initial_pose_by_status||[]);
-  renderBarList("outcomeBars", ["trainable","success","rejected","failed","diagnostic","planning"].map(k=>({key:k,count:counts[k]||0,status:k})).filter(r=>r.count||r.key==="trainable"||r.key==="rejected"), {colorByStatus:true});
-  renderBarList("reasonBars", compact.primary_reasons||[], {});
-  renderBarList("warningBars", compact.top_warnings||[], {warn:true});
+  renderBarList("outcomeBars", ["trainable","success","rejected","failed","diagnostic","planning","skip"].map(k=>({key:k,count:counts[k]||0,status:k})).filter(r=>r.count||r.key==="trainable"||r.key==="rejected"||r.key==="skip"), {colorByStatus:true});
+  renderBarList("reasonBars", blockerRows, {info:true});
+  renderBarList("qualityBars", qualityRows, {quality:true});
+  renderBarList("warningBars", warningRows, {warn:true});
   renderBarList("segmentBars", Object.entries(segments).map(([key,count])=>({key,count})), {info:true});
-  const pathSep = data.run_dir && data.run_dir.includes(String.fromCharCode(92)) ? String.fromCharCode(92) : "/";
-  $("reportHint").textContent = data.run_dir ? `Static report: ${data.run_dir}${pathSep}analysis_plots${pathSep}report.html  |  generate with --plots` : "";
+  $("reportHint").textContent = data.run_dir ? "Static report: analysis_plots/report.html  |  generate with --plots" : "";
   setupStatusFilter(data.episodes||[]);
   refreshFilteredViews();
 }
-function renderKPIs(items){$("kpiCards").innerHTML=(items||[]).map(it=>`<div class="kpi ${esc(it.cls||"")}"><div class="kpiLabel">${esc(it.label)}</div><div class="kpiValue">${esc(it.value)}</div><div class="kpiSub">${esc(it.sub||"")}</div></div>`).join("")}
-function renderReadiness(diagnosis, topReason){const score=Number(diagnosis.readiness_score||0); $("readinessCard").innerHTML=`<div class="scoreLabel">Training readiness</div><div class="scoreNumber">${fmt(score,0)}</div><div class="scoreBar"><div class="scoreFill" style="width:${Math.max(0,Math.min(100,score))}%"></div></div><div class="chips"><span class="chip">top: ${esc(shortText(topReason,34))}</span><span class="chip">${(diagnosis.readiness_gates||[]).length} gates</span></div>`}
-function renderFindings(id, rows){$(id).innerHTML=(rows||[]).length?(rows||[]).map(r=>`<div class="finding sev-${esc(r.severity||"info")}"><div class="findingTitle">${esc(r.title||r.key||"finding")}</div><div class="findingDetail">${esc(r.detail||r.message||"")}</div></div>`).join(""):'<div class="empty">no findings</div>'}
+
+function renderRuntimePie(id, data, metrics, diagnosis={}, counts={}){
+  const el=$(id); if(!el) return;
+  el.className="diagCard runtimePieCard info";
+  const entries=Object.entries(data||{}).map(([key,value])=>({key:statusKey(key), value:Number(value)||0})).filter(r=>r.value>0);
+  const total=entries.reduce((a,r)=>a+r.value,0);
+  const attempts=Number(counts.attempts||0);
+  const trainable=Number(counts.trainable||0);
+  const rejected=Number(counts.rejected||0);
+  const failed=Number(counts.failed||0);
+  const skip=Number(counts.skip||0);
+  const readiness=Number(diagnosis.readiness_score||0);
+  const efficiency=Number((metrics&&metrics.data_efficiency_score)||0);
+  const medianScore=diagnosis.score_median;
+  const statRows=[
+    {label:"Readiness", value:`${fmt(readiness,0)}/100`},
+    {label:"Data eff.", value:`${fmt(efficiency,0)}/100`},
+    {label:"Attempts", value:attempts},
+    {label:"Trainable", value:`${trainable} ${pct(trainable/Math.max(1,attempts))}`},
+    {label:"Rejected", value:`${rejected} ${pct(rejected/Math.max(1,attempts))}`},
+    {label:"Failed", value:`${failed} ${pct(failed/Math.max(1,attempts))}`},
+    {label:"Skip", value:`${skip} ${skip?"unexportable":"0"}`},
+    {label:"Median score", value:fmt(medianScore,1)||"—"},
+  ];
+  const statHtml=`<div class="diagStats">${statRows.map(s=>`<div class="diagStat"><div class="diagStatLabel">${esc(s.label)}</div><div class="diagStatValue">${esc(s.value)}</div></div>`).join("")}</div>`;
+  const framesHtml=`<div class="datasetScore">usable frames: ${esc((metrics&&metrics.usable_frames)||0)} / ${esc((metrics&&metrics.total_frames)||0)}</div>`;
+  if(total<=0){
+    const fallbackCounts=(metrics&&metrics.tag_counts)||{};
+    const countEntries=Object.entries(fallbackCounts).map(([key,value])=>({key:statusKey(key), value:Number(value)||0})).filter(r=>r.value>0);
+    if(!countEntries.length){
+      el.innerHTML=`<div class="diagCardTitle">Runtime distribution</div><div class="diagCardValue">no runtime data</div><div class="diagCardDetail">Counts, readiness and data efficiency are consolidated here; no duplicate KPI strip is shown.</div>${statHtml}${framesHtml}`;
+      return;
+    }
+    el.innerHTML=`<div class="diagCardTitle">Runtime distribution</div><div class="diagCardValue">count fallback</div><div class="diagCardDetail">No runtime seconds were available. Counts/readiness/efficiency are consolidated here instead of repeated in KPI cards.</div>${pieMarkup(countEntries,"episodes")}${statHtml}${framesHtml}`;
+    return;
+  }
+  el.innerHTML=`<div class="diagCardTitle">Runtime distribution</div><div class="diagCardValue">${fmt(total,1)}s total</div><div class="diagCardDetail">Tag runtime share plus dataset balance. Skip is surfaced instead of silently dropped; duplicate KPI cards are removed.</div>${pieMarkup(entries,"s")}${statHtml}${framesHtml}`;
+}
+function pieMarkup(entries, unit){
+  const total=entries.reduce((a,r)=>a+r.value,0)||1;
+  let angle=-Math.PI/2;
+  const cx=64, cy=64, r=54;
+  let paths="";
+  for(const item of entries){
+    const slice=(item.value/total)*Math.PI*2;
+    const x1=cx+r*Math.cos(angle), y1=cy+r*Math.sin(angle);
+    const x2=cx+r*Math.cos(angle+slice), y2=cy+r*Math.sin(angle+slice);
+    const large=slice>Math.PI?1:0;
+    const color=statusColor(item.key);
+    if(slice>=Math.PI*2-1e-6){
+      paths+=`<circle cx="${cx}" cy="${cy}" r="${r}" fill="${color}"><title>${esc(item.key)} ${fmt(item.value,1)}${unit}</title></circle>`;
+    }else{
+      paths+=`<path d="M ${cx} ${cy} L ${x1.toFixed(1)} ${y1.toFixed(1)} A ${r} ${r} 0 ${large} 1 ${x2.toFixed(1)} ${y2.toFixed(1)} Z" fill="${color}"><title>${esc(item.key)} ${fmt(item.value,1)}${unit}</title></path>`;
+    }
+    angle+=slice;
+  }
+  const legend=entries.sort((a,b)=>b.value-a.value).map(item=>`<div class="pieLegendRow"><span><span class="pieSwatch" style="background:${statusColor(item.key)}"></span>${esc(item.key)}</span><b>${fmt(item.value,1)}${esc(unit)}</b></div>`).join("");
+  return `<div class="pieWrap"><svg class="pieSvg" viewBox="0 0 128 128" role="img">${paths}<circle cx="${cx}" cy="${cy}" r="25" fill="#fff" opacity=".96"></circle></svg><div class="pieLegend">${legend}</div></div>`;
+}
+function renderKPIs(items){const el=$("kpiCards"); if(!el) return; el.innerHTML=(items||[]).map(it=>`<div class="kpi ${esc(it.cls||"")}"><div class="kpiLabel">${esc(it.label)}</div><div class="kpiValue">${esc(it.value)}</div><div class="kpiSub">${esc(it.sub||"")}</div></div>`).join("")}
+function renderReadiness(diagnosis, topBlocker){const score=Number(diagnosis.readiness_score||0); const blocker=topBlocker?`blocker: ${shortText(topBlocker,26)}`:"no blocker"; $("readinessCard").innerHTML=`<div class="scoreLabel">Training readiness</div><div class="scoreNumber">${fmt(score,0)}</div><div class="scoreBar"><div class="scoreFill" style="width:${Math.max(0,Math.min(100,score))}%"></div></div><div class="chips"><span class="chip">${esc(blocker)}</span><span class="chip">${(diagnosis.readiness_gates||[]).length} gates</span></div>`}
+function renderDiagCard(id, cls, title, value, detail, stats){const statHtml=(stats||[]).length?`<div class="diagStats">${stats.map(s=>`<div class="diagStat"><div class="diagStatLabel">${esc(s.label)}</div><div class="diagStatValue">${esc(s.value)}</div></div>`).join("")}</div>`:""; $(id).className=`diagCard ${esc(cls||"info")}`; $(id).innerHTML=`<div class="diagCardTitle">${esc(title)}</div><div class="diagCardValue">${esc(value)}</div><div class="diagCardDetail">${esc(detail||"")}</div>${statHtml}`}
+function renderTriageSummary(diagnosis, c){const problem=Number(diagnosis.problem_attempts ?? (c.rejected+c.failed+c.diagnostic)); const rate=c.attempts?pct(c.trainable/Math.max(1,c.attempts)):""; const cls=c.trainable>0?"good":"bad"; renderDiagCard("triageSummaryCard", cls, "Dataset balance", `${c.trainable}/${c.attempts} trainable`, `problem episodes: ${problem}; rejected=${c.rejected}, failed=${c.failed}`, [{label:"trainable",value:rate||"0%"},{label:"problem",value:pct(problem/Math.max(1,c.attempts))},{label:"diagnostic",value:c.diagnostic}])}
+function renderTopBlocker(diagnosis, rows){const top=(diagnosis.top_problem_reason&&diagnosis.top_problem_reason.key)?diagnosis.top_problem_reason:(rows||[])[0]; if(!top||!top.key){renderDiagCard("topBlockerCard","good","Top blocker","None","Failure Pareto excludes trainable/success ok rows. No rejected/failed blocker is currently dominant.",[]);return} const count=Number(top.count||0); const denom=Number(diagnosis.problem_attempts||diagnosis.attempts||count||1); const cls=count>=Math.max(1,denom/2)?"bad":"warn"; renderDiagCard("topBlockerCard",cls,"Top blocker",shortText(top.key,58),`${count}/${denom} problem episode(s). This is the first item to debug; it is not an \"ok\" status.`,[{label:"count",value:count},{label:"share",value:pct(count/Math.max(1,denom))},{label:"scope",value:"problem-only"}])}
+function renderQualitySignal(diagnosis, rows){const top=(diagnosis.top_quality_signal&&diagnosis.top_quality_signal.key)?diagnosis.top_quality_signal:(rows||[])[0]; if(!top||!top.key){renderDiagCard("qualitySignalCard","good","Quality signal","No dominant signal","score_low / spill / low bin are grouped separately from failure blockers.",[]);return} const count=Number(top.count||0); const cls=String(top.key).includes("spill")||String(top.key).includes("low")?"warn":"info"; renderDiagCard("qualitySignalCard",cls,"Quality signal",shortText(top.key,58),`${count} episode(s). Median bin/spill live here with the quality signal instead of in the KPI strip.`,[{label:"median score",value:fmt(diagnosis.score_median,1)||"—"},{label:"median bin",value:`${fmt(diagnosis.final_bin_median,1)||"0"} particles`},{label:"median spill",value:`${fmt(diagnosis.final_spill_median,0)||"0"} particles`}])}
+function renderFindings(id, rows){const el=$(id); if(!el) return; el.innerHTML=(rows||[]).length?(rows||[]).map(r=>`<div class="finding sev-${esc(r.severity||"info")}"><div class="findingTitle">${esc(r.title||r.key||"finding")}</div><div class="findingDetail">${esc(r.detail||r.message||"")}</div></div>`).join(""):'<div class="empty">no findings</div>'}
 function renderActions(id, rows){$(id).innerHTML=(rows||[]).length?(rows||[]).map((r,i)=>`<div class="action"><b>${i+1}.</b> ${esc(r)}</div>`).join(""):'<div class="empty">no actions</div>'}
-function renderBarList(id, rows, opts={}){const data=(rows||[]).map(r=>({key:String(r.key??r[0]??""), count:Number(r.count??r[1]??0), status:r.status})).filter(r=>Number.isFinite(r.count)); if(!data.length){$(id).innerHTML='<div class="empty">no data</div>';return} const max=Math.max(...data.map(r=>r.count),1); $(id).innerHTML=data.map(r=>{const color=opts.colorByStatus?statusColor(r.status||r.key):(opts.warn?"#b54708":opts.info?"#175cd3":"#344054"); return `<div class="barRow"><div class="barLabel" title="${esc(r.key)}">${esc(shortText(r.key,44))}</div><div class="barTrack"><div class="barFill" style="width:${Math.max(1,100*r.count/max)}%;background:${color}"></div></div><div class="barVal">${esc(r.count)}</div></div>`}).join("")}
+function renderBarList(id, rows, opts={}){const el=$(id); if(!el) return; const data=(rows||[]).map(r=>({key:String(r.key??r[0]??""), count:Number(r.count??r[1]??0), status:r.status})).filter(r=>Number.isFinite(r.count)&&r.count>=0); if(!data.length){el.innerHTML='<div class="empty">no data</div>';return} const max=Math.max(...data.map(r=>r.count),1); el.innerHTML=data.map(r=>{const color=opts.colorByStatus?statusColor(r.status||r.key):(opts.quality?"#7a5af8":opts.warn?"#b54708":opts.info?"#175cd3":"#344054"); return `<div class="barRow"><div class="barLabel" title="${esc(r.key)}">${esc(shortText(r.key,48))}</div><div class="barTrack"><div class="barFill" style="width:${Math.max(1,100*r.count/max)}%;background:${color}"></div></div><div class="barVal">${esc(r.count)}</div></div>`}).join("")}
 function renderGates(rows){const html=['<thead><tr><th>Gate</th><th>Status</th><th>Detail</th></tr></thead><tbody>']; for(const g of rows||[]){const st=g.status||g.state||""; const cls=st==="pass"?"gate-pass":st==="warn"?"gate-warn":"gate-fail"; html.push(`<tr><td>${esc(g.name||g.key||"")}</td><td><span class="${cls}">${esc(st)}</span></td><td>${esc(g.detail||g.reason||"")}</td></tr>`)} html.push('</tbody>'); $("gatesTable").innerHTML=rows&&rows.length?html.join(""):'<tbody><tr><td class="muted">no gates</td></tr></tbody>'}
 function renderMaterialTable(rows){const html=['<thead><tr><th>Metric</th><th>Count</th><th>Min</th><th>Median</th><th>Mean</th><th>Max</th></tr></thead><tbody>']; for(const r of rows||[]){html.push(`<tr><td>${esc(r.key||r.metric||"")}</td><td>${esc(r.count??"")}</td><td>${fmt(r.min,1)}</td><td>${fmt(r.median,1)}</td><td>${fmt(r.mean,1)}</td><td>${fmt(r.max,1)}</td></tr>`)} html.push('</tbody>'); $("materialTable").innerHTML=rows&&rows.length?html.join(""):'<tbody><tr><td class="muted">no stats</td></tr></tbody>'}
 function renderInitialPoseTable(rows){const parts=['<thead><tr><th>Initial pose</th><th>Status</th><th>Count</th></tr></thead><tbody>']; for(const r of rows||[]){const key=String(r.key||""); const split=key.lastIndexOf(":"); const pose=split>=0?key.slice(0,split):key; const status=split>=0?key.slice(split+1):""; parts.push(`<tr><td>${esc(shortText(pose,46))}</td><td><span class="pill ${esc(cssClassStatus(status))}">${esc(status)}</span></td><td>${esc(r.count??"")}</td></tr>`)} parts.push('</tbody>'); $("initialPoseTable").innerHTML=rows&&rows.length?parts.join(""):'<tbody><tr><td class="muted">no data</td></tr></tbody>'}
@@ -3127,7 +3473,7 @@ function setupStatusFilter(episodes){
   for(const btn of el.querySelectorAll(".filterBtn")){btn.onclick=()=>toggleStatusFilter(btn.dataset.status)}
   updateFilterUI();
 }
-function statusOrder(s){return {trainable:1,success:2,rejected:3,failed:4,diagnostic:5,planning:6,unknown:99}[statusKey(s)]||50}
+function statusOrder(s){return {trainable:1,success:2,rejected:3,failed:4,diagnostic:5,planning:6,skip:7,unknown:99}[statusKey(s)]||50}
 function toggleStatusFilter(status){
   if(status==="__all__"){
     const allActive=selectedStatuses.size===availableStatuses.length;
@@ -3224,7 +3570,7 @@ function numericOrNull(v){const n=Number(v); return Number.isFinite(n)?n:null}
 function markSelectedTab(index){document.querySelectorAll("#episodeTabs tr[data-ep]").forEach(row=>row.classList.toggle("selected",row.dataset.ep==String(index)))}
 
 function renderEpisode(data){
-  const ep=data.episode||{}; $("episodeTitle").textContent=`Attempt ${ep.episode_index} timeline`; $("episodeMeta").textContent=`${statusKey(ep.status)} · score=${fmt(ep.score,1)} · samples=${data.sample_count} · shown=${data.returned_points} · ${shortText(ep.reason||ep.warning_reason||"",260)}`; $("rawBox").textContent=JSON.stringify({episode:ep,stage_spans:data.stage_spans},null,2);
+  const ep=data.episode||{}; $("episodeTitle").textContent=`Attempt ${ep.episode_index} timeline`; $("episodeMeta").textContent=`${statusKey(ep.status)} · score=${fmt(ep.score,1)} · samples=${data.sample_count} · shown=${data.returned_points} · ${shortText(ep.dataset_skip_reason || ep.reason||ep.warning_reason||"",260)}`; $("rawBox").textContent=JSON.stringify({episode:ep,stage_spans:data.stage_spans},null,2);
   const s=data.series||{}; drawLineChart("bucketChart","Bucket sand holding",s.t,[{name:"bucket_from_pile",values:s.bucket_from_pile},{name:"bucket_total",values:s.bucket_total}],data.stage_spans,"particles"); drawVectorChart("qChart","Joint angles",s.t,s.q_deg,data.stage_spans,"deg"); drawVectorChart("dqChart","Joint velocity",s.t,s.dq_deg_s,data.stage_spans,"deg/s"); drawVectorChart("ddqChart","Joint acceleration",s.t,s.ddq_deg_s2,data.stage_spans,"deg/s²"); drawVectorChart("effortChart","Measured joint effort",s.t,s.effort,data.stage_spans,"effort");
   markSelectedTab(ep.episode_index);
   syncEpisodeInspectorHeight();

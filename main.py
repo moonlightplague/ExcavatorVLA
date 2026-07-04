@@ -42,10 +42,29 @@ def _validated_model_source(config):
     return "original"
 
 
+def _clear_runtime_module_cache():
+    importlib_prefixes = (
+        "excavator_app.",
+    )
+    cleared = []
+    for name in sorted(list(sys.modules.keys())):
+        if any(name.startswith(prefix) for prefix in importlib_prefixes):
+            sys.modules.pop(name, None)
+            cleared.append(name)
+    try:
+        import importlib
+        importlib.invalidate_caches()
+    except Exception:
+        pass
+    if cleared:
+        print(f"[INFO] [MAIN CACHE CLEAR] modules={cleared}")
+
+
 PROJECT_ROOT = paths.find_project_root(start=__file__)
 _add_import_roots(PROJECT_ROOT)
 CONFIG = _load_runtime_config(PROJECT_ROOT)
 MODEL_SOURCE = _validated_model_source(CONFIG)
+_clear_runtime_module_cache()
 
 print(f"[INFO] Excavator model source: {MODEL_SOURCE}")
 print(f"[INFO] Excavator project root: {PROJECT_ROOT}")

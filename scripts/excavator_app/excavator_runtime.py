@@ -1,9 +1,8 @@
-import asyncio
+﻿import asyncio
 import copy
 import hashlib
 import importlib
 import importlib.util
-import inspect
 import json
 import math
 import os
@@ -25,10 +24,6 @@ import omni.usd
 import omni.kit.app
 import omni.ui as ui
 try:
-    import omni.replicator.core as rep
-except Exception:
-    rep = None
-try:
     import omni.timeline
     HAS_OMNI_TIMELINE = True
 except Exception:
@@ -47,18 +42,9 @@ except Exception:
 from isaacsim.core.api.world import World
 from isaacsim.core.prims import SingleArticulation
 from isaacsim.core.utils.types import ArticulationAction
-try:
-    from isaacsim.sensors.camera import Camera as IsaacCamera
-    HAS_ISAAC_CAMERA = True
-except Exception:
-    IsaacCamera = None
-    HAS_ISAAC_CAMERA = False
-try:
-    from PIL import Image
-except Exception:
-    Image = None
 
 from . import auto_dataset_collect
+from . import excavator_dataset_camera
 from . import ik_calculation
 from . import ik_movement
 from . import trace_showing
@@ -643,11 +629,11 @@ AUTO_COLLECT_HOME_BUCKET_RELAXED_TOL_DEG = 28.0
 AUTO_COLLECT_HOME_NON_BUCKET_RELAXED_SCALE = 1.5
 DIRECT_INITIAL_POSE_SETTLE_FRAMES = 18
 DIRECT_PLAN_END_HOME_SETTLE_FRAMES = 8
-AUTO_SCENE_RANDOM_TRUCK_DEFAULT = True
-AUTO_SCENE_RANDOM_TRUCK_YAW_DEFAULT = True
-AUTO_SCENE_RANDOM_ROBOT_YAW_DEFAULT = True
-AUTO_SCENE_RANDOM_SAND_XY_DEFAULT = True
-AUTO_SCENE_RANDOM_SAND_AMOUNT_DEFAULT = True
+AUTO_SCENE_RANDOM_TRUCK_DEFAULT = env_bool("EXCAVATOR_RANDOM_TRUCK", True)
+AUTO_SCENE_RANDOM_TRUCK_YAW_DEFAULT = env_bool("EXCAVATOR_RANDOM_TRUCK_YAW", True)
+AUTO_SCENE_RANDOM_ROBOT_YAW_DEFAULT = env_bool("EXCAVATOR_RANDOM_ROBOT_YAW", True)
+AUTO_SCENE_RANDOM_SAND_XY_DEFAULT = env_bool("EXCAVATOR_RANDOM_SAND_XY", True)
+AUTO_SCENE_RANDOM_SAND_AMOUNT_DEFAULT = env_bool("EXCAVATOR_RANDOM_SAND_AMOUNT", True)
 AUTO_SCENE_RANDOM_MAX_TRIES = 96
 AUTO_SCENE_TRUCK_ROOT_PATH = "/World/truck"
 AUTO_SCENE_TRUCK_RANDOM_DX_RANGE = (-1.20, 1.20)
@@ -1131,6 +1117,8 @@ UNLOAD_MODELS = {}
 # ============================================================
 # Helpers
 # ============================================================
+_STEP_UPDATES_LOCK = None
+
 
 def sdf_path(path):
     if isinstance(path, Sdf.Path):
@@ -1145,9 +1133,13 @@ def get_prim(path):
 
 
 async def step_updates(n=1):
+    global _STEP_UPDATES_LOCK
+    if _STEP_UPDATES_LOCK is None:
+        _STEP_UPDATES_LOCK = asyncio.Lock()
     app = omni.kit.app.get_app()
-    for _ in range(n):
-        await app.next_update_async()
+    for _ in range(max(0, int(n))):
+        async with _STEP_UPDATES_LOCK:
+            await app.next_update_async()
 
 
 def deg_to_rad(x):
@@ -1916,7 +1908,7 @@ def find_robot_paths():
             root = prim.GetPath().pathString
             base = prim.GetPath().GetParentPath().pathString
             return root, base
-    raise RuntimeError("No ArticulationRootAPI found. 请先导入 URDF。")
+    raise RuntimeError("No ArticulationRootAPI found. Please import the URDF first.")
 
 
 def clear_xform(prim):
@@ -6440,740 +6432,97 @@ def ensure_xform_path(stage_obj, path):
 
 
 def dataset_camera_image_extension():
-    requested = str(STATE.get("dataset_camera_image_format", "ppm") or "ppm").strip().lower()
-    if requested in ("ppm", "raw", "raw_ppm"):
-        return "ppm"
-    return "png" if Image is not None else "ppm"
+    return excavator_dataset_camera.image_extension(runtime_module())
 
 
 def dataset_camera_resolution():
-    value = STATE.get("dataset_camera_resolution", DATASET_CAMERA_DEFAULT_RESOLUTION)
-    try:
-        width = int(value[0])
-        height = int(value[1])
-    except Exception:
-        width, height = DATASET_CAMERA_DEFAULT_RESOLUTION
-    return [max(32, width), max(32, height)]
-
-
-def asyncio_task_active():
-    try:
-        return asyncio.current_task() is not None
-    except Exception:
-        return False
-
-
-def _replicator_step_async(rt_subframes=1):
-    if rep is None:
-        return None
-    step_async = getattr(rep.orchestrator, "step_async", None)
-    if not callable(step_async):
-        return None
-    return step_async(
-        rt_subframes=int(rt_subframes),
-        delta_time=CONTROL_DT,
-        pause_timeline=False,
-    )
+    return excavator_dataset_camera.resolution(runtime_module())
 
 
 def camera_global_tick():
-    """
-    Uniformly drive all Isaac camera / replicator graph reads.
-    Dataset capture must follow this clock: world step -> replicator step -> annotator read.
-
-    This synchronous entrypoint is intentionally non-blocking while an asyncio task
-    is active. Kit's async engine is not re-entrant; calling blocking orchestrator
-    or app/world updates from a running coroutine can corrupt the loop with
-    "Cannot enter into task ... while another task ... is being executed".
-    """
-    if rep is None:
-        info_print("[WARN] camera tick failed:", "replicator_unavailable")
-        return False
-    install_replicator_simtime_guard()
-    try:
-        if asyncio_task_active():
-            # Do not schedule fire-and-forget Replicator tasks from synchronous
-            # dataset code running inside a coroutine. Those tasks can survive
-            # shutdown and trigger Kit/SimulationManager pending-task warnings.
-            # Coroutine paths that need a hard camera tick must await
-            # camera_global_tick_async() directly.
-            STATE["dataset_camera_deferred_ticks"] = int(STATE.get("dataset_camera_deferred_ticks", 0) or 0) + 1
-            return True
-        step = getattr(rep.orchestrator, "step", None)
-        if callable(step):
-            step(rt_subframes=1, delta_time=CONTROL_DT, pause_timeline=False, wait_for_render=True)
-        else:
-            pending = _replicator_step_async(rt_subframes=1)
-            if inspect.isawaitable(pending):
-                asyncio.ensure_future(pending)
-        return True
-    except Exception as e:
-        info_print("[WARN] camera tick failed:", type(e).__name__, e)
-        return False
+    return excavator_dataset_camera.global_tick(runtime_module())
 
 
 async def camera_global_tick_async():
-    """Async-safe Replicator camera tick for coroutine-driven runtime paths."""
-    if rep is None:
-        info_print("[WARN] camera tick failed:", "replicator_unavailable")
-        return False
-    install_replicator_simtime_guard()
-    try:
-        pending = _replicator_step_async(rt_subframes=1)
-        if inspect.isawaitable(pending):
-            await pending
-        elif pending is None:
-            await step_updates(1)
-        return True
-    except Exception as e:
-        info_print("[WARN] camera tick failed:", type(e).__name__, e)
-        return False
+    return await excavator_dataset_camera.global_tick_async(runtime_module())
 
 
 def install_replicator_simtime_guard():
-    if bool(STATE.get("replicator_simtime_guard_installed", False)):
-        return True
-    try:
-        import omni.graph.core as og
-    except Exception:
-        return False
-    original_set = getattr(og.AttributeValueHelper, "set", None)
-    if not callable(original_set):
-        return False
-    if bool(getattr(original_set, "_excavator_replicator_guard", False)):
-        STATE["replicator_simtime_guard_installed"] = True
-        return True
-
-    def guarded_set(self, new_value, *args, **kwargs):
-        try:
-            return original_set(self, new_value, *args, **kwargs)
-        except TypeError as exc:
-            text = str(exc)
-            if "Unable to write from unknown dtype" not in text:
-                raise
-            try:
-                values = list(new_value)
-            except Exception:
-                raise
-            if all(isinstance(item, tuple) and len(item) == 2 for item in values):
-                try:
-                    return original_set(self, np.asarray(values, dtype=np.int64).reshape(-1), *args, **kwargs)
-                except TypeError:
-                    return None
-            try:
-                arr = np.asarray(values)
-                if arr.dtype.kind in ("i", "u"):
-                    return original_set(self, np.asarray(values, dtype=np.int64), *args, **kwargs)
-                if arr.dtype.kind == "f":
-                    return original_set(self, np.asarray(values, dtype=np.float64), *args, **kwargs)
-            except Exception:
-                pass
-            raise
-
-    guarded_set._excavator_replicator_guard = True
-    og.AttributeValueHelper.set = guarded_set
-    STATE["replicator_simtime_guard_installed"] = True
-    return True
+    return excavator_dataset_camera.install_replicator_simtime_guard(runtime_module())
 
 
 def camera_warmup_graph(frames=5):
-    # Synchronous warmup must not call world.step() or app.update() from inside
-    # Kit coroutines. Those calls re-enter the async engine. Coroutine callers use
-    # dataset_camera_warmup_for_episode(), which awaits step_updates() and
-    # camera_global_tick_async() explicitly.
-    for _ in range(max(1, int(frames))):
-        camera_global_tick()
+    return excavator_dataset_camera.warmup_graph(runtime_module(), frames=frames)
 
 
 def dataset_camera_backend():
-    STATE["dataset_camera_backend"] = "isaac"
-    return "isaac"
+    return excavator_dataset_camera.backend(runtime_module())
 
 
 def dataset_camera_specs():
-    swing_parent = LINK_PATHS.get("swing_link") or (f"{ROBOT_BASE}/swing_link" if ROBOT_BASE else "")
-    arm_parent = LINK_PATHS.get("arm_link") or (f"{ROBOT_BASE}/arm_link" if ROBOT_BASE else "")
-    return [
-        {
-            "name": "0",
-            "meaning": "arm-tip top-down camera",
-            "parent": arm_parent,
-            "path": f"{arm_parent}/Camera_0" if arm_parent else "",
-            "translate": [0.0, 0.0, 0.45],
-            "rotate_xyz_deg": [0.0, -60.0, 0.0],
-        },
-        {
-            "name": "1",
-            "meaning": "original main camera on swing",
-            "parent": swing_parent,
-            "path": f"{swing_parent}/Camera_1" if swing_parent else "",
-            "translate": [0.0, -1.2, 1.4],
-            "rotate_xyz_deg": [65.0, 0.0, 0.0],
-        },
-        {
-            "name": "2",
-            "meaning": "swing-mounted overhead panorama camera",
-            "parent": swing_parent,
-            "path": f"{swing_parent}/Camera_2" if swing_parent else "",
-            "translate": [0.0, 0.0, 3.0],
-            "rotate_xyz_deg": [0.0, -70.0, 0.0],
-        },
-    ]
+    return excavator_dataset_camera.specs(runtime_module())
 
 
 def is_camera_prim(prim):
-    if not prim or not prim.IsValid():
-        return False
-    try:
-        return bool(prim.IsA(UsdGeom.Camera))
-    except Exception:
-        return str(prim.GetTypeName()) == "Camera"
+    return excavator_dataset_camera.is_camera_prim(prim)
 
 
 def ensure_dataset_camera_prim(stage_obj, spec):
-    path = str(spec.get("path", ""))
-    parent = str(spec.get("parent", ""))
-    if not path or not parent:
-        return None, "missing_camera_path_or_parent"
-    parent_prim = stage_obj.GetPrimAtPath(parent)
-    if not parent_prim or not parent_prim.IsValid():
-        return None, f"missing_parent:{parent}"
-    prim = stage_obj.GetPrimAtPath(path)
-    if not is_camera_prim(prim):
-        try:
-            camera = UsdGeom.Camera.Define(stage_obj, Sdf.Path(path))
-            prim = camera.GetPrim()
-            xform = UsdGeom.XformCommonAPI(prim)
-            translate = spec.get("translate", [0.0, 0.0, 0.0])
-            rotate_xyz = spec.get("rotate_xyz_deg", [0.0, 0.0, 0.0])
-            xform.SetTranslate(Gf.Vec3d(float(translate[0]), float(translate[1]), float(translate[2])))
-            xform.SetRotate(Gf.Vec3f(float(rotate_xyz[0]), float(rotate_xyz[1]), float(rotate_xyz[2])), UsdGeom.XformCommonAPI.RotationOrderXYZ)
-            camera.GetFocalLengthAttr().Set(18.0)
-            camera.GetHorizontalApertureAttr().Set(20.955)
-            camera.GetVerticalApertureAttr().Set(15.2908)
-            camera.GetClippingRangeAttr().Set(Gf.Vec2f(0.01, 1000.0))
-            return prim, "created"
-        except Exception as exc:
-            return None, f"configured_camera_missing:{path}:{type(exc).__name__}:{exc}"
-    return prim, "ok"
+    return excavator_dataset_camera.ensure_prim(runtime_module(), stage_obj, spec)
 
 
 def dataset_camera_prim_metadata(path):
-    prim = get_prim(path)
-    if not prim or not prim.IsValid():
-        return {"available": False, "prim_path": str(path)}
-    meta = {"available": True, "prim_path": str(path)}
-    try:
-        cam = UsdGeom.Camera(prim)
-        for key, attr_name in [
-            ("focal_length", "focalLength"),
-            ("horizontal_aperture", "horizontalAperture"),
-            ("vertical_aperture", "verticalAperture"),
-        ]:
-            attr = cam.GetPrim().GetAttribute(attr_name)
-            value = attr.Get() if attr else None
-            if value is not None:
-                meta[key] = float(value)
-        clip_attr = cam.GetPrim().GetAttribute("clippingRange")
-        clip = clip_attr.Get() if clip_attr else None
-        if clip is not None:
-            meta["clipping_range"] = [float(clip[0]), float(clip[1])]
-    except Exception as exc:
-        meta["metadata_error"] = f"{type(exc).__name__}:{exc}"
-    return meta
+    return excavator_dataset_camera.prim_metadata(runtime_module(), path)
 
 
 def dataset_camera_world_pose(path):
-    prim = get_prim(path)
-    if not prim or not prim.IsValid():
-        return {"available": False, "prim_path": str(path)}
-    try:
-        mat = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
-        translation = mat.ExtractTranslation()
-        rows = []
-        for r in range(4):
-            rows.append([float(mat[r][c]) for c in range(4)])
-        return {
-            "available": True,
-            "prim_path": str(path),
-            "position": [float(translation[0]), float(translation[1]), float(translation[2])],
-            "world_transform": rows,
-        }
-    except Exception as exc:
-        return {"available": False, "prim_path": str(path), "reason": f"{type(exc).__name__}:{exc}"}
+    return excavator_dataset_camera.world_pose(runtime_module(), path)
 
 
 @debug_profiled("dataset_save_rgb_image", threshold_ms=2.0)
 def save_rgb_image(path, rgb, ensure_dir=True):
-    if ensure_dir:
-        ensure_parent_dir(path)
-    rgb = np.asarray(rgb)
-    if rgb.ndim == 3 and rgb.shape[-1] == 4:
-        rgb = rgb[:, :, :3]
-    if rgb.dtype != np.uint8:
-        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
-    if Image is not None and str(path).lower().endswith(".png"):
-        compress_level = int(STATE.get("dataset_camera_png_compress_level", 3) or 3)
-        compress_level = max(0, min(9, compress_level))
-        Image.fromarray(np.ascontiguousarray(rgb[:, :, :3])).save(
-            str(path),
-            format="PNG",
-            optimize=bool(STATE.get("dataset_camera_png_optimize", False)),
-            compress_level=compress_level,
-        )
-        return "png"
-    with open(str(path), "wb") as f:
-        h, w = int(rgb.shape[0]), int(rgb.shape[1])
-        f.write(f"P6\n{w} {h}\n255\n".encode("ascii"))
-        f.write(np.ascontiguousarray(rgb[:, :, :3]).tobytes())
-    return "ppm"
+    return excavator_dataset_camera.save_rgb_image(runtime_module(), path, rgb, ensure_dir=ensure_dir)
 
 
 def dataset_camera_runtime_ready():
-    if not bool(STATE.get("running", False)):
-        return False, "runtime_not_running"
-    if not simulation_timeline_is_playing():
-        return False, "timeline_not_playing"
-    try:
-        ctx = omni.usd.get_context()
-        if ctx is None:
-            return False, "usd_context_missing"
-        stage_obj = ctx.get_stage()
-        if stage_obj is None:
-            return False, "stage_missing"
-        if hasattr(ctx, "get_stage_id"):
-            stage_id = ctx.get_stage_id()
-            try:
-                if int(stage_id) < 0:
-                    return False, f"stage_id_not_ready:{stage_id}"
-            except Exception:
-                pass
-    except Exception as exc:
-        return False, f"stage_not_ready:{type(exc).__name__}:{exc}"
-    return True, "ok"
+    return excavator_dataset_camera.runtime_ready(runtime_module())
 
 
 def dataset_camera_shutdown(reason="shutdown"):
-    objects = STATE.get("dataset_camera_objects")
-    closed = 0
-    if isinstance(objects, dict):
-        for name, cam in list(objects.items()):
-            for method_name in ("destroy", "cleanup", "stop", "pause"):
-                method = getattr(cam, method_name, None)
-                if not callable(method):
-                    continue
-                try:
-                    method()
-                    closed += 1
-                    break
-                except Exception:
-                    continue
-    STATE["dataset_camera_objects"] = {}
-    STATE["dataset_camera_initialized"] = False
-    STATE["dataset_camera_init_attempted"] = False
-    STATE["dataset_camera_last_status"] = {"enabled": bool(STATE.get("dataset_camera_enabled", True)), "available": False, "reason": reason, "closed": closed}
-    return closed
+    return excavator_dataset_camera.shutdown(runtime_module(), reason=reason)
 
 
 def dataset_camera_initialize(force=False):
-    if not bool(STATE.get("dataset_camera_enabled", True)):
-        STATE["dataset_camera_last_status"] = {"enabled": False, "reason": "disabled"}
-        return False
-    backend = dataset_camera_backend()
-    if backend == "isaac" and (not HAS_ISAAC_CAMERA or IsaacCamera is None):
-        STATE["dataset_camera_last_status"] = {"enabled": True, "available": False, "reason": "isaac_camera_api_unavailable", "backend": backend}
-        return False
-    ready, ready_reason = dataset_camera_runtime_ready()
-    if not ready:
-        STATE["dataset_camera_last_status"] = {"enabled": True, "available": False, "reason": ready_reason, "backend": backend}
-        return False
-    if bool(STATE.get("dataset_camera_initialized", False)) and not force:
-        objects = STATE.get("dataset_camera_objects")
-        if isinstance(objects, dict) and objects:
-            return True
-
-    stage_obj = omni.usd.get_context().get_stage()
-    resolution = dataset_camera_resolution()
-    frequency = int(STATE.get("dataset_camera_frequency", 10) or 10)
-    objects = {}
-    install_replicator_simtime_guard()
-    status = {
-        "enabled": True,
-        "schema": DATASET_CAMERA_SCHEMA,
-        "backend": backend,
-        "resolution": resolution,
-        "image_format": dataset_camera_image_extension(),
-        "views": {},
-    }
-    for spec in dataset_camera_specs():
-        name = str(spec.get("name", ""))
-        path = str(spec.get("path", ""))
-        view_status = dict(spec)
-        view_status.pop("translate", None)
-        view_status.pop("rotate_xyz_deg", None)
-        try:
-            prim, reason = ensure_dataset_camera_prim(stage_obj, spec)
-            if prim is None:
-                view_status.update({"available": False, "reason": reason})
-                status["views"][name] = view_status
-                continue
-            set_prim_visibility(prim, True)
-            cam = IsaacCamera(prim_path=path, resolution=(int(resolution[0]), int(resolution[1])), frequency=frequency)
-            cam.initialize()
-            objects[name] = cam
-            view_status.update(dataset_camera_prim_metadata(path))
-            view_status.update({"available": True, "reason": "ok"})
-        except Exception as exc:
-            view_status.update({"available": False, "reason": f"{type(exc).__name__}:{exc}", "prim_path": path})
-        status["views"][name] = view_status
-
-    if objects:
-        first_name = sorted(objects.keys())[0]
-        first_cam = objects[first_name]
-        for name in DATASET_CAMERA_NAMES:
-            if name not in objects:
-                objects[name] = first_cam
-                view_status = status["views"].get(name, {"name": name})
-                view_status.update({"available": True, "reason": "shared_isaac_camera_fallback", "fallback_source": first_name})
-                status["views"][name] = view_status
-
-    STATE["dataset_camera_objects"] = objects
-    STATE["dataset_camera_initialized"] = bool(objects)
-    STATE["dataset_camera_init_attempted"] = True
-    STATE["dataset_camera_last_status"] = status
-    if objects:
-        camera_warmup_graph(5)
-        info_print(
-            "[DATASET CAMERA]",
-            "backend=isaac",
-            f"views={list(objects.keys())}",
-            f"resolution={resolution}",
-            f"format={dataset_camera_image_extension()}",
-        )
-    else:
-        info_print("[WARN] [DATASET CAMERA] no usable camera views", status)
-    return bool(objects)
+    return excavator_dataset_camera.initialize(runtime_module(), force=force)
 
 
 def dataset_camera_episode_metadata():
-    status = STATE.get("dataset_camera_last_status")
-    if not isinstance(status, dict) or not status:
-        status = {
-            "enabled": bool(STATE.get("dataset_camera_enabled", True)),
-            "schema": DATASET_CAMERA_SCHEMA,
-            "resolution": dataset_camera_resolution(),
-            "image_format": dataset_camera_image_extension(),
-            "views": {},
-        }
-        for spec in dataset_camera_specs():
-            name = str(spec.get("name", ""))
-            path = str(spec.get("path", ""))
-            view = dict(spec)
-            view.update(dataset_camera_prim_metadata(path))
-            status["views"][name] = view
-    return status
+    return excavator_dataset_camera.episode_metadata(runtime_module())
 
 
 def dataset_camera_episode_cache(reset=False):
-    episode_dir = str(STATE.get("dataset_episode_dir", "") or "")
-    image_dir = str(STATE.get("dataset_image_dir", "") or "")
-    extension = dataset_camera_image_extension()
-    resolution = dataset_camera_resolution()
-    key = (
-        episode_dir,
-        image_dir,
-        extension,
-        tuple(int(x) for x in resolution),
-        tuple(str(x) for x in DATASET_CAMERA_NAMES),
-    )
-    cache = STATE.get("dataset_camera_episode_cache")
-    if (
-        not reset
-        and isinstance(cache, dict)
-        and cache.get("key") == key
-        and isinstance(cache.get("views"), dict)
-    ):
-        return cache
-
-    specs = dataset_camera_specs()
-    spec_by_name = {str(item.get("name", "")): item for item in specs}
-    views = {}
-    if image_dir:
-        for name in DATASET_CAMERA_NAMES:
-            name = str(name)
-            abs_dir = os.path.join(image_dir, name)
-            try:
-                os.makedirs(abs_dir, exist_ok=True)
-            except Exception:
-                pass
-            rel_dir = ""
-            if episode_dir:
-                try:
-                    rel_dir = os.path.relpath(abs_dir, episode_dir).replace(os.sep, "/")
-                except Exception:
-                    rel_dir = f"images/{name}"
-            else:
-                rel_dir = f"images/{name}"
-            spec = spec_by_name.get(name, {})
-            views[name] = {
-                "name": name,
-                "spec": spec,
-                "prim_path": str(spec.get("path", "")),
-                "abs_dir": abs_dir,
-                "rel_dir": rel_dir,
-            }
-    cache = {
-        "key": key,
-        "episode_dir": episode_dir,
-        "image_dir": image_dir,
-        "extension": extension,
-        "resolution": resolution,
-        "views": views,
-    }
-    STATE["dataset_camera_episode_cache"] = cache
-    return cache
+    return excavator_dataset_camera.episode_cache(runtime_module(), reset=reset)
 
 
 def dataset_camera_sample_requires_complete_images(sample_index):
-    if not bool(STATE.get("dataset_camera_enabled", True)):
-        return False
-    if not bool(STATE.get("dataset_camera_require_complete_samples", True)):
-        return False
-    stride = max(1, int(STATE.get("dataset_camera_sample_stride", 1) or 1))
-    return int(sample_index) % stride == 0
+    return excavator_dataset_camera.sample_requires_complete_images(runtime_module(), sample_index)
 
 
 def dataset_camera_payload_complete(payload, sample_index):
-    if not dataset_camera_sample_requires_complete_images(sample_index):
-        return True, "not_required"
-    if not isinstance(payload, dict):
-        return False, "payload_missing"
-    missing = []
-    for name in DATASET_CAMERA_NAMES:
-        key = f"observation.images.{name}"
-        if not payload.get(key):
-            missing.append(str(name))
-    if missing:
-        camera_info = payload.get("observation.camera", {})
-        reason = ""
-        if isinstance(camera_info, dict):
-            reason = str(camera_info.get("reason", "") or "")
-            if not reason:
-                view_reasons = []
-                views = camera_info.get("views", {})
-                if isinstance(views, dict):
-                    for name in missing:
-                        view = views.get(str(name), {})
-                        if isinstance(view, dict):
-                            view_reasons.append(f"{name}:{view.get('reason', 'missing')}")
-                reason = ",".join(view_reasons)
-        return False, reason or f"missing_camera_images:{','.join(missing)}"
-    return True, "ok"
+    return excavator_dataset_camera.payload_complete(runtime_module(), payload, sample_index)
 
 
 def dataset_camera_rgb_ready():
-    if not bool(STATE.get("dataset_camera_enabled", True)):
-        return True, "disabled"
-    if not simulation_timeline_is_playing():
-        return False, "timeline_not_playing"
-    if not dataset_camera_initialize(force=False):
-        status = STATE.get("dataset_camera_last_status", {})
-        reason = status.get("reason", "camera_unavailable") if isinstance(status, dict) else "camera_unavailable"
-        return False, str(reason)
-    camera_global_tick()
-    objects = STATE.get("dataset_camera_objects")
-    if not isinstance(objects, dict):
-        return False, "camera_objects_missing"
-    if objects:
-        return True, "ok"
-    missing = []
-    for name in DATASET_CAMERA_NAMES:
-        cam = objects.get(str(name))
-        if cam is None:
-            missing.append(f"{name}:missing")
-            continue
-        try:
-            rgb = cam.get_rgb()
-            if rgb is None:
-                missing.append(f"{name}:rgb_none")
-        except Exception as exc:
-            missing.append(f"{name}:{type(exc).__name__}")
-    if missing:
-        return False, ",".join(missing)
-    return True, "ok"
+    return excavator_dataset_camera.rgb_ready(runtime_module())
 
 
 async def dataset_camera_warmup_for_episode(label="episode"):
-    if not bool(STATE.get("dataset_camera_enabled", True)):
-        STATE["dataset_camera_warmup_status"] = {"ok": True, "reason": "disabled", "label": str(label)}
-        return True
-    if not bool(STATE.get("dataset_camera_require_complete_samples", True)):
-        STATE["dataset_camera_warmup_status"] = {"ok": True, "reason": "complete_samples_not_required", "label": str(label)}
-        return True
-    max_frames = max(0, int(STATE.get("dataset_camera_warmup_max_frames", 12) or 12))
-    min_frames = max(0, int(STATE.get("dataset_camera_warmup_frames", 3) or 3))
-    ready_required = max(1, int(STATE.get("dataset_camera_warmup_ready_frames", 2) or 2))
-    ready_streak = 0
-    last_reason = "not_checked"
-    if max_frames <= 0:
-        max_frames = max(min_frames, ready_required)
-    for frame in range(max_frames):
-        await step_updates(1)
-        await camera_global_tick_async()
-        ready, reason = dataset_camera_rgb_ready()
-        last_reason = reason
-        if ready:
-            ready_streak += 1
-        else:
-            ready_streak = 0
-        if frame + 1 >= min_frames and ready_streak >= ready_required:
-            status = {
-                "ok": True,
-                "reason": "ok",
-                "label": str(label),
-                "frames": int(frame + 1),
-                "ready_streak": int(ready_streak),
-            }
-            STATE["dataset_camera_warmup_status"] = status
-            info_print(
-                "[DATASET CAMERA WARMUP]",
-                f"label={label}",
-                f"ok=True",
-                f"frames={frame + 1}",
-                f"ready_streak={ready_streak}",
-            )
-            return True
-    status = {
-        "ok": False,
-        "reason": str(last_reason),
-        "label": str(label),
-        "frames": int(max_frames),
-        "ready_streak": int(ready_streak),
-    }
-    STATE["dataset_camera_warmup_status"] = status
-    info_print(
-        "[WARN] [DATASET CAMERA WARMUP]",
-        f"label={label}",
-        "ok=False",
-        f"frames={max_frames}",
-        f"ready_streak={ready_streak}",
-        f"reason={last_reason}",
-    )
-    return False
+    return await excavator_dataset_camera.warmup_for_episode(runtime_module(), label=label)
 
 
 @debug_profiled("dataset_capture_camera_observations", threshold_ms=5.0)
 def dataset_capture_camera_observations(sample_index):
-    payload = {
-        "observation.images.0": None,
-        "observation.images.1": None,
-        "observation.images.2": None,
-        "observation.camera": {
-            "schema": DATASET_CAMERA_SCHEMA,
-            "available": False,
-            "frame_index": int(sample_index),
-            "views": {},
-        },
-    }
-    if not bool(STATE.get("dataset_camera_enabled", True)):
-        payload["observation.camera"]["reason"] = "disabled"
-        return payload
-    stride = max(1, int(STATE.get("dataset_camera_sample_stride", 1) or 1))
-    if int(sample_index) % stride != 0:
-        payload["observation.camera"]["reason"] = "stride_skipped"
-        return payload
-    camera_global_tick()
-    backend = dataset_camera_backend()
-    if not dataset_camera_initialize(force=False):
-        status = STATE.get("dataset_camera_last_status", {})
-        payload["observation.camera"]["reason"] = status.get("reason", "camera_unavailable") if isinstance(status, dict) else "camera_unavailable"
-        return payload
-    payload["observation.camera"]["backend"] = backend
-
-    episode_dir = str(STATE.get("dataset_episode_dir", "") or "")
-    image_dir = str(STATE.get("dataset_image_dir", "") or "")
-    if not episode_dir or not image_dir:
-        payload["observation.camera"]["reason"] = "missing_episode_image_dir"
-        return payload
-
-    objects = STATE.get("dataset_camera_objects")
-    if not isinstance(objects, dict):
-        objects = {}
-    camera_cache = dataset_camera_episode_cache(reset=False)
-    extension = str(camera_cache.get("extension", dataset_camera_image_extension()))
-    resolution = dataset_camera_resolution()
-    any_available = False
-    view_cache = camera_cache.get("views", {}) if isinstance(camera_cache, dict) else {}
-    for name in DATASET_CAMERA_NAMES:
-        cam = objects.get(name)
-        view_payload = {
-            "available": False,
-            "name": name,
-            "path": None,
-            "shape": None,
-            "dtype": None,
-        }
-        cached_view = view_cache.get(str(name), {}) if isinstance(view_cache, dict) else {}
-        prim_path = str(cached_view.get("prim_path", ""))
-        view_payload["prim_path"] = prim_path
-        view_payload["pose"] = dataset_camera_world_pose(prim_path)
-        try:
-            fallback_reason = ""
-            if cam is None:
-                rgb = np.zeros((int(resolution[1]), int(resolution[0]), 3), dtype=np.uint8)
-                fallback_reason = "camera_object_fallback"
-            else:
-                rgb = cam.get_rgb()
-                if rgb is None:
-                    rgb = np.zeros((int(resolution[1]), int(resolution[0]), 3), dtype=np.uint8)
-                    fallback_reason = "camera_rgb_fallback"
-            rgb = np.asarray(rgb)
-            if rgb.ndim != 3 or rgb.shape[-1] < 3:
-                rgb = np.zeros((int(resolution[1]), int(resolution[0]), 3), dtype=np.uint8)
-                fallback_reason = "camera_shape_fallback"
-            if rgb.ndim == 3 and rgb.shape[-1] == 4:
-                rgb = rgb[:, :, :3]
-            if rgb.dtype != np.uint8:
-                rgb = np.clip(rgb, 0, 255).astype(np.uint8)
-            filename = f"{int(sample_index):06d}.{extension}"
-            abs_dir = str(cached_view.get("abs_dir", os.path.join(image_dir, name)))
-            rel_dir = str(cached_view.get("rel_dir", f"images/{name}"))
-            abs_path = os.path.join(abs_dir, filename)
-            rel_path = f"{rel_dir}/{filename}".replace("\\", "/")
-            fmt = extension
-            image_job = {
-                "kind": "image",
-                "path": abs_path,
-                "rgb": np.ascontiguousarray(rgb[:, :, :3]).copy(),
-                "ensure_dir": False,
-            }
-            if not dataset_writer_enqueue(image_job):
-                fmt = save_rgb_image(abs_path, rgb, ensure_dir=False)
-            payload[f"observation.images.{name}"] = rel_path
-            view_payload.update(
-                {
-                    "available": True,
-                    "path": rel_path,
-                    "shape": [int(x) for x in rgb.shape],
-                    "dtype": str(rgb.dtype),
-                    "format": fmt,
-                    "capture_backend": backend,
-                }
-            )
-            if fallback_reason:
-                view_payload["reason"] = fallback_reason
-            any_available = True
-        except Exception as exc:
-            view_payload["reason"] = f"{type(exc).__name__}:{exc}"
-            now = time.time()
-            if now - float(STATE.get("dataset_camera_last_error_time", 0.0)) > 2.0:
-                STATE["dataset_camera_last_error_time"] = now
-                info_print("[WARN] dataset camera capture failed:", name, type(exc).__name__, exc)
-        payload["observation.camera"]["views"][name] = view_payload
-    payload["observation.camera"]["available"] = any_available
-    payload["observation.camera"]["image_format"] = extension
-    payload["observation.camera"]["resolution"] = dataset_camera_resolution()
-    return payload
+    return excavator_dataset_camera.capture_observations(runtime_module(), sample_index)
 
 
 def jsonl_line_count(path):
@@ -7391,8 +6740,10 @@ def quality_gate_config_snapshot():
 
 
 def auto_scene_sand_amount_range():
-    default_lo = float(min(AUTO_SCENE_SAND_AMOUNT_RANGE))
-    default_hi = float(max(AUTO_SCENE_SAND_AMOUNT_RANGE))
+    env_lo = os.environ.get("EXCAVATOR_RANDOM_SAND_AMOUNT_MIN", "")
+    env_hi = os.environ.get("EXCAVATOR_RANDOM_SAND_AMOUNT_MAX", "")
+    default_lo = safe_float(env_lo, float(min(AUTO_SCENE_SAND_AMOUNT_RANGE))) if env_lo != "" else float(min(AUTO_SCENE_SAND_AMOUNT_RANGE))
+    default_hi = safe_float(env_hi, float(max(AUTO_SCENE_SAND_AMOUNT_RANGE))) if env_hi != "" else float(max(AUTO_SCENE_SAND_AMOUNT_RANGE))
     lo = safe_float(STATE.get("auto_scene_sand_amount_min", default_lo), default_lo)
     hi = safe_float(STATE.get("auto_scene_sand_amount_max", default_hi), default_hi)
     lo = max(0.10, min(30.0, float(lo)))
@@ -7455,40 +6806,7 @@ def auto_dataset_config_snapshot():
 
 
 def camera_config_snapshot():
-    backend = dataset_camera_backend()
-    return {
-        "schema": DATASET_CAMERA_SCHEMA,
-        "enabled": bool(STATE.get("dataset_camera_enabled", True)),
-        "available": bool(HAS_ISAAC_CAMERA),
-        "backend": backend,
-        "backend_available": {
-            "isaac_camera": bool(HAS_ISAAC_CAMERA),
-            "viewport_capture": False,
-            "viewport_reason": "dataset_viewport_capture_disabled",
-        },
-        "resolution": dataset_camera_resolution(),
-        "frequency": int(STATE.get("dataset_camera_frequency", 10) or 10),
-        "sample_stride": max(1, int(STATE.get("dataset_camera_sample_stride", 1) or 1)),
-        "require_complete_samples": bool(STATE.get("dataset_camera_require_complete_samples", True)),
-        "warmup_frames": int(STATE.get("dataset_camera_warmup_frames", 3) or 3),
-        "warmup_ready_frames": int(STATE.get("dataset_camera_warmup_ready_frames", 2) or 2),
-        "warmup_max_frames": int(STATE.get("dataset_camera_warmup_max_frames", 12) or 12),
-        "requested_image_format": str(STATE.get("dataset_camera_image_format", "ppm") or "ppm"),
-        "image_format": dataset_camera_image_extension(),
-        "image_format_note": "Default PPM keeps RGB frame content uncompressed during collection; LeRobot export converts images/videos after the run.",
-        "png_compression": {
-            "compress_level": int(STATE.get("dataset_camera_png_compress_level", 3) or 3),
-            "optimize": bool(STATE.get("dataset_camera_png_optimize", False)),
-            "lossless": True,
-        },
-        "async_writer": {
-            "enabled": bool(STATE.get("dataset_async_writer_enabled", True)),
-            "queue_max": int(STATE.get("dataset_async_writer_queue_max", 4096) or 4096),
-            "content_unchanged": True,
-        },
-        "views": dataset_camera_specs(),
-        "pil_available": bool(Image is not None),
-    }
+    return excavator_dataset_camera.config_snapshot(runtime_module())
 
 
 def sand_config_snapshot():
@@ -18133,7 +17451,7 @@ def get_unload_mesh_shrink_from_model():
 
 def sync_target_from_sliders_live(force=False):
     """
-    target ball 随 slider 自动更新。为了避免每帧 author，做轻微 throttle。
+    target ball 闅?slider 鑷姩鏇存柊銆備负浜嗛伩鍏嶆瘡甯?author锛屽仛杞诲井 throttle銆?
     """
     if STATE.get("auto_collect_active", False):
         return
@@ -19806,7 +19124,7 @@ def q_deg(swing_rad, boom_deg, arm_deg, bucket_deg):
 
 def get_joint_anchor_world(joint_name):
     """
-    返回 USD Physics joint anchor 的 world position。
+    杩斿洖 USD Physics joint anchor 鐨?world position銆?
     """
     joint_path = JOINT_PATHS.get(joint_name)
     if joint_path is None:
@@ -19850,7 +19168,7 @@ def get_joint_anchor_world(joint_name):
 
 def get_swing_center_world():
     """
-    挖掘机工作装置的水平回转中心。
+    鎸栨帢鏈哄伐浣滆缃殑姘村钩鍥炶浆涓績銆?
     """
     p = get_joint_anchor_world("swing")
     if p is not None:
@@ -19871,7 +19189,7 @@ def get_swing_xy_center():
 
 def estimate_dynamic_reach_radius():
     """
-    根据当前 bucket tip 距离估计模型工作半径。
+    鏍规嵁褰撳墠 bucket tip 璺濈浼拌妯″瀷宸ヤ綔鍗婂緞銆?
     """
     try:
         center = get_swing_center_world()
@@ -23447,7 +22765,7 @@ def target_radius_from_swing_center(target_xyz):
 
 def validate_dig_target(target_xyz, hard_block=False):
     """
-    不再用固定 5.5m 硬阻止。
+    涓嶅啀鐢ㄥ浐瀹?5.5m 纭樆姝€?
     """
     r = target_radius_from_swing_center(target_xyz)
     if r < DIG_MIN_RADIUS:
@@ -23461,7 +22779,7 @@ def validate_dig_target(target_xyz, hard_block=False):
 
 def target_to_swing_angle(target_xyz):
     """
-    用 swing joint center 计算回转角。
+    鐢?swing joint center 璁＄畻鍥炶浆瑙掋€?
     """
     center_xy = get_swing_xy_center()
 
@@ -23475,7 +22793,7 @@ def target_to_swing_angle(target_xyz):
 
 def dig_direction_unit(target_xyz):
     """
-    从目标点指向 swing center。
+    浠庣洰鏍囩偣鎸囧悜 swing center銆?
     """
     center_xy = get_swing_xy_center()
     txy = np.array([float(target_xyz[0]), float(target_xyz[1])], dtype=np.float32)
@@ -32469,6 +31787,12 @@ def build_ui():
             os.makedirs(path, exist_ok=True)
             if hasattr(os, "startfile"):
                 os.startfile(path)
+                update_status(f"[AUTO DATASET] opened dir: {path}", force=True)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+                update_status(f"[AUTO DATASET] opened dir: {path}", force=True)
+            elif os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+                subprocess.Popen(["xdg-open", path])
                 update_status(f"[AUTO DATASET] opened dir: {path}", force=True)
             else:
                 update_status(f"[AUTO DATASET] dir: {path}", force=True)

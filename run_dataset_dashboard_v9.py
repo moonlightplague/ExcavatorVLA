@@ -4,8 +4,6 @@ import os
 import re
 import shutil
 import time
-import threading
-import hashlib
 from collections import Counter, defaultdict
 from statistics import mean, median
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -38,7 +36,6 @@ LEROBOT_IMAGE_KEYS = [
     "observation.images.1",
     "observation.images.2",
 ]
-SUCCESS_POOL_DIRNAME = ".dashboard_success"
 LEROBOT_IMAGE_KEY_ALIASES = {
     "observation.images.0": ["observation.images.0", "observation.images.camera", "observation.images.front"],
     "observation.images.1": ["observation.images.1", "observation.images.cameraleft", "observation.images.bucket"],
@@ -128,8 +125,7 @@ def load_episode_bundle(row: dict) -> Dict[str, object]:
 
 def summarize_run(run_dir: Union[str, os.PathLike]) -> Dict[str, object]:
     run_dir = str(run_dir)
-    raw_counts = {name: len(load_index(run_dir, name)) for name in INDEX_FILES}
-    counts, catchup = success_index_catchup_counts(run_dir, raw_counts)
+    counts = {name: len(load_index(run_dir, name)) for name in INDEX_FILES}
     segments = {
         name: len(read_jsonl(os.path.join(run_dir, filename)))
         for name, filename in SEGMENT_FILES.items()
@@ -147,7 +143,6 @@ def summarize_run(run_dir: Union[str, os.PathLike]) -> Dict[str, object]:
         "summary": read_json(os.path.join(run_dir, "summary.json"), default={}),
         "counts": counts,
         "segments": segments,
-        "success_catchup": catchup,
         "success_rate": success_rate,
         "rejection_rate": rejection_rate,
         "failure_rate": failure_rate,
@@ -1853,48 +1848,22 @@ def resize_rgb_frame(frame, target_size: Optional[Tuple[int, int]] = None):
     return np.asarray(image)
 
 
-def _call_frame_progress(progress_callback, done: int, total: int, message: str) -> None:
-    if not progress_callback:
-        return
-    try:
-        progress_callback(int(done), int(max(1, total)), str(message or ""))
-    except Exception:
-        pass
-
-
-def _frame_progress_interval(total: int) -> int:
-    # Around 120 updates at most per stream.  This keeps the dashboard responsive
-    # without spamming the HTTP job state for large video exports.
-    return max(1, int(max(1, total) // 120))
-
-
 def try_encode_mp4_imageio(
     image_paths: Sequence[str],
     output_path: str,
     fps: float,
     target_size: Optional[Tuple[int, int]] = None,
-    progress_callback=None,
-    progress_label: str = "",
 ) -> Tuple[bool, str]:
     try:
         import imageio.v2 as imageio  # type: ignore
     except Exception as exc:
         return False, f"imageio_unavailable:{type(exc).__name__}:{exc}"
-    total = len(image_paths)
-    interval = _frame_progress_interval(total)
     try:
         ensure_dir(os.path.dirname(output_path) or ".")
         writer = imageio.get_writer(output_path, fps=float(fps), codec="libx264", quality=8, macro_block_size=1)
         try:
-            for frame_i, image_path in enumerate(image_paths, 1):
+            for image_path in image_paths:
                 writer.append_data(resize_rgb_frame(imageio.imread(image_path), target_size=target_size))
-                if frame_i == 1 or frame_i == total or frame_i % interval == 0:
-                    _call_frame_progress(
-                        progress_callback,
-                        frame_i,
-                        total,
-                        f"encoding {progress_label or os.path.basename(os.path.dirname(output_path))} with imageio: {frame_i}/{total}",
-                    )
         finally:
             writer.close()
         return True, "ok"
@@ -1907,15 +1876,11 @@ def try_encode_mp4_cv2(
     output_path: str,
     fps: float,
     target_size: Optional[Tuple[int, int]] = None,
-    progress_callback=None,
-    progress_label: str = "",
 ) -> Tuple[bool, str]:
     try:
         import cv2  # type: ignore
     except Exception as exc:
         return False, f"cv2_unavailable:{type(exc).__name__}:{exc}"
-    total = len(image_paths)
-    interval = _frame_progress_interval(total)
     try:
         first = cv2.imread(str(image_paths[0]), cv2.IMREAD_COLOR)
         if first is None:
@@ -1929,20 +1894,13 @@ def try_encode_mp4_cv2(
         if not writer.isOpened():
             return False, "cv2_writer_not_opened"
         try:
-            for frame_i, image_path in enumerate(image_paths, 1):
+            for image_path in image_paths:
                 frame = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
                 if frame is None:
                     return False, f"cv2_frame_unreadable:{image_path}"
                 if int(frame.shape[1]) != width or int(frame.shape[0]) != height:
                     frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
                 writer.write(frame)
-                if frame_i == 1 or frame_i == total or frame_i % interval == 0:
-                    _call_frame_progress(
-                        progress_callback,
-                        frame_i,
-                        total,
-                        f"encoding {progress_label or os.path.basename(os.path.dirname(output_path))} with cv2: {frame_i}/{total}",
-                    )
         finally:
             writer.release()
         return True, "ok"
@@ -1955,33 +1913,17 @@ def encode_mp4(
     output_path: str,
     fps: float,
     target_size: Optional[Tuple[int, int]] = None,
-    progress_callback=None,
-    progress_label: str = "",
 ) -> Tuple[bool, str, str]:
     if not image_paths:
         return False, "none", "no_images"
     missing = [path for path in image_paths if not path or not os.path.isfile(path)]
     if missing:
         return False, "none", f"missing_images:{len(missing)}"
-    ok, reason = try_encode_mp4_imageio(
-        image_paths,
-        output_path,
-        fps,
-        target_size=target_size,
-        progress_callback=progress_callback,
-        progress_label=progress_label,
-    )
+    ok, reason = try_encode_mp4_imageio(image_paths, output_path, fps, target_size=target_size)
     if ok:
         return True, "imageio", reason
     first_reason = reason
-    ok, reason = try_encode_mp4_cv2(
-        image_paths,
-        output_path,
-        fps,
-        target_size=target_size,
-        progress_callback=progress_callback,
-        progress_label=progress_label,
-    )
+    ok, reason = try_encode_mp4_cv2(image_paths, output_path, fps, target_size=target_size)
     if ok:
         return True, "cv2", reason
     return False, "none", f"{first_reason}; {reason}"
@@ -2198,8 +2140,6 @@ def collect_lerobot_rows(
     limit_episodes: Optional[int] = None,
 ) -> Dict[str, object]:
     run_dir = str(run_dir)
-    if is_dashboard_success_pool_dir(run_dir):
-        reconcile_success_pool_indexes(run_dir, recover_orphan_folders=True)
     episode_rows = load_index(run_dir, split)
     if limit_episodes is not None:
         episode_rows = episode_rows[: max(0, int(limit_episodes))]
@@ -2375,22 +2315,11 @@ def export_lerobot_dataset(
     overwrite: bool = False,
     require_standard: bool = False,
     require_vla: bool = False,
-    progress_callback=None,
 ) -> Dict[str, object]:
-    def progress(percent: float, message: str, current: Optional[int] = None, total: Optional[int] = None) -> None:
-        if not progress_callback:
-            return
-        try:
-            progress_callback(float(max(0.0, min(100.0, percent))), str(message or ""), current, total)
-        except Exception:
-            pass
-
     run_dir = os.path.abspath(str(run_dir))
-    progress(1.0, "checking source run folder")
     if not os.path.isdir(run_dir):
         raise FileNotFoundError(run_dir)
     export_dir = os.path.abspath(str(output_dir or os.path.join(run_dir, LEROBOT_DEFAULT_EXPORT_DIRNAME)))
-    progress(2.0, "preparing export directory")
     if os.path.exists(export_dir):
         if not overwrite:
             raise FileExistsError(f"{export_dir} already exists; pass --export-overwrite to rebuild it")
@@ -2404,7 +2333,6 @@ def export_lerobot_dataset(
     except Exception as exc:
         raise RuntimeError(f"pandas is required for strict LeRobot v3 export: {type(exc).__name__}:{exc}") from exc
 
-    progress(5.0, "collecting trainable rows and validating camera files")
     collected = collect_lerobot_rows(run_dir, split=split, limit_episodes=limit_episodes)
     rows: List[dict] = list(collected["rows"])  # type: ignore[arg-type]
     if not rows:
@@ -2421,34 +2349,17 @@ def export_lerobot_dataset(
     video_results = {}
     image_features = list(LEROBOT_IMAGE_KEYS)
     image_paths: Dict[str, List[str]] = collected["image_paths"]  # type: ignore[assignment]
-    image_frame_counts = {key: len(image_paths.get(key, []) or []) for key in image_features}
-    image_missing_file_counts = {
-        key: len([path for path in (image_paths.get(key, []) or []) if not path or not os.path.isfile(path)])
-        for key in image_features
-    }
-    progress(12.0, "camera preflight: " + ", ".join(f"{key}={image_frame_counts.get(key, 0)}" for key in image_features))
-    for camera_i, key in enumerate(image_features):
+    for key in LEROBOT_IMAGE_KEYS:
         paths = image_paths.get(key, [])
-        start_percent = 15.0 + camera_i * 20.0
-        end_percent = 15.0 + (camera_i + 1) * 20.0
         if not paths or not any(paths):
-            video_results[key] = {"available": False, "reason": "no_images", "frames": 0}
-            progress(end_percent, f"{key}: no images")
+            video_results[key] = {"available": False, "reason": "no_images"}
             continue
         video_path = os.path.join(export_dir, "videos", key, "chunk-000", "file-000.mp4")
-
-        def camera_progress(done: int, total: int, message: str, _start=start_percent, _end=end_percent):
-            ratio = float(done) / float(max(1, total))
-            progress(_start + (_end - _start) * ratio, message, int(done), int(max(1, total)))
-
-        progress(start_percent, f"encoding {key}: 0/{len(paths)}", 0, len(paths))
         ok, encoder, reason = encode_mp4(
             paths,
             video_path,
             export_fps,
             target_size=(LEROBOT_IMAGE_SHAPE[1], LEROBOT_IMAGE_SHAPE[0]),
-            progress_callback=camera_progress,
-            progress_label=key,
         )
         if ok:
             video_results[key] = {
@@ -2458,16 +2369,12 @@ def export_lerobot_dataset(
                 "frames": len(paths),
                 "shape": LEROBOT_IMAGE_SHAPE,
             }
-            progress(end_percent, f"encoded {key}: {len(paths)} frames", len(paths), len(paths))
             continue
         video_results[key] = {
             "available": False,
             "reason": reason,
-            "frames": len(paths),
         }
-        progress(end_percent, f"{key}: video encode failed: {reason}", len(paths), len(paths))
 
-    progress(78.0, "building parquet tables and metadata")
     tasks = collected["tasks"]
     episodes = collected["episodes"]
     state_names = list(collected["state_names"])  # type: ignore[arg-type]
@@ -2499,7 +2406,6 @@ def export_lerobot_dataset(
     parquet_path = os.path.join(data_dir, "file-000.parquet")
     data_df = pd.DataFrame(data_rows)
     parquet_ok, parquet_reason = try_write_dataframe_parquet(data_df, parquet_path, index=False)
-    progress(82.0, "wrote data parquet" if parquet_ok else f"data parquet failed: {parquet_reason}")
 
     tasks_path = os.path.join(meta_dir, "tasks.parquet")
     tasks_df = pd.DataFrame(
@@ -2507,7 +2413,6 @@ def export_lerobot_dataset(
         index=pd.Index([str(task["task"]) for task in tasks]),  # type: ignore[index]
     )
     tasks_ok, tasks_reason = try_write_dataframe_parquet(tasks_df, tasks_path, index=True)
-    progress(84.0, "wrote tasks parquet" if tasks_ok else f"tasks parquet failed: {tasks_reason}")
 
     episode_meta_rows = []
     for episode in episodes:  # type: ignore[assignment]
@@ -2535,7 +2440,6 @@ def export_lerobot_dataset(
     episodes_path = os.path.join(episodes_dir, "file-000.parquet")
     episodes_df = pd.DataFrame(episode_meta_rows)
     episodes_ok, episodes_reason = try_write_dataframe_parquet(episodes_df, episodes_path, index=False)
-    progress(86.0, "wrote episode metadata" if episodes_ok else f"episode metadata failed: {episodes_reason}")
 
     features = {
         "observation.state": {
@@ -2583,7 +2487,6 @@ def export_lerobot_dataset(
         "features": features,
     }
     write_json(os.path.join(meta_dir, "info.json"), info)
-    progress(90.0, "wrote info.json")
 
     stats = build_lerobot_v3_stats(
         data_rows,
@@ -2593,11 +2496,9 @@ def export_lerobot_dataset(
         image_features,
     )
     write_json(os.path.join(meta_dir, "stats.json"), stats)
-    progress(93.0, "wrote stats.json")
 
     video_ready = all(video_results.get(key, {}).get("available") is True for key in image_features)
     parquet_ready = bool(parquet_ok and tasks_ok and episodes_ok)
-    progress(95.0, "validating LeRobot/VLA export")
     validation = validate_lerobot_v3_export(export_dir, image_features)
     vla_training_ready = bool(parquet_ready and video_ready and validation["ok"])
     manifest = {
@@ -2621,8 +2522,6 @@ def export_lerobot_dataset(
             "episodes_reason": episodes_reason,
         },
         "videos": video_results,
-        "image_frame_counts": image_frame_counts,
-        "image_missing_file_counts": image_missing_file_counts,
         "validation": validation,
         "fps": export_fps,
         "total_frames": len(data_rows),
@@ -2667,7 +2566,6 @@ def export_lerobot_dataset(
         "",
     ]
     write_text(os.path.join(export_dir, "README.md"), "\n".join(readme))
-    progress(98.0, "VLA export ready" if vla_training_ready else "VLA export incomplete; see manifest.validation")
     if require_standard and not vla_training_ready:
         raise RuntimeError(f"LeRobot export incomplete: {json.dumps(manifest, ensure_ascii=True)}")
     if require_vla and not vla_training_ready:
@@ -3184,10 +3082,6 @@ RUN_SIZE_CACHE_FILENAME = "folder_size_cache.json"
 RUN_SIZE_CACHE_VERSION = 2
 RUN_SIZE_EXCLUDE_DIRS = {".dashboard_cache", "__pycache__"}
 RUN_DATA_SIZE_LIMIT = 8
-RUN_PAYLOAD_CACHE_VERSION = 1
-RUN_PAYLOAD_CACHE_DIRNAME = "run_payload_cache"
-RUN_PAYLOAD_MEMORY_CACHE: Dict[str, Dict[str, object]] = {}
-RUN_PAYLOAD_CACHE_LOCK = threading.Lock()
 
 
 def fast_jsonl_count(path: Union[str, os.PathLike]) -> int:
@@ -3203,83 +3097,6 @@ def fast_jsonl_count(path: Union[str, os.PathLike]) -> int:
         return 0
     return count
 
-
-
-
-def success_index_catchup_counts(
-    run_dir: Union[str, os.PathLike],
-    counts: Optional[Dict[str, object]] = None,
-) -> Tuple[Dict[str, int], Dict[str, object]]:
-    """Recover dashboard counts when disk-full shutdown left only successful_episodes.jsonl.
-
-    Some interrupted runs can have empty/missing episodes.jsonl and
-    trainable_episodes.jsonl while successful_episodes.jsonl was already flushed.
-    For dashboard/export management, those rows are still valuable training data.
-    This helper keeps raw counts visible while providing effective counts that do
-    not display attempts/trainable as zero when success rows exist.
-    """
-    run_dir = os.path.abspath(str(run_dir))
-    raw: Dict[str, int] = {}
-    if counts is not None:
-        for key in INDEX_FILES:
-            try:
-                raw[key] = int(counts.get(key, 0) or 0)
-            except Exception:
-                raw[key] = 0
-    else:
-        for key in INDEX_FILES:
-            raw[key] = fast_jsonl_count(index_path(run_dir, key))
-    effective = dict(raw)
-    success = int(raw.get("success", 0) or 0)
-    reasons: List[str] = []
-    if success > 0 and int(raw.get("all", 0) or 0) <= 0:
-        effective["all"] = success
-        reasons.append("episodes_index_missing_success_recovered")
-    if success > 0 and int(raw.get("trainable", 0) or 0) <= 0:
-        effective["trainable"] = success
-        reasons.append("trainable_index_missing_success_recovered")
-    active = bool(reasons)
-    catchup = {
-        "active": active,
-        "source": "successful_episodes.jsonl" if active else "normal_indexes",
-        "reason": ";".join(reasons),
-        "raw_counts": raw,
-        "effective_counts": effective,
-        "message": (
-            "Recovered effective attempts/trainable from successful_episodes.jsonl. "
-            "This usually means the run was interrupted after success rows were flushed "
-            "but before episodes/trainable indexes or summary were completed."
-        ) if active else "",
-    }
-    return effective, catchup
-
-
-def load_dashboard_all_rows(run_dir: Union[str, os.PathLike]) -> Tuple[List[dict], Dict[str, object]]:
-    """Load rows for dashboard inspection with success-index catch-up.
-
-    Normal runs use episodes.jsonl.  If that index is empty but
-    successful_episodes.jsonl contains rows, use the success index so the run can
-    still be inspected, selected, pooled, and exported.
-    """
-    run_dir = os.path.abspath(str(run_dir))
-    rows = load_index(run_dir, "all")
-    raw_counts = {key: fast_jsonl_count(index_path(run_dir, key)) for key in INDEX_FILES}
-    _, catchup = success_index_catchup_counts(run_dir, raw_counts)
-    if rows:
-        catchup = dict(catchup)
-        catchup["rows_source"] = "episodes.jsonl"
-        return rows, catchup
-    success_rows = load_index(run_dir, "success")
-    if success_rows:
-        catchup = dict(catchup)
-        catchup["active"] = True
-        catchup["rows_source"] = "successful_episodes.jsonl"
-        catchup["reason"] = catchup.get("reason") or "episodes_index_missing_success_rows_used"
-        catchup["message"] = catchup.get("message") or "Using successful_episodes.jsonl because episodes.jsonl is empty."
-        return success_rows, catchup
-    catchup = dict(catchup)
-    catchup["rows_source"] = "episodes.jsonl"
-    return rows, catchup
 
 def format_bytes(value: object) -> str:
     try:
@@ -3562,31 +3379,9 @@ def dashboard_refresh_folder_sizes(dataset_root: Union[str, os.PathLike], run_pa
     return {"ok": True, "root": root, "refreshed": refreshed, "skipped": skipped, "cache_path": folder_size_cache_path(root)}
 
 
-def normalize_dashboard_client_path(path: Union[str, os.PathLike, None]) -> str:
-    """Normalize paths supplied by the browser before filesystem use.
-
-    The dashboard HTML runs in a browser and cannot know the server OS reliably.
-    Older UI code always used Windows backslashes for .dashboard_success.  On
-    Linux/POSIX, backslash is a literal filename character, not a separator, so
-    a path like ``excavator_auto_dataset\\.dashboard_success`` points to the
-    wrong sibling directory.  For POSIX servers, treat client backslashes as
-    separators.  Windows still accepts forward slashes via os.path.abspath().
-    """
-    text = str(path or "").strip()
-    if not text:
-        return ""
-    try:
-        text = unquote(text)
-    except Exception:
-        pass
-    if os.sep == "/" and "\\" in text:
-        text = text.replace("\\", "/")
-    return os.path.abspath(os.path.expanduser(text))
-
-
 def run_is_under_root(dataset_root: Union[str, os.PathLike], run_dir: Union[str, os.PathLike]) -> bool:
-    root = normalize_dashboard_client_path(dataset_root)
-    path = normalize_dashboard_client_path(run_dir)
+    root = os.path.abspath(str(dataset_root))
+    path = os.path.abspath(str(run_dir))
     try:
         return os.path.commonpath([root, path]) == root and os.path.basename(path).startswith("run_")
     except Exception:
@@ -3604,99 +3399,16 @@ def unique_path(path: str) -> str:
     return f"{base}_{int(time.time())}"
 
 
-SUCCESS_TRANSFER_PATH_FIELDS = {"trajectory", "meta", "score_path", "events"}
-SUCCESS_TRANSFER_TEXT_FIELDS = {
-    "status",
-    "reason",
-    "warning_reason",
-    "episode_id",
-    "initial_pose_id",
-    "chosen_plan_id",
-}
-SUCCESS_POOL_STATUS_VALUES = {
-    "trainable",
-    "success",
-    "successful",
-    "rejected",
-    "failed",
-    "fail",
-    "diagnostic",
-    "planning",
-    "skip",
-    "unknown",
-}
-SUCCESS_POOL_TEXT_BASENAME_VALUES = SUCCESS_POOL_STATUS_VALUES | {"ok", "none", "null"}
-
-
-def value_looks_like_path(value: object) -> bool:
-    text = str(value or "")
-    if not text:
-        return False
-    return bool(os.path.isabs(text) or "\\" in text or "/" in text)
-
-
-def clean_path_polluted_text(value: object, field: str = "") -> object:
-    if not isinstance(value, str) or not value:
-        return value
-    text = value.strip()
-    if not value_looks_like_path(text):
-        return value
-    normalized = text.replace("\\", "/").rstrip("/")
-    parts = [part for part in normalized.split("/") if part]
-    tail = parts[-1] if parts else text
-    tail_key = tail.strip().lower()
-    field_key = str(field or "")
-    if field_key == "status":
-        if tail_key in {"successful", "success"}:
-            return "success"
-        if tail_key in {"fail", "failure", "failed"}:
-            return "failed"
-        if tail_key in SUCCESS_POOL_STATUS_VALUES:
-            return tail_key
-        if tail_key == "ok":
-            return "trainable"
-        return tail_key or "unknown"
-    if "dashboard_success" in normalized.lower() or "/episodes/" in normalized.lower():
-        if field_key in SUCCESS_TRANSFER_TEXT_FIELDS:
-            return tail
-        if tail_key in SUCCESS_POOL_TEXT_BASENAME_VALUES:
-            return tail_key
-    return value
-
-
-def sanitize_success_pool_row(row: dict) -> dict:
-    out = dict(row or {})
-    for field in SUCCESS_TRANSFER_TEXT_FIELDS:
-        if field in out:
-            out[field] = clean_path_polluted_text(out.get(field), field)
-    status = clean_path_polluted_text(out.get("status", "trainable"), "status")
-    status_key = normalized_status_name(status)
-    if status_key in {"successful"}:
-        status_key = "success"
-    if status_key in {"ok", "none", "null", ""}:
-        status_key = "trainable"
-    if status_key not in {"trainable", "success", "rejected", "failed", "diagnostic", "planning", "skip", "unknown"}:
-        # .dashboard_success is a curated pool.  If a historical text-path bug
-        # left a non-status string here, keep the episode visible as trainable
-        # instead of creating one status-filter button per path.
-        status_key = "trainable"
-    out["status"] = status_key
-    return out
-
-
 def rewrite_row_paths_for_transfer(row: dict, src_dir: str, dst_dir: str) -> dict:
     src_dir = os.path.abspath(src_dir)
     dst_dir = os.path.abspath(dst_dir)
-    out = sanitize_success_pool_row(dict(row))
-    # Only rewrite fields that are known to hold filesystem paths.  The previous
-    # implementation rewrote every string, which corrupted status="trainable"
-    # into <dest_episode_dir>/trainable and exploded the dashboard status filter.
-    for key in SUCCESS_TRANSFER_PATH_FIELDS:
-        value = out.get(key)
+    out = dict(row)
+    for key, value in list(out.items()):
         if not isinstance(value, str) or not value:
             continue
+        text = value
         try:
-            abs_value = os.path.abspath(value) if os.path.isabs(value) else os.path.abspath(os.path.join(src_dir, value))
+            abs_value = os.path.abspath(text) if os.path.isabs(text) else os.path.abspath(os.path.join(src_dir, text))
             if os.path.commonpath([src_dir, abs_value]) == src_dir:
                 rel = os.path.relpath(abs_value, src_dir)
                 out[key] = os.path.join(dst_dir, rel)
@@ -3735,711 +3447,17 @@ def dashboard_delete_runs(dataset_root: Union[str, os.PathLike], run_paths: Sequ
     return {"ok": True, "trash_dir": trash_root, "deleted": deleted, "skipped": skipped}
 
 
-
-def dashboard_success_pool_dir(dataset_root: Union[str, os.PathLike], dest_dir: Optional[Union[str, os.PathLike]] = None) -> str:
-    """Return the canonical success-pool directory used by the dashboard.
-
-    Browser paths are normalized first so Linux does not create or read a literal
-    ``excavator_auto_dataset\\.dashboard_success`` sibling directory.
-    """
-    root = normalize_dashboard_client_path(dataset_root or "excavator_auto_dataset")
-    if dest_dir:
-        dest = normalize_dashboard_client_path(dest_dir)
-        if os.path.basename(os.path.normpath(dest)).lower() == SUCCESS_POOL_DIRNAME.lower():
-            return dest
-        return os.path.join(dest, SUCCESS_POOL_DIRNAME)
-    return os.path.join(root, SUCCESS_POOL_DIRNAME)
-
-
-SUCCESS_TRANSFER_CACHE_FILENAME = "transfer_source_cache.json"
-SUCCESS_TRANSFER_CACHE_VERSION = 1
-
-
-def success_transfer_cache_path(pool_dir: Union[str, os.PathLike]) -> str:
-    return os.path.join(os.path.abspath(str(pool_dir)), SUCCESS_TRANSFER_CACHE_FILENAME)
-
-
-def file_update_signature(path: Union[str, os.PathLike]) -> Dict[str, object]:
-    text = str(path or "")
-    if not text:
-        return {"path": "", "exists": False, "mtime_ns": 0, "size": 0}
-    abs_path = os.path.abspath(text)
-    try:
-        st = os.stat(abs_path)
-        return {
-            "path": abs_path,
-            "exists": True,
-            "mtime_ns": int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))),
-            "size": int(st.st_size),
-        }
-    except Exception:
-        return {"path": abs_path, "exists": False, "mtime_ns": 0, "size": 0}
-
-
-def dashboard_transfer_source_key(run_dir: Union[str, os.PathLike], row: dict, src_dir: object = None) -> str:
-    source_run = str(row.get("source_run_dir") or run_dir or "")
-    source_episode_index = row.get("source_episode_index", row.get("episode_index", ""))
-    source_dir = str(src_dir or row.get("source_episode_dir") or episode_dir_from_row(row) or "")
-    try:
-        source_run = os.path.normcase(os.path.abspath(source_run)) if source_run else ""
-    except Exception:
-        source_run = os.path.normcase(source_run)
-    try:
-        source_dir = os.path.normcase(os.path.abspath(source_dir)) if source_dir else ""
-    except Exception:
-        source_dir = os.path.normcase(source_dir)
-    # Do not key on episode_id: several interrupted runs can reuse or corrupt it.
-    # source_run + source episode index + source episode directory is the stable
-    # identity; the signature hash below still detects real content updates.
-    return "|".join([source_run, str(source_episode_index), source_dir])
-
-
-def source_episode_update_signature(run_dir: Union[str, os.PathLike], row: dict, src_dir: str) -> Dict[str, object]:
-    source_key = dashboard_transfer_source_key(run_dir, row, src_dir)
-    watched = {"episode_dir": file_update_signature(src_dir)}
-    for field in ["trajectory", "meta", "score_path", "events"]:
-        value = row_path_value(row, field)
-        watched[field] = file_update_signature(resolve_episode_file(src_dir, value)) if value else {"path": "", "exists": False, "mtime_ns": 0, "size": 0}
-    row_hash = hashlib.sha1(json.dumps(row, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8")).hexdigest()
-    latest_mtime_ns = max(int(item.get("mtime_ns", 0) or 0) for item in watched.values()) if watched else 0
-    payload = {
-        "source_key": source_key,
-        "source_run_dir": os.path.abspath(str(run_dir or "")),
-        "source_episode_index": row.get("episode_index"),
-        "source_episode_id": row.get("episode_id", ""),
-        "source_episode_dir": os.path.abspath(str(src_dir or "")),
-        "row_hash": row_hash,
-        "watched_files": watched,
-        "latest_mtime_ns": int(latest_mtime_ns),
-    }
-    payload["source_signature_hash"] = hashlib.sha1(json.dumps(payload, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8")).hexdigest()
-    return payload
-
-
-def load_success_transfer_cache(pool_dir: Union[str, os.PathLike]) -> Dict[str, dict]:
-    payload = read_json(success_transfer_cache_path(pool_dir), default={}) or {}
-    if not isinstance(payload, dict) or int(payload.get("version", 0) or 0) != SUCCESS_TRANSFER_CACHE_VERSION:
-        return {}
-    sources = payload.get("sources")
-    if not isinstance(sources, dict):
-        return {}
-    return {str(key): dict(value) for key, value in sources.items() if isinstance(value, dict)}
-
-
-def write_success_transfer_cache(pool_dir: Union[str, os.PathLike], sources: Dict[str, dict]) -> str:
-    clean = {str(key): value for key, value in (sources or {}).items() if isinstance(value, dict)}
-    return write_json(
-        success_transfer_cache_path(pool_dir),
-        {
-            "version": SUCCESS_TRANSFER_CACHE_VERSION,
-            "updated_at": time.time(),
-            "note": "Maps original source run/episode signatures to .dashboard_success entries so repeat copy/cut skips unchanged success episodes.",
-            "sources": clean,
-        },
-    )
-
-
-def aggregate_row_source_key(row: dict) -> str:
-    key = str(row.get("dashboard_transfer_source_key") or "").strip()
-    if key:
-        return key
-    return dashboard_transfer_source_key(row.get("source_run_dir", ""), row, row.get("source_episode_dir", ""))
-
-
-def rewrite_row_paths_after_episode_relocation(row: dict, old_dir: str, new_dir: str) -> dict:
-    old_dir = os.path.abspath(str(old_dir or ""))
-    new_dir = os.path.abspath(str(new_dir or ""))
-    out = dict(row)
-    if not old_dir or not new_dir:
-        return out
-    for key, value in list(out.items()):
-        if not isinstance(value, str) or not value:
-            continue
-        try:
-            abs_value = os.path.abspath(value)
-            if os.path.commonpath([old_dir, abs_value]) == old_dir:
-                rel = os.path.relpath(abs_value, old_dir)
-                out[key] = os.path.join(new_dir, rel)
-        except Exception:
-            pass
-    out["transferred_episode_dir"] = new_dir
-    return out
-
-
-def run_timestamp_token_from_name(value: object) -> Optional[str]:
-    text = str(value or "")
-    m = re.search(r"run_(\d{4})(\d{2})(\d{2})_(\d{6})", text)
-    if m:
-        return f"{m.group(1)[2:]}{m.group(2)}{m.group(3)}_{m.group(4)}"
-    m = re.search(r"(\d{4})(\d{2})(\d{2})_(\d{6})", text)
-    if m:
-        return f"{m.group(1)[2:]}{m.group(2)}{m.group(3)}_{m.group(4)}"
-    m = re.search(r"(\d{2})(\d{2})(\d{2})_(\d{6})", text)
-    if m:
-        return f"{m.group(1)}{m.group(2)}{m.group(3)}_{m.group(4)}"
-    return None
-
-
-def source_run_timestamp_token(run_name: str, row: dict, runtime_id: str = "") -> str:
-    for value in [
-        run_name,
-        row.get("source_run_name"),
-        row.get("source_run_dir"),
-        row.get("source_episode_dir"),
-        row.get("trajectory"),
-        runtime_id,
-    ]:
-        token = run_timestamp_token_from_name(value)
-        if token:
-            return token
-    # Last resort: keep the requested shape even when a legacy row lacks a run timestamp.
-    return time.strftime("%y%m%d_%H%M%S")
-
-
-def success_pool_episode_folder_name(run_name: str, row: dict, runtime_id: str = "") -> str:
-    token = source_run_timestamp_token(run_name, row, runtime_id)
-    try:
-        ep = int(row.get("source_episode_index", row.get("episode_index")))
-    except Exception:
-        ep = int(time.time()) % 1000000
-    return f"{token}_ep{ep:06d}"
-
-
-def normalize_existing_success_pool_rows(pool_dir: str, aggregate_rows: Sequence[dict]) -> Tuple[List[dict], Dict[str, int]]:
-    episodes_root = ensure_dir(os.path.join(pool_dir, "episodes"))
-    normalized: List[dict] = []
-    seen_sources = set()
-    stats = {"renamed": 0, "deduped": 0, "missing_dest": 0}
-    for original in aggregate_rows or []:
-        row = dict(original)
-        source_key = aggregate_row_source_key(row)
-        if source_key and source_key in seen_sources:
-            stats["deduped"] += 1
-            continue
-        current_dir = str(row.get("transferred_episode_dir") or row.get("dest_episode_dir") or "")
-        desired_name = success_pool_episode_folder_name(str(row.get("source_run_name") or os.path.basename(str(row.get("source_run_dir") or ""))), row, str(row.get("dashboard_transfer_runtime_id") or ""))
-        desired_dir = os.path.join(episodes_root, desired_name)
-        if current_dir:
-            current_abs = os.path.abspath(current_dir)
-            try:
-                if os.path.isdir(current_abs) and os.path.basename(current_abs) != desired_name and not os.path.exists(desired_dir):
-                    os.rename(current_abs, desired_dir)
-                    row = rewrite_row_paths_after_episode_relocation(row, current_abs, desired_dir)
-                    stats["renamed"] += 1
-                elif os.path.isdir(desired_dir) and not os.path.isdir(current_abs):
-                    row = rewrite_row_paths_after_episode_relocation(row, current_abs, desired_dir)
-                elif not os.path.isdir(current_abs) and not os.path.isdir(desired_dir):
-                    stats["missing_dest"] += 1
-            except Exception:
-                pass
-        if source_key:
-            seen_sources.add(source_key)
-        normalized.append(row)
-    return normalized, stats
-
-
-def build_existing_success_source_cache(pool_dir: str, aggregate_rows: Sequence[dict]) -> Dict[str, dict]:
-    cache = load_success_transfer_cache(pool_dir)
-    for row in aggregate_rows or []:
-        key = aggregate_row_source_key(row)
-        if not key:
-            continue
-        cache[key] = {
-            "source_key": key,
-            "source_run_name": row.get("source_run_name", ""),
-            "source_run_dir": row.get("source_run_dir", ""),
-            "source_episode_index": row.get("source_episode_index"),
-            "source_episode_id": row.get("source_episode_id", ""),
-            "source_episode_dir": row.get("source_episode_dir", ""),
-            "transferred_episode_dir": row.get("transferred_episode_dir", ""),
-            "folder_name": os.path.basename(str(row.get("transferred_episode_dir") or "")),
-            "pool_episode_index": row.get("episode_index"),
-            "pool_episode_id": row.get("episode_id", ""),
-            "pool_row": dict(row),
-            "source_signature_hash": row.get("dashboard_transfer_source_signature_hash", ""),
-            "latest_mtime_ns": row.get("dashboard_transfer_source_latest_mtime_ns", 0),
-            "created_from_existing_index": True,
-        }
-
-    # Also recover from transfer manifests. This matters for pools created before
-    # transfer_source_cache.json existed, or when the process was restarted before
-    # the cache file was flushed.
-    manifest_dir = os.path.join(pool_dir, "transfer_manifests")
-    try:
-        manifest_files = [os.path.join(manifest_dir, name) for name in os.listdir(manifest_dir) if name.endswith(".json")]
-    except Exception:
-        manifest_files = []
-    for manifest_path in manifest_files:
-        manifest = read_json(manifest_path, default={}) or {}
-        if not isinstance(manifest, dict):
-            continue
-        source_run_dir = str(manifest.get("source_run_dir") or "")
-        source_run_name = os.path.basename(source_run_dir)
-        for record in manifest.get("records", []) if isinstance(manifest.get("records"), list) else []:
-            if not isinstance(record, dict):
-                continue
-            row_hint = {
-                "episode_index": record.get("source_episode_index"),
-                "source_episode_index": record.get("source_episode_index"),
-                "source_episode_id": record.get("source_episode_id", ""),
-                "source_run_dir": source_run_dir,
-                "source_episode_dir": record.get("source_episode_dir", ""),
-            }
-            key = str(record.get("source_key") or dashboard_transfer_source_key(source_run_dir, row_hint, record.get("source_episode_dir", "")))
-            if not key:
-                continue
-            cache.setdefault(
-                key,
-                {
-                    "source_key": key,
-                    "source_run_name": source_run_name,
-                    "source_run_dir": source_run_dir,
-                    "source_episode_index": record.get("source_episode_index"),
-                    "source_episode_id": record.get("source_episode_id", ""),
-                    "source_episode_dir": record.get("source_episode_dir", ""),
-                    "transferred_episode_dir": record.get("dest_episode_dir", ""),
-                    "folder_name": os.path.basename(str(record.get("dest_episode_dir") or "")),
-                    "pool_episode_index": record.get("episode_index"),
-                    "pool_episode_id": "",
-                    "source_signature_hash": record.get("source_signature_hash", ""),
-                    "latest_mtime_ns": 0,
-                    "created_from_manifest": True,
-                },
-            )
-    return cache
-
-def success_pool_entry_content_complete(entry: Optional[dict], sample_limit: int = 16) -> Tuple[bool, str]:
-    """Verify that a cached success-pool entry is usable before skipping it.
-
-    A cache hit is not enough.  The destination episode directory must exist,
-    the rewritten row must point to a non-empty trajectory, metadata files that
-    are present in the row must still exist, and sampled camera files referenced
-    from the trajectory must exist.  This prevents a half-copied episode from
-    being marked as cached after a crash, disk-full event, or interrupted copy.
-    """
-    if not isinstance(entry, dict):
-        return False, "cache_entry_missing"
-    dest_dir = str(entry.get("transferred_episode_dir") or entry.get("dest_episode_dir") or "")
-    if not dest_dir or not os.path.isdir(dest_dir):
-        return False, "dest_episode_dir_missing"
-    pool_row = entry.get("pool_row") if isinstance(entry.get("pool_row"), dict) else None
-    if not pool_row:
-        # Manifest-only legacy cache entries do not carry enough information to
-        # prove that the copied episode is complete.  Force a reprocess instead
-        # of silently skipping a possibly partial destination folder.
-        return False, "cache_unverifiable_no_pool_row"
-    trajectory_path = row_path_value(pool_row, "trajectory")
-    if not trajectory_path or not os.path.isfile(trajectory_path):
-        return False, "trajectory_missing"
-    try:
-        if os.path.getsize(trajectory_path) <= 0:
-            return False, "trajectory_empty_file"
-    except Exception:
-        return False, "trajectory_unreadable"
-    trajectory_probe = read_jsonl_limited(trajectory_path, limit=max(1, int(sample_limit)))
-    if not trajectory_probe:
-        return False, "trajectory_no_samples"
-    for field in ["meta", "score_path"]:
-        value = row_path_value(pool_row, field)
-        if value and not os.path.isfile(value):
-            return False, f"{field}_missing"
-    # events can legitimately be absent in some historical rows, but if the row
-    # points at an events file and it exists in the source-derived destination,
-    # keep checking it.  Missing events should not block VLA export.
-    checked_camera_samples = 0
-    for sample in trajectory_probe:
-        if not isinstance(sample, dict):
-            continue
-        # Keep the check aligned with LeRobot export requirements: state/action
-        # plus the three camera keys must be resolvable for sampled frames.
-        if not sample_has_state_action(sample):
-            return False, "sample_missing_state_or_action"
-        for key in LEROBOT_IMAGE_KEYS:
-            image_value = sample_image_value(sample, key)
-            if not image_value:
-                return False, f"sample_missing_{key}"
-            image_text = str(image_value or "")
-            image_path = resolve_episode_file(dest_dir, image_text)
-            source_dir = str(pool_row.get("source_episode_dir") or "")
-            # Some historical trajectories store absolute image paths.  If such
-            # a path points into the original source episode, validate the copied
-            # destination-relative counterpart instead; otherwise cut would later
-            # delete the source and leave the pool with broken absolute paths.
-            try:
-                if os.path.isabs(image_text) and source_dir:
-                    image_abs = os.path.abspath(image_text)
-                    source_abs = os.path.abspath(source_dir)
-                    if os.path.commonpath([source_abs, image_abs]) == source_abs:
-                        image_path = os.path.join(dest_dir, os.path.relpath(image_abs, source_abs))
-            except Exception:
-                pass
-            if not image_path or not os.path.isfile(image_path):
-                return False, f"image_missing:{key}"
-        checked_camera_samples += 1
-    if checked_camera_samples <= 0:
-        return False, "no_camera_samples_checked"
-    return True, "complete"
-
-
-def existing_success_entry_is_current(entry: Optional[dict], signature: Dict[str, object]) -> Tuple[bool, str]:
-    if not isinstance(entry, dict):
-        return False, "not_seen"
-    complete, complete_reason = success_pool_entry_content_complete(entry)
-    cached_hash = str(entry.get("source_signature_hash") or entry.get("dashboard_transfer_source_signature_hash") or "")
-    current_hash = str(signature.get("source_signature_hash") or "")
-    if not complete:
-        return False, f"cached_dest_incomplete:{complete_reason}"
-    if cached_hash and current_hash and cached_hash == current_hash:
-        return True, "already_transferred_unchanged"
-    if not cached_hash:
-        return True, "already_transferred_legacy_cache_complete"
-    if cached_hash and current_hash and cached_hash != current_hash:
-        return False, "source_updated"
-    return False, "cache_incomplete"
-
-
-def next_success_pool_episode_index(pool_dir: str) -> int:
-    indexes = []
-    for split in ("trainable", "success", "all"):
-        for row in load_index(pool_dir, split):
-            try:
-                indexes.append(int(row.get("episode_index")))
-            except Exception:
-                pass
-    return max(indexes, default=-1) + 1
-
-
-def write_success_pool_indexes(pool_dir: str, rows: Sequence[dict]) -> None:
-    ordered = sorted(rows, key=lambda row: int(row.get("episode_index", 0) or 0))
-    write_jsonl(os.path.join(pool_dir, "trainable_episodes.jsonl"), ordered)
-    write_jsonl(os.path.join(pool_dir, "successful_episodes.jsonl"), ordered)
-    write_jsonl(os.path.join(pool_dir, "episodes.jsonl"), ordered)
-
-
-
-
-def is_dashboard_success_pool_dir(run_dir: Union[str, os.PathLike]) -> bool:
-    try:
-        return os.path.basename(os.path.normpath(os.path.abspath(str(run_dir)))) == SUCCESS_POOL_DIRNAME
-    except Exception:
-        return False
-
-
-def episode_dir_key_from_row(row: dict) -> str:
-    for value in [row.get("transferred_episode_dir"), row.get("dest_episode_dir")]:
-        if value:
-            try:
-                return os.path.normcase(os.path.abspath(str(value)))
-            except Exception:
-                return os.path.normcase(str(value))
-    try:
-        ep_dir = episode_dir_from_row(row)
-        return os.path.normcase(os.path.abspath(ep_dir)) if ep_dir else ""
-    except Exception:
-        return ""
-
-
-def find_direct_episode_file(ep_dir: str, names: Sequence[str] = (), contains: Sequence[str] = (), suffixes: Sequence[str] = ()) -> str:
-    try:
-        entries = [entry for entry in os.scandir(ep_dir) if entry.is_file()]
-    except Exception:
-        return ""
-    lowered_names = {str(name).lower() for name in names}
-    lowered_contains = [str(part).lower() for part in contains]
-    lowered_suffixes = [str(suffix).lower() for suffix in suffixes]
-    for entry in entries:
-        name = entry.name.lower()
-        if name in lowered_names:
-            return entry.path
-    for entry in entries:
-        name = entry.name.lower()
-        if lowered_suffixes and not any(name.endswith(suffix) for suffix in lowered_suffixes):
-            continue
-        if lowered_contains and all(part in name for part in lowered_contains):
-            return entry.path
-    return ""
-
-
-def find_success_pool_trajectory_file(ep_dir: str) -> str:
-    explicit = find_direct_episode_file(
-        ep_dir,
-        names=["trajectory.jsonl", "trajectory.json", "samples.jsonl"],
-        suffixes=[".jsonl", ".json"],
-    )
-    if explicit:
-        return explicit
-    by_name = find_direct_episode_file(ep_dir, contains=["trajectory"], suffixes=[".jsonl", ".json"])
-    if by_name:
-        return by_name
-    try:
-        candidates = []
-        for entry in os.scandir(ep_dir):
-            if not entry.is_file():
-                continue
-            name = entry.name.lower()
-            if not name.endswith(".jsonl"):
-                continue
-            if any(skip in name for skip in ["event", "segment", "diagnostic", "planning"]):
-                continue
-            try:
-                candidates.append((int(entry.stat().st_size), entry.path))
-            except Exception:
-                candidates.append((0, entry.path))
-        candidates.sort(reverse=True)
-        return candidates[0][1] if candidates else ""
-    except Exception:
-        return ""
-
-
-def parse_source_episode_index_from_pool_folder(folder_name: object) -> Optional[int]:
-    m = re.search(r"_ep(\d{1,9})$", str(folder_name or ""))
-    if not m:
-        return None
-    try:
-        return int(m.group(1))
-    except Exception:
-        return None
-
-
-def recover_success_pool_row_from_episode_folder(pool_dir: str, ep_dir: str, next_ep_index: int) -> Optional[dict]:
-    ep_dir = os.path.abspath(str(ep_dir))
-    folder_name = os.path.basename(ep_dir)
-    trajectory_path = find_success_pool_trajectory_file(ep_dir)
-    if not trajectory_path or not os.path.isfile(trajectory_path):
-        return None
-    try:
-        if os.path.getsize(trajectory_path) <= 0:
-            return None
-    except Exception:
-        return None
-    meta_path = find_direct_episode_file(ep_dir, names=["meta.json", "episode_meta.json"], contains=["meta"], suffixes=[".json"])
-    score_path = find_direct_episode_file(ep_dir, names=["score.json", "episode_score.json"], contains=["score"], suffixes=[".json"])
-    events_path = find_direct_episode_file(ep_dir, names=["events.jsonl", "event_log.jsonl"], contains=["event"], suffixes=[".jsonl"])
-    meta = read_json(meta_path, default={}) or {}
-    score_data = read_json(score_path, default={}) or {}
-    sample_probe = read_jsonl_limited(trajectory_path, limit=1)
-    source_ep = parse_source_episode_index_from_pool_folder(folder_name)
-    row = {
-        "episode_index": int(next_ep_index),
-        "episode_id": folder_name,
-        "status": "trainable",
-        "trajectory": trajectory_path,
-        "transferred_episode_dir": ep_dir,
-        "dashboard_recovered_from_episode_folder": True,
-    }
-    if meta_path:
-        row["meta"] = meta_path
-    if score_path:
-        row["score_path"] = score_path
-    if events_path:
-        row["events"] = events_path
-    if source_ep is not None:
-        row["source_episode_index"] = source_ep
-    for source in [meta, score_data]:
-        if not isinstance(source, dict):
-            continue
-        for key in [
-            "status",
-            "score",
-            "reason",
-            "warning_reason",
-            "samples",
-            "freeze_count",
-            "max_bucket_from_pile_particles",
-            "lift_bucket_from_pile_particles",
-            "final_bin_from_pile_particles",
-            "final_spill_from_pile_particles",
-            "initial_pose_id",
-            "chosen_plan_id",
-            "q_initial_deg",
-            "target_xyz",
-            "unload_landing_xyz",
-            "unload_point_xyz",
-            "scene_randomization",
-        ]:
-            if key not in row and key in source:
-                row[key] = source.get(key)
-    if "samples" not in row:
-        try:
-            row["samples"] = fast_jsonl_count(trajectory_path)
-        except Exception:
-            row["samples"] = len(sample_probe)
-    # Do not trust arbitrary recovered status values from meta/score.  The pool
-    # itself is curated for trainable/success data; dataset_training_tag_for_row()
-    # will still demote incomplete rows to skip after schema/camera checks.
-    row = sanitize_success_pool_row(row)
-    if row.get("status") not in {"trainable", "success"}:
-        row["status"] = "trainable"
-    return row
-
-
-def reconcile_success_pool_indexes(pool_dir: Union[str, os.PathLike], recover_orphan_folders: bool = True) -> Dict[str, object]:
-    pool_dir = os.path.abspath(str(pool_dir))
-    if not is_dashboard_success_pool_dir(pool_dir):
-        return {"ok": True, "is_success_pool": False, "changed": False}
-    episodes_root = os.path.join(pool_dir, "episodes")
-    aggregate: List[dict] = []
-    seen_dirs = set()
-    seen_ids = set()
-    sanitized = 0
-    duplicate_rows = 0
-    raw_index_rows = {split: load_index(pool_dir, split) for split in ["trainable", "success", "all"]}
-    initial_trainable_rows = len(raw_index_rows.get("trainable") or [])
-    # Read all three pool indexes.  Some interrupted transfers wrote only one of
-    # them; this prevents Load .dashboard_success from depending on a single file.
-    for split in ["trainable", "success", "all"]:
-        for original in raw_index_rows.get(split, []):
-            row = sanitize_success_pool_row(original)
-            if row != original:
-                sanitized += 1
-            dir_key = episode_dir_key_from_row(row)
-            row_id = str(row.get("episode_id") or "")
-            unique_key = dir_key or row_id or json.dumps(row, ensure_ascii=True, sort_keys=True, default=str)
-            if unique_key in seen_dirs or (row_id and row_id in seen_ids and not dir_key):
-                duplicate_rows += 1
-                continue
-            if dir_key:
-                seen_dirs.add(unique_key)
-            if row_id:
-                seen_ids.add(row_id)
-            aggregate.append(row)
-    next_index = max([int(row.get("episode_index", -1) or -1) for row in aggregate], default=-1) + 1
-    recovered = 0
-    incomplete_folders = 0
-    scanned_folders = 0
-    if recover_orphan_folders and os.path.isdir(episodes_root):
-        try:
-            entries = sorted([entry for entry in os.scandir(episodes_root) if entry.is_dir()], key=lambda entry: entry.name)
-        except Exception:
-            entries = []
-        for entry in entries:
-            scanned_folders += 1
-            dir_key = os.path.normcase(os.path.abspath(entry.path))
-            if dir_key in seen_dirs:
-                continue
-            row = recover_success_pool_row_from_episode_folder(pool_dir, entry.path, next_index)
-            if row is None:
-                incomplete_folders += 1
-                continue
-            aggregate.append(row)
-            seen_dirs.add(dir_key)
-            seen_ids.add(str(row.get("episode_id") or ""))
-            next_index += 1
-            recovered += 1
-    changed = bool(
-        sanitized
-        or recovered
-        or len(aggregate) != initial_trainable_rows
-        or (aggregate and not os.path.exists(index_path(pool_dir, "trainable")))
-    )
-    if changed:
-        write_success_pool_indexes(pool_dir, aggregate)
-    return {
-        "ok": True,
-        "is_success_pool": True,
-        "changed": changed,
-        "indexed_rows": len(aggregate),
-        "scanned_episode_folders": scanned_folders,
-        "recovered_orphan_folders": recovered,
-        "incomplete_or_unreadable_folders": incomplete_folders,
-        "sanitized_rows": sanitized,
-        "duplicate_index_rows_dropped": duplicate_rows,
-        "episodes_root": episodes_root,
-    }
-
-
-def maybe_reconcile_success_pool_for_dashboard(run_dir: Union[str, os.PathLike]) -> Dict[str, object]:
-    if is_dashboard_success_pool_dir(run_dir):
-        return reconcile_success_pool_indexes(run_dir, recover_orphan_folders=True)
-    return {"ok": True, "is_success_pool": False, "changed": False}
-
-def short_success_episode_folder_name(run_name: str, row: dict, runtime_id: str = "") -> str:
-    """Canonical success-pool folder name: YYMMDD_HHMMSS_epXXXXXX."""
-    return success_pool_episode_folder_name(run_name, row, runtime_id)
-
-def dashboard_cut_trash_root(dataset_root: Union[str, os.PathLike], runtime_id: str) -> str:
-    return ensure_dir(os.path.join(os.path.abspath(str(dataset_root or "")), ".dashboard_trash", f"cut_success_{runtime_id}"))
-
-
-def safe_move_source_episode_dir_to_trash_for_cut(
-    root: str,
-    run_dir: str,
-    src_dir: str,
-    trash_root: str,
-) -> Tuple[bool, str]:
-    root_abs = os.path.abspath(str(root or ""))
-    run_abs = os.path.abspath(str(run_dir or ""))
-    src_abs = os.path.abspath(str(src_dir or ""))
-    trash_root = ensure_dir(str(trash_root or dashboard_cut_trash_root(root_abs, time.strftime("%Y%m%d_%H%M%S"))))
-    if not src_abs or not os.path.exists(src_abs):
-        return True, "already_missing"
-    try:
-        if os.path.commonpath([root_abs, run_abs]) != root_abs:
-            return False, "run_not_under_dataset_root"
-        if os.path.commonpath([run_abs, src_abs]) != run_abs:
-            return False, "source_not_under_run"
-        if os.path.commonpath([root_abs, os.path.abspath(trash_root)]) != root_abs:
-            return False, "trash_not_under_dataset_root"
-    except Exception:
-        return False, "source_path_invalid"
-    if os.path.normcase(run_abs) == os.path.normcase(src_abs):
-        return False, "refuse_move_run_as_episode"
-    try:
-        dst_dir = unique_path(os.path.join(trash_root, "episodes", os.path.basename(run_abs), os.path.basename(src_abs)))
-        ensure_dir(os.path.dirname(dst_dir))
-        shutil.move(src_abs, dst_dir)
-        return True, f"moved_to_trash:{dst_dir}"
-    except Exception as exc:
-        return False, f"move_to_trash_failed:{type(exc).__name__}:{exc}"
-
-
-def remaining_success_episode_dirs(run_dir: str, rows: Optional[Sequence[dict]] = None) -> List[str]:
-    remaining = []
-    for row in list(rows if rows is not None else load_index(run_dir, "success")):
-        src_dir = episode_dir_from_row(row)
-        if src_dir and os.path.isdir(src_dir):
-            remaining.append(os.path.abspath(src_dir))
-    return remaining
-
-
-def move_source_run_to_trash_if_cut_complete(root: str, run_dir: str, rows: Sequence[dict], trash_root: str) -> Dict[str, object]:
-    result = {"trashed": False, "reason": "not_checked", "remaining_success_dirs": 0, "trash_dir": ""}
-    if not run_is_under_root(root, run_dir) or not os.path.isdir(run_dir):
-        result["reason"] = "run_missing_or_not_under_root"
-        return result
-    remaining = remaining_success_episode_dirs(run_dir, rows)
-    result["remaining_success_dirs"] = len(remaining)
-    if remaining:
-        result["reason"] = "success_episode_dirs_remaining"
-        return result
-    try:
-        trash_root = ensure_dir(str(trash_root or dashboard_cut_trash_root(root, time.strftime("%Y%m%d_%H%M%S"))))
-        dst_dir = unique_path(os.path.join(trash_root, "runs", os.path.basename(os.path.abspath(run_dir))))
-        ensure_dir(os.path.dirname(dst_dir))
-        shutil.move(os.path.abspath(run_dir), dst_dir)
-        result.update({"trashed": True, "reason": "zero_success_left_moved_run_to_trash", "trash_dir": dst_dir})
-    except Exception as exc:
-        result["reason"] = f"run_move_to_trash_failed:{type(exc).__name__}:{exc}"
-    return result
-
-
 def dashboard_transfer_success_records(
     dataset_root: Union[str, os.PathLike],
     run_paths: Sequence[object],
     dest_dir: Union[str, os.PathLike],
     mode: str = "copy",
-    progress_callback=None,
 ) -> Dict[str, object]:
     root = os.path.abspath(str(dataset_root or "excavator_auto_dataset"))
-    dest_root = ensure_dir(dashboard_success_pool_dir(root, dest_dir))
-    episodes_root = ensure_dir(os.path.join(dest_root, "episodes"))
+    dest_root = ensure_dir(os.path.abspath(str(dest_dir or os.path.join(root, "success_records"))))
     mode = "move" if str(mode).lower() in {"move", "cut"} else "copy"
-    runtime_id = time.strftime("%Y%m%d_%H%M%S") + f"_{int((time.time() % 1) * 1000):03d}"
-    cut_trash_root = dashboard_cut_trash_root(root, runtime_id) if mode == "move" else ""
     transferred = []
     skipped = []
-    run_rows: List[Tuple[str, str, List[dict]]] = []
-    total_records = 0
     for raw_path in run_paths or []:
         run_dir = os.path.abspath(str(raw_path))
         run_name = os.path.basename(run_dir)
@@ -4450,364 +3468,39 @@ def dashboard_transfer_success_records(
         if not rows:
             skipped.append({"path": run_dir, "reason": "no_success_records"})
             continue
-        run_rows.append((run_dir, run_name, rows))
-        total_records += len(rows)
-    done_records = 0
-
-    def progress(message: str = ""):
-        if progress_callback:
-            try:
-                progress_callback(done_records, max(1, total_records), message)
-            except Exception:
-                pass
-
-    progress("preparing success pool")
-    aggregate_rows = load_index(dest_root, "trainable")
-    aggregate_rows, existing_pool_stats = normalize_existing_success_pool_rows(dest_root, aggregate_rows)
-    existing_sources = build_existing_success_source_cache(dest_root, aggregate_rows)
-    next_ep_index = max([int(row.get("episode_index", -1) or -1) for row in aggregate_rows], default=-1) + 1
-    cached_skipped = 0
-    updated_reprocessed = 0
-    cut_source_episode_trashed = 0
-    cut_source_episode_trash_failed = 0
-    cut_source_runs_trashed = []
-    cut_source_runs_trash_failed = []
-    if not os.path.exists(os.path.join(dest_root, "camera_config.json")):
-        for run_dir, _, _ in run_rows:
-            if safe_copy_file(os.path.join(run_dir, "camera_config.json"), os.path.join(dest_root, "camera_config.json")):
-                break
-    if not os.path.exists(os.path.join(dest_root, "run_meta.json")):
-        for run_dir, _, _ in run_rows:
-            if safe_copy_file(os.path.join(run_dir, "run_meta.json"), os.path.join(dest_root, "run_meta.json")):
-                break
-
-    for run_dir, run_name, rows in run_rows:
+        run_dest = ensure_dir(os.path.join(dest_root, "success_records", run_name))
         rewritten_rows = []
-        run_manifest = {"source_run_dir": run_dir, "mode": mode, "runtime_id": runtime_id, "records": [], "skipped": [], "cached_skipped": 0, "updated_reprocessed": 0, "cut_source_episode_trashed": 0, "cut_source_episode_trash_failed": 0}
+        run_manifest = {"source_run_dir": run_dir, "mode": mode, "records": [], "skipped": []}
         for row in rows:
             src_dir = episode_dir_from_row(row)
             if not src_dir or not os.path.isdir(src_dir):
                 item = {"episode_index": row.get("episode_index"), "reason": "episode_dir_missing", "source_episode_dir": src_dir}
                 skipped.append({"path": run_dir, **item})
                 run_manifest["skipped"].append(item)
-                done_records += 1
-                progress(f"skipped missing episode dir in {run_name}")
                 continue
-            source_signature = source_episode_update_signature(run_dir, row, src_dir)
-            source_key = str(source_signature.get("source_key") or "")
-            is_current, cache_reason = existing_success_entry_is_current(existing_sources.get(source_key), source_signature)
-            if is_current:
-                entry = existing_sources.get(source_key, {})
-                item = {
-                    "episode_index": row.get("episode_index"),
-                    "reason": cache_reason,
-                    "source_key": source_key,
-                    "source_episode_dir": src_dir,
-                    "dest_episode_dir": entry.get("transferred_episode_dir") or entry.get("dest_episode_dir", ""),
-                    "source_signature_hash": source_signature.get("source_signature_hash"),
-                }
-                if mode == "move":
-                    removed, remove_reason = safe_move_source_episode_dir_to_trash_for_cut(root, run_dir, src_dir, cut_trash_root)
-                    item["cut_source_trash_reason"] = remove_reason
-                    if removed:
-                        cut_source_episode_trashed += 1
-                        run_manifest["cut_source_episode_trashed"] += 1
-                    else:
-                        cut_source_episode_trash_failed += 1
-                        run_manifest["cut_source_episode_trash_failed"] += 1
-                skipped.append({"path": run_dir, **item})
-                run_manifest["skipped"].append(item)
-                cached_skipped += 1
-                run_manifest["cached_skipped"] += 1
-                done_records += 1
-                progress(f"cached {run_name}: {done_records}/{max(1, total_records)}")
-                continue
-            if cache_reason == "source_updated":
-                # Replace the older aggregate row for this source key so the VLA export
-                # uses only the newest copy, while the old physical folder is left in
-                # place for audit/recovery.
-                aggregate_rows = [existing_row for existing_row in aggregate_rows if aggregate_row_source_key(existing_row) != source_key]
-                updated_reprocessed += 1
-                run_manifest["updated_reprocessed"] += 1
-            dst_name = short_success_episode_folder_name(run_name, row, runtime_id)
-            existing_entry = existing_sources.get(source_key) if isinstance(existing_sources.get(source_key), dict) else {}
-            existing_dest = str(existing_entry.get("transferred_episode_dir") or "")
-            dst_dir = os.path.join(episodes_root, dst_name)
+            ep_name = os.path.basename(os.path.normpath(src_dir)) or f"episode_{row.get('episode_index', 'unknown')}"
+            dst_dir = unique_path(os.path.join(run_dest, ep_name))
             try:
-                if cache_reason == "source_updated" and existing_dest:
-                    existing_abs = os.path.abspath(existing_dest)
-                    try:
-                        if os.path.commonpath([episodes_root, existing_abs]) == episodes_root:
-                            dst_dir = existing_abs
-                            if os.path.isdir(dst_dir):
-                                shutil.rmtree(dst_dir)
-                    except Exception:
-                        dst_dir = os.path.join(episodes_root, dst_name)
-                elif os.path.exists(dst_dir):
-                    # A canonical folder alone is not proof that the transfer is
-                    # complete. Verify the destination content using a rewritten
-                    # row; only then allow cache skip. If incomplete, remove the
-                    # partial destination and reprocess from the source episode.
-                    legacy_row = rewrite_row_paths_for_transfer(row, src_dir, dst_dir)
-                    legacy_entry = {"transferred_episode_dir": dst_dir, "pool_row": legacy_row}
-                    complete, complete_reason = success_pool_entry_content_complete(legacy_entry)
-                    if complete:
-                        item = {"episode_index": row.get("episode_index"), "reason": "canonical_folder_exists_complete", "source_key": source_key, "source_episode_dir": src_dir, "dest_episode_dir": dst_dir}
-                        if mode == "move":
-                            removed, remove_reason = safe_move_source_episode_dir_to_trash_for_cut(root, run_dir, src_dir, cut_trash_root)
-                            item["cut_source_trash_reason"] = remove_reason
-                            if removed:
-                                cut_source_episode_trashed += 1
-                                run_manifest["cut_source_episode_trashed"] += 1
-                            else:
-                                cut_source_episode_trash_failed += 1
-                                run_manifest["cut_source_episode_trash_failed"] += 1
-                        skipped.append({"path": run_dir, **item})
-                        run_manifest["skipped"].append(item)
-                        cached_skipped += 1
-                        run_manifest["cached_skipped"] += 1
-                        done_records += 1
-                        progress(f"cached {run_name}: {done_records}/{max(1, total_records)}")
-                        continue
-                    try:
-                        existing_abs = os.path.abspath(dst_dir)
-                        if os.path.commonpath([episodes_root, existing_abs]) == episodes_root:
-                            shutil.rmtree(existing_abs)
-                        else:
-                            raise RuntimeError("canonical_dest_not_under_episodes_root")
-                    except Exception as exc:
-                        item = {"episode_index": row.get("episode_index"), "reason": f"partial_dest_remove_failed:{complete_reason}:{type(exc).__name__}:{exc}", "source_key": source_key, "source_episode_dir": src_dir, "dest_episode_dir": dst_dir}
-                        skipped.append({"path": run_dir, **item})
-                        run_manifest["skipped"].append(item)
-                        done_records += 1
-                        progress(f"skipped partial dest {run_name}: {done_records}/{max(1, total_records)}")
-                        continue
                 if mode == "move":
                     shutil.move(src_dir, dst_dir)
                 else:
                     shutil.copytree(src_dir, dst_dir)
                 rewritten = rewrite_row_paths_for_transfer(row, src_dir, dst_dir)
-                rewritten["source_run_name"] = run_name
-                rewritten["source_run_dir"] = run_dir
-                rewritten["source_episode_index"] = row.get("episode_index")
-                rewritten["source_episode_id"] = row.get("episode_id", "")
-                rewritten["dashboard_transfer_runtime_id"] = runtime_id
-                rewritten["dashboard_transfer_mode"] = mode
-                rewritten["dashboard_transfer_source_key"] = source_key
-                rewritten["dashboard_transfer_source_signature_hash"] = source_signature.get("source_signature_hash")
-                rewritten["dashboard_transfer_source_latest_mtime_ns"] = source_signature.get("latest_mtime_ns", 0)
-                rewritten["dashboard_transfer_source_signature"] = source_signature
-                rewritten["episode_index"] = int(next_ep_index)
-                rewritten["episode_id"] = f"dashboard_success_{next_ep_index:06d}_{runtime_id}"
                 rewritten_rows.append(rewritten)
-                aggregate_rows.append(rewritten)
-                record = {
-                    "episode_index": int(next_ep_index),
-                    "source_episode_index": row.get("episode_index"),
-                    "source_episode_id": row.get("episode_id", ""),
-                    "source_episode_dir": src_dir,
-                    "dest_episode_dir": dst_dir,
-                    "folder_name": os.path.basename(dst_dir),
-                    "source_key": source_key,
-                    "source_signature_hash": source_signature.get("source_signature_hash"),
-                    "cache_reason": cache_reason,
-                }
+                record = {"episode_index": row.get("episode_index"), "source_episode_dir": src_dir, "dest_episode_dir": dst_dir}
                 run_manifest["records"].append(record)
-                existing_sources[source_key] = {
-                    "source_key": source_key,
-                    "source_run_name": run_name,
-                    "source_run_dir": run_dir,
-                    "source_episode_index": row.get("episode_index"),
-                    "source_episode_id": row.get("episode_id", ""),
-                    "source_episode_dir": src_dir,
-                    "transferred_episode_dir": dst_dir,
-                    "folder_name": os.path.basename(dst_dir),
-                    "pool_episode_index": int(next_ep_index),
-                    "pool_episode_id": rewritten["episode_id"],
-                    "pool_row": dict(rewritten),
-                    "source_signature_hash": source_signature.get("source_signature_hash"),
-                    "latest_mtime_ns": source_signature.get("latest_mtime_ns", 0),
-                    "updated_at": time.time(),
-                    "mode": mode,
-                }
-                next_ep_index += 1
             except Exception as exc:
-                item = {"episode_index": row.get("episode_index"), "reason": f"{mode}_failed:{type(exc).__name__}:{exc}", "source_episode_dir": src_dir, "source_key": source_key}
+                item = {"episode_index": row.get("episode_index"), "reason": f"{mode}_failed:{type(exc).__name__}:{exc}", "source_episode_dir": src_dir}
                 skipped.append({"path": run_dir, **item})
                 run_manifest["skipped"].append(item)
-            finally:
-                done_records += 1
-                progress(f"{mode} {run_name}: {done_records}/{max(1, total_records)}")
-        manifest_dir = ensure_dir(os.path.join(dest_root, "transfer_manifests"))
-        run_manifest.update({"created_at": time.time(), "record_count": len(rewritten_rows), "pool_dir": dest_root, "cache_path": success_transfer_cache_path(dest_root), "existing_pool_normalization": existing_pool_stats})
-        run_delete_result = {"deleted": False, "reason": "not_cut"}
-        if mode == "move":
-            run_delete_result = move_source_run_to_trash_if_cut_complete(root, run_dir, rows, cut_trash_root)
-            if run_delete_result.get("trashed"):
-                cut_source_runs_trashed.append({"run": run_name, "path": run_dir})
-            elif run_delete_result.get("remaining_success_dirs", 0) == 0:
-                cut_source_runs_trash_failed.append({"run": run_name, "path": run_dir, "reason": run_delete_result.get("reason")})
-        run_manifest["source_run_delete"] = run_delete_result
-        write_json(os.path.join(manifest_dir, f"{run_name}_{runtime_id}.json"), run_manifest)
-        transferred.append({"run": run_name, "source_run_dir": run_dir, "dest_dir": dest_root, "records": len(rewritten_rows), "cached_skipped": run_manifest["cached_skipped"], "updated_reprocessed": run_manifest["updated_reprocessed"], "cut_source_episode_trashed": run_manifest["cut_source_episode_trashed"], "cut_source_episode_trash_failed": run_manifest["cut_source_episode_trash_failed"], "source_run_delete": run_delete_result, "mode": mode})
-    if aggregate_rows:
-        write_success_pool_indexes(dest_root, aggregate_rows)
-    cache_path = write_success_transfer_cache(dest_root, existing_sources)
-    summary = {"ok": True, "mode": mode, "dest_root": dest_root, "episodes_dir": episodes_root, "runtime_id": runtime_id, "transferred": transferred, "skipped": skipped, "cached_skipped": cached_skipped, "updated_reprocessed": updated_reprocessed, "cut_source_episode_trashed": cut_source_episode_trashed, "cut_source_episode_trash_failed": cut_source_episode_trash_failed, "cut_source_runs_trashed": cut_source_runs_trashed, "cut_source_runs_trash_failed": cut_source_runs_trash_failed, "existing_pool_normalization": existing_pool_stats, "cache_path": cache_path, "total_pool_records": len(aggregate_rows)}
-    write_json(os.path.join(dest_root, f"transfer_summary_{runtime_id}.json"), summary)
-    progress("complete")
+        if rewritten_rows:
+            write_jsonl(os.path.join(run_dest, "successful_episodes.jsonl"), rewritten_rows)
+        run_manifest.update({"created_at": time.time(), "record_count": len(rewritten_rows), "run_dest": run_dest})
+        write_json(os.path.join(run_dest, "transfer_manifest.json"), run_manifest)
+        transferred.append({"run": run_name, "source_run_dir": run_dir, "dest_dir": run_dest, "records": len(rewritten_rows), "mode": mode})
+    summary = {"ok": True, "mode": mode, "dest_root": dest_root, "transferred": transferred, "skipped": skipped}
+    write_json(os.path.join(dest_root, "success_records", f"transfer_summary_{int(time.time())}.json"), summary)
     return summary
-
-
-DASHBOARD_JOBS: Dict[str, Dict[str, object]] = {}
-DASHBOARD_JOBS_LOCK = threading.Lock()
-DASHBOARD_JOB_COUNTER = 0
-
-
-def dashboard_job_snapshot(job_id: str) -> Dict[str, object]:
-    with DASHBOARD_JOBS_LOCK:
-        job = DASHBOARD_JOBS.get(str(job_id))
-        if not job:
-            return {"ok": False, "error": f"job_not_found:{job_id}"}
-        return dict(job)
-
-
-def dashboard_job_update(job_id: str, **updates) -> None:
-    with DASHBOARD_JOBS_LOCK:
-        job = DASHBOARD_JOBS.get(str(job_id))
-        if not job:
-            return
-        job.update(updates)
-        job["updated_at"] = time.time()
-
-
-def dashboard_start_job(kind: str, title: str, worker) -> Dict[str, object]:
-    global DASHBOARD_JOB_COUNTER
-    with DASHBOARD_JOBS_LOCK:
-        DASHBOARD_JOB_COUNTER += 1
-        job_id = f"{int(time.time() * 1000)}_{DASHBOARD_JOB_COUNTER:04d}"
-        DASHBOARD_JOBS[job_id] = {
-            "ok": True,
-            "job_id": job_id,
-            "kind": kind,
-            "title": title,
-            "status": "queued",
-            "percent": 0.0,
-            "current": 0,
-            "total": 1,
-            "message": "queued",
-            "result": None,
-            "error": None,
-            "created_at": time.time(),
-            "updated_at": time.time(),
-        }
-
-    def run_worker():
-        dashboard_job_update(job_id, status="running", message="started", percent=0.0)
-        try:
-            result = worker(job_id)
-            dashboard_job_update(job_id, status="done", message="done", percent=100.0, result=result)
-        except Exception as exc:
-            dashboard_job_update(job_id, status="error", message=str(exc), error=f"{type(exc).__name__}: {exc}", percent=100.0)
-
-    thread = threading.Thread(target=run_worker, name=f"dashboard-job-{job_id}", daemon=True)
-    thread.start()
-    return dashboard_job_snapshot(job_id)
-
-
-def dashboard_start_success_transfer_job(dataset_root: Union[str, os.PathLike], run_paths: Sequence[object], dest_dir: Union[str, os.PathLike], mode: str = "copy") -> Dict[str, object]:
-    root = os.path.abspath(str(dataset_root or "excavator_auto_dataset"))
-    paths = list(run_paths or [])
-    mode = "move" if str(mode).lower() in {"move", "cut"} else "copy"
-
-    def worker(job_id: str):
-        def progress(done: int, total: int, message: str):
-            percent = 0.0 if total <= 0 else max(0.0, min(100.0, float(done) * 100.0 / float(total)))
-            dashboard_job_update(job_id, current=int(done), total=int(max(1, total)), percent=percent, message=message or "working")
-        return dashboard_transfer_success_records(root, paths, dest_dir, mode=mode, progress_callback=progress)
-
-    return dashboard_start_job("success_records", f"{mode} success records", worker)
-
-
-def dashboard_export_success_pool(
-    dataset_root: Union[str, os.PathLike],
-    overwrite: bool = True,
-    fps: Optional[float] = None,
-    require_vla: bool = False,
-    progress_callback=None,
-) -> Dict[str, object]:
-    root = os.path.abspath(str(dataset_root or "excavator_auto_dataset"))
-    pool_dir = dashboard_success_pool_dir(root)
-
-    def progress(percent: float, message: str, current: Optional[int] = None, total: Optional[int] = None) -> None:
-        if not progress_callback:
-            return
-        try:
-            progress_callback(float(percent), str(message or ""), current, total)
-        except Exception:
-            pass
-
-    if not os.path.isdir(pool_dir):
-        raise FileNotFoundError(pool_dir)
-    progress(2.0, "reconciling .dashboard_success indexes")
-    reconcile_result = reconcile_success_pool_indexes(pool_dir, recover_orphan_folders=True)
-    rows = load_index(pool_dir, "trainable")
-    if not rows:
-        raise ValueError(f"no success pool trainable rows found: {pool_dir}")
-    progress(4.0, f"success pool rows={len(rows)}; recovered={reconcile_result.get('recovered_orphan_folders', 0)}")
-    final_export_dir = os.path.join(pool_dir, LEROBOT_DEFAULT_EXPORT_DIRNAME)
-    staging_export_dir = unique_path(os.path.join(pool_dir, f".{LEROBOT_DEFAULT_EXPORT_DIRNAME}_staging_{time.strftime('%Y%m%d_%H%M%S')}"))
-    try:
-        result = export_lerobot_dataset(
-            pool_dir,
-            output_dir=staging_export_dir,
-            split="trainable",
-            fps=fps,
-            overwrite=True,
-            require_standard=False,
-            require_vla=require_vla,
-            progress_callback=progress,
-        )
-        progress(99.0, "publishing final lerobot_v3 folder")
-        if overwrite and os.path.exists(final_export_dir):
-            shutil.rmtree(final_export_dir)
-        if os.path.exists(final_export_dir):
-            raise FileExistsError(f"{final_export_dir} already exists; pass overwrite=True")
-        shutil.move(staging_export_dir, final_export_dir)
-        result = dict(result)
-        result["export_dir"] = final_export_dir
-        result["staging_export_dir"] = staging_export_dir
-        result["success_pool_reconcile"] = reconcile_result
-        write_json(os.path.join(final_export_dir, "manifest.json"), result)
-        progress(100.0, "VLA export complete", 1, 1)
-        return result
-    except Exception:
-        # Keep the staging folder for post-mortem inspection, but never publish a
-        # half-built export as lerobot_v3.  This prevents stale two-camera exports
-        # from looking like a valid VLA dataset after a failed third-camera encode.
-        raise
-
-
-def dashboard_start_success_pool_export_job(dataset_root: Union[str, os.PathLike], overwrite: bool = True, fps: Optional[float] = None, require_vla: bool = True) -> Dict[str, object]:
-    root = os.path.abspath(str(dataset_root or "excavator_auto_dataset"))
-
-    def worker(job_id: str):
-        def progress(percent: float, message: str, current: Optional[int] = None, total: Optional[int] = None):
-            dashboard_job_update(
-                job_id,
-                current=int(current if current is not None else round(percent)),
-                total=int(max(1, total if total is not None else 100)),
-                percent=max(0.0, min(100.0, float(percent))),
-                message=message or "working",
-            )
-
-        progress(0.0, "starting .dashboard_success VLA export", 0, 100)
-        result = dashboard_export_success_pool(root, overwrite=overwrite, fps=fps, require_vla=require_vla, progress_callback=progress)
-        if require_vla and not result.get("vla_training_ready"):
-            raise RuntimeError(f"VLA export incomplete: {json.dumps(result, ensure_ascii=True)}")
-        return result
-
-    return dashboard_start_job("export_success_vla", "Export .dashboard_success VLA", worker)
 
 def list_dashboard_runs(dataset_root: Union[str, os.PathLike], limit: int = 80) -> List[dict]:
     root = os.path.abspath(str(dataset_root or "excavator_auto_dataset"))
@@ -4824,9 +3517,9 @@ def list_dashboard_runs(dataset_root: Union[str, os.PathLike], limit: int = 80) 
         summary = read_json(os.path.join(path, "summary.json"), default={}) or {}
         activity = run_activity_snapshot(path, now=now)
         latest_mtime = float(activity.get("latest_mtime") or 0.0)
-        raw_index_counts = {key: fast_jsonl_count(index_path(path, key)) for key in INDEX_FILES}
-        effective_counts, catchup = success_index_catchup_counts(path, raw_index_counts)
-        success_count = int(effective_counts.get("success", 0) or 0)
+        success_count = summary.get("success")
+        if success_count is None:
+            success_count = fast_jsonl_count(index_path(path, "success"))
         # Bounded scans keep "Loading runs..." fast even when many episode
         # image/video/data folders contain tens of thousands of files.
         size_snapshot = directory_size_snapshot(
@@ -4842,14 +3535,12 @@ def list_dashboard_runs(dataset_root: Union[str, os.PathLike], limit: int = 80) 
                 "name": name,
                 "path": path,
                 "mtime": max(float(os.path.getmtime(path)), latest_mtime),
-                "attempts": int(effective_counts.get("all", 0) or 0),
+                "attempts": summary.get("attempts"),
                 "success": success_count,
-                "trainable": int(effective_counts.get("trainable", 0) or 0),
-                "rejected": int(effective_counts.get("rejected", 0) or 0),
-                "failed": int(effective_counts.get("failed", 0) or 0),
+                "trainable": summary.get("trainable"),
+                "rejected": summary.get("rejected"),
+                "failed": summary.get("failed"),
                 "requested": summary.get("requested"),
-                "raw_index_counts": raw_index_counts,
-                "success_catchup": catchup,
                 "size_bytes": size_snapshot.get("size_bytes", 0),
                 "size_human": size_snapshot.get("size_human", "-"),
                 "size_truncated": size_snapshot.get("truncated", False),
@@ -4870,166 +3561,11 @@ def list_dashboard_runs(dataset_root: Union[str, os.PathLike], limit: int = 80) 
     return runs[: max(1, int(limit))]
 
 
-
-
-def stat_signature(path: Union[str, os.PathLike]) -> Dict[str, object]:
-    text = str(path or "")
-    if not text:
-        return {"exists": False, "mtime_ns": 0, "size": 0}
-    abs_path = os.path.abspath(text)
-    try:
-        st = os.stat(abs_path)
-        return {
-            "exists": True,
-            "mtime_ns": int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))),
-            "size": int(st.st_size),
-        }
-    except Exception:
-        return {"exists": False, "mtime_ns": 0, "size": 0}
-
-
-def direct_child_dirs_signature(path: Union[str, os.PathLike]) -> Dict[str, object]:
-    root = os.path.abspath(str(path or ""))
-    names: List[str] = []
-    latest_mtime_ns = 0
-    try:
-        for entry in os.scandir(root):
-            try:
-                if not entry.is_dir(follow_symlinks=False):
-                    continue
-                names.append(entry.name)
-                st = entry.stat(follow_symlinks=False)
-                latest_mtime_ns = max(latest_mtime_ns, int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))))
-            except Exception:
-                continue
-    except Exception:
-        pass
-    names.sort()
-    names_hash = hashlib.sha1("\n".join(names).encode("utf-8", errors="replace")).hexdigest()
-    return {
-        "exists": os.path.isdir(root),
-        "count": len(names),
-        "latest_mtime_ns": int(latest_mtime_ns),
-        "names_hash": names_hash,
-    }
-
-
-def dashboard_run_cache_dataset_root(run_dir: Union[str, os.PathLike]) -> str:
-    run_abs = os.path.abspath(str(run_dir or ""))
-    if is_dashboard_success_pool_dir(run_abs):
-        return os.path.dirname(run_abs)
-    return os.path.dirname(run_abs)
-
-
-def dashboard_run_payload_cache_path(run_dir: Union[str, os.PathLike]) -> str:
-    run_abs = os.path.abspath(str(run_dir or ""))
-    dataset_root = dashboard_run_cache_dataset_root(run_abs)
-    digest = hashlib.sha1(os.path.normcase(run_abs).encode("utf-8", errors="replace")).hexdigest()
-    return os.path.join(dataset_root, RUN_SIZE_CACHE_DIRNAME, RUN_PAYLOAD_CACHE_DIRNAME, f"{digest}.json")
-
-
-def dashboard_run_payload_signature(run_dir: Union[str, os.PathLike]) -> Dict[str, object]:
-    run_abs = os.path.abspath(str(run_dir or ""))
-    files: Dict[str, object] = {}
-    for key, filename in INDEX_FILES.items():
-        files[f"index/{key}"] = stat_signature(os.path.join(run_abs, filename))
-    for key, filename in SEGMENT_FILES.items():
-        files[f"segment/{key}"] = stat_signature(os.path.join(run_abs, filename))
-    for filename in [
-        "summary.json",
-        "run_meta.json",
-        "camera_config.json",
-        "lerobot_v3_export.json",
-        "transfer_source_cache.json",
-    ]:
-        files[f"root/{filename}"] = stat_signature(os.path.join(run_abs, filename))
-    signature: Dict[str, object] = {
-        "cache_version": RUN_PAYLOAD_CACHE_VERSION,
-        "run_dir": run_abs,
-        "run_stat": stat_signature(run_abs),
-        "folder_signature": folder_signature(run_abs),
-        "files": files,
-        "is_success_pool": is_dashboard_success_pool_dir(run_abs),
-    }
-    if is_dashboard_success_pool_dir(run_abs):
-        # Direct directory listing only.  This detects new/orphan/removed pool
-        # episode folders without walking camera/image trees or reading trajectories.
-        signature["success_pool_episode_dirs"] = direct_child_dirs_signature(os.path.join(run_abs, "episodes"))
-    payload = json.dumps(signature, ensure_ascii=True, sort_keys=True, default=str)
-    signature["signature_hash"] = hashlib.sha1(payload.encode("utf-8")).hexdigest()
-    return signature
-
-
-def clone_jsonable(data: object) -> object:
-    return json.loads(json.dumps(data, ensure_ascii=True, default=str))
-
-
-def cached_dashboard_run_payload(run_dir: str, signature: Dict[str, object]) -> Optional[Dict[str, object]]:
-    signature_hash = str(signature.get("signature_hash") or "")
-    cache_key = os.path.normcase(os.path.abspath(str(run_dir or "")))
-    with RUN_PAYLOAD_CACHE_LOCK:
-        cached = RUN_PAYLOAD_MEMORY_CACHE.get(cache_key)
-    if isinstance(cached, dict) and cached.get("signature_hash") == signature_hash and isinstance(cached.get("payload"), dict):
-        payload = clone_jsonable(cached.get("payload"))  # type: ignore[assignment]
-        if isinstance(payload, dict):
-            payload["analysis_cache"] = {
-                "hit": True,
-                "source": "memory",
-                "signature_hash": signature_hash,
-                "cache_path": cached.get("cache_path", ""),
-                "created_at": cached.get("created_at", 0.0),
-            }
-            return payload
-    cache_path = dashboard_run_payload_cache_path(run_dir)
-    disk = read_json(cache_path, default={}) or {}
-    if (
-        isinstance(disk, dict)
-        and int(disk.get("version", 0) or 0) == RUN_PAYLOAD_CACHE_VERSION
-        and disk.get("signature_hash") == signature_hash
-        and isinstance(disk.get("payload"), dict)
-    ):
-        with RUN_PAYLOAD_CACHE_LOCK:
-            RUN_PAYLOAD_MEMORY_CACHE[cache_key] = dict(disk)
-        payload = clone_jsonable(disk.get("payload"))  # type: ignore[assignment]
-        if isinstance(payload, dict):
-            payload["analysis_cache"] = {
-                "hit": True,
-                "source": "disk",
-                "signature_hash": signature_hash,
-                "cache_path": cache_path,
-                "created_at": disk.get("created_at", 0.0),
-            }
-            return payload
-    return None
-
-
-def save_dashboard_run_payload_cache(run_dir: str, signature: Dict[str, object], payload: Dict[str, object]) -> str:
-    cache_path = dashboard_run_payload_cache_path(run_dir)
-    clean_payload = dict(payload)
-    clean_payload.pop("analysis_cache", None)
-    entry = {
-        "version": RUN_PAYLOAD_CACHE_VERSION,
-        "created_at": time.time(),
-        "run_dir": os.path.abspath(str(run_dir or "")),
-        "signature_hash": signature.get("signature_hash", ""),
-        "signature": signature,
-        "payload": clone_jsonable(clean_payload),
-        "cache_path": cache_path,
-    }
-    ensure_dir(os.path.dirname(cache_path))
-    write_json(cache_path, entry)
-    cache_key = os.path.normcase(os.path.abspath(str(run_dir or "")))
-    with RUN_PAYLOAD_CACHE_LOCK:
-        RUN_PAYLOAD_MEMORY_CACHE[cache_key] = dict(entry)
-    return cache_path
-
-
-def dashboard_run_payload_uncached(run_dir: Union[str, os.PathLike]) -> Dict[str, object]:
+def dashboard_run_payload(run_dir: Union[str, os.PathLike]) -> Dict[str, object]:
     run_dir = os.path.abspath(str(run_dir))
-    success_pool_reconcile = maybe_reconcile_success_pool_for_dashboard(run_dir)
     report = analyze_run(run_dir, include_timeline=False)
     compact = compact_analysis(report)
-    rows, success_catchup = load_dashboard_all_rows(run_dir)
+    rows = load_index(run_dir, "all")
     dataset_metrics = compute_dataset_generation_metrics(rows)
     tag_by_episode = {}
     skip_reason_by_episode = {}
@@ -5055,8 +3591,6 @@ def dashboard_run_payload_uncached(run_dir: Union[str, os.PathLike]) -> Dict[str
     diagnosis["usable_frames"] = dataset_metrics.get("usable_frames", 0)
     diagnosis["total_frames"] = dataset_metrics.get("total_frames", 0)
     diagnosis["data_efficiency_score"] = dataset_metrics.get("data_efficiency_score", 0)
-    diagnosis["success_catchup"] = success_catchup
-    diagnosis["success_pool_reconcile"] = success_pool_reconcile
     compact = dict(compact)
     compact_counts = dict(compact.get("counts", {}) if isinstance(compact.get("counts"), dict) else {})
     compact_counts["skip"] = int(status_counts.get("skip", 0))
@@ -5068,35 +3602,11 @@ def dashboard_run_payload_uncached(run_dir: Union[str, os.PathLike]) -> Dict[str
         "dataset_metrics": dataset_metrics,
         "tag_runtime_seconds": dataset_metrics.get("tag_runtime_seconds", {}),
         "run_activity": run_activity_snapshot(run_dir),
-        "success_catchup": success_catchup,
-        "success_pool_reconcile": success_pool_reconcile,
         "status_counts": dict(status_counts),
         "episodes": episodes,
         "scene_points": scene_points,
         "generated_at": time.time(),
     }
-
-
-
-def dashboard_run_payload(run_dir: Union[str, os.PathLike], force_refresh: bool = False) -> Dict[str, object]:
-    run_dir = os.path.abspath(str(run_dir))
-    if not force_refresh:
-        signature = dashboard_run_payload_signature(run_dir)
-        cached = cached_dashboard_run_payload(run_dir, signature)
-        if cached is not None:
-            return cached
-    payload = dashboard_run_payload_uncached(run_dir)
-    signature = dashboard_run_payload_signature(run_dir)
-    cache_path = save_dashboard_run_payload_cache(run_dir, signature, payload)
-    payload["analysis_cache"] = {
-        "hit": False,
-        "source": "rebuilt",
-        "signature_hash": signature.get("signature_hash", ""),
-        "cache_path": cache_path,
-        "created_at": time.time(),
-        "force_refresh": bool(force_refresh),
-    }
-    return payload
 
 
 def downsample_indices(count: int, max_points: int) -> List[int]:
@@ -5160,8 +3670,7 @@ def dashboard_episode_payload(
     max_points: int = 1800,
 ) -> Dict[str, object]:
     run_dir = os.path.abspath(str(run_dir))
-    maybe_reconcile_success_pool_for_dashboard(run_dir)
-    rows, _success_catchup = load_dashboard_all_rows(run_dir)
+    rows = load_index(run_dir, "all")
     selected = None
     wanted = str(episode_index)
     for row in rows:
@@ -5257,13 +3766,13 @@ body{margin:0;background:linear-gradient(180deg,#eef3fb 0,#f6f8fb 220px,#f6f8fb 
 h1{font-size:21px;line-height:1.2;margin:0 0 10px;color:#101828}
 h2{font-size:15px;line-height:1.25;margin:0;color:#101828}
 h3{font-size:13px;margin:0 0 8px;color:#344054;text-transform:uppercase;letter-spacing:.04em}
-.controls{display:grid;gap:8px;align-items:center}.rootControls{grid-template-columns:auto minmax(260px,1fr) auto auto auto minmax(320px,560px) auto}.runControls{grid-template-columns:auto minmax(320px,1fr) auto auto minmax(120px,auto)}
+.controls{display:grid;grid-template-columns:auto minmax(280px,1fr) auto minmax(320px,560px) auto;gap:8px;align-items:center}
 label{font-size:12px;color:#475467;font-weight:600;white-space:nowrap}
 input,select,button{min-height:34px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;padding:0 10px;font-size:13px;min-width:0}
 input.path{width:100%}select{width:100%}
 button{background:#1f2937;color:#fff;border-color:#1f2937;cursor:pointer;font-weight:600}
 button.secondary{background:#fff;color:#111827;border-color:#cbd5e1}.linkBtn{border:0;background:transparent;color:#175cd3;padding:0;min-height:0;font-weight:800;text-align:left;cursor:pointer}.linkBtn:hover{text-decoration:underline}
-.statusLine{margin-top:8px;display:flex;gap:10px;align-items:center;min-height:18px}.runMonitor{margin-top:9px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;color:#475467}.runMonitorTitle{font-weight:800;color:#101828}.runBadge{display:inline-flex;align-items:center;gap:6px;border:1px solid #d0d5dd;border-radius:999px;background:#fff;color:#344054;padding:4px 9px;min-height:26px;font-size:12px;cursor:pointer}.runBadge.active{border-color:#12b76a;background:#ecfdf3;color:#027a48}.runBadge.recent{border-color:#fdb022;background:#fffaeb;color:#b54708}.activityDot{width:9px;height:9px;border-radius:999px;display:inline-block;background:#98a2b3;box-shadow:0 0 0 2px rgba(152,162,179,.14)}.activityDot.active{background:#12b76a;box-shadow:0 0 0 3px rgba(18,183,106,.18)}.activityDot.recent{background:#fdb022;box-shadow:0 0 0 3px rgba(253,176,34,.18)}.activityDot.idle{background:#f04438;box-shadow:0 0 0 3px rgba(240,68,56,.14)}.activityDot.missing,.activityDot.unknown{background:#98a2b3}.managerPanel{margin-bottom:14px;padding:0}.managerPanel>summary{cursor:pointer;list-style:none;padding:14px 16px;display:flex;align-items:flex-start;justify-content:space-between;gap:14px;border-bottom:1px solid #eaecf0}.managerPanel>summary::-webkit-details-marker{display:none}.managerPanel>summary:after{content:"收起";font-size:12px;color:#667085;border:1px solid #d0d5dd;border-radius:999px;padding:3px 9px;background:#fff;flex:0 0 auto}.managerPanel:not([open])>summary{border-bottom:0}.managerPanel:not([open])>summary:after{content:"展开"}.managerBody{padding:12px 14px 14px}.managerToolbar{display:flex;flex-wrap:nowrap;overflow-x:auto;gap:8px;align-items:center;margin-bottom:10px;padding-bottom:2px}.managerToolbar button{flex:0 0 auto}.managerToolbar input.path{flex:1 0 360px;min-width:260px}.managerToolbar .danger{background:#b42318;border-color:#b42318;color:#fff}.managerToolbar .warn{background:#b54708;border-color:#b54708;color:#fff}.managerSummary{font-size:12px;color:#475467;margin-bottom:8px;min-height:18px}.managerTableWrap{max-height:260px;overflow:auto;border:1px solid #eaecf0;border-radius:10px;background:#fff}.managerTable{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.managerTable th,.managerTable td{padding:7px 8px;border-bottom:1px solid #eef2f6;white-space:nowrap;vertical-align:middle}.managerTable th{position:sticky;top:0;background:#f8fafc;z-index:2;text-transform:uppercase;letter-spacing:.04em;font-size:10.5px;color:#475467}.managerTable .nameCell{font-weight:800;color:#101828}.managerTable .num{text-align:right;font-variant-numeric:tabular-nums}.managerTable .zeroSuccess{color:#b42318;font-weight:850}.managerTable .successRun{color:#067647;font-weight:850}.managerTable .dataSizeCell{max-width:280px;overflow:hidden;text-overflow:ellipsis}.ok{color:#047857}.error{color:#b91c1c}.muted{color:var(--muted);font-size:12px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.small{font-size:12px}.nowrap{white-space:nowrap}
+.statusLine{margin-top:8px;display:flex;gap:10px;align-items:center;min-height:18px}.runMonitor{margin-top:9px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;color:#475467}.runMonitorTitle{font-weight:800;color:#101828}.runBadge{display:inline-flex;align-items:center;gap:6px;border:1px solid #d0d5dd;border-radius:999px;background:#fff;color:#344054;padding:4px 9px;min-height:26px;font-size:12px;cursor:pointer}.runBadge.active{border-color:#12b76a;background:#ecfdf3;color:#027a48}.runBadge.recent{border-color:#fdb022;background:#fffaeb;color:#b54708}.activityDot{width:9px;height:9px;border-radius:999px;display:inline-block;background:#98a2b3;box-shadow:0 0 0 2px rgba(152,162,179,.14)}.activityDot.active{background:#12b76a;box-shadow:0 0 0 3px rgba(18,183,106,.18)}.activityDot.recent{background:#fdb022;box-shadow:0 0 0 3px rgba(253,176,34,.18)}.activityDot.idle{background:#f04438;box-shadow:0 0 0 3px rgba(240,68,56,.14)}.activityDot.missing,.activityDot.unknown{background:#98a2b3}.managerPanel{margin-bottom:14px}.managerToolbar{display:grid;grid-template-columns:repeat(3,auto) minmax(280px,1fr) repeat(4,auto);gap:8px;align-items:center;margin-bottom:10px}.managerToolbar .danger{background:#b42318;border-color:#b42318;color:#fff}.managerToolbar .warn{background:#b54708;border-color:#b54708;color:#fff}.managerSummary{font-size:12px;color:#475467;margin-bottom:8px;min-height:18px}.managerTableWrap{max-height:260px;overflow:auto;border:1px solid #eaecf0;border-radius:10px;background:#fff}.managerTable{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.managerTable th,.managerTable td{padding:7px 8px;border-bottom:1px solid #eef2f6;white-space:nowrap;vertical-align:middle}.managerTable th{position:sticky;top:0;background:#f8fafc;z-index:2;text-transform:uppercase;letter-spacing:.04em;font-size:10.5px;color:#475467}.managerTable .nameCell{font-weight:800;color:#101828}.managerTable .num{text-align:right;font-variant-numeric:tabular-nums}.managerTable .zeroSuccess{color:#b42318;font-weight:850}.managerTable .successRun{color:#067647;font-weight:850}.managerTable .dataSizeCell{max-width:280px;overflow:hidden;text-overflow:ellipsis}.ok{color:#047857}.error{color:#b91c1c}.muted{color:var(--muted);font-size:12px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.small{font-size:12px}.nowrap{white-space:nowrap}
 .grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:14px;align-items:start}
 .panel{background:var(--panel);border:1px solid var(--border);border-radius:14px;box-shadow:0 1px 2px rgba(16,24,40,.04);padding:14px;min-width:0;overflow:hidden}
 .panelHeader{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:10px}.panelHint{font-size:12px;color:#667085;line-height:1.35}
@@ -5289,7 +3798,6 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
 .compactScore{min-height:132px}.runtimePieCard{min-height:132px}.runtimePieCard .diagStats{grid-template-columns:repeat(4,minmax(0,1fr));margin-top:4px}.runtimePieCard .diagStatValue{font-size:15px}.pieWrap{display:grid;grid-template-columns:130px 1fr;gap:10px;align-items:center}.pieLegend{display:grid;gap:5px;font-size:11px;color:#475467}.pieLegendRow{display:flex;align-items:center;justify-content:space-between;gap:8px}.pieSwatch{width:9px;height:9px;border-radius:99px;display:inline-block;margin-right:5px}.pieSvg{width:130px;height:130px;display:block}.datasetScore{font-size:12px;color:#667085;margin-top:6px}.compactScore{min-height:132px}.compactScore .scoreNumber{font-size:46px}.diagCard{border:1px solid #e5e7eb;border-radius:14px;background:#fff;padding:13px;min-width:0;display:flex;flex-direction:column;gap:8px}.diagCardTitle{font-size:11px;color:#667085;text-transform:uppercase;letter-spacing:.05em;font-weight:800}.diagCardValue{font-size:20px;line-height:1.15;font-weight:850;color:#101828;overflow-wrap:anywhere}.diagCardDetail{font-size:12px;line-height:1.4;color:#667085}.diagCard.bad{border-left:4px solid #d92d20}.diagCard.warn{border-left:4px solid #f79009}.diagCard.good{border-left:4px solid #067647}.diagCard.info{border-left:4px solid #175cd3}.diagStats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-top:auto}.diagStat{border:1px solid #eef2f6;border-radius:10px;background:#f8fafc;padding:7px}.diagStatLabel{font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.04em}.diagStatValue{font-size:17px;font-weight:800;color:#101828}.actionsStrip{margin-top:12px;border-top:1px solid #eaecf0;padding-top:10px;display:grid;grid-template-columns:130px 1fr;gap:12px;align-items:start}.actionsStrip h3{margin-top:4px}.actionsInline{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.actionsInline .action{margin:0;min-height:52px;background:#fcfcfd}.detailsPanel{padding:0}.detailsPanel>summary{cursor:pointer;list-style:none;padding:14px 16px;font-weight:850;color:#101828;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #eaecf0}.detailsPanel>summary::-webkit-details-marker{display:none}.detailsPanel>summary:after{content:"展开";font-size:12px;color:#667085;border:1px solid #d0d5dd;border-radius:999px;padding:3px 9px;background:#fff}.detailsPanel[open]>summary:after{content:"收起"}.diagDetailsGrid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:14px;padding:14px}.diagDetailsGrid>.span3{grid-column:span 3}.diagDetailsGrid>.span4{grid-column:span 4}.diagDetailsGrid>.span6{grid-column:span 6}.diagDetailsGrid>.span12{grid-column:span 12}.subPanel{border:1px solid #eaecf0;border-radius:12px;background:#fff;padding:12px;min-width:0;overflow:hidden}.subPanel h2{font-size:14px;margin:0}.qualityNote{font-size:11px;color:#667085;line-height:1.35;margin-top:6px}
 @media(max-width:1280px){.triageGrid{grid-template-columns:1fr 1fr}.actionsInline{grid-template-columns:1fr}.actionsStrip{grid-template-columns:1fr}.diagDetailsGrid>.span3,.diagDetailsGrid>.span4,.diagDetailsGrid>.span6{grid-column:span 12}}
 @media(max-width:720px){.triageGrid{grid-template-columns:1fr}.diagStats{grid-template-columns:1fr}}
-.transferProgress{margin:8px 0 10px;border:1px solid #dbe3ee;border-radius:10px;background:#f8fafc;padding:8px 10px}.transferProgressMeta{display:flex;justify-content:space-between;gap:10px;font-size:12px;color:#475467;margin-bottom:6px}.transferProgressTrack{height:8px;border-radius:999px;background:#e5e7eb;overflow:hidden}.transferProgressFill{height:100%;border-radius:999px;background:#12b76a;transition:width .22s ease}.transferProgressFill.busy{background:linear-gradient(90deg,#12b76a,#60a5fa,#12b76a);background-size:180% 100%;animation:progressSlide 1.1s linear infinite}@keyframes progressSlide{from{background-position:0 0}to{background-position:180% 0}}
 
 </style>
 </head>
@@ -5297,16 +3805,14 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
 <header class="topbar">
   <div class="shell">
     <h1>Excavator Training Dataset Generation Dashboard</h1>
-    <div class="controls rootControls">
+    <div class="controls">
       <label for="rootInput">Dataset root</label>
       <input id="rootInput" class="path" value="excavator_auto_dataset">
       <button id="loadRunsBtn">Load runs</button>
-      <button class="secondary" id="loadSuccessPoolBtn">Load .dashboard_success</button>
-      <button class="secondary" id="exportSuccessPoolBtn">Export success VLA</button>
       <select id="runSelect"></select>
       <button id="loadRunBtn">Analyze run</button>
     </div>
-    <div class="controls runControls" style="margin-top:8px">
+    <div class="controls" style="margin-top:8px;grid-template-columns:auto minmax(280px,1fr) auto auto auto">
       <label for="runInput">Run folder</label>
       <input id="runInput" class="path" placeholder="D:\450\assets\usd\URDF_real3\excavator_auto_dataset\run_...">
       <button class="secondary" id="reloadBtn">Reload</button>
@@ -5321,31 +3827,25 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
   </div>
 </header>
 <main class="shell">
-  <details class="panel managerPanel" open>
-    <summary>
-      <div><h2>Run folder manager</h2><div class="panelHint">选择 0 success run 移入 trash，或复制/剪切 success records 到 .dashboard_success。</div></div>
-      <div class="panelHint">删除默认移动到 dataset_root/.dashboard_trash</div>
-    </summary>
-    <div class="managerBody">
-      <div class="managerToolbar">
-        <button type="button" class="secondary" id="selectAllRunsBtn">Select all</button>
-        <button type="button" class="secondary" id="selectZeroSuccessBtn">Select 0 success</button>
-        <button type="button" class="secondary" id="selectSuccessRunsBtn">Select success&gt;0</button>
-        <input id="successDestInput" class="path" readonly placeholder="dataset_root\.dashboard_success">
-        <button type="button" id="copySuccessBtn">Copy selected success</button>
-        <button type="button" class="warn" id="moveSuccessBtn">Cut selected success</button>
-        <button type="button" class="secondary" id="clearRunSelectionBtn">Clear</button>
-        <button type="button" class="secondary" id="refreshSelectedSizesBtn">Refresh selected sizes</button>
-        <button type="button" class="danger" id="deleteSelectedRunsBtn">Trash selected 0-success</button>
-      </div>
-      <div id="successTransferProgress" class="transferProgress" style="display:none">
-        <div class="transferProgressMeta"><span id="successTransferProgressText">idle</span><span id="successTransferProgressPct">0%</span></div>
-        <div class="transferProgressTrack"><div id="successTransferProgressFill" class="transferProgressFill" style="width:0%"></div></div>
-      </div>
-      <div id="managerSummary" class="managerSummary">loading run folders...</div>
-      <div class="managerTableWrap"><table id="runManagerTable" class="managerTable"></table></div>
+  <section class="panel managerPanel">
+    <div class="panelHeader">
+      <div><h2>Run folder manager</h2><div class="panelHint">批量管理训练数据生成目录：显示 run/data* 大小，选择 0 success run 移入 trash，或复制/剪切 success records 到目标目录。</div></div>
+      <div class="panelHint">删除默认移动到 dataset_root/.dashboard_trash；success records 目标为 dest/success_records/&lt;run_name&gt;/...</div>
     </div>
-  </details>
+    <div class="managerToolbar">
+      <button type="button" class="secondary" id="selectAllRunsBtn">Select all</button>
+      <button type="button" class="secondary" id="selectZeroSuccessBtn">Select 0 success</button>
+      <button type="button" class="secondary" id="selectSuccessRunsBtn">Select success&gt;0</button>
+      <input id="successDestInput" class="path" placeholder="Destination dir for success records, e.g. D:\450\success_dataset_pool">
+      <button type="button" id="copySuccessBtn">Copy selected success</button>
+      <button type="button" class="warn" id="moveSuccessBtn">Cut selected success</button>
+      <button type="button" class="secondary" id="clearRunSelectionBtn">Clear</button>
+      <button type="button" class="secondary" id="refreshSelectedSizesBtn">Refresh selected sizes</button>
+      <button type="button" class="danger" id="deleteSelectedRunsBtn">Trash selected 0-success</button>
+    </div>
+    <div id="managerSummary" class="managerSummary">loading run folders...</div>
+    <div class="managerTableWrap"><table id="runManagerTable" class="managerTable"></table></div>
+  </section>
   <section class="panel hero">
     <div class="panelHeader">
       <div><h2>Run diagnosis</h2><div class="panelHint">面向训练数据生成：先看可训练数据量、skip/无效样本、真正阻塞和质量信号。成功样本的空 reason 不再显示为 ok 失败。</div></div>
@@ -5444,21 +3944,11 @@ function $(id){return document.getElementById(id)}
 function esc(s){return String(s ?? "").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]))}
 function setStatus(text, cls="muted"){const el=$("status"); if(el){el.className=cls; el.textContent=text}}
 async function api(path, params){const qs=new URLSearchParams(params||{}); const r=await fetch(path+"?"+qs.toString()); if(!r.ok) throw new Error(await r.text()); return await r.json()}
-async function postJSON(path, payload){let r; try{r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload||{})});}catch(err){throw new Error(`Failed to fetch ${path}: ${err.message||err}`);} if(!r.ok) throw new Error(await r.text()); return await r.json()}
+async function postJSON(path, payload){const r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload||{})}); if(!r.ok) throw new Error(await r.text()); return await r.json()}
 function finite(v){return typeof v==="number" && Number.isFinite(v)}
 function number(v){const n=Number(v); return Number.isFinite(n)?n:null}
 function numeric(values){return (values||[]).map(v=>Number(v)).filter(v=>Number.isFinite(v))}
-function statusKey(s){
-  let t=String(s||"unknown").trim().toLowerCase();
-  if(t.includes("\\") || t.includes("/")){
-    const parts=t.split(/[\\/]+/).filter(Boolean);
-    t=parts.length?parts[parts.length-1]:t;
-  }
-  if(t==="fail"||t==="failed"||t==="failure") return "failed";
-  if(t==="successful") return "success";
-  if(t==="ok") return "trainable";
-  return t||"unknown"
-}
+function statusKey(s){const t=String(s||"unknown").toLowerCase(); if(t==="fail"||t==="failed"||t==="failure") return "failed"; if(t==="successful") return "success"; return t||"unknown"}
 function statusColor(s){return statusPalette[statusKey(s)] || statusPalette.unknown}
 function cssClassStatus(s){return statusKey(s).replace(/[^a-zA-Z0-9_-]/g,"_")}
 function fmt(v,d=1){const n=Number(v); if(!Number.isFinite(n)) return ""; if(Math.abs(n)>=10000) return n.toFixed(0); if(Math.abs(n)>=1000) return n.toFixed(1); return n.toFixed(d)}
@@ -5467,55 +3957,8 @@ function pct(v){const n=Number(v); return Number.isFinite(n)?`${(n*100).toFixed(
 function shortText(s,n){s=String(s||""); return s.length>n?s.slice(0,n-1)+"…":s}
 function basename(path){return String(path||"").split(/[\\/]/).pop()}
 
-function pathSepForBase(base){
-  const text=String(base||'');
-  return (/^[A-Za-z]:[\\/]/.test(text) || text.includes('\\')) ? '\\' : '/';
-}
-function joinOne(base, child){
-  const root=String(base||'').replace(/[\\/]+$/,'');
-  return `${root}${pathSepForBase(root)}${child}`;
-}
-function successPoolPath(){
-  const root=String($('rootInput').value||'excavator_auto_dataset').replace(/[\\/]+$/,'');
-  return joinOne(root, '.dashboard_success');
-}
-function syncSuccessPoolPath(){const input=$('successDestInput'); if(input) input.value=successPoolPath();}
-function setTransferProgress(text, percent=0, busy=false){
-  const box=$('successTransferProgress'), fill=$('successTransferProgressFill'), label=$('successTransferProgressText'), pctEl=$('successTransferProgressPct');
-  if(!box||!fill) return;
-  const p=Math.max(0, Math.min(100, Number(percent)||0));
-  box.style.display='block';
-  if(label) label.textContent=text||'working';
-  if(pctEl) pctEl.textContent=`${Math.round(p)}%`;
-  fill.style.width=`${p}%`;
-  fill.classList.toggle('busy', !!busy);
-}
-function hideTransferProgressSoon(){setTimeout(()=>{const box=$('successTransferProgress'); if(box) box.style.display='none';}, 3500);}
-async function pollDashboardJob(jobId, onDone){
-  let last = null;
-  for(;;){
-    const job = await api('/api/manage/job', {job_id:jobId, _:Date.now()});
-    last = job;
-    const percent = Number(job.percent || 0);
-    const msg = job.message || job.title || 'working';
-    setTransferProgress(`${msg} (${job.current||0}/${job.total||1})`, percent, job.status==='running' || job.status==='queued');
-    if(job.status === 'done'){
-      setTransferProgress('complete', 100, false);
-      if(onDone) await onDone(job.result || job);
-      hideTransferProgressSoon();
-      return job;
-    }
-    if(job.status === 'error'){
-      setTransferProgress(job.error || 'job failed', 100, false);
-      throw new Error(job.error || 'job failed');
-    }
-    await new Promise(resolve=>setTimeout(resolve, 500));
-  }
-}
-
 async function loadRuns(opts={}){
   const silent = !!opts.silent;
-  syncSuccessPoolPath();
   if(!silent) setStatus("Loading runs...");
   const previous = $("runSelect").value || $("runInput").value || "";
   const data = await api("/api/runs", {root:$("rootInput").value});
@@ -5532,8 +3975,7 @@ async function loadRuns(opts={}){
     const dot=state==="active" ? "🟢" : (state==="recent" ? "🟡" : "🔴");
     const age=activity.age_s==null ? "unknown" : ageText(activity.age_s);
     const label=state==="active" ? `active ${age}` : (state==="recent" ? `recent ${age}` : `idle ${age}`);
-    const catchup=(run.success_catchup&&run.success_catchup.active)?"  CATCHUP":"";
-    opt.textContent=`${dot} ${run.name}${catchup}  attempts=${run.attempts ?? "-"} success=${run.success ?? 0} trainable=${run.trainable ?? "-"} size=${run.size_human || "-"}  ${label}`;
+    opt.textContent=`${dot} ${run.name}  attempts=${run.attempts ?? "-"} success=${run.success ?? 0} trainable=${run.trainable ?? "-"} size=${run.size_human || "-"}  ${label}`;
     if(previous && run.path === previous){opt.selected=true; selectedPath=run.path;}
     sel.appendChild(opt);
   }
@@ -5558,11 +4000,10 @@ function renderRunManager(runs){
   const zero=(runs||[]).filter(r=>Number(r.success||0)===0);
   const successRuns=(runs||[]).filter(r=>Number(r.success||0)>0);
   const selected=[...selectedRunPaths].length;
-  const catchupRuns=(runs||[]).filter(r=>r.success_catchup&&r.success_catchup.active);
   const summary=$("managerSummary");
-  if(summary) summary.textContent=`folders=${runs.length}; selected=${selected}; 0-success=${zero.length}; success>0=${successRuns.length}; catch-up=${catchupRuns.length}; cached/displayed size=${humanBytes(totalSize)} · sizes are cache-first; refresh selected for exact scan`;
+  if(summary) summary.textContent=`folders=${runs.length}; selected=${selected}; 0-success=${zero.length}; success>0=${successRuns.length}; cached/displayed size=${humanBytes(totalSize)} · sizes are cache-first; refresh selected for exact scan`;
   if(!runs.length){table.innerHTML='<tbody><tr><td class="muted">no run folders</td></tr></tbody>';return;}
-  const rows=[`<thead><tr><th><input type="checkbox" onchange="toggleAllRuns(this.checked)"></th><th>State</th><th>Run</th><th>Catch-up</th><th class="num">Attempts</th><th class="num">Success</th><th class="num">Trainable</th><th class="num">Rejected</th><th class="num">Failed</th><th>Run size</th><th>data* size</th><th>Latest write</th></tr></thead><tbody>`];
+  const rows=[`<thead><tr><th><input type="checkbox" onchange="toggleAllRuns(this.checked)"></th><th>State</th><th>Run</th><th class="num">Attempts</th><th class="num">Success</th><th class="num">Trainable</th><th class="num">Rejected</th><th class="num">Failed</th><th>Run size</th><th>data* size</th><th>Latest write</th></tr></thead><tbody>`];
   for(const run of runs){
     const activity=run.activity||{};
     const state=activity.state||"unknown";
@@ -5570,13 +4011,10 @@ function renderRunManager(runs){
     const success=Number(run.success||0);
     const successCls=success>0?"successRun":"zeroSuccess";
     const activeTitle=activity.latest_file ? `${state}: ${activity.latest_file}` : state;
-    const catchup=run.success_catchup || {};
-    const catchupText=catchup.active ? `success-index · raw all=${((catchup.raw_counts||{}).all ?? 0)} raw trainable=${((catchup.raw_counts||{}).trainable ?? 0)}` : "normal";
     rows.push(`<tr>
       <td><input type="checkbox" ${checked} onchange="toggleRunSelection(${esc(JSON.stringify(run.path))}, this.checked)"></td>
       <td title="${esc(activeTitle)}"><span class="activityDot ${esc(state)}"></span> ${esc(state)}</td>
       <td class="nameCell" title="${esc(run.path)}"><button type="button" class="linkBtn" onclick="chooseRun(${esc(JSON.stringify(run.path))})">${esc(run.name)}</button></td>
-      <td title="${esc(catchup.message||catchup.reason||'')}">${catchup.active?'<span class="pill diagnostic">catch-up</span>':'<span class="muted">normal</span>'}<div class="muted">${esc(catchupText)}</div></td>
       <td class="num">${esc(run.attempts ?? "-")}</td>
       <td class="num ${successCls}">${esc(success)}</td>
       <td class="num">${esc(run.trainable ?? "-")}</td>
@@ -5626,53 +4064,19 @@ async function deleteSelectedZeroSuccessRuns(){
   await loadRuns({silent:true});
 }
 async function transferSuccessRecords(mode, allSuccess=false){
-  syncSuccessPoolPath();
-  const dest=$('successDestInput').value.trim() || successPoolPath();
+  const dest=$("successDestInput").value.trim();
+  if(!dest){setStatus("Destination dir is required for success records", "error"); return;}
   const paths=allSuccess ? runRecords.filter(r=>Number(r.success||0)>0).map(r=>r.path) : selectedRunList();
-  if(!paths.length){setStatus(allSuccess?'No success>0 runs found':'No run folders selected', 'error'); return;}
-  const verb=mode==='move'?'Cut/move':'Copy';
-  if(!confirm(`${verb} success episodes from ${paths.length} run folder(s) to:\n${joinOne(dest,'episodes')}\n\nFolder names are canonical: YYMMDD_HHMMSS_epXXXXXX. The operation runs as a background job with percentage progress.`)) return;
-  setStatus(`${verb} success records job starting...`);
-  setTransferProgress('starting success transfer', 0, true);
-  const job=await postJSON('/api/manage/success_records', {root:$('rootInput').value, paths, dest_dir:dest, mode});
-  if(!job.job_id){throw new Error(job.error || 'success_records job did not start');}
-  await pollDashboardJob(job.job_id, async (result)=>{
-    const done=(result.transferred||[]).reduce((a,r)=>a+Number(r.records||0),0);
-    const cached=Number(result.cached_skipped||0);
-    const updated=Number(result.updated_reprocessed||0);
-    const skipped=(result.skipped||[]).length;
-    const cutEpTrashed=Number(result.cut_source_episode_trashed||0);
-    const cutRunTrashed=(result.cut_source_runs_trashed||[]).length;
-    const cutFailed=Number(result.cut_source_episode_trash_failed||0)+(result.cut_source_runs_trash_failed||[]).length;
-    setStatus(`${verb} complete: new=${done}, cached=${cached}, updated=${updated}, skipped=${skipped}, cut_ep_trashed=${cutEpTrashed}, cut_run_trashed=${cutRunTrashed}, dest=${result.dest_root||dest}`, (skipped>cached||cutFailed)?'error':'ok');
-    await loadRuns({silent:true});
-  });
+  if(!paths.length){setStatus(allSuccess?"No success>0 runs found":"No run folders selected", "error"); return;}
+  const verb=mode==="move"?"Cut/move":"Copy";
+  if(!confirm(`${verb} success records from ${paths.length} run folder(s) to:\n${dest}\n\nThis operates on successful_episodes.jsonl records.`)) return;
+  setStatus(`${verb} success records...`);
+  const result=await postJSON("/api/manage/success_records", {root:$("rootInput").value, paths, dest_dir:dest, mode});
+  const done=(result.transferred||[]).reduce((a,r)=>a+Number(r.records||0),0);
+  const skipped=(result.skipped||[]).length;
+  setStatus(`${verb} complete: records=${done}, skipped=${skipped}, dest=${result.dest_root||dest}`, skipped?"error":"ok");
+  await loadRuns({silent:true});
 }
-
-async function loadSuccessPool(){
-  syncSuccessPoolPath();
-  const pool=successPoolPath();
-  $('runInput').value=pool;
-  setStatus('Loading .dashboard_success...');
-  await loadRun();
-}
-async function exportSuccessPool(){
-  syncSuccessPoolPath();
-  const root=$('rootInput').value;
-  const pool=successPoolPath();
-  if(!confirm(`Export .dashboard_success to LeRobot/VLA?\n\nSource:\n${pool}\n\nOutput will be rebuilt at:\n${joinOne(pool,'lerobot_v3')}`)) return;
-  setStatus('Starting .dashboard_success VLA export...');
-  setTransferProgress('starting VLA export', 0, true);
-  const job=await postJSON('/api/manage/export_success_vla', {root, overwrite:true, require_vla:true});
-  if(!job.job_id){throw new Error(job.error || 'export_success_vla job did not start');}
-  await pollDashboardJob(job.job_id, async (result)=>{
-    const videoSummary=Object.entries(result.videos||{}).map(([k,v])=>`${k}:${v&&v.available?'ok':'fail'}`).join(', ');
-    setTransferProgress(`Export complete: ${result.total_episodes||0} episodes, ${result.total_frames||0} frames`, 100, false);
-    setStatus(`Export complete: ready=${!!result.vla_training_ready}; videos=${videoSummary}; dir=${result.export_dir||''}`, result.vla_training_ready?'ok':'error');
-    $('runInput').value=pool;
-  });
-}
-
 function renderRunMonitor(data){
   const el=$("runMonitor"); if(!el) return;
   const summary=data.activity_summary || {};
@@ -5696,19 +4100,14 @@ function chooseRun(path){
   for(const opt of Array.from(sel.options)){ if(opt.value===path){sel.value=path; break;} }
   loadRun().catch(e=>setStatus(e.message,"error"));
 }
-async function loadRun(force=false){
+async function loadRun(){
   const runDir=$("runInput").value || $("runSelect").value;
   if(!runDir){setStatus("Choose a run folder first", "error"); return}
-  setStatus(force ? "Refreshing run analysis..." : "Loading run analysis cache...");
-  const data=await api("/api/run", {run_dir:runDir, force:force ? "1" : "0", _:Date.now()});
+  setStatus("Analyzing run...");
+  const data=await api("/api/run", {run_dir:runDir});
   currentRun=data; currentEpisodeIndex=null;
   renderRun(data);
-  const cache=data.analysis_cache || {};
-  if(cache.hit){
-    setStatus(`Run loaded from ${cache.source || "analysis"} cache`, "ok");
-  }else{
-    setStatus(force ? "Run refreshed and cached" : "Run analyzed and cached", "ok");
-  }
+  setStatus("Run loaded", "ok");
   const eps=filteredEpisodes();
   if(eps.length) loadEpisode(eps[0].episode_index);
 }
@@ -5745,13 +4144,7 @@ function renderRun(data){
   const act=data.run_activity || {};
   const actState=act.state || "unknown";
   const actText=act.age_s==null ? "write state unknown" : `${actState} · last write ${ageText(act.age_s)} ago`;
-  const catchup=data.success_catchup || (diagnosis&&diagnosis.success_catchup) || {};
-  const catchupText=catchup.active ? ` &nbsp;|&nbsp; <span class="pill diagnostic" title="${esc(catchup.message||catchup.reason||'')}">success catch-up</span> rows=${esc(catchup.rows_source||catchup.source||'successful_episodes.jsonl')}` : "";
-  const reconcile=data.success_pool_reconcile || (diagnosis&&diagnosis.success_pool_reconcile) || {};
-  const reconcileText=reconcile.is_success_pool ? ` &nbsp;|&nbsp; <span class="pill diagnostic" title="folders=${esc(reconcile.scanned_episode_folders||0)}, incomplete=${esc(reconcile.incomplete_or_unreadable_folders||0)}, sanitized=${esc(reconcile.sanitized_rows||0)}">pool index ${esc(reconcile.indexed_rows||0)}/${esc(reconcile.scanned_episode_folders||0)} folders; recovered=${esc(reconcile.recovered_orphan_folders||0)}</span>` : "";
-  const analysisCache=data.analysis_cache || {};
-  const cacheText=analysisCache.source ? ` &nbsp;|&nbsp; <span class="pill ${analysisCache.hit?'success':'diagnostic'}" title="${esc(analysisCache.cache_path||'')}">analysis cache: ${analysisCache.hit?'hit':'rebuilt'} (${esc(analysisCache.source)})</span>` : "";
-  $("reportHint").innerHTML = data.run_dir ? `<span class="activityDot ${esc(actState)}"></span> ${esc(actText)}${catchupText}${reconcileText}${cacheText} &nbsp;|&nbsp; Static report: analysis_plots/report.html  |  generate with --plots` : "";
+  $("reportHint").innerHTML = data.run_dir ? `<span class="activityDot ${esc(actState)}"></span> ${esc(actText)} &nbsp;|&nbsp; Static report: analysis_plots/report.html  |  generate with --plots` : "";
   setupStatusFilter(data.episodes||[]);
   refreshFilteredViews();
 }
@@ -5835,7 +4228,7 @@ function setupStatusFilter(episodes){
   selectedStatuses=new Set(availableStatuses);
   const el=$("statusFilter");
   const buttons=[`<button class="filterBtn all active" data-status="__all__">All</button>`];
-  for(const st of availableStatuses){const label=shortText(st,28); buttons.push(`<button class="filterBtn ${esc(st)} active" data-status="${esc(st)}" title="${esc(st)}"><span style="display:inline-block;width:8px;height:8px;border-radius:9px;background:${statusColor(st)};margin-right:5px"></span>${esc(label)} ${counts.get(st)||0}</button>`)}
+  for(const st of availableStatuses){buttons.push(`<button class="filterBtn ${esc(st)} active" data-status="${esc(st)}"><span style="display:inline-block;width:8px;height:8px;border-radius:9px;background:${statusColor(st)};margin-right:5px"></span>${esc(st)} ${counts.get(st)||0}</button>`)}
   el.innerHTML=buttons.join("");
   for(const btn of el.querySelectorAll(".filterBtn")){btn.onclick=()=>toggleStatusFilter(btn.dataset.status)}
   updateFilterUI();
@@ -6055,10 +4448,8 @@ function syncEpisodeInspectorHeight(){
 }
 
 $("loadRunsBtn").onclick=()=>loadRuns().catch(e=>setStatus(e.message,"error"));
-$("loadSuccessPoolBtn").onclick=()=>loadSuccessPool().catch(e=>setStatus(e.message,"error"));
-$("exportSuccessPoolBtn").onclick=()=>exportSuccessPool().catch(e=>setStatus(e.message,"error"));
-$("loadRunBtn").onclick=()=>loadRun(false).catch(e=>setStatus(e.message,"error"));
-$("reloadBtn").onclick=()=>loadRun(true).catch(e=>setStatus(e.message,"error"));
+$("loadRunBtn").onclick=()=>loadRun().catch(e=>setStatus(e.message,"error"));
+$("reloadBtn").onclick=()=>loadRun().catch(e=>setStatus(e.message,"error"));
 $("copyPathBtn").onclick=()=>navigator.clipboard&&navigator.clipboard.writeText($("runInput").value).then(()=>setStatus("Run path copied","ok")).catch(()=>setStatus("Copy failed","error"));
 $("runSelect").onchange=()=>{$("runInput").value=$("runSelect").value};
 $("selectAllRunsBtn").onclick=()=>toggleAllRuns(true);
@@ -6070,7 +4461,6 @@ $("deleteSelectedRunsBtn").onclick=()=>deleteSelectedZeroSuccessRuns().catch(e=>
 $("copySuccessBtn").onclick=()=>transferSuccessRecords("copy", false).catch(e=>setStatus(e.message,"error"));
 $("moveSuccessBtn").onclick=()=>transferSuccessRecords("move", false).catch(e=>setStatus(e.message,"error"));
 const episodeSortSelect=$("episodeSortSelect"); if(episodeSortSelect) episodeSortSelect.onchange=()=>refreshFilteredViews();
-$("rootInput").addEventListener("input", ()=>syncSuccessPoolPath());
 $("rootInput").addEventListener("keydown", e=>{if(e.key==="Enter") loadRuns().then(()=>loadRun()).catch(err=>setStatus(err.message,"error"))});
 $("runInput").addEventListener("keydown", e=>{if(e.key==="Enter") loadRun().catch(err=>setStatus(err.message,"error"))});
 window.addEventListener("resize",()=>syncEpisodeInspectorHeight());
@@ -6097,7 +4487,7 @@ def serve_dashboard(
     import socketserver
     import webbrowser
 
-    default_root = normalize_dashboard_client_path(dataset_root or "excavator_auto_dataset")
+    default_root = os.path.abspath(str(dataset_root or "excavator_auto_dataset"))
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -6121,25 +4511,20 @@ def serve_dashboard(
                 if parsed.path == "/":
                     self.send_bytes(dashboard_html().encode("utf-8"), "text/html; charset=utf-8")
                     return
-                if parsed.path == "/api/manage/job":
-                    job_id = params.get("job_id") or ""
-                    self.send_json(dashboard_job_snapshot(job_id))
-                    return
                 if parsed.path == "/api/runs":
-                    root = normalize_dashboard_client_path(params.get("root") or default_root)
+                    root = os.path.abspath(unquote(params.get("root") or default_root))
                     runs = list_dashboard_runs(root)
                     self.send_json({"root": root, "runs": runs, "activity_summary": summarize_run_activity(runs)})
                     return
                 if parsed.path == "/api/run":
-                    run_dir = normalize_dashboard_client_path(params.get("run_dir") or latest_run(default_root))
+                    run_dir = os.path.abspath(unquote(params.get("run_dir") or latest_run(default_root)))
                     if not run_dir or not os.path.isdir(run_dir):
                         self.send_json({"error": f"run_dir_not_found:{run_dir}"}, status=404)
                         return
-                    force_refresh = str(params.get("force") or params.get("refresh") or "").lower() in {"1", "true", "yes", "y", "force"}
-                    self.send_json(dashboard_run_payload(run_dir, force_refresh=force_refresh))
+                    self.send_json(dashboard_run_payload(run_dir))
                     return
                 if parsed.path == "/api/episode":
-                    run_dir = normalize_dashboard_client_path(params.get("run_dir") or latest_run(default_root))
+                    run_dir = os.path.abspath(unquote(params.get("run_dir") or latest_run(default_root)))
                     episode = params.get("episode_index") or "1"
                     max_points = int(params.get("max_points") or 1800)
                     self.send_json(dashboard_episode_payload(run_dir, episode, max_points=max_points))
@@ -6165,12 +4550,12 @@ def serve_dashboard(
             try:
                 body = self.read_json_body()
                 if parsed.path == "/api/manage/refresh_sizes":
-                    root = normalize_dashboard_client_path(body.get("root") or default_root)
+                    root = os.path.abspath(unquote(str(body.get("root") or default_root)))
                     result = dashboard_refresh_folder_sizes(root, body.get("paths") or [])
                     self.send_json(result)
                     return
                 if parsed.path == "/api/manage/delete_runs":
-                    root = normalize_dashboard_client_path(body.get("root") or default_root)
+                    root = os.path.abspath(unquote(str(body.get("root") or default_root)))
                     result = dashboard_delete_runs(
                         root,
                         body.get("paths") or [],
@@ -6180,27 +4565,12 @@ def serve_dashboard(
                     self.send_json(result)
                     return
                 if parsed.path == "/api/manage/success_records":
-                    root = normalize_dashboard_client_path(body.get("root") or default_root)
-                    result = dashboard_start_success_transfer_job(
+                    root = os.path.abspath(unquote(str(body.get("root") or default_root)))
+                    result = dashboard_transfer_success_records(
                         root,
                         body.get("paths") or [],
-                        body.get("dest_dir") or dashboard_success_pool_dir(root),
+                        body.get("dest_dir") or os.path.join(root, "success_records"),
                         mode=str(body.get("mode") or "copy"),
-                    )
-                    self.send_json(result)
-                    return
-                if parsed.path == "/api/manage/export_success_vla":
-                    root = normalize_dashboard_client_path(body.get("root") or default_root)
-                    fps_value = body.get("fps")
-                    try:
-                        fps = float(fps_value) if fps_value not in (None, "") else None
-                    except Exception:
-                        fps = None
-                    result = dashboard_start_success_pool_export_job(
-                        root,
-                        overwrite=bool(body.get("overwrite", True)),
-                        fps=fps,
-                        require_vla=bool(body.get("require_vla", True)),
                     )
                     self.send_json(result)
                     return

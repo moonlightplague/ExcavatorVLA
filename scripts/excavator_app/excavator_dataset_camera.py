@@ -35,7 +35,7 @@ def replicator_tick_enabled(rt):
     state_value = rt.STATE.get("dataset_camera_replicator_tick_enabled", None)
     if state_value is not None:
         return bool(state_value)
-    return os.name != "nt"
+    return False
 
 
 def image_extension(rt):

@@ -238,6 +238,8 @@ def run_auto_collect(simulation_app, rt, success_count, max_attempts, wait_expor
 
     started = False
     last_print = 0.0
+    last_status_key = None
+    heartbeat_interval = float(os.environ.get("EXCAVATOR_AUTO_COLLECT_HEARTBEAT_SECONDS", "60") or 60)
     while simulation_app.is_running():
         simulation_app.update()
         active = bool(rt.STATE.get("auto_collect_active", False))
@@ -246,13 +248,24 @@ def run_auto_collect(simulation_app, rt, success_count, max_attempts, wait_expor
             started = True
 
         now = time.time()
-        if now - last_print > 5.0:
+        status_key = (
+            bool(active),
+            int(rt.STATE.get("auto_collect_attempts", 0) or 0),
+            int(rt.STATE.get("auto_collect_successes", 0) or 0),
+            int(rt.STATE.get("auto_collect_rejections", 0) or 0),
+            int(rt.STATE.get("auto_collect_failures", 0) or 0),
+            str(rt.STATE.get("auto_collect_last_result", "") or ""),
+        )
+        if status_key != last_status_key or now - last_print > heartbeat_interval:
             last_print = now
+            last_status_key = status_key
             print(
                 "[AUTO COLLECT]",
                 f"active={active}",
                 f"attempts={rt.STATE.get('auto_collect_attempts', 0)}",
                 f"success={rt.STATE.get('auto_collect_successes', 0)}",
+                f"rejected={rt.STATE.get('auto_collect_rejections', 0)}",
+                f"fail={rt.STATE.get('auto_collect_failures', 0)}",
                 f"target={rt.STATE.get('auto_collect_requested', success_count)}",
                 f"max_attempts={rt.STATE.get('auto_collect_max_attempts_requested', 0)}",
                 f"run_dir={rt.STATE.get('auto_collect_run_dir', '')}",

@@ -317,6 +317,8 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_camera_warmup_ready_frames": int(os.environ.get("EXCAVATOR_DATASET_CAMERA_WARMUP_READY_FRAMES", "2") or 2),
     "dataset_camera_warmup_max_frames": int(os.environ.get("EXCAVATOR_DATASET_CAMERA_WARMUP_MAX_FRAMES", "12") or 12),
     "dataset_camera_warmup_status": {},
+    "dataset_camera_run_warmup_status": {},
+    "dataset_camera_run_warmup_run_id": "",
     "dataset_camera_dropped_incomplete_samples": 0,
     "dataset_image_dir": "",
     "dataset_async_writer_enabled": str(os.environ.get("EXCAVATOR_DATASET_ASYNC_WRITER", "1") or "1").strip().lower()
@@ -538,6 +540,8 @@ FREEZE_STALL_MOTION_DEG = 0.12
 FREEZE_MIN_DURATION = 0.45
 FREEZE_SWING_ONLY_MIN_DURATION = 2.25
 FREEZE_BUCKET_CUT_MIN_DURATION = 1.35
+FREEZE_LOADED_UNLOAD_BUCKET_SOFT_ERR_DEG = 10.0
+FREEZE_LOADED_UNLOAD_BUCKET_MIN_DURATION = 2.0
 FREEZE_PRINT_INTERVAL = 1.0
 SAND_CONTACT_PHASES = {"insert_cut", "pull_mid_cut", "pull_exit_cut", "curl_to_hold_material", "secure_load"}
 SAND_CUT_GEOMETRY_PHASES = {"insert_cut", "pull_mid_cut", "pull_exit_cut"}
@@ -932,7 +936,7 @@ BUCKET_DIG_SURFACE_ANGLE_MAX_DEG = 18.0
 BUCKET_DIG_INSERT_JOINT_DEG = -48.0
 BUCKET_DIG_PULL_JOINT_DEG = -104.0
 BUCKET_DIG_EXIT_JOINT_DEG = -114.0
-BUCKET_UNLOAD_DUMP_DEG = 82.0
+BUCKET_UNLOAD_DUMP_DEG = 45.0
 LOADED_ROUTE_UNLOAD_DUMP_DEG = 45.0
 UNLOAD_DUMP_BUCKET_TOL_DEG = 18.0
 UNLOAD_DUMP_ACCEPT_ERR = 0.45
@@ -1001,7 +1005,7 @@ DIG_PLAN_CANDIDATES = [
         "curl_z": 0.34,
         "lift_height": 0.70,
         "unload_height_delta": 0.00,
-        "unload_dump_deg": 82.0,
+        "unload_dump_deg": 45.0,
         "bucket_attack_world": -52.0,
         "bucket_cut_world": -48.0,
         "bucket_mid_cut_world": -82.0,
@@ -1023,7 +1027,7 @@ DIG_PLAN_CANDIDATES = [
         "curl_z": 0.40,
         "lift_height": 1.05,
         "unload_height_delta": 0.18,
-        "unload_dump_deg": 86.0,
+        "unload_dump_deg": 45.0,
         "bucket_attack_world": -48.0,
         "bucket_cut_world": -46.0,
         "bucket_mid_cut_world": -80.0,
@@ -1045,7 +1049,7 @@ DIG_PLAN_CANDIDATES = [
         "curl_z": 0.36,
         "lift_height": 0.88,
         "unload_height_delta": 0.10,
-        "unload_dump_deg": 88.0,
+        "unload_dump_deg": 45.0,
         "bucket_attack_world": -58.0,
         "bucket_cut_world": -54.0,
         "bucket_mid_cut_world": -88.0,
@@ -1067,7 +1071,7 @@ DIG_PLAN_CANDIDATES = [
         "curl_z": 0.44,
         "lift_height": 1.15,
         "unload_height_delta": 0.22,
-        "unload_dump_deg": 86.0,
+        "unload_dump_deg": 45.0,
         "bucket_attack_world": -45.0,
         "bucket_cut_world": -44.0,
         "bucket_mid_cut_world": -76.0,
@@ -6539,8 +6543,88 @@ def dataset_camera_rgb_ready():
     return excavator_dataset_camera.rgb_ready(runtime_module())
 
 
+def dataset_record_sample_due(force=False):
+    if not bool(STATE.get("dataset_recording", False)):
+        return False
+    if not str(STATE.get("dataset_episode_uid", "") or ""):
+        return False
+    if not str(STATE.get("dataset_episode_dir", "") or ""):
+        return False
+    if force:
+        return True
+    interval = float(STATE.get("dataset_sample_interval", 0.10))
+    return time.time() - float(STATE.get("dataset_last_sample_time", 0.0)) >= interval
+
+
 async def dataset_camera_warmup_for_episode(label="episode"):
     return await excavator_dataset_camera.warmup_for_episode(runtime_module(), label=label)
+
+
+async def dataset_camera_warmup_for_auto_run_once(label="auto_collect_run"):
+    if not bool(STATE.get("dataset_camera_enabled", True)):
+        STATE["dataset_camera_warmup_status"] = {"ok": True, "reason": "disabled", "label": str(label)}
+        return True
+    if not bool(STATE.get("dataset_camera_require_complete_samples", True)):
+        STATE["dataset_camera_warmup_status"] = {"ok": True, "reason": "complete_samples_not_required", "label": str(label)}
+        return True
+    run_id = str(STATE.get("auto_collect_run_id", "") or "")
+    cached = STATE.get("dataset_camera_run_warmup_status")
+    if (
+        isinstance(cached, dict)
+        and bool(cached.get("ok", False))
+        and str(STATE.get("dataset_camera_run_warmup_run_id", "") or "") == run_id
+    ):
+        status = dict(cached)
+        status["label"] = str(label)
+        status["reused_from_run_warmup"] = True
+        STATE["dataset_camera_warmup_status"] = status
+        return True
+    ok = await dataset_camera_warmup_for_episode(label=label)
+    status = dict(STATE.get("dataset_camera_warmup_status", {}) or {})
+    status["run_once"] = True
+    status["run_id"] = run_id
+    STATE["dataset_camera_warmup_status"] = status
+    if ok:
+        STATE["dataset_camera_run_warmup_status"] = dict(status)
+        STATE["dataset_camera_run_warmup_run_id"] = run_id
+    return bool(ok)
+
+
+async def auto_collect_camera_preflight(label="auto_collect_camera_preflight"):
+    if not bool(STATE.get("dataset_camera_enabled", True)):
+        return True
+    if not bool(STATE.get("dataset_camera_require_complete_samples", True)):
+        return True
+    if not simulation_timeline_is_playing():
+        ensure_timeline_playing(label)
+        await step_updates(2)
+    ok = await dataset_camera_warmup_for_auto_run_once(label=label)
+    status = dict(STATE.get("dataset_camera_warmup_status", {}) or {})
+    if ok:
+        info_print(
+            "[AUTO DATASET CAMERA PREFLIGHT]",
+            "ok=True",
+            f"label={label}",
+            f"reason={status.get('reason', 'ok')}",
+            f"reused={bool(status.get('reused_from_run_warmup', False))}",
+        )
+        return True
+    reason = str(status.get("reason", "camera_preflight_failed") or "camera_preflight_failed")
+    STATE["auto_collect_last_result"] = f"blocked=camera_preflight_failed:{reason}"
+    debug_timeline_record(
+        "CAMERA_PREFLIGHT",
+        result="failed",
+        reason=reason,
+        data={"camera_warmup_status": status},
+    )
+    info_print(
+        "[ERROR] [AUTO DATASET CAMERA PREFLIGHT]",
+        "ok=False",
+        f"reason={reason}",
+        "action=abort_auto_collect",
+        force_log=True,
+    )
+    return False
 
 
 async def dataset_camera_refresh_for_sample(label="sample"):
@@ -10305,7 +10389,7 @@ def dataset_observation_state(q_real=None, bucket_load_metrics=None):
 
 
 @debug_profiled("dataset_record_sample", threshold_ms=2.0)
-def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False):
+def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False, camera_payload=None):
     if not bool(STATE.get("dataset_recording", False)):
         return
     if not str(STATE.get("dataset_episode_uid", "") or ""):
@@ -10339,12 +10423,12 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False)
         mark_span("dataset_record_sample.motion", span_t, threshold_ms=1.0)
 
         sample_index = int(STATE.get("dataset_samples", 0)) - int(STATE.get("dataset_episode_sample_start", 0))
-        camera_payload = None
         if dataset_camera_sample_requires_complete_images(sample_index):
-            span_t = time.perf_counter()
-            camera_payload = dataset_capture_camera_observations(sample_index)
+            if camera_payload is None:
+                span_t = time.perf_counter()
+                camera_payload = dataset_capture_camera_observations(sample_index)
+                mark_span("dataset_record_sample.camera", span_t, threshold_ms=4.0)
             camera_ok, camera_reason = dataset_camera_payload_complete(camera_payload, sample_index)
-            mark_span("dataset_record_sample.camera", span_t, threshold_ms=4.0)
             if not camera_ok:
                 dropped = int(STATE.get("dataset_camera_dropped_incomplete_samples", 0) or 0) + 1
                 STATE["dataset_camera_dropped_incomplete_samples"] = dropped
@@ -10510,6 +10594,25 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False)
         if now - float(STATE.get("dataset_last_error_time", 0.0)) > 2.0:
             STATE["dataset_last_error_time"] = now
             info_print("[WARN] dataset record failed:", type(e).__name__, e)
+
+
+async def dataset_record_sample_async(phase, q_cmd=None, q_real=None, label="", force=False):
+    if not dataset_record_sample_due(force=force):
+        return
+    sample_index = int(STATE.get("dataset_samples", 0)) - int(STATE.get("dataset_episode_sample_start", 0))
+    camera_payload = None
+    if dataset_camera_sample_requires_complete_images(sample_index):
+        span_t = time.perf_counter()
+        camera_payload = await dataset_capture_camera_observations_async(sample_index)
+        debug_profile_span("dataset_record_sample.camera_async", span_t, threshold_ms=4.0)
+    dataset_record_sample(
+        phase,
+        q_cmd=q_cmd,
+        q_real=q_real,
+        label=label,
+        force=force,
+        camera_payload=camera_payload,
+    )
 
 
 def dataset_record_event(event, detail="", data=None):
@@ -11288,6 +11391,21 @@ def auto_collect_episode_metrics():
         "effort_missing_samples": int(STATE.get("dataset_effort_missing_samples", 0) or 0),
         "max_abs_effort": float(STATE.get("dataset_max_abs_effort", 0.0)),
     }
+
+
+def current_episode_bucket_loaded_count():
+    return max(
+        int(STATE.get("dataset_max_bucket_from_pile_particles", 0) or 0),
+        int(STATE.get("dataset_lift_bucket_from_pile_particles", 0) or 0),
+        int(STATE.get("dataset_final_bucket_from_pile_particles", 0) or 0),
+    )
+
+
+def loaded_bucket_best_effort_unload_allowed():
+    return bool(
+        bool(STATE.get("dataset_recording", False))
+        and current_episode_bucket_loaded_count() >= int(QUALITY_MIN_BUCKET_PARTICLES)
+    )
 
 
 def record_phase_metrics(label, q_cmd=None, q_real=None, action=None, need_full=None):
@@ -12178,12 +12296,23 @@ def compute_episode_quality_score(execution_success, reason):
     freezes = int(final_metrics.get("freeze_count", 0))
     samples = int(final_metrics.get("samples", 0))
     max_joint_err = float(final_metrics.get("max_joint_error_deg", 0.0))
+    raw_reason = str(reason)
+    raw_best_effort_unload_ik = bool(
+        max_bucket >= int(QUALITY_MIN_BUCKET_PARTICLES)
+        and "best IK error too high" in raw_reason
+        and (
+            "staged_unload_dump_pose" in raw_reason
+            or "unload_dump_pose" in raw_reason
+        )
+    )
+    best_effort_bin_success = bool(raw_best_effort_unload_ik and final_bin > 0)
+    effective_execution_success = bool(execution_success or best_effort_bin_success)
 
     dig_load_score = clamp01(max_bucket / max(1.0, float(QUALITY_TARGET_BUCKET_PARTICLES)))
     dump_transfer_score = clamp01(final_bin / max(1.0, float(max(lift_bucket, max_bucket))))
     retention_score = clamp01(lift_bucket / max(1.0, float(max_bucket)))
     smoothness_score = clamp01(1.0 - max(0.0, max_joint_err - 8.0) / 35.0)
-    completion_score = 1.0 if execution_success and freezes == 0 else 0.0
+    completion_score = 1.0 if effective_execution_success and freezes == 0 else 0.0
     spill_ratio = final_spill / max(1.0, float(lift_bucket))
 
     score = (
@@ -12199,9 +12328,10 @@ def compute_episode_quality_score(execution_success, reason):
 
     quality_reasons = []
     quality_warnings = []
-    if not execution_success:
-        raw_reason = str(reason)
-        if raw_reason.startswith((
+    if not effective_execution_success:
+        if raw_best_effort_unload_ik:
+            pass
+        elif raw_reason.startswith((
             "prepare_failed/",
             "preflight_failed/",
             "planning_failed/",
@@ -12222,6 +12352,16 @@ def compute_episode_quality_score(execution_success, reason):
     dump_gate_has_lifted_sand = bool(lift_bucket >= QUALITY_MIN_BUCKET_PARTICLES)
     if dump_gate_has_lifted_sand and final_bin < QUALITY_MIN_DUMP_PARTICLES:
         quality_warnings.append(f"quality_warning/low_final_bin_particles:{final_bin}")
+    best_effort_unload_warning = str(STATE.get("dataset_best_effort_unload_warning", "") or "")
+    if raw_best_effort_unload_ik and not best_effort_unload_warning:
+        best_effort_unload_warning = raw_reason
+    if best_effort_unload_warning:
+        quality_warnings.append(
+            "quality_warning/best_effort_unload_ik:"
+            + debug_short_string(best_effort_unload_warning, max_len=180)
+        )
+        if final_bin <= 0 and not any("best_effort_unload_no_bin_particles" in item for item in quality_reasons):
+            quality_reasons.append("quality_rejected/best_effort_unload_no_bin_particles:0")
     if spill_ratio > QUALITY_MAX_SPILL_RATIO:
         quality_warnings.append(f"quality_warning/high_spill_ratio:{spill_ratio:.2f}")
     if score < QUALITY_MIN_SCORE:
@@ -12229,10 +12369,12 @@ def compute_episode_quality_score(execution_success, reason):
     if samples <= 0:
         quality_reasons.append("diagnostic/no_samples")
 
-    quality_success = execution_success and len(quality_reasons) == 0
+    quality_success = effective_execution_success and len(quality_reasons) == 0
     return {
         "success": bool(quality_success),
-        "execution_success": bool(execution_success),
+        "execution_success": bool(effective_execution_success),
+        "raw_execution_success": bool(execution_success),
+        "best_effort_bin_success": bool(best_effort_bin_success),
         "score": float(score),
         "failure_reason": "; ".join(quality_reasons),
         "warning_reason": "; ".join(quality_warnings),
@@ -12418,6 +12560,7 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
     STATE["dataset_final_bin_from_pile_particles"] = 0
     STATE["dataset_final_spill_from_pile_particles"] = 0
     STATE["dataset_raw_region_spill_from_pile_particles"] = 0
+    STATE["dataset_best_effort_unload_warning"] = ""
     STATE["dataset_max_joint_error_deg"] = 0.0
     STATE["dataset_max_action_speed"] = 0.0
     STATE["bucket_load_fast_last"] = None
@@ -12625,6 +12768,7 @@ def auto_collect_finish_episode(meta, success, reason):
     reason = str(reason)
     score_report = compute_episode_quality_score(execution_success, reason)
     success = bool(score_report.get("success", False))
+    execution_success = bool(score_report.get("execution_success", execution_success))
     metrics = score_report.get("final_metrics", auto_collect_episode_metrics())
     moved_soil = max(
         int(metrics.get("max_bucket_from_pile_particles", 0)),
@@ -15285,7 +15429,7 @@ async def auto_collect_one_episode():
         return False
 
     meta = auto_collect_begin_episode(attempt, target, plan_attempts, seq, initial_info=initial_info)
-    await dataset_camera_warmup_for_episode(label=f"auto_collect_episode_{attempt:06d}")
+    await dataset_camera_warmup_for_auto_run_once(label=f"auto_collect_episode_{attempt:06d}")
 
     shared_plan = STATE.get("current_dig_plan")
     if isinstance(shared_plan, dict):
@@ -15402,6 +15546,8 @@ async def auto_collect_loop(count, max_attempts=None):
     STATE["debug_profile_last"] = None
     STATE["plan_build_summary"] = {}
     STATE["dataset_record_sample_spans"] = {}
+    STATE["dataset_camera_run_warmup_status"] = {}
+    STATE["dataset_camera_run_warmup_run_id"] = ""
     STATE["auto_scene_last_randomization"] = {}
     STATE["auto_scene_truck_baseline"] = None
     cancel_registered_task("startup_sand_reset", reason="auto_collect_loop_start")
@@ -15466,6 +15612,11 @@ async def auto_collect_loop(count, max_attempts=None):
             f"attempts_source={attempts_source}",
             f"attempt_multiplier={AUTO_COLLECT_MAX_ATTEMPT_MULTIPLIER}",
         )
+        camera_preflight_ok = await auto_collect_camera_preflight(
+            label=f"auto_collect_run_{STATE.get('auto_collect_run_id', '')}"
+        )
+        if not camera_preflight_ok:
+            return
         consecutive_prepare_failed = 0
         while (
             int(STATE.get("auto_collect_successes", 0)) < target_successes
@@ -16282,10 +16433,34 @@ def check_freeze_state(label="loop"):
     if suppress_contact_freeze:
         return
     action_mode_l = action_mode.lower()
+    bucket_idx = CTRL.name_to_idx.get("bucket", 3)
+    bucket_only_loaded_unload = bool(
+        blocked_names == ["bucket"]
+        and ("unload_to_bin" in action_mode_l or "loaded_route_group" in action_mode_l)
+        and current_episode_bucket_loaded_count() >= int(QUALITY_MIN_BUCKET_PARTICLES)
+    )
+    if bucket_only_loaded_unload:
+        bucket_err = float(cmd_err_deg[bucket_idx]) if len(cmd_err_deg) > bucket_idx else float(max_err)
+        if bucket_err <= float(FREEZE_LOADED_UNLOAD_BUCKET_SOFT_ERR_DEG):
+            STATE["freeze_candidate_since"] = 0.0
+            if now - float(STATE.get("freeze_last_print_time", 0.0)) >= float(FREEZE_PRINT_INTERVAL):
+                STATE["freeze_last_print_time"] = now
+                info_print(
+                    "[FREEZE SOFT IGNORE]",
+                    f"mode={action_mode}",
+                    f"bucket_err={bucket_err:.2f}deg",
+                    f"threshold={float(FREEZE_LOADED_UNLOAD_BUCKET_SOFT_ERR_DEG):.2f}deg",
+                    f"bucket_loaded={current_episode_bucket_loaded_count()}",
+                    "reason=loaded_unload_bucket_small_lag",
+                    force_log=debug_diagnostics_enabled(),
+                )
+            return
     if "swing" in blocked_names:
         min_duration = FREEZE_SWING_ONLY_MIN_DURATION
     elif "bucket" in blocked_names and ("cut" in action_mode_l or "dig" in action_mode_l or "pull" in action_mode_l):
         min_duration = FREEZE_BUCKET_CUT_MIN_DURATION
+    elif bucket_only_loaded_unload:
+        min_duration = FREEZE_LOADED_UNLOAD_BUCKET_MIN_DURATION
     else:
         min_duration = FREEZE_MIN_DURATION
     if candidate_age < min_duration:
@@ -18250,6 +18425,25 @@ def estimate_stage_motion_seconds(q0, q1, requested_seconds=0.0):
     return max(0.08, requested, max_joint_seconds + MOVE_DURATION_MARGIN_SECONDS)
 
 
+def estimate_loaded_unload_motion_seconds(q0, q1, requested_seconds=0.0):
+    seconds = estimate_stage_motion_seconds(q0, q1, requested_seconds=requested_seconds)
+    try:
+        q0_arr = np.array(q0, dtype=np.float32).reshape(-1)[:4]
+        q1_arr = np.array(q1, dtype=np.float32).reshape(-1)[:4]
+        swing_idx = CTRL.name_to_idx.get("swing", 0)
+        swing_deg = abs(rad_to_deg(swing_delta(float(q1_arr[swing_idx]), float(q0_arr[swing_idx]))))
+        if swing_deg > 1.0:
+            swing_rate = max(1.0, float(LOADED_ROUTE_CARRY_SWING_MAX_DEG_PER_S))
+            seconds = max(
+                float(seconds),
+                float(swing_deg) / swing_rate + float(LOADED_ROUTE_CARRY_SWING_TIME_PAD_SECONDS),
+            )
+        seconds = max(float(seconds), float(LOADED_ROUTE_FINAL_STAGE_SECONDS))
+    except Exception:
+        pass
+    return float(seconds)
+
+
 def motion_reach_report(q_goal):
     try:
         q_goal = np.array(q_goal, dtype=np.float32)
@@ -18768,8 +18962,8 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
             update_status(f"[MOVE STOPPED] {label}", force=True)
             return False
         if not loaded_route_fast_motion:
-            await dataset_camera_refresh_for_sample(label=label)
-            dataset_record_sample(mode, q_cmd=CTRL.q_cmd.copy(), label=label)
+            if dataset_record_sample_due():
+                await dataset_record_sample_async(mode, q_cmd=CTRL.q_cmd.copy(), label=label)
             notify_sand_site_tool_sample(mode)
         if is_sand_contact_phase(contact_stage_name):
             try:
@@ -22642,6 +22836,7 @@ def solve_priority_ik_to_target(
     soft_accept_err=None,
     deadline=None,
     score_goal_obstacle=True,
+    return_best_on_error=False,
 ):
     global IK_MODEL
 
@@ -22897,6 +23092,16 @@ def solve_priority_ik_to_target(
         return [(row["q"].copy(), info_from_row(row)) for row in rows], "ok"
 
     if best["planar_err"] > float(accept_err):
+        if bool(return_best_on_error):
+            info = info_from_row(best)
+            info["ik_planar_warning"] = True
+            info["ik_planar_warning_reason"] = (
+                f"warning_best_ik_error_too_high:planar={float(best['planar_err']):.3f}m>"
+                f"{float(accept_err):.3f}m"
+            )
+            info["ik_planar_best_effort"] = True
+            info["ik_planar_hard_accept_err_m"] = float(accept_err)
+            return best["q"].copy(), info
         return None, f"best IK error too high: planar={best['planar_err']:.3f} m"
 
     q_goal = best["q"]
@@ -24727,6 +24932,11 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                 if planning_deadline_exceeded(deadline):
                     break
 
+                duration = estimate_loaded_unload_motion_seconds(
+                    q_motion_seed,
+                    q_pre_dump,
+                    requested_seconds=duration,
+                )
                 motion = plan_joint_motion_metrics(q_pre_dump, q_motion_seed, duration)
                 if planning_deadline_exceeded(deadline):
                     fail_reasons.append("planning budget exceeded")
@@ -28283,27 +28493,55 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
     if not isinstance(final_drop, dict):
         final_drop = unload_drop_report(q=q_release_align, reference_q=q_lift)
     if isinstance(final_drop, dict) and not unload_drop_execution_ready(final_drop):
-        reason = (
-            "planning_failed/staged_unload_drop_unaligned:"
-            f"inside_xy={final_drop.get('inside_xy')} "
-            f"above_wall={final_drop.get('above_wall')} "
-            f"scatter_xy_ok={final_drop.get('scatter_xy_ok')} "
-            f"acceptance={final_drop.get('landing_acceptance')} "
-            f"xy_err={fmt_optional(final_drop.get('xy_err'))}"
+        best_effort_loaded = bool(
+            isinstance(dump_info, dict)
+            and bool(dump_info.get("best_effort_loaded_unload_warning", False))
         )
-        set_execution_failure_reason(reason)
-        info_print(
-            "[DIG PLAN STAGED FAILED]",
-            "stage=unload_to_bin",
-            "reason=drop_not_inside_bin",
-            f"inside_xy={final_drop.get('inside_xy')}",
-            f"above_wall={final_drop.get('above_wall')}",
-            f"scatter_xy_ok={final_drop.get('scatter_xy_ok')}",
-            f"acceptance={final_drop.get('landing_acceptance')}",
-            f"xy_err={fmt_optional(final_drop.get('xy_err'))}",
-            force_log=True,
-        )
-        return False
+        if best_effort_loaded:
+            warning_reason = (
+                "warning_best_effort_unload_drop_unaligned:"
+                f"inside_xy={final_drop.get('inside_xy')} "
+                f"above_wall={final_drop.get('above_wall')} "
+                f"scatter_xy_ok={final_drop.get('scatter_xy_ok')} "
+                f"acceptance={final_drop.get('landing_acceptance')} "
+                f"xy_err={fmt_optional(final_drop.get('xy_err'))}"
+            )
+            candidate.setdefault("warnings", [])
+            try:
+                candidate["warnings"].append(warning_reason)
+            except Exception:
+                candidate["warnings"] = [warning_reason]
+            STATE["dig_plan_candidate"] = candidate
+            info_print(
+                "[WARN] [DIG PLAN STAGED]",
+                "stage=unload_to_bin",
+                "action=continue_best_effort_loaded_unload",
+                f"bucket={current_episode_bucket_loaded_count()}",
+                f"reason={warning_reason}",
+                force_log=True,
+            )
+        else:
+            reason = (
+                "planning_failed/staged_unload_drop_unaligned:"
+                f"inside_xy={final_drop.get('inside_xy')} "
+                f"above_wall={final_drop.get('above_wall')} "
+                f"scatter_xy_ok={final_drop.get('scatter_xy_ok')} "
+                f"acceptance={final_drop.get('landing_acceptance')} "
+                f"xy_err={fmt_optional(final_drop.get('xy_err'))}"
+            )
+            set_execution_failure_reason(reason)
+            info_print(
+                "[DIG PLAN STAGED FAILED]",
+                "stage=unload_to_bin",
+                "reason=drop_not_inside_bin",
+                f"inside_xy={final_drop.get('inside_xy')}",
+                f"above_wall={final_drop.get('above_wall')}",
+                f"scatter_xy_ok={final_drop.get('scatter_xy_ok')}",
+                f"acceptance={final_drop.get('landing_acceptance')}",
+                f"xy_err={fmt_optional(final_drop.get('xy_err'))}",
+                force_log=True,
+            )
+            return False
     unload_exec_clearance = exec_clearance_for(q_pre_dump)
     info_print(
         "[UNLOAD EXEC GOAL]",
@@ -28477,7 +28715,7 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
 
     q_release_align = bucket_only_dump_pose(q_pre_dump, unload_release_alignment_bucket_deg(unload_dump_target_deg()))
     q_dump = bucket_only_dump_pose(q_pre_dump, unload_dump_target_deg())
-    unload_duration = estimate_stage_motion_seconds(
+    unload_duration = estimate_loaded_unload_motion_seconds(
         q_route_seed,
         q_pre_dump,
         requested_seconds=LOADED_ROUTE_FINAL_STAGE_SECONDS if loaded_route_test else 1.2,
@@ -29177,7 +29415,8 @@ def plan_unload_from_current():
         f"release_target={dump_info.get('release_target')} q_pre_dump={q_deg_values(q_pre_dump, wrap_swing_for_display=True)} "
         f"q_dump={q_deg_values(q_dump, wrap_swing_for_display=True)}"
     )
-    return ("unload_to_bin", q_pre_dump, 1.35)
+    duration = estimate_loaded_unload_motion_seconds(q_seed, q_pre_dump, requested_seconds=1.2)
+    return ("unload_to_bin", q_pre_dump, duration)
 
 
 def unload_dump_target_deg():
@@ -29212,6 +29451,7 @@ def plan_dump_pose_to_bin(
     goal_obstacle_check=True,
     bucket_candidate_count_override=None,
     release_z_override=None,
+    allow_best_effort_ik=None,
 ):
     if q_seed is None:
         q_seed = CTRL.q_cmd.copy()
@@ -29221,6 +29461,8 @@ def plan_dump_pose_to_bin(
         dump_deg = unload_dump_target_deg()
     final_dump_deg = float(dump_deg)
     release_alignment_bucket_deg = unload_release_alignment_bucket_deg(final_dump_deg)
+    if allow_best_effort_ik is None:
+        allow_best_effort_ik = loaded_bucket_best_effort_unload_allowed()
 
     bucket_idx = CTRL.name_to_idx["bucket"]
     q_seed_dump = q_seed.copy()
@@ -29436,6 +29678,7 @@ def plan_dump_pose_to_bin(
             ),
             deadline=deadline,
             score_goal_obstacle=bool(goal_obstacle_check),
+            return_best_on_error=bool(allow_best_effort_ik),
         )
 
         if q_dump is None:
@@ -29489,10 +29732,17 @@ def plan_dump_pose_to_bin(
         bucket_penalty = max(0.0, bucket_err - UNLOAD_DUMP_BUCKET_TOL_DEG)
         ik_bucket_penalty = max(0.0, ik_bucket_err - UNLOAD_DUMP_BUCKET_TOL_DEG)
         planar_err = float(info.get("planar_err", 0.0)) if isinstance(info, dict) else 0.0
-        ik_planar_warning = bool(planar_err > float(UNLOAD_DUMP_ACCEPT_ERR))
+        ik_planar_warning = bool(
+            planar_err > float(UNLOAD_DUMP_ACCEPT_ERR)
+            or (isinstance(info, dict) and bool(info.get("ik_planar_best_effort", False)))
+        )
         ik_planar_warning_reason = (
-            f"warning_ik_planar_err:{planar_err:.3f}m>"
-            f"{float(UNLOAD_DUMP_ACCEPT_ERR):.3f}m"
+            str(info.get("ik_planar_warning_reason"))
+            if isinstance(info, dict) and info.get("ik_planar_warning_reason")
+            else (
+                f"warning_ik_planar_err:{planar_err:.3f}m>"
+                f"{float(UNLOAD_DUMP_ACCEPT_ERR):.3f}m"
+            )
             if ik_planar_warning
             else ""
         )
@@ -29527,6 +29777,9 @@ def plan_dump_pose_to_bin(
         row["info"]["ik_planar_warning_reason"] = ik_planar_warning_reason
         row["info"]["ik_planar_soft_accept_err_m"] = float(UNLOAD_DUMP_ACCEPT_ERR)
         row["info"]["ik_planar_hard_accept_err_m"] = float(UNLOAD_DUMP_WARNING_ACCEPT_ERR)
+        row["info"]["best_effort_loaded_unload_warning"] = bool(
+            allow_best_effort_ik and ik_planar_warning
+        )
         row["info"]["center_alignment_warning"] = bool(center_alignment_warning)
         row["info"]["center_alignment_warning_reason"] = (
             "warning_center_release_not_exact_but_landing_inside_bin"
@@ -29594,6 +29847,10 @@ def plan_dump_pose_to_bin(
                     "center_soft_close_xy_high_release" if center_release_mode and not center_ready else "scatter_tolerant_high_release",
                 )
             )
+            if bool(row["info"].get("best_effort_loaded_unload_warning", False)):
+                STATE["dataset_best_effort_unload_warning"] = str(
+                    row["info"].get("ik_planar_warning_reason", "best_effort_loaded_unload")
+                )
             if log:
                 raw_swing = row["info"].get("raw_swing_goal")
                 swing_goal = row["info"].get("swing_goal")
@@ -29718,6 +29975,10 @@ def plan_dump_pose_to_bin(
         best["info"]["ik_bucket_err_deg"] = float(best.get("ik_bucket_err", 0.0))
         best["info"]["drop_alignment_ready"] = True
         best["info"]["drop_alignment_policy"] = str(drop.get("landing_acceptance", "scatter_tolerant_high_release"))
+        if bool(best["info"].get("best_effort_loaded_unload_warning", False)):
+            STATE["dataset_best_effort_unload_warning"] = str(
+                best["info"].get("ik_planar_warning_reason", "best_effort_loaded_unload")
+            )
         if log:
             info_print(
                 f"[UNLOAD DUMP PLAN] {label}: accepted_inside_bin_fallback "
@@ -29781,6 +30042,43 @@ def plan_dump_pose_to_bin(
                 q_seed_dump=q_seed_dump,
                 best_drop=drop,
                 reason=reason,
+            )
+            return best["q"], best["info"]
+        if bool(allow_best_effort_ik):
+            best["info"]["drop"] = drop
+            best["info"]["drop_target"] = vec_list(drop_target, 3)
+            best["info"]["pour_target"] = vec_list(best.get("pour_target"), 3)
+            best["info"]["release_target"] = vec_list(best.get("release_target"), 3)
+            best["info"]["release_source"] = drop.get("release_source", "bucket_opening_center")
+            best["info"]["dump_bucket_target_deg"] = float(final_dump_deg)
+            best["info"]["release_alignment_bucket_deg"] = float(release_alignment_bucket_deg)
+            best["info"]["q_release_align_rad"] = vec_list(best["q"], 4)
+            best["info"]["q_release_align_deg"] = q_deg_values(best["q"], wrap_swing_for_display=True)
+            best["info"]["dump_bucket_err_deg"] = float(best.get("bucket_err", 0.0))
+            best["info"]["ik_bucket_err_deg"] = float(best.get("ik_bucket_err", 0.0))
+            best["info"]["drop_alignment_ready"] = False
+            best["info"]["drop_alignment_policy"] = "best_effort_loaded_execute_then_score"
+            best["info"]["drop_alignment_reason"] = reason
+            best["info"]["best_effort_loaded_unload_warning"] = True
+            best["info"]["best_effort_loaded_bucket_count"] = int(current_episode_bucket_loaded_count())
+            STATE["dataset_best_effort_unload_warning"] = str(reason)
+            if log:
+                info_print(
+                    f"[WARN] [UNLOAD DUMP PLAN] {label}: best_effort_loaded_execute_then_score "
+                    f"bucket={current_episode_bucket_loaded_count()} "
+                    f"reason={reason} "
+                    f"planar_err={fmt_optional(best['info'].get('planar_err'))} "
+                    f"landing={drop.get('landing')} release={drop.get('release')} "
+                    f"q={q_deg_values(best['q'], wrap_swing_for_display=True)}"
+                )
+            draw_unload_dump_debug(
+                label,
+                landing_target=drop_target,
+                release_target=best.get("release_target"),
+                q_seed=q_seed,
+                q_seed_dump=q_seed_dump,
+                best_drop=drop,
+                reason="best_effort_loaded_execute_then_score:" + reason,
             )
             return best["q"], best["info"]
     else:
@@ -30020,6 +30318,23 @@ def record_unload_trajectory_sample(stage_name, label, q_cmd=None, force=True):
             info_print("[WARN] unload trajectory sample failed:", type(e).__name__, e)
 
 
+async def record_unload_trajectory_sample_async(stage_name, label, q_cmd=None, force=True):
+    """Async camera/state capture for direct unload motions that bypass move_to_profile."""
+    if not bool(STATE.get("dataset_recording", False)):
+        return
+    try:
+        q_cmd_now = CTRL.q_cmd.copy() if q_cmd is None else np.array(q_cmd, dtype=np.float32).reshape(-1)[:4].copy()
+        try:
+            q_real_now = current_real_q_near(q_cmd_now)
+        except Exception:
+            q_real_now = None
+        await dataset_record_sample_async(stage_name, q_cmd=q_cmd_now, q_real=q_real_now, label=label, force=force)
+    except Exception as e:
+        if time.time() - float(STATE.get("dataset_last_error_time", 0.0)) > 2.0:
+            STATE["dataset_last_error_time"] = time.time()
+            info_print("[WARN] unload trajectory sample failed:", type(e).__name__, e)
+
+
 def bucket_only_dump_ready(stage_name, dump_deg, label="before_dump"):
     try:
         q_real = current_real_q_near()
@@ -30054,12 +30369,12 @@ async def wait_for_dump_settle(stage_name, task_id=None):
         await step_updates(1)
         if (frame + 1) % sample_frames != 0 and (frame + 1) < max_frames:
             continue
-        record_unload_trajectory_sample(stage_name, "after_dump_settle_probe")
+        await record_unload_trajectory_sample_async(stage_name, "after_dump_settle_probe")
         if (frame + 1) >= min_frames:
             break
 
     record_phase_metrics("after_dump_settle", need_full=True)
-    record_unload_trajectory_sample(stage_name, "after_dump_settle")
+    await record_unload_trajectory_sample_async(stage_name, "after_dump_settle")
     return True
 
 
@@ -30085,7 +30400,7 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
     loaded_route_dump = str(STATE.get("active_task_name", "")) == "loaded_unload_route_test"
     metric_stride = max(1, int(UNLOAD_DUMP_METRIC_SAMPLE_STRIDE_LOADED if loaded_route_dump else 1))
     start_metrics = record_phase_metrics("before_dump_direct")
-    record_unload_trajectory_sample(stage_name, "before_dump_direct", q_cmd=q0)
+    await record_unload_trajectory_sample_async(stage_name, "before_dump_direct", q_cmd=q0)
     start_bucket_count = int(start_metrics.get("bucket_from_pile_count", 0)) if isinstance(start_metrics, dict) else 0
     start_bin_count = int(start_metrics.get("bin_from_pile_count", 0)) if isinstance(start_metrics, dict) and "bin_from_pile_count" in start_metrics else None
     if loaded_route_dump and bool(LOADED_ROUTE_STAGE_PARTICLE_DIAGNOSTICS):
@@ -30128,7 +30443,7 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
             set_execution_failure_reason(f"execution_failed/unload_dump_action_failed:{stage_name}:{send_reason}")
             return False
         await step_updates(wait_frames)
-        record_unload_trajectory_sample(stage_name, "during_dump_direct", q_cmd=q)
+        await record_unload_trajectory_sample_async(stage_name, "during_dump_direct", q_cmd=q)
         do_metric_sample = (i == 0) or ((i + 1) >= max_steps) or ((i + 1) % metric_stride == 0)
         if do_metric_sample:
             last_metrics = record_phase_metrics("during_dump_direct")
@@ -30165,7 +30480,7 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
         q_real = q_real_near_command(get_real_joint_positions(), q_final)
         err_deg = abs(rad_to_deg(float(q_final[bucket_idx] - q_real[bucket_idx])))
         end_metrics = record_phase_metrics("after_dump_direct")
-        record_unload_trajectory_sample(stage_name, "after_dump_direct", q_cmd=q_final)
+        await record_unload_trajectory_sample_async(stage_name, "after_dump_direct", q_cmd=q_final)
         bucket_end = int(end_metrics.get("bucket_from_pile_count", 0)) if isinstance(end_metrics, dict) else 0
         bin_end = int(end_metrics.get("bin_from_pile_count", 0)) if isinstance(end_metrics, dict) and "bin_from_pile_count" in end_metrics else None
         if loaded_route_dump and bool(LOADED_ROUTE_STAGE_PARTICLE_DIAGNOSTICS):

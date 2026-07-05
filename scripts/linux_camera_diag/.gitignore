@@ -1,0 +1,6 @@
+output/
+*.log
+*.tar.gz
+*.ppm
+*.png
+

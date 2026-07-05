@@ -5,7 +5,6 @@ import time
 
 import numpy as np
 import omni.usd
-import omni.kit.app
 try:
     import omni.replicator.core as rep
 except Exception:
@@ -13,18 +12,12 @@ except Exception:
 
 from pxr import Usd, UsdGeom, Gf, Sdf
 try:
-    from isaacsim.sensors.camera import Camera as IsaacCamera
-    HAS_ISAAC_CAMERA = True
-except Exception:
-    IsaacCamera = None
-    HAS_ISAAC_CAMERA = False
-try:
     from PIL import Image
 except Exception:
     Image = None
 
 
-CAMERA_MODULE_VERSION = "dataset_camera_no_manual_replicator_tick_v3"
+CAMERA_MODULE_VERSION = "dataset_camera_explicit_replicator_rgb_v13_offscreen_replicator_async"
 SYNC_STEP_ERROR_TEXT = "Synchronous call to `step`"
 
 
@@ -35,7 +28,82 @@ def replicator_tick_enabled(rt):
     state_value = rt.STATE.get("dataset_camera_replicator_tick_enabled", None)
     if state_value is not None:
         return bool(state_value)
-    return False
+    return True
+
+
+def syntheticdata_wait_enabled(rt):
+    value = os.environ.get("EXCAVATOR_CAMERA_SYNTHETICDATA_WAIT", "")
+    if value != "":
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(rt.STATE.get("dataset_camera_syntheticdata_wait_enabled", False))
+
+
+def camera_tick_timeout_seconds(rt):
+    return max(0.1, _state_float(rt, "dataset_camera_tick_timeout_s", "EXCAVATOR_CAMERA_TICK_TIMEOUT_S", 12.0))
+
+
+def camera_wait_for_render_enabled(rt):
+    value = os.environ.get("EXCAVATOR_CAMERA_WAIT_FOR_RENDER", "")
+    if value != "":
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    state_value = rt.STATE.get("dataset_camera_wait_for_render", None)
+    if state_value is not None:
+        return bool(state_value)
+    return True
+
+
+def camera_delta_time(rt):
+    value = os.environ.get("EXCAVATOR_CAMERA_DELTA_TIME", "")
+    if value == "":
+        value = rt.STATE.get("dataset_camera_delta_time", 0.0)
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in ("none", "null"):
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def camera_rt_subframes(rt):
+    value = os.environ.get("EXCAVATOR_CAMERA_RT_SUBFRAMES", "")
+    if value == "":
+        value = rt.STATE.get("dataset_camera_rt_subframes", 16)
+    try:
+        return max(1, int(value))
+    except Exception:
+        return 16
+
+
+def reset_replicator_tick_state(rt, reason=""):
+    rt.STATE["dataset_camera_replicator_step_disabled"] = False
+    rt.STATE["dataset_camera_replicator_step_disable_logged"] = False
+    rt.STATE["dataset_camera_replicator_step_disable_reason"] = ""
+    rt.STATE["dataset_camera_replicator_step_disable_detail"] = ""
+    rt.STATE["dataset_camera_tick_pending"] = False
+    rt.STATE["dataset_camera_last_tick_reset_reason"] = str(reason)
+
+
+def mark_replicator_step_disabled(rt, reason, detail=""):
+    reason = str(reason or "replicator_step_disabled")
+    detail = str(detail or "")
+    # Keep this as diagnostic state only. Production capture must fail fast
+    # when explicit Replicator RGB rendering fails.
+    rt.STATE["dataset_camera_replicator_step_disabled"] = False
+    rt.STATE["dataset_camera_replicator_step_disable_reason"] = reason
+    rt.STATE["dataset_camera_replicator_step_disable_detail"] = detail
+    return reason
+
+
+def disabled_step_context(rt):
+    return {
+        "replicator_step_disabled": bool(rt.STATE.get("dataset_camera_replicator_step_disabled", False)),
+        "disable_reason": str(rt.STATE.get("dataset_camera_replicator_step_disable_reason", "") or ""),
+        "disable_detail": str(rt.STATE.get("dataset_camera_replicator_step_disable_detail", "") or ""),
+        "last_tick_reset_reason": str(rt.STATE.get("dataset_camera_last_tick_reset_reason", "") or ""),
+    }
 
 
 def image_extension(rt):
@@ -55,107 +123,602 @@ def resolution(rt):
     return [max(32, width), max(32, height)]
 
 
-def _replicator_step_async(rt, rt_subframes=1):
+def _state_float(rt, key, env_key, default_value):
+    value = os.environ.get(env_key, "")
+    if value == "":
+        value = rt.STATE.get(key, default_value)
+    try:
+        return float(value)
+    except Exception:
+        return float(default_value)
+
+
+def camera_black_mean_threshold(rt):
+    return max(0.0, _state_float(rt, "dataset_camera_black_mean_threshold", "EXCAVATOR_DATASET_CAMERA_BLACK_MEAN", 0.5))
+
+
+def camera_black_max_threshold(rt):
+    return max(0.0, _state_float(rt, "dataset_camera_black_max_threshold", "EXCAVATOR_DATASET_CAMERA_BLACK_MAX", 2.0))
+
+
+def coerce_rgb_uint8(rgb):
+    if rgb is None:
+        return None, "rgb_none", {}
+    try:
+        arr = np.asarray(rgb)
+    except Exception as exc:
+        return None, f"rgb_array_error:{type(exc).__name__}:{exc}", {}
+    if arr.ndim != 3 or arr.shape[-1] < 3:
+        return None, f"rgb_bad_shape:{list(arr.shape)}", {}
+    arr = arr[:, :, :3]
+    source_dtype = str(arr.dtype)
+    source_min = None
+    source_max = None
+    if arr.size:
+        try:
+            source_min = float(np.nanmin(arr))
+            source_max = float(np.nanmax(arr))
+        except Exception:
+            source_min = None
+            source_max = None
+    if np.issubdtype(arr.dtype, np.floating):
+        arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=0.0)
+        if source_max is not None and source_max <= 1.5 and (source_min is None or source_min >= -0.01):
+            arr = arr * 255.0
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    elif arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    else:
+        arr = np.ascontiguousarray(arr)
+    stats = rgb_stats(arr)
+    stats["source_dtype"] = source_dtype
+    if source_min is not None:
+        stats["source_min"] = source_min
+    if source_max is not None:
+        stats["source_max"] = source_max
+    return arr, "ok", stats
+
+
+def resize_rgb_to_resolution(rgb, target_resolution):
+    arr = np.asarray(rgb)
+    if arr.ndim != 3 or arr.shape[-1] < 3:
+        return None, f"resize_bad_shape:{list(arr.shape)}"
+    target_w = int(target_resolution[0])
+    target_h = int(target_resolution[1])
+    if int(arr.shape[1]) == target_w and int(arr.shape[0]) == target_h:
+        return np.ascontiguousarray(arr[:, :, :3]), "ok"
+    arr = np.ascontiguousarray(arr[:, :, :3])
+    if Image is not None:
+        try:
+            image = Image.fromarray(arr)
+            image = image.resize((target_w, target_h), Image.Resampling.BILINEAR)
+            return np.asarray(image, dtype=np.uint8), "pil_resize"
+        except Exception as exc:
+            return None, f"pil_resize_failed:{type(exc).__name__}:{exc}"
+    try:
+        y_idx = np.linspace(0, max(0, arr.shape[0] - 1), target_h).astype(np.int32)
+        x_idx = np.linspace(0, max(0, arr.shape[1] - 1), target_w).astype(np.int32)
+        return np.ascontiguousarray(arr[y_idx][:, x_idx, :3]), "nearest_resize"
+    except Exception as exc:
+        return None, f"nearest_resize_failed:{type(exc).__name__}:{exc}"
+
+
+def rgb_stats(rgb):
+    arr = np.asarray(rgb)
+    if arr.ndim != 3 or arr.shape[-1] < 3 or arr.size == 0:
+        return {"shape": [int(x) for x in arr.shape], "mean": 0.0, "max": 0}
+    arr = arr[:, :, :3]
+    flat = arr.reshape(-1, 3)
+    step = max(1, int(flat.shape[0] // 4096))
+    sample = flat[::step]
+    return {
+        "shape": [int(x) for x in arr.shape],
+        "mean": float(np.mean(sample)) if sample.size else 0.0,
+        "max": int(np.max(sample)) if sample.size else 0,
+        "min": int(np.min(sample)) if sample.size else 0,
+    }
+
+
+def validate_rgb_content(rt, rgb, stats=None):
+    if rgb is None:
+        return False, "rgb_none"
+    if stats is None:
+        stats = rgb_stats(rgb)
+    mean_value = float(stats.get("mean", 0.0) or 0.0)
+    max_value = float(stats.get("max", 0.0) or 0.0)
+    if max_value <= camera_black_max_threshold(rt) and mean_value <= camera_black_mean_threshold(rt):
+        return False, f"black_frame:mean={mean_value:.3f}:max={max_value:.0f}"
+    return True, "ok"
+
+
+def camera_render_product_paths(rt):
+    render_products = rt.STATE.get("dataset_camera_render_products")
+    if isinstance(render_products, dict) and render_products:
+        paths = []
+        seen = set()
+        for name in rt.DATASET_CAMERA_NAMES:
+            path = render_product_path(render_products.get(str(name)))
+            if path and path not in seen:
+                seen.add(path)
+                paths.append(path)
+        return paths
+    objects = rt.STATE.get("dataset_camera_objects")
+    if not isinstance(objects, dict):
+        return []
+    paths = []
+    seen = set()
+    for name in rt.DATASET_CAMERA_NAMES:
+        cam = objects.get(str(name))
+        if cam is None:
+            continue
+        path = ""
+        try:
+            getter = getattr(cam, "get_render_product_path", None)
+            if callable(getter):
+                path = str(getter() or "")
+            if not path:
+                path = str(getattr(cam, "_render_product_path", "") or "")
+        except Exception:
+            path = ""
+        if path and path not in seen:
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def render_product_path(render_product):
+    if render_product is None:
+        return ""
+    try:
+        return str(render_product.path)
+    except Exception:
+        pass
+    try:
+        return str(render_product.get_output_prims()["renderProduct"][0])
+    except Exception:
+        pass
+    return str(render_product)
+
+
+def simulation_render_product_path(render_product):
+    """Path used by SyntheticData NEW_FRAME events for a render product."""
+    if render_product is None:
+        return ""
+    try:
+        hydra_texture = getattr(render_product, "hydra_texture", None)
+        getter = getattr(hydra_texture, "get_render_product_path", None)
+        if callable(getter):
+            path = str(getter() or "")
+            if path and not path.startswith("/"):
+                path = "/Render/RenderProduct_" + path
+            if path:
+                return path
+    except Exception:
+        pass
+    path = render_product_path(render_product)
+    if path.startswith("/Render/OmniverseKit/HydraTextures/"):
+        name = path.rsplit("/", 1)[-1]
+        if name:
+            return "/Render/RenderProduct_" + name
+    return path
+
+
+def camera_sim_render_product_paths(rt):
+    render_products = rt.STATE.get("dataset_camera_render_products")
+    if not isinstance(render_products, dict):
+        return []
+    paths = []
+    seen = set()
+    for name in rt.DATASET_CAMERA_NAMES:
+        path = simulation_render_product_path(render_products.get(str(name)))
+        if path and path not in seen:
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def set_render_products_updates_enabled(rt, enabled=True):
+    render_products = rt.STATE.get("dataset_camera_render_products")
+    if not isinstance(render_products, dict):
+        return 0
+    count = 0
+    for render_product in list(render_products.values()):
+        try:
+            hydra_texture = getattr(render_product, "hydra_texture", None)
+            setter = getattr(hydra_texture, "set_updates_enabled", None)
+            if callable(setter):
+                setter(bool(enabled))
+                count += 1
+        except Exception:
+            continue
+    rt.STATE["dataset_camera_render_product_updates_enabled"] = bool(enabled)
+    rt.STATE["dataset_camera_render_product_updates_enabled_count"] = int(count)
+    return count
+
+
+def get_rgb_annotator():
+    if rep is None:
+        raise RuntimeError("replicator_unavailable")
+    registry = getattr(rep, "AnnotatorRegistry", None)
+    if registry is not None and callable(getattr(registry, "get_annotator", None)):
+        return registry.get_annotator("rgb")
+    annotators = getattr(rep, "annotators", None)
+    getter = getattr(annotators, "get", None)
+    if callable(getter):
+        return getter("rgb")
+    raise RuntimeError("rgb_annotator_registry_unavailable")
+
+
+def attach_annotator_to_render_product(annotator, render_product):
+    path = render_product_path(render_product)
+    attempts = []
+    if path:
+        attempts.append([path])
+    attempts.append([render_product])
+    attempts.append(render_product)
+    last_error = None
+    for target in attempts:
+        try:
+            annotator.attach(target)
+            return True, "ok"
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None:
+        return False, f"{type(last_error).__name__}:{last_error}"
+    return False, "attach_target_missing"
+
+
+def disable_capture_on_play(rt):
+    if rep is None:
+        return {"ok": False, "reason": "replicator_unavailable", "captureOnPlay": None}
+    try:
+        rep.orchestrator.set_capture_on_play(False)
+        return {"ok": True, "reason": "set_false_ok", "captureOnPlay": False}
+    except Exception as exc:
+        return {"ok": False, "reason": f"{type(exc).__name__}:{exc}", "captureOnPlay": None}
+
+
+def camera_fingerprint(rt, status=None):
+    status = status if isinstance(status, dict) else rt.STATE.get("dataset_camera_last_status", {})
+    if not isinstance(status, dict):
+        status = {}
+    views = status.get("views", {}) if isinstance(status.get("views", {}), dict) else {}
+    result = {
+        "module_version": CAMERA_MODULE_VERSION,
+        "module_file": __file__,
+        "backend": backend(rt),
+        "captureOnPlay": (rt.STATE.get("dataset_camera_capture_on_play_status") or {}).get("captureOnPlay"),
+        "captureOnPlay_status": rt.STATE.get("dataset_camera_capture_on_play_status"),
+        "replicator_available": bool(rep is not None),
+        "wait_for_render": bool(camera_wait_for_render_enabled(rt)),
+        "delta_time": camera_delta_time(rt),
+        "tick_timeout_s": float(camera_tick_timeout_seconds(rt)),
+        "rt_subframes": int(camera_rt_subframes(rt)),
+        "replicator_step": disabled_step_context(rt),
+        "render_tick": dict(rt.STATE.get("dataset_camera_render_tick_status", {}) or {}),
+        "required_cameras": [str(x) for x in rt.DATASET_CAMERA_NAMES],
+        "views": {},
+    }
+    for name in rt.DATASET_CAMERA_NAMES:
+        name = str(name)
+        view = views.get(name, {}) if isinstance(views.get(name, {}), dict) else {}
+        render_product_obj = None
+        render_products = rt.STATE.get("dataset_camera_render_products")
+        if isinstance(render_products, dict):
+            render_product_obj = render_products.get(name)
+        result["views"][name] = {
+            "prim": str(view.get("path") or view.get("prim_path") or ""),
+            "valid": bool(view.get("available", False)),
+            "render_product": str(view.get("render_product", "")),
+            "sim_render_product": simulation_render_product_path(render_product_obj),
+            "annotator": str(view.get("rgb_annotator", "")),
+            "reason": str(view.get("reason", "")),
+        }
+    return result
+
+
+def log_camera_fingerprint(rt, status=None, force=False):
+    fp = camera_fingerprint(rt, status=status)
+    key = repr(fp)
+    if (not force) and rt.STATE.get("dataset_camera_last_fingerprint_key") == key:
+        return fp
+    rt.STATE["dataset_camera_last_fingerprint_key"] = key
+    pieces = [
+        "[DATASET CAMERA FINGERPRINT]",
+        f"module={fp.get('module_version')}",
+        f"backend={fp.get('backend')}",
+        f"captureOnPlay={fp.get('captureOnPlay')}",
+        f"captureOnPlay_status={(fp.get('captureOnPlay_status') or {}).get('reason')}",
+        f"replicator={fp.get('replicator_available')}",
+        f"wait_for_render={fp.get('wait_for_render')}",
+        f"rt_subframes={fp.get('rt_subframes')}",
+        f"tick_timeout_s={fp.get('tick_timeout_s'):.2f}",
+    ]
+    for name in rt.DATASET_CAMERA_NAMES:
+        view = (fp.get("views") or {}).get(str(name), {})
+        pieces.append(
+            f"{name}:prim={view.get('prim')} valid={view.get('valid')} "
+            f"rp={view.get('render_product')} annotator={view.get('annotator')} reason={view.get('reason')}"
+        )
+    rt.info_print(*pieces)
+    return fp
+
+
+def format_rgb_stats(views):
+    chunks = []
+    views = views if isinstance(views, dict) else {}
+    for name in sorted(str(x) for x in views.keys()):
+        view = views.get(name, {}) if isinstance(views.get(name, {}), dict) else {}
+        stats = view.get("rgb_stats", {}) if isinstance(view.get("rgb_stats", {}), dict) else {}
+        shape = stats.get("shape") or view.get("shape")
+        mean_value = float(stats.get("mean", 0.0) or 0.0)
+        max_value = float(stats.get("max", 0.0) or 0.0)
+        dtype = view.get("dtype") or stats.get("source_dtype", "")
+        chunks.append(f"{name}:shape={shape} dtype={dtype} mean={mean_value:.3f} max={max_value:.0f}")
+    return " ".join(chunks)
+
+
+def read_rgb_frames(rt):
+    annotators = rt.STATE.get("dataset_camera_rgb_annotators")
+    if not isinstance(annotators, dict):
+        return None, {"ok": False, "reason": "annotators_missing", "views": {}}
+    frames = {}
+    views = {}
+    failures = []
+    for name in rt.DATASET_CAMERA_NAMES:
+        name = str(name)
+        annotator = annotators.get(name)
+        view_payload = {"available": False, "name": name, "reason": ""}
+        if annotator is None:
+            reason = "annotator_missing"
+            view_payload["reason"] = reason
+            views[name] = view_payload
+            failures.append(f"{name}:{reason}")
+            continue
+        try:
+            raw = annotator.get_data()
+            rgb, reason, stats = coerce_rgb_uint8(raw)
+            view_payload["rgb_stats"] = stats
+            if rgb is None:
+                view_payload["reason"] = reason
+                views[name] = view_payload
+                failures.append(f"{name}:{reason}")
+                continue
+            valid, valid_reason = validate_rgb_content(rt, rgb, stats)
+            if not valid:
+                if str(valid_reason).startswith("black_frame"):
+                    rt.STATE["dataset_camera_black_rejected"] = int(rt.STATE.get("dataset_camera_black_rejected", 0) or 0) + 1
+                view_payload["reason"] = valid_reason
+                views[name] = view_payload
+                failures.append(f"{name}:{valid_reason}")
+                continue
+            view_payload.update(
+                {
+                    "available": True,
+                    "reason": "ok",
+                    "shape": [int(x) for x in rgb.shape],
+                    "dtype": str(rgb.dtype),
+                    "capture_backend": backend(rt),
+                }
+            )
+            frames[name] = np.ascontiguousarray(rgb[:, :, :3])
+            views[name] = view_payload
+        except Exception as exc:
+            reason = f"{type(exc).__name__}:{exc}"
+            view_payload["reason"] = reason
+            views[name] = view_payload
+            failures.append(f"{name}:{reason}")
+    if failures:
+        return None, {"ok": False, "reason": ",".join(failures), "views": views}
+    return frames, {"ok": True, "reason": "ok", "views": views}
+
+
+def resolve_syntheticdata_sensors():
+    errors = []
+    try:
+        import omni.syntheticdata as syntheticdata
+
+        sensors = getattr(syntheticdata, "sensors", None)
+        if sensors is not None and callable(getattr(sensors, "next_render_simulation_async", None)):
+            return sensors, "omni.syntheticdata.sensors_attr"
+        errors.append("omni.syntheticdata.sensors_attr:missing_next_render_simulation_async")
+    except Exception as exc:
+        errors.append(f"omni.syntheticdata:{type(exc).__name__}:{exc}")
+    try:
+        from omni.syntheticdata import sensors
+
+        if callable(getattr(sensors, "next_render_simulation_async", None)):
+            return sensors, "from_omni.syntheticdata_import_sensors"
+        errors.append("from_omni.syntheticdata_import_sensors:missing_next_render_simulation_async")
+    except Exception as exc:
+        errors.append(f"from_omni.syntheticdata_import_sensors:{type(exc).__name__}:{exc}")
+    try:
+        import omni.syntheticdata.sensors as sensors
+
+        if callable(getattr(sensors, "next_render_simulation_async", None)):
+            return sensors, "omni.syntheticdata.sensors_module"
+        errors.append("omni.syntheticdata.sensors_module:missing_next_render_simulation_async")
+    except Exception as exc:
+        errors.append(f"omni.syntheticdata.sensors_module:{type(exc).__name__}:{exc}")
+    return None, "syntheticdata_unavailable:" + " | ".join(errors)
+
+
+async def tick_camera_render_products_async(rt, frames=0):
+    paths = camera_sim_render_product_paths(rt)
+    hydra_paths = camera_render_product_paths(rt)
+    if not paths:
+        rt.STATE["dataset_camera_render_tick_status"] = {
+            "ok": False,
+            "reason": "no_sim_render_products",
+            "paths": [],
+            "hydra_paths": hydra_paths,
+        }
+        return False, "no_render_products"
+    sd_sensors, source = resolve_syntheticdata_sensors()
+    if sd_sensors is None:
+        reason = source
+        rt.STATE["dataset_camera_render_tick_status"] = {
+            "ok": False,
+            "reason": reason,
+            "paths": paths,
+            "hydra_paths": hydra_paths,
+        }
+        return False, reason
+    failures = []
+    frame_offset = max(0, int(frames))
+    for path in paths:
+        try:
+            await sd_sensors.next_render_simulation_async(path, frame_offset)
+        except Exception as exc:
+            failures.append(f"{path}:{type(exc).__name__}:{exc}")
+    if failures:
+        reason = ";".join(failures)
+        rt.STATE["dataset_camera_render_tick_status"] = {
+            "ok": False,
+            "reason": reason,
+            "paths": paths,
+            "hydra_paths": hydra_paths,
+            "frame_offset": int(frame_offset),
+        }
+        now = time.time()
+        if now - float(rt.STATE.get("dataset_camera_last_render_tick_error_time", 0.0)) > 2.0:
+            rt.STATE["dataset_camera_last_render_tick_error_time"] = now
+            rt.info_print("[WARN] dataset camera render tick failed:", reason)
+        return False, reason
+    reason = f"rendered:{len(paths)}"
+    rt.STATE["dataset_camera_render_tick_status"] = {
+        "ok": True,
+        "reason": reason,
+        "paths": paths,
+        "hydra_paths": hydra_paths,
+        "source": source,
+        "frame_offset": int(frame_offset),
+    }
+    return True, reason
+
+
+def _replicator_step_async(rt, rt_subframes=1, wait_for_render=None, delta_time=None):
     if rep is None:
         return None
     step_async = getattr(rep.orchestrator, "step_async", None)
     if not callable(step_async):
         return None
-    return step_async(
-        rt_subframes=int(rt_subframes),
-        delta_time=rt.CONTROL_DT,
-        pause_timeline=False,
-    )
-
-
-def global_tick(rt):
-    if not replicator_tick_enabled(rt):
-        return True
-    if rep is None:
-        rt.info_print("[WARN] camera tick failed:", "replicator_unavailable")
-        return False
-    if bool(rt.STATE.get("dataset_camera_replicator_step_disabled", False)):
-        return True
-    install_replicator_simtime_guard(rt)
+    if wait_for_render is None:
+        wait_for_render = camera_wait_for_render_enabled(rt)
+    if delta_time is None:
+        delta_time = camera_delta_time(rt)
+    kwargs = {
+        "rt_subframes": int(rt_subframes),
+        "delta_time": None if delta_time is None else float(delta_time),
+        "pause_timeline": False,
+        "wait_for_render": bool(wait_for_render),
+    }
     try:
-        # This module runs inside Kit's asyncio loop. Replicator's synchronous
-        # orchestrator.step() is only legal in standalone workflows, so the
-        # sync API here only schedules step_async and returns immediately.
-        if bool(rt.STATE.get("dataset_camera_tick_pending", False)):
-            return True
-        pending = _replicator_step_async(rt, rt_subframes=1)
-        if inspect.isawaitable(pending):
-            rt.STATE["dataset_camera_tick_pending"] = True
-            task = asyncio.ensure_future(pending)
-
-            def _clear_tick_pending(_task):
-                rt.STATE["dataset_camera_tick_pending"] = False
-                try:
-                    _task.result()
-                except Exception as exc:
-                    if SYNC_STEP_ERROR_TEXT in str(exc):
-                        rt.STATE["dataset_camera_replicator_step_disabled"] = True
-                        if not bool(rt.STATE.get("dataset_camera_replicator_step_disable_logged", False)):
-                            rt.STATE["dataset_camera_replicator_step_disable_logged"] = True
-                            rt.info_print(
-                                "[WARN] camera async tick disabled:",
-                                type(exc).__name__,
-                                "Kit rejected Replicator step_async; using IsaacCamera/Kit update frames only",
-                            )
-                    else:
-                        rt.info_print("[WARN] camera async tick failed:", type(exc).__name__, exc)
-
-            task.add_done_callback(_clear_tick_pending)
-        elif pending is None:
-            return True
-        return True
-    except Exception as e:
-        rt.STATE["dataset_camera_tick_pending"] = False
-        if SYNC_STEP_ERROR_TEXT in str(e):
-            rt.STATE["dataset_camera_replicator_step_disabled"] = True
-            if not bool(rt.STATE.get("dataset_camera_replicator_step_disable_logged", False)):
-                rt.STATE["dataset_camera_replicator_step_disable_logged"] = True
-                rt.info_print(
-                    "[WARN] camera async tick disabled:",
-                    type(e).__name__,
-                    "Kit rejected Replicator step_async; using IsaacCamera/Kit update frames only",
-                )
-            return True
-        rt.info_print("[WARN] camera tick failed:", type(e).__name__, e)
-        return False
+        return step_async(**kwargs)
+    except TypeError:
+        kwargs.pop("wait_for_render", None)
+        return step_async(**kwargs)
 
 
 async def global_tick_async(rt):
     if not replicator_tick_enabled(rt):
         await rt.step_updates(1)
+        rt.STATE["dataset_camera_render_tick_status"] = {
+            "ok": True,
+            "reason": "kit_update",
+            "paths": camera_render_product_paths(rt),
+            "source": "kit_update",
+        }
+        if syntheticdata_wait_enabled(rt):
+            await tick_camera_render_products_async(rt, frames=0)
         return True
     if rep is None:
         rt.info_print("[WARN] camera tick failed:", "replicator_unavailable")
         return False
-    if bool(rt.STATE.get("dataset_camera_replicator_step_disabled", False)):
-        await rt.step_updates(1)
-        return True
     install_replicator_simtime_guard(rt)
     try:
         rt.STATE["dataset_camera_tick_pending"] = False
-        pending = _replicator_step_async(rt, rt_subframes=1)
+        rt.STATE["dataset_camera_capture_on_play_status"] = disable_capture_on_play(rt)
+        wait_for_render = camera_wait_for_render_enabled(rt)
+        rt_subframes = camera_rt_subframes(rt)
+        delta_time = camera_delta_time(rt)
+        updates_enabled_count = set_render_products_updates_enabled(rt, True)
+        pending = _replicator_step_async(
+            rt,
+            rt_subframes=rt_subframes,
+            wait_for_render=wait_for_render,
+            delta_time=delta_time,
+        )
         if inspect.isawaitable(pending):
-            await pending
-        elif pending is None:
+            try:
+                await asyncio.wait_for(pending, timeout=camera_tick_timeout_seconds(rt))
+            except asyncio.TimeoutError:
+                detail = (
+                    f"timeout_s={camera_tick_timeout_seconds(rt):.3f};"
+                    f"wait_for_render={bool(wait_for_render)};"
+                    f"rt_subframes={int(rt_subframes)};delta_time={delta_time}"
+                )
+                mark_replicator_step_disabled(rt, "replicator_step_async_timeout", detail)
+                rt.STATE["dataset_camera_render_tick_status"] = {
+                    "ok": False,
+                    "reason": "replicator_step_async_timeout",
+                    "paths": camera_render_product_paths(rt),
+                    "source": "replicator_step_async",
+                    "timeout_s": camera_tick_timeout_seconds(rt),
+                    "wait_for_render": bool(wait_for_render),
+                    "delta_time": delta_time,
+                    "rt_subframes": int(rt_subframes),
+                    "updates_enabled_count": int(updates_enabled_count),
+                }
+                now = time.time()
+                if now - float(rt.STATE.get("dataset_camera_last_tick_timeout_log_time", 0.0)) > 2.0:
+                    rt.STATE["dataset_camera_last_tick_timeout_log_time"] = now
+                    rt.info_print(
+                        "[WARN] camera async tick timeout; explicit Replicator RGB capture failed fast",
+                        f"timeout={camera_tick_timeout_seconds(rt):.2f}s",
+                    )
+                return False
             await rt.step_updates(1)
+            rt.STATE["dataset_camera_render_tick_status"] = {
+                "ok": True,
+                "reason": "replicator_step_async",
+                "paths": camera_render_product_paths(rt),
+                "source": "replicator_step_async",
+                "wait_for_render": bool(wait_for_render),
+                "delta_time": delta_time,
+                "rt_subframes": int(rt_subframes),
+                "updates_enabled_count": int(updates_enabled_count),
+            }
+        elif pending is None:
+            mark_replicator_step_disabled(rt, "replicator_step_async_missing", "rep.orchestrator.step_async unavailable")
+            rt.STATE["dataset_camera_render_tick_status"] = {
+                "ok": False,
+                "reason": "replicator_step_async_missing",
+                "paths": camera_render_product_paths(rt),
+                "source": "replicator_step_async",
+            }
+            return False
+        if syntheticdata_wait_enabled(rt):
+            await tick_camera_render_products_async(rt, frames=0)
         return True
     except Exception as e:
         if SYNC_STEP_ERROR_TEXT in str(e):
-            rt.STATE["dataset_camera_replicator_step_disabled"] = True
+            mark_replicator_step_disabled(rt, "replicator_step_async_rejected", f"{type(e).__name__}:{e}")
             if not bool(rt.STATE.get("dataset_camera_replicator_step_disable_logged", False)):
                 rt.STATE["dataset_camera_replicator_step_disable_logged"] = True
                 rt.info_print(
                     "[WARN] camera async tick disabled:",
                     type(e).__name__,
-                    "Kit rejected Replicator step_async; using IsaacCamera/Kit update frames only",
+                    "Kit rejected Replicator step_async; RGB frames will not be marked ready until async render succeeds",
                 )
-            await rt.step_updates(1)
-            return True
+            rt.STATE["dataset_camera_render_tick_status"] = {
+                "ok": False,
+                "reason": "replicator_step_async_rejected",
+                "paths": camera_render_product_paths(rt),
+                "source": "replicator_step_async",
+                "detail": f"{type(e).__name__}:{e}",
+            }
+            return False
         rt.info_print("[WARN] camera tick failed:", type(e).__name__, e)
         return False
 
@@ -207,17 +770,17 @@ def install_replicator_simtime_guard(rt):
 
 
 def warmup_graph(rt, frames=5):
-    if not replicator_tick_enabled(rt):
-        return
-    if bool(rt.STATE.get("dataset_camera_replicator_step_disabled", False)):
-        return
-    for _ in range(max(1, int(frames))):
-        global_tick(rt)
+    rt.STATE["dataset_camera_render_tick_status"] = {
+        "ok": False,
+        "reason": "warmup_graph_deprecated_use_warmup_for_episode",
+        "paths": camera_render_product_paths(rt),
+        "source": "sync_noop",
+    }
 
 
 def backend(rt):
-    rt.STATE["dataset_camera_backend"] = "isaac"
-    return "isaac"
+    rt.STATE["dataset_camera_backend"] = "replicator_rgb"
+    return "replicator_rgb"
 
 
 def specs(rt):
@@ -336,11 +899,9 @@ def world_pose(rt, path):
 def save_rgb_image(rt, path, rgb, ensure_dir=True):
     if ensure_dir:
         rt.ensure_parent_dir(path)
-    rgb = np.asarray(rgb)
-    if rgb.ndim == 3 and rgb.shape[-1] == 4:
-        rgb = rgb[:, :, :3]
-    if rgb.dtype != np.uint8:
-        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+    rgb, reason, _stats = coerce_rgb_uint8(rgb)
+    if rgb is None:
+        raise ValueError(f"invalid_rgb:{reason}")
     if Image is not None and str(path).lower().endswith(".png"):
         compress_level = int(rt.STATE.get("dataset_camera_png_compress_level", 3) or 3)
         compress_level = max(0, min(9, compress_level))
@@ -383,8 +944,28 @@ def runtime_ready(rt):
 
 
 def shutdown(rt, reason="shutdown"):
-    objects = rt.STATE.get("dataset_camera_objects")
     closed = 0
+    annotators = rt.STATE.get("dataset_camera_rgb_annotators")
+    if isinstance(annotators, dict):
+        for _name, annotator in list(annotators.items()):
+            method = getattr(annotator, "detach", None)
+            if callable(method):
+                try:
+                    method()
+                    closed += 1
+                except Exception:
+                    pass
+    render_products = rt.STATE.get("dataset_camera_render_products")
+    if isinstance(render_products, dict):
+        for _name, render_product in list(render_products.items()):
+            method = getattr(render_product, "destroy", None)
+            if callable(method):
+                try:
+                    method()
+                    closed += 1
+                except Exception:
+                    pass
+    objects = rt.STATE.get("dataset_camera_objects")
     if isinstance(objects, dict):
         for _name, cam in list(objects.items()):
             for method_name in ("destroy", "cleanup", "stop", "pause"):
@@ -398,6 +979,8 @@ def shutdown(rt, reason="shutdown"):
                 except Exception:
                     continue
     rt.STATE["dataset_camera_objects"] = {}
+    rt.STATE["dataset_camera_render_products"] = {}
+    rt.STATE["dataset_camera_rgb_annotators"] = {}
     rt.STATE["dataset_camera_initialized"] = False
     rt.STATE["dataset_camera_init_attempted"] = False
     rt.STATE["dataset_camera_last_status"] = {"enabled": bool(rt.STATE.get("dataset_camera_enabled", True)), "available": False, "reason": reason, "closed": closed}
@@ -409,30 +992,38 @@ def initialize(rt, force=False):
         rt.STATE["dataset_camera_last_status"] = {"enabled": False, "reason": "disabled"}
         return False
     current_backend = backend(rt)
-    if current_backend == "isaac" and (not HAS_ISAAC_CAMERA or IsaacCamera is None):
-        rt.STATE["dataset_camera_last_status"] = {"enabled": True, "available": False, "reason": "isaac_camera_api_unavailable", "backend": current_backend}
+    if rep is None:
+        rt.STATE["dataset_camera_last_status"] = {"enabled": True, "available": False, "reason": "replicator_unavailable", "backend": current_backend}
         return False
     ready, ready_reason = runtime_ready(rt)
     if not ready:
         rt.STATE["dataset_camera_last_status"] = {"enabled": True, "available": False, "reason": ready_reason, "backend": current_backend}
         return False
     if bool(rt.STATE.get("dataset_camera_initialized", False)) and not force:
-        objects = rt.STATE.get("dataset_camera_objects")
-        if isinstance(objects, dict) and objects:
+        annotators = rt.STATE.get("dataset_camera_rgb_annotators")
+        if isinstance(annotators, dict) and all(str(name) in annotators for name in rt.DATASET_CAMERA_NAMES):
             return True
 
     stage_obj = omni.usd.get_context().get_stage()
     cam_resolution = resolution(rt)
-    frequency = int(rt.STATE.get("dataset_camera_frequency", 10) or 10)
-    objects = {}
+    render_products = {}
+    annotators = {}
     install_replicator_simtime_guard(rt)
+    capture_status = disable_capture_on_play(rt)
+    rt.STATE["dataset_camera_capture_on_play_status"] = capture_status
     status = {
         "enabled": True,
         "schema": rt.DATASET_CAMERA_SCHEMA,
         "module_version": CAMERA_MODULE_VERSION,
         "module_file": __file__,
         "backend": current_backend,
+        "captureOnPlay": capture_status.get("captureOnPlay"),
+        "captureOnPlay_status": capture_status,
         "replicator_tick_enabled": bool(replicator_tick_enabled(rt)),
+        "wait_for_render": bool(camera_wait_for_render_enabled(rt)),
+        "delta_time": camera_delta_time(rt),
+        "rt_subframes": int(camera_rt_subframes(rt)),
+        "tick_timeout_s": float(camera_tick_timeout_seconds(rt)),
         "resolution": cam_resolution,
         "image_format": image_extension(rt),
         "views": {},
@@ -449,44 +1040,75 @@ def initialize(rt, force=False):
                 view_status.update({"available": False, "reason": reason})
                 status["views"][name] = view_status
                 continue
-            rt.set_prim_visibility(prim, True)
-            cam = IsaacCamera(prim_path=path, resolution=(int(cam_resolution[0]), int(cam_resolution[1])), frequency=frequency)
-            cam.initialize()
-            objects[name] = cam
+            if not is_camera_prim(prim):
+                view_status.update({"available": False, "reason": f"not_camera_prim:{prim.GetTypeName()}", "prim_path": path})
+                status["views"][name] = view_status
+                continue
+            try:
+                render_product = rep.create.render_product(
+                    path,
+                    resolution=(int(cam_resolution[0]), int(cam_resolution[1])),
+                    name=f"excavator_dataset_rp_{name}",
+                )
+            except TypeError:
+                render_product = rep.create.render_product(
+                    path,
+                    resolution=(int(cam_resolution[0]), int(cam_resolution[1])),
+                )
+            try:
+                hydra_texture = getattr(render_product, "hydra_texture", None)
+                setter = getattr(hydra_texture, "set_updates_enabled", None)
+                if callable(setter):
+                    setter(True)
+            except Exception:
+                pass
+            rgb_annotator = get_rgb_annotator()
+            attached, attach_reason = attach_annotator_to_render_product(rgb_annotator, render_product)
+            if not attached:
+                raise RuntimeError(f"rgb_annotator_attach_failed:{attach_reason}")
+            render_products[name] = render_product
+            annotators[name] = rgb_annotator
             view_status.update(prim_metadata(rt, path))
-            view_status.update({"available": True, "reason": "ok"})
+            view_status.update(
+                {
+                    "available": True,
+                    "reason": "ok",
+                    "render_product": render_product_path(render_product),
+                    "sim_render_product": simulation_render_product_path(render_product),
+                    "rgb_annotator": "explicit",
+                    "rgb_annotator_attach": attach_reason,
+                    "rgb_annotator_ok": True,
+                }
+            )
         except Exception as exc:
             view_status.update({"available": False, "reason": f"{type(exc).__name__}:{exc}", "prim_path": path})
         status["views"][name] = view_status
 
-    if objects:
-        first_name = sorted(objects.keys())[0]
-        first_cam = objects[first_name]
-        for name in rt.DATASET_CAMERA_NAMES:
-            if name not in objects:
-                objects[name] = first_cam
-                view_status = status["views"].get(name, {"name": name})
-                view_status.update({"available": True, "reason": "shared_isaac_camera_fallback", "fallback_source": first_name})
-                status["views"][name] = view_status
-
-    rt.STATE["dataset_camera_objects"] = objects
-    rt.STATE["dataset_camera_initialized"] = bool(objects)
+    missing = [str(name) for name in rt.DATASET_CAMERA_NAMES if str(name) not in annotators]
+    status["available"] = not bool(missing)
+    if missing:
+        status["reason"] = "missing_required_cameras:" + ",".join(missing)
+    rt.STATE["dataset_camera_objects"] = {}
+    rt.STATE["dataset_camera_render_products"] = render_products
+    rt.STATE["dataset_camera_rgb_annotators"] = annotators
+    status["render_product_updates_enabled_count"] = int(set_render_products_updates_enabled(rt, True))
+    rt.STATE["dataset_camera_initialized"] = not bool(missing)
     rt.STATE["dataset_camera_init_attempted"] = True
     rt.STATE["dataset_camera_last_status"] = status
-    if objects:
-        warmup_graph(rt, 5)
+    log_camera_fingerprint(rt, status=status, force=force)
+    if not missing:
         rt.info_print(
             "[DATASET CAMERA]",
             f"module={CAMERA_MODULE_VERSION}",
-            "backend=isaac",
+            "backend=replicator_rgb",
             f"replicator_tick={replicator_tick_enabled(rt)}",
-            f"views={list(objects.keys())}",
+            f"views={list(annotators.keys())}",
             f"resolution={cam_resolution}",
             f"format={image_extension(rt)}",
         )
     else:
-        rt.info_print("[WARN] [DATASET CAMERA] no usable camera views", status)
-    return bool(objects)
+        rt.info_print("[WARN] [DATASET CAMERA] missing required camera views", status)
+    return not bool(missing)
 
 
 def episode_metadata(rt):
@@ -506,6 +1128,59 @@ def episode_metadata(rt):
             view.update(prim_metadata(rt, path))
             status["views"][name] = view
     return status
+
+
+def episode_summary(rt, meta=None):
+    meta = meta if isinstance(meta, dict) else {}
+    episode_dir = str(rt.STATE.get("dataset_episode_dir", "") or "")
+    extension = image_extension(rt)
+    image_counts = {}
+    for name in rt.DATASET_CAMERA_NAMES:
+        name = str(name)
+        count = 0
+        image_dir = os.path.join(episode_dir, "images", name) if episode_dir else ""
+        try:
+            if image_dir and os.path.isdir(image_dir):
+                suffix = "." + extension.lower().lstrip(".")
+                count = sum(1 for item in os.listdir(image_dir) if str(item).lower().endswith(suffix))
+        except Exception:
+            count = 0
+        image_counts[name] = int(count)
+    metrics = meta.get("final_metrics", {}) if isinstance(meta.get("final_metrics", {}), dict) else {}
+    samples = metrics.get("samples")
+    if samples is None:
+        samples = int(rt.STATE.get("dataset_samples", 0) or 0) - int(rt.STATE.get("dataset_episode_sample_start", 0) or 0)
+    summary = {
+        "module_version": CAMERA_MODULE_VERSION,
+        "backend": backend(rt),
+        "samples": int(max(0, samples or 0)),
+        "image_counts": image_counts,
+        "dropped_incomplete": int(rt.STATE.get("dataset_camera_dropped_incomplete_samples", 0) or 0),
+        "black_rejected": int(rt.STATE.get("dataset_camera_black_rejected", 0) or 0),
+        "require_complete_samples": bool(rt.STATE.get("dataset_camera_require_complete_samples", True)),
+        "warmup": dict(rt.STATE.get("dataset_camera_warmup_status", {}) or {}),
+        "fingerprint": camera_fingerprint(rt),
+    }
+    counts_match = all(int(image_counts.get(str(name), 0) or 0) == int(summary["samples"]) for name in rt.DATASET_CAMERA_NAMES)
+    summary["counts_match_samples"] = bool(counts_match)
+    return summary
+
+
+def log_episode_summary(rt, meta=None):
+    summary = episode_summary(rt, meta=meta)
+    counts = summary.get("image_counts", {})
+    rt.info_print(
+        "[DATASET CAMERA EPISODE SUMMARY]",
+        f"backend={summary.get('backend')}",
+        f"samples={summary.get('samples')}",
+        f"image_counts.0={counts.get('0', 0)}",
+        f"image_counts.1={counts.get('1', 0)}",
+        f"image_counts.2={counts.get('2', 0)}",
+        f"dropped_incomplete={summary.get('dropped_incomplete')}",
+        f"black_rejected={summary.get('black_rejected')}",
+        f"counts_match_samples={summary.get('counts_match_samples')}",
+    )
+    return summary
 
 
 def episode_cache(rt, reset=False):
@@ -585,7 +1260,13 @@ def payload_complete(rt, payload, sample_index):
     missing = []
     for name in rt.DATASET_CAMERA_NAMES:
         key = f"observation.images.{name}"
-        if not payload.get(key):
+        view = {}
+        camera_info = payload.get("observation.camera", {})
+        if isinstance(camera_info, dict):
+            views = camera_info.get("views", {})
+            if isinstance(views, dict):
+                view = views.get(str(name), {}) if isinstance(views.get(str(name), {}), dict) else {}
+        if not payload.get(key) or not bool(view.get("available", False)):
             missing.append(str(name))
     if missing:
         camera_info = payload.get("observation.camera", {})
@@ -614,25 +1295,9 @@ def rgb_ready(rt):
         status = rt.STATE.get("dataset_camera_last_status", {})
         reason = status.get("reason", "camera_unavailable") if isinstance(status, dict) else "camera_unavailable"
         return False, str(reason)
-    objects = rt.STATE.get("dataset_camera_objects")
-    if not isinstance(objects, dict):
-        return False, "camera_objects_missing"
-    if objects:
-        return True, "ok"
-    missing = []
-    for name in rt.DATASET_CAMERA_NAMES:
-        cam = objects.get(str(name))
-        if cam is None:
-            missing.append(f"{name}:missing")
-            continue
-        try:
-            rgb = cam.get_rgb()
-            if rgb is None:
-                missing.append(f"{name}:rgb_none")
-        except Exception as exc:
-            missing.append(f"{name}:{type(exc).__name__}")
-    if missing:
-        return False, ",".join(missing)
+    frames, meta = read_rgb_frames(rt)
+    if frames is None:
+        return False, str(meta.get("reason", "rgb_invalid") if isinstance(meta, dict) else "rgb_invalid")
     return True, "ok"
 
 
@@ -643,6 +1308,7 @@ async def warmup_for_episode(rt, label="episode"):
     if not bool(rt.STATE.get("dataset_camera_require_complete_samples", True)):
         rt.STATE["dataset_camera_warmup_status"] = {"ok": True, "reason": "complete_samples_not_required", "label": str(label)}
         return True
+    reset_replicator_tick_state(rt, reason=f"warmup_start:{label}")
     max_frames = max(0, int(rt.STATE.get("dataset_camera_warmup_max_frames", 12) or 12))
     min_frames = max(0, int(rt.STATE.get("dataset_camera_warmup_frames", 3) or 3))
     ready_required = max(1, int(rt.STATE.get("dataset_camera_warmup_ready_frames", 2) or 2))
@@ -650,38 +1316,64 @@ async def warmup_for_episode(rt, label="episode"):
     last_reason = "not_checked"
     if max_frames <= 0:
         max_frames = max(min_frames, ready_required)
+    initialize(rt, force=False)
     for frame in range(max_frames):
-        await rt.step_updates(1)
-        await global_tick_async(rt)
-        ready, reason = rgb_ready(rt)
-        last_reason = reason
+        tick_ok = await global_tick_async(rt)
+        if not tick_ok:
+            status = rt.STATE.get("dataset_camera_render_tick_status", {}) or {}
+            last_reason = str(status.get("reason", "replicator_tick_failed"))
+            ready = False
+            if last_reason in ("replicator_step_async_timeout", "replicator_step_async_missing", "replicator_step_async_rejected"):
+                break
+        else:
+            ready, reason = rgb_ready(rt)
+            last_reason = reason
         if ready:
             ready_streak += 1
         else:
             ready_streak = 0
         if frame + 1 >= min_frames and ready_streak >= ready_required:
+            _frames, frame_meta = read_rgb_frames(rt)
+            view_stats = frame_meta.get("views", {}) if isinstance(frame_meta, dict) else {}
             status = {
                 "ok": True,
                 "reason": "ok",
                 "label": str(label),
                 "frames": int(frame + 1),
                 "ready_streak": int(ready_streak),
+                "render_products": camera_render_product_paths(rt),
+                "sim_render_products": camera_sim_render_product_paths(rt),
+                "render_tick": dict(rt.STATE.get("dataset_camera_render_tick_status", {}) or {}),
+                "replicator_step": disabled_step_context(rt),
+                "views": view_stats,
             }
             rt.STATE["dataset_camera_warmup_status"] = status
             rt.info_print(
-                "[DATASET CAMERA WARMUP]",
+                "[DATASET CAMERA WARMUP OK]",
+                "backend=replicator_rgb",
                 f"label={label}",
                 f"ok=True",
                 f"frames={frame + 1}",
                 f"ready_streak={ready_streak}",
+                f"render_tick={(status.get('render_tick') or {}).get('reason')}",
+                f"replicator_step={(status.get('replicator_step') or {}).get('disable_reason')}",
+                f"wait_for_render={camera_wait_for_render_enabled(rt)}",
+                format_rgb_stats(view_stats),
             )
             return True
+    _frames, frame_meta = read_rgb_frames(rt)
+    view_stats = frame_meta.get("views", {}) if isinstance(frame_meta, dict) else {}
     status = {
         "ok": False,
         "reason": str(last_reason),
         "label": str(label),
         "frames": int(max_frames),
         "ready_streak": int(ready_streak),
+        "render_products": camera_render_product_paths(rt),
+        "sim_render_products": camera_sim_render_product_paths(rt),
+        "render_tick": dict(rt.STATE.get("dataset_camera_render_tick_status", {}) or {}),
+        "replicator_step": disabled_step_context(rt),
+        "views": view_stats,
     }
     rt.STATE["dataset_camera_warmup_status"] = status
     rt.info_print(
@@ -691,6 +1383,9 @@ async def warmup_for_episode(rt, label="episode"):
         f"frames={max_frames}",
         f"ready_streak={ready_streak}",
         f"reason={last_reason}",
+        f"render_tick={(status.get('render_tick') or {}).get('reason')}",
+        f"replicator_step={(status.get('replicator_step') or {}).get('disable_reason')}",
+        format_rgb_stats(view_stats),
     )
     return False
 
@@ -727,45 +1422,37 @@ def capture_observations(rt, sample_index):
         payload["observation.camera"]["reason"] = "missing_episode_image_dir"
         return payload
 
-    objects = rt.STATE.get("dataset_camera_objects")
-    if not isinstance(objects, dict):
-        objects = {}
     camera_cache = episode_cache(rt, reset=False)
     extension = str(camera_cache.get("extension", image_extension(rt)))
-    cam_resolution = resolution(rt)
-    any_available = False
     view_cache = camera_cache.get("views", {}) if isinstance(camera_cache, dict) else {}
+
+    frames, frame_meta = read_rgb_frames(rt)
+    if frames is None:
+        payload["observation.camera"]["reason"] = str(frame_meta.get("reason", "rgb_invalid") if isinstance(frame_meta, dict) else "rgb_invalid")
+        payload["observation.camera"]["views"] = frame_meta.get("views", {}) if isinstance(frame_meta, dict) else {}
+        return payload
+    capture_backend = str(frame_meta.get("backend", current_backend) if isinstance(frame_meta, dict) else current_backend)
+    payload["observation.camera"]["backend"] = capture_backend
+
     for name in rt.DATASET_CAMERA_NAMES:
-        cam = objects.get(name)
-        view_payload = {
-            "available": False,
-            "name": name,
-            "path": None,
-            "shape": None,
-            "dtype": None,
-        }
+        name = str(name)
+        rgb = frames.get(name)
+        meta_views = frame_meta.get("views", {}) if isinstance(frame_meta, dict) else {}
+        view_payload = dict(meta_views.get(name, {}) if isinstance(meta_views.get(name, {}), dict) else {})
+        view_payload.setdefault("available", False)
+        view_payload.setdefault("name", name)
+        view_payload.setdefault("path", None)
+        view_payload.setdefault("shape", None)
+        view_payload.setdefault("dtype", None)
         cached_view = view_cache.get(str(name), {}) if isinstance(view_cache, dict) else {}
         prim_path = str(cached_view.get("prim_path", ""))
         view_payload["prim_path"] = prim_path
         view_payload["pose"] = world_pose(rt, prim_path)
         try:
-            fallback_reason = ""
-            if cam is None:
-                rgb = np.zeros((int(cam_resolution[1]), int(cam_resolution[0]), 3), dtype=np.uint8)
-                fallback_reason = "camera_object_fallback"
-            else:
-                rgb = cam.get_rgb()
-                if rgb is None:
-                    rgb = np.zeros((int(cam_resolution[1]), int(cam_resolution[0]), 3), dtype=np.uint8)
-                    fallback_reason = "camera_rgb_fallback"
-            rgb = np.asarray(rgb)
-            if rgb.ndim != 3 or rgb.shape[-1] < 3:
-                rgb = np.zeros((int(cam_resolution[1]), int(cam_resolution[0]), 3), dtype=np.uint8)
-                fallback_reason = "camera_shape_fallback"
-            if rgb.ndim == 3 and rgb.shape[-1] == 4:
-                rgb = rgb[:, :, :3]
-            if rgb.dtype != np.uint8:
-                rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+            if rgb is None:
+                view_payload["reason"] = "rgb_frame_missing_after_validation"
+                payload["observation.camera"]["views"][name] = view_payload
+                continue
             filename = f"{int(sample_index):06d}.{extension}"
             abs_dir = str(cached_view.get("abs_dir", os.path.join(image_dir, name)))
             rel_dir = str(cached_view.get("rel_dir", f"images/{name}"))
@@ -788,12 +1475,9 @@ def capture_observations(rt, sample_index):
                     "shape": [int(x) for x in rgb.shape],
                     "dtype": str(rgb.dtype),
                     "format": fmt,
-                    "capture_backend": current_backend,
+                    "capture_backend": capture_backend,
                 }
             )
-            if fallback_reason:
-                view_payload["reason"] = fallback_reason
-            any_available = True
         except Exception as exc:
             view_payload["reason"] = f"{type(exc).__name__}:{exc}"
             now = time.time()
@@ -801,26 +1485,81 @@ def capture_observations(rt, sample_index):
                 rt.STATE["dataset_camera_last_error_time"] = now
                 rt.info_print("[WARN] dataset camera capture failed:", name, type(exc).__name__, exc)
         payload["observation.camera"]["views"][name] = view_payload
-    payload["observation.camera"]["available"] = any_available
+    payload["observation.camera"]["available"] = all(
+        bool(payload["observation.camera"]["views"].get(str(name), {}).get("available", False))
+        for name in rt.DATASET_CAMERA_NAMES
+    )
+    if payload["observation.camera"]["available"]:
+        payload["observation.camera"]["reason"] = "ok"
     payload["observation.camera"]["image_format"] = extension
     payload["observation.camera"]["resolution"] = resolution(rt)
     return payload
 
 
+async def capture_observations_async(rt, sample_index):
+    if bool(rt.STATE.get("dataset_camera_enabled", True)):
+        stride = max(1, int(rt.STATE.get("dataset_camera_sample_stride", 1) or 1))
+        should_tick = int(sample_index) % stride == 0
+        if should_tick and initialize(rt, force=False):
+            tick_ok = await global_tick_async(rt)
+            if not tick_ok:
+                status = dict(rt.STATE.get("dataset_camera_render_tick_status", {}) or {})
+                return {
+                    "observation.images.0": None,
+                    "observation.images.1": None,
+                    "observation.images.2": None,
+                    "observation.camera": {
+                        "schema": rt.DATASET_CAMERA_SCHEMA,
+                        "available": False,
+                        "frame_index": int(sample_index),
+                        "backend": backend(rt),
+                        "reason": str(status.get("reason", "render_tick_failed")),
+                        "render_tick": status,
+                        "views": {},
+                    },
+                }
+    return capture_observations(rt, sample_index)
+
+
 def config_snapshot(rt):
     current_backend = backend(rt)
+    active_gpu_raw = str(os.environ.get("EXCAVATOR_ACTIVE_GPU", "") or "")
+    physics_gpu_raw = str(os.environ.get("EXCAVATOR_PHYSICS_GPU", "") or "")
+    multi_gpu_raw = str(os.environ.get("EXCAVATOR_MULTI_GPU", "") or "")
+    try:
+        active_gpu_value = int(active_gpu_raw) if active_gpu_raw != "" else None
+    except Exception:
+        active_gpu_value = active_gpu_raw or None
+    try:
+        physics_gpu_value = int(physics_gpu_raw) if physics_gpu_raw != "" else None
+    except Exception:
+        physics_gpu_value = physics_gpu_raw or None
+    multi_gpu_value = None
+    if multi_gpu_raw != "":
+        multi_gpu_value = multi_gpu_raw.strip().lower() in ("1", "true", "yes", "on")
+    renderer_launch = {
+        "graphics_api": str(os.environ.get("EXCAVATOR_GRAPHICS_API", "unknown") or "unknown"),
+        "renderer": str(os.environ.get("EXCAVATOR_RENDERER", "unknown") or "unknown"),
+        "active_gpu": active_gpu_value,
+        "physics_gpu": physics_gpu_value,
+        "multi_gpu": multi_gpu_value,
+        "notes": "Graphics API is launch-time only; it must be set before SimulationApp creates the renderer.",
+    }
     return {
         "schema": rt.DATASET_CAMERA_SCHEMA,
         "module_version": CAMERA_MODULE_VERSION,
         "module_file": __file__,
         "enabled": bool(rt.STATE.get("dataset_camera_enabled", True)),
-        "available": bool(HAS_ISAAC_CAMERA),
+        "available": bool(rep is not None),
         "backend": current_backend,
+        "renderer_launch": renderer_launch,
+        "captureOnPlay": (rt.STATE.get("dataset_camera_capture_on_play_status") or {}).get("captureOnPlay"),
+        "captureOnPlay_status": rt.STATE.get("dataset_camera_capture_on_play_status"),
         "backend_available": {
-            "isaac_camera": bool(HAS_ISAAC_CAMERA),
-            "viewport_capture": False,
-            "viewport_reason": "dataset_viewport_capture_disabled",
+            "replicator": bool(rep is not None),
             "replicator_tick": bool(replicator_tick_enabled(rt)),
+            "syntheticdata_wait": bool(syntheticdata_wait_enabled(rt)),
+            "wait_for_render": bool(camera_wait_for_render_enabled(rt)),
             "module_version": CAMERA_MODULE_VERSION,
         },
         "resolution": resolution(rt),
@@ -830,6 +1569,20 @@ def config_snapshot(rt):
         "warmup_frames": int(rt.STATE.get("dataset_camera_warmup_frames", 3) or 3),
         "warmup_ready_frames": int(rt.STATE.get("dataset_camera_warmup_ready_frames", 2) or 2),
         "warmup_max_frames": int(rt.STATE.get("dataset_camera_warmup_max_frames", 12) or 12),
+        "replicator_tick": bool(replicator_tick_enabled(rt)),
+        "syntheticdata_wait": bool(syntheticdata_wait_enabled(rt)),
+        "wait_for_render": bool(camera_wait_for_render_enabled(rt)),
+        "delta_time": camera_delta_time(rt),
+        "rt_subframes": int(camera_rt_subframes(rt)),
+        "tick_timeout_s": camera_tick_timeout_seconds(rt),
+        "replicator_step": disabled_step_context(rt),
+        "render_tick": dict(rt.STATE.get("dataset_camera_render_tick_status", {}) or {}),
+        "black_frame_guard": {
+            "mean_threshold": camera_black_mean_threshold(rt),
+            "max_threshold": camera_black_max_threshold(rt),
+            "note": "Frames at or below both thresholds are rejected and are not written as valid observations.",
+        },
+        "fingerprint": camera_fingerprint(rt),
         "requested_image_format": str(rt.STATE.get("dataset_camera_image_format", "ppm") or "ppm"),
         "image_format": image_extension(rt),
         "image_format_note": "Default PPM keeps RGB frame content uncompressed during collection; LeRobot export converts images/videos after the run.",

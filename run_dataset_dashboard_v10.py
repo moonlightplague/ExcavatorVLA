@@ -1,8 +1,10 @@
 import json
+import io
 import math
 import os
 import re
 import shutil
+import struct
 import time
 import threading
 import hashlib
@@ -10,6 +12,11 @@ from collections import Counter, defaultdict
 from statistics import mean, median
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 from urllib.parse import parse_qs, unquote, urlparse
+
+try:
+    import excavator_dataset_tools as shared_dataset_tools
+except Exception:
+    shared_dataset_tools = None
 
 
 INDEX_FILES = {
@@ -111,7 +118,8 @@ def iter_episodes(run_dir: Union[str, os.PathLike], split: str = "trainable") ->
 
 def load_trajectory(row_or_path: Union[dict, str, os.PathLike]) -> List[dict]:
     if isinstance(row_or_path, dict):
-        path = row_or_path.get("trajectory", "")
+        episode_dir = episode_dir_from_row(row_or_path)
+        path = resolve_episode_file(episode_dir, row_or_path.get("trajectory", ""))
     else:
         path = str(row_or_path)
     return read_jsonl(path)
@@ -1741,6 +1749,48 @@ def row_path_value(row: dict, key: str) -> str:
     return str(value or "")
 
 
+def _path_parts_any_platform(path: object) -> List[str]:
+    text = str(path or "").strip()
+    if not text:
+        return []
+    return [part for part in text.replace("\\", "/").split("/") if part]
+
+
+def _basename_any_platform(path: object) -> str:
+    parts = _path_parts_any_platform(path)
+    return parts[-1] if parts else ""
+
+
+def _dirname_any_platform(path: object) -> str:
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    if "\\" not in text:
+        return os.path.dirname(text)
+    parts = _path_parts_any_platform(text)
+    if len(parts) <= 1:
+        return ""
+    return "/".join(parts[:-1])
+
+
+def _is_windows_absolute_path(path: object) -> bool:
+    text = str(path or "").strip()
+    return bool(re.match(r"^[A-Za-z]:[\\/]", text) or text.startswith("\\\\"))
+
+
+def _normalize_client_path_for_server(path: object) -> str:
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    try:
+        text = unquote(text)
+    except Exception:
+        pass
+    if os.sep == "/" and "\\" in text:
+        text = text.replace("\\", "/")
+    return os.path.abspath(os.path.expanduser(text))
+
+
 def sample_image_value(sample: dict, canonical_key: str) -> object:
     for key in LEROBOT_IMAGE_KEY_ALIASES.get(canonical_key, [canonical_key]):
         value = sample.get(key)
@@ -1749,11 +1799,39 @@ def sample_image_value(sample: dict, canonical_key: str) -> object:
     return None
 
 
-def episode_dir_from_row(row: dict) -> str:
+def episode_dir_from_row(row: dict, run_dir: Optional[Union[str, os.PathLike]] = None) -> str:
+    for key in ["transferred_episode_dir", "dest_episode_dir", "source_episode_dir"]:
+        candidate = _normalize_client_path_for_server(row.get(key))
+        if candidate and os.path.isdir(candidate):
+            return candidate
+    if run_dir:
+        episodes_root = os.path.join(str(run_dir), "episodes")
+        for key in ["transferred_episode_dir", "dest_episode_dir"]:
+            folder = _basename_any_platform(row.get(key))
+            if folder:
+                candidate = os.path.join(episodes_root, folder)
+                if os.path.isdir(candidate):
+                    return candidate
     for key in ["trajectory", "meta", "score_path", "events"]:
         path = row_path_value(row, key)
         if path:
-            return os.path.dirname(path)
+            if os.path.isabs(path) and os.path.isdir(os.path.dirname(path)):
+                return os.path.dirname(path)
+            dirname = _dirname_any_platform(path)
+            if dirname:
+                if run_dir:
+                    parent_name = _basename_any_platform(dirname)
+                    if parent_name:
+                        candidate = os.path.join(str(run_dir), parent_name)
+                        if os.path.isdir(candidate):
+                            return candidate
+                        candidate = os.path.join(str(run_dir), "episodes", parent_name)
+                        if os.path.isdir(candidate):
+                            return candidate
+                normalized = _normalize_client_path_for_server(dirname)
+                if os.path.isdir(normalized):
+                    return normalized
+                return dirname
     return ""
 
 
@@ -1761,9 +1839,28 @@ def resolve_episode_file(episode_dir: str, value: object) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
-    if os.path.isabs(text):
+    if os.path.isabs(text) and os.path.exists(text):
         return text
-    return os.path.normpath(os.path.join(episode_dir, text))
+    normalized = _normalize_client_path_for_server(text)
+    if os.path.isabs(text) and os.path.exists(normalized):
+        return normalized
+    basename = _basename_any_platform(text)
+    if _is_windows_absolute_path(text) and episode_dir and basename:
+        candidate = os.path.join(episode_dir, basename)
+        if os.path.exists(candidate):
+            return candidate
+        return os.path.normpath(candidate)
+    if episode_dir:
+        rel_text = text.replace("\\", os.sep) if os.sep == "/" else text.replace("/", os.sep)
+        candidate = os.path.normpath(os.path.join(episode_dir, rel_text))
+        if os.path.exists(candidate):
+            return candidate
+        if basename:
+            basename_candidate = os.path.join(episode_dir, basename)
+            if os.path.exists(basename_candidate):
+                return basename_candidate
+        return candidate
+    return normalized
 
 
 def relpath_posix(path: Union[str, os.PathLike], base: Union[str, os.PathLike]) -> str:
@@ -2366,7 +2463,7 @@ def collect_lerobot_rows(
     }
 
 
-def export_lerobot_dataset(
+def _legacy_export_lerobot_dataset(
     run_dir: Union[str, os.PathLike],
     output_dir: Optional[Union[str, os.PathLike]] = None,
     split: str = "trainable",
@@ -2673,6 +2770,43 @@ def export_lerobot_dataset(
     if require_vla and not vla_training_ready:
         raise RuntimeError(f"VLA export incomplete: {json.dumps(manifest, ensure_ascii=True)}")
     return manifest
+
+
+def export_lerobot_dataset(
+    run_dir: Union[str, os.PathLike],
+    output_dir: Optional[Union[str, os.PathLike]] = None,
+    split: str = "trainable",
+    fps: Optional[float] = None,
+    limit_episodes: Optional[int] = None,
+    overwrite: bool = False,
+    require_standard: bool = False,
+    require_vla: bool = False,
+    progress_callback=None,
+) -> Dict[str, object]:
+    shared_exporter = getattr(shared_dataset_tools, "export_lerobot_dataset", None) if shared_dataset_tools is not None else None
+    if shared_exporter is None:
+        return _legacy_export_lerobot_dataset(
+            run_dir,
+            output_dir=output_dir,
+            split=split,
+            fps=fps,
+            limit_episodes=limit_episodes,
+            overwrite=overwrite,
+            require_standard=require_standard,
+            require_vla=require_vla,
+            progress_callback=progress_callback,
+        )
+    return shared_exporter(
+        run_dir,
+        output_dir=output_dir,
+        split=split,
+        fps=fps,
+        limit_episodes=limit_episodes,
+        overwrite=overwrite,
+        require_standard=require_standard,
+        require_vla=require_vla,
+        progress_callback=progress_callback,
+    )
 
 
 def print_lerobot_export(
@@ -3022,6 +3156,7 @@ def dashboard_episode_summary(row: dict, dataset_tag: Optional[str] = None, data
         "score": row.get("score"),
         "reason": row.get("reason", ""),
         "warning_reason": row.get("warning_reason", ""),
+        "task_prompt": dashboard_episode_task_prompt(row),
         "samples": row.get("samples"),
         "freeze_count": row.get("freeze_count"),
         "max_bucket": row.get("max_bucket_from_pile_particles"),
@@ -3034,6 +3169,34 @@ def dashboard_episode_summary(row: dict, dataset_tag: Optional[str] = None, data
         "unload_landing_xyz": row.get("unload_landing_xyz"),
         "scene": scene,
     }
+
+
+def dashboard_episode_task_prompt(
+    row: dict,
+    trajectory: Optional[Sequence[dict]] = None,
+    episode_meta: Optional[dict] = None,
+) -> str:
+    first_sample = trajectory[0] if trajectory else {}
+    meta = episode_meta if isinstance(episode_meta, dict) else {}
+    if not meta:
+        try:
+            episode_dir = episode_dir_from_row(row)
+            meta = read_json(resolve_episode_file(episode_dir, row_path_value(row, "meta")), default={}) or {}
+        except Exception:
+            meta = {}
+    shared_builder = getattr(shared_dataset_tools, "build_episode_task_text", None) if shared_dataset_tools is not None else None
+    if shared_builder is not None:
+        try:
+            return str(shared_builder(first_sample, meta, row)).strip()
+        except Exception:
+            pass
+    for source in [first_sample, meta, row]:
+        if isinstance(source, dict):
+            for key in ["task", "dataset_task_text"]:
+                text = str(source.get(key) or "").strip()
+                if text:
+                    return text
+    return "Dig soil from the marked area and dump it into the target container."
 
 
 RUN_ACTIVITY_ACTIVE_SECONDS = 180.0
@@ -3188,6 +3351,14 @@ RUN_PAYLOAD_CACHE_VERSION = 1
 RUN_PAYLOAD_CACHE_DIRNAME = "run_payload_cache"
 RUN_PAYLOAD_MEMORY_CACHE: Dict[str, Dict[str, object]] = {}
 RUN_PAYLOAD_CACHE_LOCK = threading.Lock()
+FRAME_CONTEXT_CACHE_TTL = 120.0
+FRAME_CONTEXT_CACHE_LIMIT = 16
+FRAME_CONTEXT_CACHE: Dict[Tuple[str, str], Dict[str, object]] = {}
+FRAME_CONTEXT_CACHE_LOCK = threading.Lock()
+FRAME_IMAGE_CACHE_TTL = 60.0
+FRAME_IMAGE_CACHE_LIMIT = 96
+FRAME_IMAGE_CACHE: Dict[str, Dict[str, object]] = {}
+FRAME_IMAGE_CACHE_LOCK = threading.Lock()
 
 
 def fast_jsonl_count(path: Union[str, os.PathLike]) -> int:
@@ -4758,7 +4929,10 @@ def dashboard_export_success_pool(
     final_export_dir = os.path.join(pool_dir, LEROBOT_DEFAULT_EXPORT_DIRNAME)
     staging_export_dir = unique_path(os.path.join(pool_dir, f".{LEROBOT_DEFAULT_EXPORT_DIRNAME}_staging_{time.strftime('%Y%m%d_%H%M%S')}"))
     try:
-        result = export_lerobot_dataset(
+        shared_exporter = getattr(shared_dataset_tools, "export_lerobot_dataset", None) if shared_dataset_tools is not None else None
+        if shared_exporter is None:
+            raise RuntimeError("shared VLA exporter unavailable: excavator_dataset_tools.export_lerobot_dataset")
+        result = shared_exporter(
             pool_dir,
             output_dir=staging_export_dir,
             split="trainable",
@@ -5154,20 +5328,480 @@ def radians_vector_to_degrees(value: object, length: int = 4) -> List[Optional[f
     return out
 
 
+def dashboard_find_episode_row(run_dir: Union[str, os.PathLike], episode_index: Union[int, str]) -> Tuple[Optional[dict], List[dict]]:
+    run_dir = os.path.abspath(str(run_dir))
+    maybe_reconcile_success_pool_for_dashboard(run_dir)
+    rows, _success_catchup = load_dashboard_all_rows(run_dir)
+    wanted = str(episode_index)
+    for row in rows:
+        if str(row.get("episode_index")) == wanted or str(row.get("episode_id")) == wanted:
+            return row, rows
+    return None, rows
+
+
+def dashboard_frame_context(
+    run_dir: Union[str, os.PathLike],
+    episode_index: Union[int, str],
+    refresh: bool = False,
+) -> Dict[str, object]:
+    run_dir = os.path.abspath(str(run_dir))
+    wanted = str(episode_index)
+    key = (run_dir, wanted)
+    now = time.time()
+    if not refresh:
+        with FRAME_CONTEXT_CACHE_LOCK:
+            cached = FRAME_CONTEXT_CACHE.get(key)
+            if cached and now - float(cached.get("created_at", 0.0) or 0.0) <= FRAME_CONTEXT_CACHE_TTL:
+                return cached
+
+    selected, _rows = dashboard_find_episode_row(run_dir, wanted)
+    if selected is None:
+        context = {"ok": False, "status": 404, "error": f"episode_not_found:{episode_index}", "created_at": now}
+    else:
+        trajectory = load_trajectory(selected)
+        context = dashboard_build_frame_context(run_dir, wanted, selected, trajectory, created_at=now)
+    with FRAME_CONTEXT_CACHE_LOCK:
+        FRAME_CONTEXT_CACHE[key] = context
+        if len(FRAME_CONTEXT_CACHE) > FRAME_CONTEXT_CACHE_LIMIT:
+            oldest_key = min(FRAME_CONTEXT_CACHE, key=lambda item: float(FRAME_CONTEXT_CACHE[item].get("created_at", 0.0) or 0.0))
+            FRAME_CONTEXT_CACHE.pop(oldest_key, None)
+    return context
+
+
+def dashboard_build_frame_context(
+    run_dir: Union[str, os.PathLike],
+    episode_index: Union[int, str],
+    selected: dict,
+    trajectory: Sequence[dict],
+    created_at: Optional[float] = None,
+) -> Dict[str, object]:
+    run_dir = os.path.abspath(str(run_dir))
+    wanted = str(episode_index)
+    image_paths: Dict[str, List[Tuple[str, object]]] = {}
+    for camera_key in LEROBOT_IMAGE_KEYS:
+        paths = []
+        for sample in trajectory:
+            if isinstance(sample, dict):
+                paths.append(dashboard_resolve_sample_image_path(selected, sample, camera_key))
+            else:
+                paths.append(("", None))
+        image_paths[camera_key] = paths
+    return {
+        "ok": True,
+        "created_at": float(created_at if created_at is not None else time.time()),
+        "run_dir": run_dir,
+        "episode_index": wanted,
+        "row": selected,
+        "trajectory": list(trajectory),
+        "image_paths": image_paths,
+        "allowed_bases": [
+            episode_dir_from_row(selected),
+            selected.get("transferred_episode_dir"),
+            selected.get("dest_episode_dir"),
+            selected.get("source_episode_dir"),
+        ],
+    }
+
+
+def dashboard_store_frame_context(context: Dict[str, object]) -> Dict[str, object]:
+    if not context.get("ok"):
+        return context
+    run_dir = os.path.abspath(str(context.get("run_dir") or ""))
+    episode_index = str(context.get("episode_index") or "")
+    if not run_dir or not episode_index:
+        return context
+    with FRAME_CONTEXT_CACHE_LOCK:
+        FRAME_CONTEXT_CACHE[(run_dir, episode_index)] = context
+        if len(FRAME_CONTEXT_CACHE) > FRAME_CONTEXT_CACHE_LIMIT:
+            oldest_key = min(FRAME_CONTEXT_CACHE, key=lambda item: float(FRAME_CONTEXT_CACHE[item].get("created_at", 0.0) or 0.0))
+            FRAME_CONTEXT_CACHE.pop(oldest_key, None)
+    return context
+
+
+def dashboard_resolve_sample_image_path(row: dict, sample: dict, camera_key: str) -> Tuple[str, object]:
+    image_value = sample_image_value(sample, camera_key)
+    if not image_value:
+        return "", image_value
+    ep_dir = episode_dir_from_row(row)
+    image_text = str(image_value or "")
+    image_path = resolve_episode_file(ep_dir, image_text)
+    source_dir = str(row.get("source_episode_dir") or "")
+    dest_dir = str(row.get("transferred_episode_dir") or row.get("dest_episode_dir") or ep_dir or "")
+    try:
+        if (os.path.isabs(image_text) or _is_windows_absolute_path(image_text)) and source_dir and dest_dir:
+            if _is_windows_absolute_path(image_text) or _is_windows_absolute_path(source_dir):
+                image_norm = image_text.replace("\\", "/")
+                source_norm = source_dir.replace("\\", "/").rstrip("/")
+                if image_norm.lower().startswith(source_norm.lower() + "/"):
+                    rel_parts = [part for part in image_norm[len(source_norm):].lstrip("/").split("/") if part]
+                    mapped = os.path.join(os.path.abspath(dest_dir), *rel_parts)
+                    if os.path.isfile(mapped):
+                        image_path = mapped
+            else:
+                image_abs = os.path.abspath(image_text)
+                source_abs = os.path.abspath(source_dir)
+                if os.path.commonpath([source_abs, image_abs]) == source_abs:
+                    mapped = os.path.join(os.path.abspath(dest_dir), os.path.relpath(image_abs, source_abs))
+                    if os.path.isfile(mapped):
+                        image_path = mapped
+    except Exception:
+        pass
+    return image_path, image_value
+
+
+def dashboard_path_under_any(path: str, bases: Sequence[object]) -> bool:
+    try:
+        path_abs = os.path.abspath(str(path or ""))
+    except Exception:
+        return False
+    for base in bases:
+        text = str(base or "")
+        if not text:
+            continue
+        try:
+            base_abs = os.path.abspath(text)
+            if os.path.exists(base_abs) and os.path.commonpath([base_abs, path_abs]) == base_abs:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def dashboard_image_content_type(path: str) -> str:
+    ext = os.path.splitext(str(path or ""))[1].lower()
+    if ext in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if ext == ".png":
+        return "image/png"
+    if ext == ".webp":
+        return "image/webp"
+    if ext == ".bmp":
+        return "image/bmp"
+    if ext == ".ppm":
+        return "image/x-portable-pixmap"
+    return "application/octet-stream"
+
+
+def dashboard_ppm_to_bmp_bytes(data: bytes) -> Optional[bytes]:
+    # Minimal P6 PPM fallback for browser preview when Pillow is unavailable.
+    # The collector writes 8-bit RGB PPM frames, so BMP can be generated without
+    # external dependencies.
+    try:
+        cursor = 0
+        tokens: List[bytes] = []
+        length = len(data)
+        while len(tokens) < 4 and cursor < length:
+            while cursor < length and data[cursor] in b" \t\r\n":
+                cursor += 1
+            if cursor < length and data[cursor] == ord("#"):
+                while cursor < length and data[cursor] not in b"\r\n":
+                    cursor += 1
+                continue
+            start = cursor
+            while cursor < length and data[cursor] not in b" \t\r\n":
+                cursor += 1
+            if start < cursor:
+                tokens.append(data[start:cursor])
+        if len(tokens) < 4 or tokens[0] != b"P6":
+            return None
+        while cursor < length and data[cursor] in b" \t\r\n":
+            cursor += 1
+        width = int(tokens[1])
+        height = int(tokens[2])
+        maxval = int(tokens[3])
+        if width <= 0 or height <= 0 or maxval <= 0 or maxval > 255:
+            return None
+        expected = width * height * 3
+        rgb = data[cursor:cursor + expected]
+        if len(rgb) < expected:
+            return None
+        row_stride = width * 3
+        bmp_row_stride = (row_stride + 3) & ~3
+        padding = b"\x00" * (bmp_row_stride - row_stride)
+        pixel_rows = []
+        for y in range(height - 1, -1, -1):
+            row = rgb[y * row_stride:(y + 1) * row_stride]
+            bgr = bytearray(row_stride)
+            bgr[0::3] = row[2::3]
+            bgr[1::3] = row[1::3]
+            bgr[2::3] = row[0::3]
+            pixel_rows.append(bytes(bgr) + padding)
+        pixel_data = b"".join(pixel_rows)
+        file_size = 14 + 40 + len(pixel_data)
+        file_header = b"BM" + struct.pack("<IHHI", file_size, 0, 0, 54)
+        dib_header = struct.pack("<IIIHHIIIIII", 40, width, height, 1, 24, 0, len(pixel_data), 2835, 2835, 0, 0)
+        return file_header + dib_header + pixel_data
+    except Exception:
+        return None
+
+
+def dashboard_read_preview_image(path: str) -> Tuple[bytes, str]:
+    try:
+        stat = os.stat(path)
+        cache_key = f"{os.path.abspath(path)}|{int(stat.st_mtime_ns)}|{int(stat.st_size)}"
+        now = time.time()
+        with FRAME_IMAGE_CACHE_LOCK:
+            cached = FRAME_IMAGE_CACHE.get(cache_key)
+            if cached and now - float(cached.get("created_at", 0.0) or 0.0) <= FRAME_IMAGE_CACHE_TTL:
+                return cached.get("data", b""), str(cached.get("content_type") or "application/octet-stream")
+    except Exception:
+        cache_key = ""
+        now = time.time()
+
+    ext = os.path.splitext(str(path or ""))[1].lower()
+    if ext in {".ppm", ".pnm", ".pgm", ".pbm"}:
+        with open(path, "rb") as f:
+            raw_data = f.read()
+        bmp_data = dashboard_ppm_to_bmp_bytes(raw_data)
+        if bmp_data:
+            data, content_type = bmp_data, "image/bmp"
+            if cache_key:
+                with FRAME_IMAGE_CACHE_LOCK:
+                    FRAME_IMAGE_CACHE[cache_key] = {"created_at": now, "data": data, "content_type": content_type}
+                    if len(FRAME_IMAGE_CACHE) > FRAME_IMAGE_CACHE_LIMIT:
+                        oldest_key = min(FRAME_IMAGE_CACHE, key=lambda item: float(FRAME_IMAGE_CACHE[item].get("created_at", 0.0) or 0.0))
+                        FRAME_IMAGE_CACHE.pop(oldest_key, None)
+            return data, content_type
+        try:
+            from PIL import Image  # type: ignore
+            with Image.open(io.BytesIO(raw_data)) as image:
+                if image.mode not in {"RGB", "RGBA"}:
+                    image = image.convert("RGB")
+                buffer = io.BytesIO()
+                image.save(buffer, format="PNG")
+                data, content_type = buffer.getvalue(), "image/png"
+        except Exception:
+            data, content_type = raw_data, dashboard_image_content_type(path)
+        if cache_key:
+            with FRAME_IMAGE_CACHE_LOCK:
+                FRAME_IMAGE_CACHE[cache_key] = {"created_at": now, "data": data, "content_type": content_type}
+                if len(FRAME_IMAGE_CACHE) > FRAME_IMAGE_CACHE_LIMIT:
+                    oldest_key = min(FRAME_IMAGE_CACHE, key=lambda item: float(FRAME_IMAGE_CACHE[item].get("created_at", 0.0) or 0.0))
+                    FRAME_IMAGE_CACHE.pop(oldest_key, None)
+        return data, content_type
+    with open(path, "rb") as f:
+        data, content_type = f.read(), dashboard_image_content_type(path)
+    if cache_key:
+        with FRAME_IMAGE_CACHE_LOCK:
+            FRAME_IMAGE_CACHE[cache_key] = {"created_at": now, "data": data, "content_type": content_type}
+            if len(FRAME_IMAGE_CACHE) > FRAME_IMAGE_CACHE_LIMIT:
+                oldest_key = min(FRAME_IMAGE_CACHE, key=lambda item: float(FRAME_IMAGE_CACHE[item].get("created_at", 0.0) or 0.0))
+                FRAME_IMAGE_CACHE.pop(oldest_key, None)
+    return data, content_type
+
+
+def dashboard_camera_key(value: object) -> Optional[str]:
+    text = str(value or "").strip()
+    if text in LEROBOT_IMAGE_KEYS:
+        return text
+    aliases = {
+        "0": "observation.images.0",
+        "cam0": "observation.images.0",
+        "camera0": "observation.images.0",
+        "1": "observation.images.1",
+        "cam1": "observation.images.1",
+        "camera1": "observation.images.1",
+        "2": "observation.images.2",
+        "cam2": "observation.images.2",
+        "camera2": "observation.images.2",
+    }
+    return aliases.get(text.lower())
+
+
+def dashboard_ppm_quick_mean(path: str, sample_pixels: int = 1024) -> Optional[float]:
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        cursor = 0
+        tokens: List[bytes] = []
+        length = len(data)
+        while len(tokens) < 4 and cursor < length:
+            while cursor < length and data[cursor] in b" \t\r\n":
+                cursor += 1
+            if cursor < length and data[cursor] == ord("#"):
+                while cursor < length and data[cursor] not in b"\r\n":
+                    cursor += 1
+                continue
+            start = cursor
+            while cursor < length and data[cursor] not in b" \t\r\n":
+                cursor += 1
+            if start < cursor:
+                tokens.append(data[start:cursor])
+        if len(tokens) < 4 or tokens[0] != b"P6":
+            return None
+        while cursor < length and data[cursor] in b" \t\r\n":
+            cursor += 1
+        width = int(tokens[1])
+        height = int(tokens[2])
+        maxval = int(tokens[3])
+        if width <= 0 or height <= 0 or maxval <= 0:
+            return None
+        rgb = data[cursor:cursor + width * height * 3]
+        if not rgb:
+            return None
+        stride = max(3, (len(rgb) // max(1, int(sample_pixels))) // 3 * 3)
+        total = 0
+        count = 0
+        for offset in range(0, len(rgb) - 2, stride):
+            total += int(rgb[offset]) + int(rgb[offset + 1]) + int(rgb[offset + 2])
+            count += 3
+        if count <= 0:
+            return None
+        return float(total) / float(count)
+    except Exception:
+        return None
+
+
+def build_episode_camera_preview(
+    row: dict,
+    trajectory: Sequence[dict],
+    first_t: float = 0.0,
+    image_paths: Optional[Dict[str, List[Tuple[str, object]]]] = None,
+) -> Dict[str, object]:
+    cameras = []
+    for index, key in enumerate(LEROBOT_IMAGE_KEYS):
+        present = 0
+        existing = 0
+        first_valid_frame = None
+        first_nonblack_frame = None
+        sampled_dark_frames = 0
+        sampled_frames = 0
+        missing_examples = []
+        for frame_index, sample in enumerate(trajectory or []):
+            if not isinstance(sample, dict):
+                continue
+            cached_paths = image_paths.get(key) if isinstance(image_paths, dict) else None
+            if isinstance(cached_paths, list) and frame_index < len(cached_paths):
+                path, value = cached_paths[frame_index]
+            else:
+                path, value = dashboard_resolve_sample_image_path(row, sample, key)
+            if value:
+                present += 1
+            if path and os.path.isfile(path):
+                existing += 1
+                if first_valid_frame is None:
+                    first_valid_frame = frame_index
+                if sampled_frames < 12 or frame_index in {0, len(trajectory or []) // 2, max(0, len(trajectory or []) - 1)}:
+                    sampled_frames += 1
+                    mean_value = dashboard_ppm_quick_mean(path)
+                    if mean_value is not None:
+                        if mean_value <= 2.0:
+                            sampled_dark_frames += 1
+                        elif first_nonblack_frame is None:
+                            first_nonblack_frame = frame_index
+            elif value and len(missing_examples) < 3:
+                missing_examples.append({"frame_index": frame_index, "value": value, "resolved": path})
+        cameras.append({
+            "key": key,
+            "index": index,
+            "label": f"Cam {index}",
+            "present_frames": int(present),
+            "existing_frames": int(existing),
+            "available": bool(existing > 0),
+            "first_valid_frame": first_valid_frame,
+            "first_nonblack_frame": first_nonblack_frame,
+            "sampled_dark_frames": int(sampled_dark_frames),
+            "sampled_frames": int(sampled_frames),
+            "looks_all_black": bool(existing > 0 and sampled_frames > 0 and sampled_dark_frames == sampled_frames and first_nonblack_frame is None),
+            "missing_examples": missing_examples,
+        })
+    frame_meta = []
+    for frame_index, sample in enumerate(trajectory or []):
+        t = safe_float_value(sample.get("t") if isinstance(sample, dict) else None, first_t)
+        frame_meta.append({
+            "index": int(frame_index),
+            "t": float(t - first_t) if t is not None else None,
+            "phase": str(sample.get("phase") or sample.get("label") or "unknown") if isinstance(sample, dict) else "unknown",
+        })
+    first_available = 0
+    for cam in cameras:
+        preferred_frame = cam.get("first_nonblack_frame")
+        if preferred_frame is None:
+            preferred_frame = cam.get("first_valid_frame")
+        if preferred_frame is not None:
+            first_available = int(preferred_frame or 0)
+            break
+    return {
+        "frame_count": len(trajectory or []),
+        "initial_frame_index": int(first_available),
+        "cameras": cameras,
+        "frames": frame_meta,
+    }
+
+
+def dashboard_episode_frame_image(
+    run_dir: Union[str, os.PathLike],
+    episode_index: Union[int, str],
+    camera: object,
+    frame_index: Union[int, str],
+) -> Dict[str, object]:
+    run_dir = os.path.abspath(str(run_dir))
+    context = dashboard_frame_context(run_dir, episode_index)
+    if not context.get("ok"):
+        return context
+    key = dashboard_camera_key(camera)
+    if not key:
+        return {"ok": False, "status": 400, "error": f"camera_not_found:{camera}"}
+    trajectory = context.get("trajectory") if isinstance(context.get("trajectory"), list) else []
+    if not trajectory:
+        return {"ok": False, "status": 404, "error": "trajectory_empty"}
+    try:
+        idx = int(frame_index)
+    except Exception:
+        idx = 0
+    idx = max(0, min(len(trajectory) - 1, idx))
+
+    candidate_indices = [idx]
+    for radius in range(1, min(64, len(trajectory))):
+        if idx - radius >= 0:
+            candidate_indices.append(idx - radius)
+        if idx + radius < len(trajectory):
+            candidate_indices.append(idx + radius)
+    image_path = ""
+    image_value = None
+    resolved_index = idx
+    image_paths = context.get("image_paths") if isinstance(context.get("image_paths"), dict) else {}
+    camera_paths = image_paths.get(key) if isinstance(image_paths.get(key), list) else []
+    for candidate in candidate_indices:
+        if candidate < len(camera_paths):
+            path, value = camera_paths[candidate]
+        else:
+            sample = trajectory[candidate]
+            path, value = dashboard_resolve_sample_image_path(context.get("row") or {}, sample, key)
+        if path and os.path.isfile(path):
+            image_path = path
+            image_value = value
+            resolved_index = candidate
+            break
+    if not image_path:
+        return {"ok": False, "status": 404, "error": f"image_not_found:{key}:frame={idx}"}
+
+    allowed_bases = context.get("allowed_bases") if isinstance(context.get("allowed_bases"), list) else []
+    if not dashboard_path_under_any(image_path, allowed_bases):
+        return {"ok": False, "status": 403, "error": "image_path_not_under_episode_dir"}
+    try:
+        data, content_type = dashboard_read_preview_image(image_path)
+    except Exception as exc:
+        return {"ok": False, "status": 500, "error": f"image_read_failed:{type(exc).__name__}:{exc}"}
+    return {
+        "ok": True,
+        "data": data,
+        "content_type": content_type,
+        "path": image_path,
+        "camera": key,
+        "requested_frame_index": idx,
+        "resolved_frame_index": resolved_index,
+        "image_value": image_value,
+    }
+
+
 def dashboard_episode_payload(
     run_dir: Union[str, os.PathLike],
     episode_index: Union[int, str],
     max_points: int = 1800,
 ) -> Dict[str, object]:
     run_dir = os.path.abspath(str(run_dir))
-    maybe_reconcile_success_pool_for_dashboard(run_dir)
-    rows, _success_catchup = load_dashboard_all_rows(run_dir)
-    selected = None
-    wanted = str(episode_index)
-    for row in rows:
-        if str(row.get("episode_index")) == wanted or str(row.get("episode_id")) == wanted:
-            selected = row
-            break
+    selected, _rows = dashboard_find_episode_row(run_dir, episode_index)
     if selected is None:
         return {"ok": False, "reason": f"episode_not_found:{episode_index}", "run_dir": run_dir}
     trajectory = load_trajectory(selected)
@@ -5188,8 +5822,18 @@ def dashboard_episode_payload(
             "stage_spans": [],
             "joint_names": ["swing", "boom", "arm", "bucket"],
             "series": empty_series,
+            "camera_preview": {"frame_count": 0, "initial_frame_index": 0, "cameras": [], "frames": []},
         }
+    episode_meta = {}
+    try:
+        episode_dir = episode_dir_from_row(selected)
+        episode_meta = read_json(resolve_episode_file(episode_dir, row_path_value(selected, "meta")), default={}) or {}
+    except Exception:
+        episode_meta = {}
+    episode_summary = dashboard_episode_summary(selected)
+    episode_summary["task_prompt"] = dashboard_episode_task_prompt(selected, trajectory=trajectory, episode_meta=episode_meta)
     first_t = safe_float_value(trajectory[0].get("t"), 0.0) or 0.0
+    frame_context = dashboard_store_frame_context(dashboard_build_frame_context(run_dir, episode_index, selected, trajectory))
     indices = downsample_indices(len(trajectory), max_points)
     series = {
         "t": [],
@@ -5227,12 +5871,18 @@ def dashboard_episode_payload(
     return {
         "ok": True,
         "run_dir": run_dir,
-        "episode": dashboard_episode_summary(selected),
+        "episode": episode_summary,
         "sample_count": len(trajectory),
         "returned_points": len(indices),
         "stage_spans": contiguous_stage_spans(trajectory, first_t),
         "joint_names": ["swing", "boom", "arm", "bucket"],
         "series": series,
+        "camera_preview": build_episode_camera_preview(
+            selected,
+            trajectory,
+            first_t,
+            image_paths=frame_context.get("image_paths") if isinstance(frame_context.get("image_paths"), dict) else None,
+        ),
     }
 
 
@@ -5282,6 +5932,24 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
 .statusFilterTitle{font-size:12px;color:#475467;font-weight:700;margin-right:4px}.statusFilter{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.filterBtn{min-height:28px;border:1px solid #d0d5dd;border-radius:999px;background:#fff;color:#344054;padding:0 10px;font-size:12px;font-weight:700;cursor:pointer}.filterBtn.active{color:#fff;border-color:transparent}.filterBtn.all.active{background:#344054}.filterBtn.trainable.active,.filterBtn.success.active{background:#067647}.filterBtn.rejected.active{background:#d92d20}.filterBtn.failed.active,.filterBtn.fail.active{background:#f79009;color:#111827}.filterBtn.diagnostic.active{background:#6941c6}.filterBtn.planning.active{background:#175cd3}.filterBtn.skip.active{background:#475467}.filterBtn.unknown.active{background:#667085}.filterCount{font-size:12px;color:#667085;white-space:nowrap}.chartMeta{font-size:11px;color:#667085;line-height:1.35;margin-top:6px}.miniChartGrid{display:grid;grid-template-columns:1fr;gap:10px}.miniChart{border:1px solid #eaecf0;border-radius:12px;background:#fcfcfd;padding:10px;min-width:0}.miniChart h3{margin:0 0 6px;font-size:12px;color:#344054;text-transform:none;letter-spacing:0}.miniChart .chart{max-height:165px}.smallChartBox{min-height:0}.pill.failed,.pill.fail{background:#fff7ed;color:#c2410c}.pill.rejected{background:#fef3f2;color:#b42318}.pill.diagnostic{background:#f4f3ff;color:#5925dc}.pill.skip{background:#f2f4f7;color:#344054}.episodeInspector{display:grid;grid-template-columns:minmax(560px,42%) minmax(0,1fr);gap:14px;align-items:start;min-height:0}.episodeSide{background:#f8fafc;border:1px solid #eaecf0;border-radius:12px;padding:10px;display:flex;flex-direction:column;min-height:0;height:var(--episodeAsideHeight,640px);max-height:var(--episodeAsideHeight,640px);overflow:hidden;align-self:start}.sideTabsToolbar{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:8px}.sideSortHint{font-size:11px;color:#667085;line-height:1.35;text-align:right;max-width:190px}.episodeTabsList{flex:1;min-height:0;overflow:auto;scrollbar-width:none;-ms-overflow-style:none;border:1px solid #eaecf0;border-radius:10px;background:#fff}.episodeTabsList::-webkit-scrollbar{display:none;width:0;height:0}.episodeDataSheet{min-width:980px;width:100%;border-collapse:separate;border-spacing:0;font-size:11.5px;line-height:1.25}.episodeDataSheet th,.episodeDataSheet td{padding:7px 8px;border-bottom:1px solid #eef2f6;white-space:nowrap;vertical-align:middle}.episodeDataSheet th{position:sticky;top:0;z-index:4;background:#f8fafc;color:#475467;text-transform:uppercase;letter-spacing:.04em;font-size:10.5px}.episodeDataSheet th.sortable{cursor:pointer;color:#175cd3;user-select:none}.episodeDataSheet th.sortable:hover{background:#eff8ff}.episodeDataSheet tbody tr{cursor:pointer}.episodeDataSheet tbody tr:hover td{background:#f8fafc}.episodeDataSheet tbody tr.selected td{background:#e0f2fe}.episodeDataSheet .epCol{position:sticky;left:0;z-index:3;background:#fff;font-weight:800;color:#101828}.episodeDataSheet th.epCol{z-index:5;background:#f8fafc}.episodeDataSheet tbody tr:hover .epCol{background:#f8fafc}.episodeDataSheet tbody tr.selected .epCol{background:#e0f2fe}.episodeDataSheet .num{text-align:right;font-variant-numeric:tabular-nums}.episodeDataSheet .reasonCell{max-width:360px;overflow:hidden;text-overflow:ellipsis}.sideFooter{font-size:11px;color:#98a2b3;margin-top:7px;line-height:1.35}.timelinePane{min-width:0;display:flex;flex-direction:column;height:auto;align-self:start}.timelinePaneHeader{position:relative;top:auto;z-index:2;background:#fff;border:1px solid #eaecf0;border-radius:12px;padding:10px 12px;margin-bottom:16px}.timelinePaneHeader + .timelineGrid{margin-top:0}#bucketChart{margin-top:0}.timelineChart svg{display:block}.timelineGrid{gap:12px;min-width:0}.timelineChart .chart{min-height:230px}.unitLegend{border:1px solid #d0d5dd;border-radius:999px;padding:2px 7px;background:#fff;color:#475467;font-weight:700}.plotNote{font-size:11px;color:#667085;margin-top:6px;line-height:1.35}.densityBadge{display:inline-block;margin-left:6px;border:1px solid #d0d5dd;border-radius:999px;padding:1px 6px;font-size:10px;color:#475467;background:#fff}.meshFrameBadge{display:inline-block;border:1px solid #d0d5dd;border-radius:999px;padding:2px 7px;background:#fff;color:#475467;font-size:11px;margin-top:6px}
 @media(max-width:1280px){.episodeInspector{grid-template-columns:1fr;min-height:0}.episodeSide{height:min(560px,var(--episodeAsideHeight,560px));max-height:min(560px,var(--episodeAsideHeight,560px))}.timelinePaneHeader{position:static}.miniChartGrid{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:760px){.miniChartGrid{grid-template-columns:1fr}.statusFilterBar{align-items:flex-start}.episodeTabMetrics{grid-template-columns:repeat(2,1fr)}}
+
+.taskPrompt{margin-top:8px;border-left:3px solid #175cd3;padding:7px 9px;background:#f8fafc;border-radius:8px;color:#344054;font-size:12px;line-height:1.4}
+.taskPromptLabel{font-weight:800;color:#175cd3;margin-right:6px}
+.cameraPreview{border:1px solid #eaecf0;border-radius:12px;background:#f8fafc;padding:10px;margin-bottom:14px}
+.cameraPreviewHeader{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:8px}
+.cameraPreviewTitle{font-size:13px;font-weight:850;color:#101828}
+.cameraFrameControls{display:flex;align-items:center;gap:8px;min-width:320px;flex:1}
+.cameraFrameControls input[type=range]{flex:1;min-width:160px}
+.cameraGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.cameraCard{border:1px solid #dbe3ee;border-radius:10px;background:#fff;overflow:hidden;min-width:0}
+.cameraCardHeader{display:flex;justify-content:space-between;gap:8px;padding:7px 8px;border-bottom:1px solid #eef2f6;font-size:11px;color:#475467}
+.cameraCardTitle{font-weight:850;color:#101828}
+.cameraCard img{display:block;width:100%;aspect-ratio:4/3;object-fit:contain;background:#0f172a}
+.cameraCard.missing img{display:none}
+.cameraMissing{display:none;min-height:160px;align-items:center;justify-content:center;padding:16px;color:#98a2b3;font-size:12px;text-align:center}
+.cameraCard.missing .cameraMissing{display:flex}
+.cameraOpenLink{font-size:11px;color:#175cd3;text-decoration:none}
+@media(max-width:900px){.cameraGrid{grid-template-columns:1fr}}
 
 
 /* v8 diagnosis refactor */
@@ -5405,7 +6073,9 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
         <div class="timelinePaneHeader">
           <h2 id="episodeTitle">Attempt timeline</h2>
           <div id="episodeMeta" class="muted" style="margin-top:6px"></div>
+          <div id="episodeTaskPrompt" class="taskPrompt" style="display:none"></div>
         </div>
+        <div id="cameraPreview" class="cameraPreview"><div class="empty">Select an attempt to preview Cam 0/1/2.</div></div>
         <div class="timelineGrid">
           <div id="bucketChart" class="timelineChart"></div>
           <div id="qChart" class="timelineChart"></div>
@@ -5439,6 +6109,8 @@ let runMonitorTimer = null;
 let availableStatuses = [];
 let runRecords = [];
 let selectedRunPaths = new Set();
+let cameraFrameIndex = 0;
+let cameraPreviewTimer = null;
 
 function $(id){return document.getElementById(id)}
 function esc(s){return String(s ?? "").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]))}
@@ -5937,10 +6609,82 @@ function numericOrNull(v){const n=Number(v); return Number.isFinite(n)?n:null}
 function markSelectedTab(index){document.querySelectorAll("#episodeTabs tr[data-ep]").forEach(row=>row.classList.toggle("selected",row.dataset.ep==String(index)))}
 
 function renderEpisode(data){
-  const ep=data.episode||{}; $("episodeTitle").textContent=`Attempt ${ep.episode_index} timeline`; $("episodeMeta").textContent=`${statusKey(ep.status)} · score=${fmt(ep.score,1)} · samples=${data.sample_count} · shown=${data.returned_points} · ${shortText(ep.dataset_skip_reason || ep.reason||ep.warning_reason||"",260)}`; $("rawBox").textContent=JSON.stringify({episode:ep,stage_spans:data.stage_spans},null,2);
+  const ep=data.episode||{}; $("episodeTitle").textContent=`Attempt ${ep.episode_index} timeline`; $("episodeMeta").textContent=`${statusKey(ep.status)} · score=${fmt(ep.score,1)} · samples=${data.sample_count} · shown=${data.returned_points} · ${shortText(ep.dataset_skip_reason || ep.reason||ep.warning_reason||"",260)}`; $("rawBox").textContent=JSON.stringify({episode:ep,stage_spans:data.stage_spans,camera_preview:data.camera_preview},null,2);
+  const promptEl=$("episodeTaskPrompt"); const promptText=String(ep.task_prompt||"").trim(); if(promptEl){promptEl.style.display=promptText?"block":"none"; promptEl.innerHTML=promptText?`<span class="taskPromptLabel">Task prompt</span>${esc(promptText)}`:"";}
+  renderCameraPreview(data);
   const s=data.series||{}; drawLineChart("bucketChart","Bucket sand holding",s.t,[{name:"bucket_from_pile",values:s.bucket_from_pile},{name:"bucket_total",values:s.bucket_total}],data.stage_spans,"particles"); drawVectorChart("qChart","Joint angles",s.t,s.q_deg,data.stage_spans,"deg"); drawVectorChart("dqChart","Joint velocity",s.t,s.dq_deg_s,data.stage_spans,"deg/s"); drawVectorChart("ddqChart","Joint acceleration",s.t,s.ddq_deg_s2,data.stage_spans,"deg/s²"); drawVectorChart("effortChart","Measured joint effort",s.t,s.effort,data.stage_spans,"effort");
   markSelectedTab(ep.episode_index);
   syncEpisodeInspectorHeight();
+}
+
+function cameraDisplayName(key){
+  const k=String(key||"");
+  if(k.endsWith(".0")) return "Cam 0";
+  if(k.endsWith(".1")) return "Cam 1";
+  if(k.endsWith(".2")) return "Cam 2";
+  return k || "camera";
+}
+function cameraFrameMeta(preview, frameIndex){
+  const frames=(preview&&preview.frames)||[];
+  const row=frames[Number(frameIndex)||0]||{};
+  const t=Number(row.t);
+  const tText=Number.isFinite(t)?`${fmt(t,2)}s`:"";
+  const phase=row.phase?` · ${row.phase}`:"";
+  return `frame ${Number(frameIndex)||0}${tText?` · ${tText}`:""}${phase}`;
+}
+function cameraImageUrl(cameraKey, frameIndex){
+  const qs=new URLSearchParams({
+    run_dir:(currentRun&&currentRun.run_dir)||$("runInput").value||"",
+    episode_index:String(currentEpisodeIndex ?? ""),
+    camera:String(cameraKey),
+    frame_index:String(frameIndex),
+    _:String(Date.now())
+  });
+  return `/api/frame?${qs.toString()}`;
+}
+function renderCameraPreview(data){
+  const box=$("cameraPreview"); if(!box) return;
+  const preview=data.camera_preview||{};
+  if(currentRun) currentRun._lastEpisodePreview=preview;
+  const frameCount=Number(preview.frame_count||data.sample_count||0);
+  const cameras=preview.cameras||[];
+  if(!frameCount || !cameras.length){
+    box.innerHTML='<div class="empty">No camera frames for this attempt.</div>';
+    return;
+  }
+  const preferred=Number(preview.initial_frame_index||0);
+  cameraFrameIndex=Math.max(0, Math.min(frameCount-1, Number.isFinite(preferred)?preferred:0));
+  const header=`<div class="cameraPreviewHeader"><div><div class="cameraPreviewTitle">Camera preview · Cam 0/1/2</div><div id="cameraFrameMeta" class="muted">${esc(cameraFrameMeta(preview,cameraFrameIndex))}</div></div><div class="cameraFrameControls"><span class="muted nowrap">frame</span><input id="cameraFrameSlider" type="range" min="0" max="${Math.max(0,frameCount-1)}" value="${cameraFrameIndex}" oninput="updateCameraPreviewFrame(this.value)"><span id="cameraFrameText" class="mono small nowrap">${cameraFrameIndex}/${Math.max(0,frameCount-1)}</span></div></div>`;
+  const cards=cameras.map((cam,idx)=>{
+    const key=cam.key; const available=!!cam.available; const existing=Number(cam.existing_frames||0); const present=Number(cam.present_frames||0);
+    const cls=available?"cameraCard":"cameraCard missing";
+    const src=available?cameraImageUrl(key,cameraFrameIndex):"";
+    const blackWarn=cam.looks_all_black?`<span class="pill failed" title="sampled frames are black">black</span>`:"";
+    return `<div class="${cls}" data-camera-key="${esc(key)}"><div class="cameraCardHeader"><span class="cameraCardTitle">${esc(cam.label||cameraDisplayName(key))} ${blackWarn}</span><span title="existing/present frames">${existing}/${present}</span></div><img id="cameraImg${idx}" src="${esc(src)}" alt="${esc(cam.label||cameraDisplayName(key))}" onerror="this.closest('.cameraCard').classList.add('missing')"><div class="cameraMissing">missing image for this camera/frame</div><div style="padding:6px 8px"><a id="cameraOpen${idx}" class="cameraOpenLink" href="${esc(src)}" target="_blank">open image</a></div></div>`;
+  }).join("");
+  box.innerHTML=header+`<div class="cameraGrid">${cards}</div>`;
+}
+function updateCameraPreviewFrame(value){
+  const frameCount=Number(((currentRun&&currentRun._lastEpisodePreview)||{}).frame_count||0);
+  const preview=(currentRun&&currentRun._lastEpisodePreview)||{};
+  if(!frameCount) return;
+  cameraFrameIndex=Math.max(0,Math.min(frameCount-1,Number(value)||0));
+  const text=$("cameraFrameText"); if(text) text.textContent=`${cameraFrameIndex}/${Math.max(0,frameCount-1)}`;
+  const meta=$("cameraFrameMeta"); if(meta) meta.textContent=cameraFrameMeta(preview,cameraFrameIndex);
+  if(cameraPreviewTimer) clearTimeout(cameraPreviewTimer);
+  cameraPreviewTimer=setTimeout(()=>refreshCameraPreviewImages(cameraFrameIndex),70);
+}
+function refreshCameraPreviewImages(frameIndex){
+  const preview=(currentRun&&currentRun._lastEpisodePreview)||{};
+  const cameras=preview.cameras||[];
+  cameras.forEach((cam,idx)=>{
+    const img=$("cameraImg"+idx), open=$("cameraOpen"+idx);
+    if(!img || !cam.available) return;
+    const url=cameraImageUrl(cam.key,frameIndex);
+    const card=img.closest(".cameraCard"); if(card) card.classList.remove("missing");
+    img.src=url;
+    if(open) open.href=url;
+  });
 }
 
 function chartFrame(width=760,height=220){const l=88,r=34,t=36,b=58; return {w:width,h:height,l,r,t,b,pw:width-l-r,ph:height-t-b}}
@@ -6143,6 +6887,17 @@ def serve_dashboard(
                     episode = params.get("episode_index") or "1"
                     max_points = int(params.get("max_points") or 1800)
                     self.send_json(dashboard_episode_payload(run_dir, episode, max_points=max_points))
+                    return
+                if parsed.path == "/api/frame":
+                    run_dir = normalize_dashboard_client_path(params.get("run_dir") or latest_run(default_root))
+                    episode = params.get("episode_index") or "1"
+                    camera = params.get("camera") or "0"
+                    frame_index = params.get("frame_index") or "0"
+                    result = dashboard_episode_frame_image(run_dir, episode, camera, frame_index)
+                    if not result.get("ok"):
+                        self.send_json({"error": result.get("error", "frame_not_found")}, status=int(result.get("status", 404) or 404))
+                        return
+                    self.send_bytes(result.get("data", b""), str(result.get("content_type") or "application/octet-stream"))
                     return
                 self.send_json({"error": "not_found"}, status=404)
             except Exception as exc:

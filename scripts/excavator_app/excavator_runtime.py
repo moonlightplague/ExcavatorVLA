@@ -296,7 +296,7 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_last_ddq_real": None,
     "dataset_current_q_goal": None,
     "dataset_camera_enabled": True,
-    "dataset_camera_backend": "isaac",
+    "dataset_camera_backend": "replicator_rgb",
     "dataset_camera_objects": {},
     "dataset_camera_initialized": False,
     "dataset_camera_init_attempted": False,
@@ -6462,10 +6462,6 @@ def dataset_camera_resolution():
     return excavator_dataset_camera.resolution(runtime_module())
 
 
-def camera_global_tick():
-    return excavator_dataset_camera.global_tick(runtime_module())
-
-
 async def camera_global_tick_async():
     return await excavator_dataset_camera.global_tick_async(runtime_module())
 
@@ -6523,6 +6519,10 @@ def dataset_camera_episode_metadata():
     return excavator_dataset_camera.episode_metadata(runtime_module())
 
 
+def dataset_camera_episode_summary(meta=None):
+    return excavator_dataset_camera.log_episode_summary(runtime_module(), meta=meta)
+
+
 def dataset_camera_episode_cache(reset=False):
     return excavator_dataset_camera.episode_cache(runtime_module(), reset=reset)
 
@@ -6543,9 +6543,17 @@ async def dataset_camera_warmup_for_episode(label="episode"):
     return await excavator_dataset_camera.warmup_for_episode(runtime_module(), label=label)
 
 
+async def dataset_camera_refresh_for_sample(label="sample"):
+    return await excavator_dataset_camera.global_tick_async(runtime_module())
+
+
 @debug_profiled("dataset_capture_camera_observations", threshold_ms=5.0)
 def dataset_capture_camera_observations(sample_index):
     return excavator_dataset_camera.capture_observations(runtime_module(), sample_index)
+
+
+async def dataset_capture_camera_observations_async(sample_index):
+    return await excavator_dataset_camera.capture_observations_async(runtime_module(), sample_index)
 
 
 def jsonl_line_count(path):
@@ -10580,6 +10588,10 @@ def ensure_auto_collect_run_dir():
             "quality_gate_version": QUALITY_GATE_VERSION,
             "config_hash": config_hash,
             "dataset_root": AUTO_COLLECT_DATASET_ROOT,
+            "camera_backend": config_snapshot["camera"].get("backend", ""),
+            "camera_module_version": config_snapshot["camera"].get("module_version", ""),
+            "camera_renderer_launch": config_snapshot["camera"].get("renderer_launch", {}),
+            "camera_black_frame_guard": config_snapshot["camera"].get("black_frame_guard", {}),
             "state_names": DATASET_STATE_NAMES,
             "action_names": DATASET_ACTION_NAMES,
             "effort_names": DATASET_EFFORT_NAMES,
@@ -12390,6 +12402,7 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
     STATE["dataset_current_q_goal"] = None
     STATE["dataset_camera_frame_count"] = 0
     STATE["dataset_camera_dropped_incomplete_samples"] = 0
+    STATE["dataset_camera_black_rejected"] = 0
     STATE["dataset_camera_warmup_status"] = {}
     STATE["dataset_task_text"] = "Dig soil from the marked area and dump it into the target container."
     STATE["last_execution_failure_reason"] = ""
@@ -12641,6 +12654,7 @@ def auto_collect_finish_episode(meta, success, reason):
     meta["final_metrics"] = metrics
     meta["camera_warmup_status"] = dict(STATE.get("dataset_camera_warmup_status", {}) or {})
     meta["camera_dropped_incomplete_samples"] = int(STATE.get("dataset_camera_dropped_incomplete_samples", 0) or 0)
+    meta["camera_episode_summary"] = dataset_camera_episode_summary(meta=meta)
     write_json_file(STATE.get("dataset_meta_path", ""), meta)
     score_path = os.path.join(str(STATE.get("dataset_episode_dir", "")), "score.json")
     write_json_file(score_path, score_report)
@@ -18754,6 +18768,7 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
             update_status(f"[MOVE STOPPED] {label}", force=True)
             return False
         if not loaded_route_fast_motion:
+            await dataset_camera_refresh_for_sample(label=label)
             dataset_record_sample(mode, q_cmd=CTRL.q_cmd.copy(), label=label)
             notify_sand_site_tool_sample(mode)
         if is_sand_contact_phase(contact_stage_name):

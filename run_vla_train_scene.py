@@ -12,6 +12,7 @@ Headless auto collect:
 import argparse
 import importlib
 import os
+import platform
 import runpy
 import sys
 import time
@@ -51,7 +52,16 @@ def parse_args():
     parser.add_argument("--with-ui", action="store_true", help="Show Excavator/Sand control windows. Off by default for this launcher.")
     parser.add_argument("--width", type=int, default=1920)
     parser.add_argument("--height", type=int, default=1080)
-    parser.add_argument("--renderer", default="RayTracedLighting")
+    parser.add_argument("--renderer", default="RaytracedLighting")
+    parser.add_argument(
+        "--graphics-api",
+        choices=("auto", "vulkan", "d3d12"),
+        default="auto",
+        help="Renderer graphics API. auto uses D3D12 for Windows headless auto-collect and Isaac defaults elsewhere.",
+    )
+    parser.add_argument("--active-gpu", type=int, default=0, help="Renderer GPU index for Isaac SimulationApp.")
+    parser.add_argument("--physics-gpu", type=int, default=0, help="Physics CUDA device index for Isaac SimulationApp.")
+    parser.add_argument("--multi-gpu", action="store_true", help="Enable Isaac multi-GPU rendering.")
 
     bridge_group = parser.add_mutually_exclusive_group()
     bridge_group.add_argument("--bridge", dest="bridge", action="store_true", help="Start TCP bridge for SmolVLA clients.")
@@ -293,11 +303,41 @@ def main():
 
     from isaacsim import SimulationApp
 
+    graphics_api = str(args.graphics_api or "auto").lower()
+    extra_args = ["--/renderer/multiGpu/autoEnable=0"]
+    if graphics_api == "auto" and platform.system().lower().startswith("win") and args.headless and args.auto_collect:
+        graphics_api = "d3d12"
+    if graphics_api == "d3d12":
+        extra_args.append("--/app/vulkan=false")
+    elif graphics_api == "vulkan":
+        extra_args.append("--/app/vulkan=true")
+
+    os.environ["EXCAVATOR_GRAPHICS_API"] = str(graphics_api)
+    os.environ["EXCAVATOR_RENDERER"] = str(args.renderer)
+    os.environ["EXCAVATOR_ACTIVE_GPU"] = str(int(args.active_gpu))
+    os.environ["EXCAVATOR_PHYSICS_GPU"] = str(int(args.physics_gpu))
+    os.environ["EXCAVATOR_MULTI_GPU"] = "1" if bool(args.multi_gpu) else "0"
+
+    print(
+        "[INFO] Isaac renderer config:",
+        f"renderer={args.renderer}",
+        f"graphics_api={graphics_api}",
+        f"multi_gpu={bool(args.multi_gpu)}",
+        f"active_gpu={int(args.active_gpu)}",
+        f"physics_gpu={int(args.physics_gpu)}",
+        f"extra_args={extra_args}",
+        flush=True,
+    )
+
     simulation_app = SimulationApp({
         "headless": bool(args.headless),
         "width": int(args.width),
         "height": int(args.height),
         "renderer": str(args.renderer),
+        "multi_gpu": bool(args.multi_gpu),
+        "active_gpu": int(args.active_gpu),
+        "physics_gpu": int(args.physics_gpu),
+        "extra_args": extra_args,
     })
     if args.headless and args.auto_collect:
         suppress_headless_log_noise()

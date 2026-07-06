@@ -1589,8 +1589,8 @@ async def capture_observations_viewport_async(rt, sample_index, write_files=True
     frames = {}
     views = {}
     failures = []
-    wait_frames = max(1, int(rt.STATE.get("dataset_camera_viewport_wait_frames", 4) or 4))
-    timeout_s = max(0.5, float(rt.STATE.get("dataset_camera_viewport_timeout_s", 5.0) or 5.0))
+    wait_frames = max(1, int(rt.STATE.get("dataset_camera_viewport_wait_frames", 1) or 1))
+    timeout_s = max(0.5, float(rt.STATE.get("dataset_camera_viewport_timeout_s", 2.0) or 2.0))
 
     for spec in specs(rt):
         name = str(spec.get("name", ""))
@@ -2049,6 +2049,8 @@ def config_snapshot(rt):
         "warmup_frames": int(rt.STATE.get("dataset_camera_warmup_frames", 3) or 3),
         "warmup_ready_frames": int(rt.STATE.get("dataset_camera_warmup_ready_frames", 2) or 2),
         "warmup_max_frames": int(rt.STATE.get("dataset_camera_warmup_max_frames", 12) or 12),
+        "viewport_wait_frames": max(1, int(rt.STATE.get("dataset_camera_viewport_wait_frames", 1) or 1)),
+        "viewport_timeout_s": max(0.5, float(rt.STATE.get("dataset_camera_viewport_timeout_s", 2.0) or 2.0)),
         "replicator_tick": bool(replicator_tick_enabled(rt)),
         "syntheticdata_wait": bool(syntheticdata_wait_enabled(rt)),
         "wait_for_render": bool(camera_wait_for_render_enabled(rt)),

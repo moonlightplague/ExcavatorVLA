@@ -318,6 +318,7 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_camera_warmup_max_frames": int(os.environ.get("EXCAVATOR_DATASET_CAMERA_WARMUP_MAX_FRAMES", "12") or 12),
     "dataset_camera_viewport_wait_frames": int(os.environ.get("EXCAVATOR_DATASET_CAMERA_VIEWPORT_WAIT_FRAMES", "0") or 0),
     "dataset_camera_viewport_timeout_s": float(os.environ.get("EXCAVATOR_DATASET_CAMERA_VIEWPORT_TIMEOUT_S", "2.0") or 2.0),
+    "dataset_camera_background_interval_s": float(os.environ.get("EXCAVATOR_DATASET_CAMERA_BACKGROUND_INTERVAL_S", "0") or 0),
     "dataset_camera_warmup_status": {},
     "dataset_camera_run_warmup_status": {},
     "dataset_camera_run_warmup_run_id": "",
@@ -6642,6 +6643,26 @@ async def dataset_capture_camera_observations_async(sample_index):
     return await excavator_dataset_camera.capture_observations_async(runtime_module(), sample_index)
 
 
+def dataset_camera_start_background(label="auto_collect"):
+    if not bool(STATE.get("dataset_camera_enabled", True)):
+        return None
+    if not bool(STATE.get("dataset_camera_require_complete_samples", True)):
+        return None
+    return register_async_task(
+        "dataset_camera_capture",
+        excavator_dataset_camera.background_capture_loop(runtime_module(), label=label),
+        replace=True,
+    )
+
+
+def dataset_camera_stop_background(reason=""):
+    try:
+        excavator_dataset_camera.stop_background_capture(runtime_module(), reason=reason)
+    except Exception:
+        pass
+    cancel_registered_task("dataset_camera_capture", reason=reason or "dataset_camera_stop")
+
+
 def jsonl_line_count(path):
     try:
         with open(str(path), "r", encoding="utf-8") as f:
@@ -10527,6 +10548,9 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False,
             "ep": int(STATE.get("dataset_episode_id", 0)),
             "id": str(STATE.get("dataset_episode_uid", "")),
             "i": int(sample_index),
+            "timestamp": float(now),
+            "observation.timestamp": float(now),
+            "action.timestamp": float(now),
             "t": float(now) - float(STATE.get("dataset_episode_start_time", now)),
             "task": str(STATE.get("dataset_task_text", "Dig soil from the marked area and dump it into the target container.")),
             "phase": str(phase),
@@ -10605,8 +10629,8 @@ async def dataset_record_sample_async(phase, q_cmd=None, q_real=None, label="", 
     camera_payload = None
     if dataset_camera_sample_requires_complete_images(sample_index):
         span_t = time.perf_counter()
-        camera_payload = await dataset_capture_camera_observations_async(sample_index)
-        debug_profile_span("dataset_record_sample.camera_async", span_t, threshold_ms=4.0)
+        camera_payload = dataset_capture_camera_observations(sample_index)
+        debug_profile_span("dataset_record_sample.camera_latest_cache", span_t, threshold_ms=4.0)
     dataset_record_sample(
         phase,
         q_cmd=q_cmd,
@@ -15619,6 +15643,7 @@ async def auto_collect_loop(count, max_attempts=None):
         )
         if not camera_preflight_ok:
             return
+        dataset_camera_start_background(label=f"auto_collect_run_{STATE.get('auto_collect_run_id', '')}")
         consecutive_prepare_failed = 0
         while (
             int(STATE.get("auto_collect_successes", 0)) < target_successes
@@ -15655,6 +15680,7 @@ async def auto_collect_loop(count, max_attempts=None):
         info_print("[ERROR] [AUTO DATASET TRACE]", traceback.format_exc(limit=8).strip(), force_log=True)
         STATE["auto_collect_last_result"] = f"loop_failed={type(e).__name__}: {e}"
     finally:
+        dataset_camera_stop_background("auto_collect_loop_end")
         try:
             auto_collect_finalize_active_episode_if_needed("auto_collect_loop_interrupted_before_finish")
         except Exception as e:

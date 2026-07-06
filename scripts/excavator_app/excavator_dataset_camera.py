@@ -1641,6 +1641,121 @@ def empty_payload(rt, sample_index, reason="", views=None):
     }
 
 
+def store_latest_capture(rt, frames, views, sample_index, capture_started, capture_finished, source="viewport_capture"):
+    required = [str(x) for x in rt.DATASET_CAMERA_NAMES]
+    if not isinstance(frames, dict) or any(name not in frames for name in required):
+        return False
+    seq = int(rt.STATE.get("dataset_camera_latest_seq", 0) or 0) + 1
+    safe_frames = {name: np.ascontiguousarray(frames[name][:, :, :3]).copy() for name in required}
+    safe_views = {
+        str(name): dict(views.get(str(name), {}) if isinstance(views, dict) and isinstance(views.get(str(name), {}), dict) else {})
+        for name in required
+    }
+    record = {
+        "seq": int(seq),
+        "source": str(source),
+        "sample_index": int(sample_index),
+        "capture_started_at": float(capture_started),
+        "capture_finished_at": float(capture_finished),
+        "capture_elapsed_ms": float(max(0.0, capture_finished - capture_started) * 1000.0),
+        "frames": safe_frames,
+        "views": safe_views,
+        "backend": backend(rt),
+        "resolution": resolution(rt),
+        "image_format": image_extension(rt),
+    }
+    rt.STATE["dataset_camera_latest_seq"] = int(seq)
+    rt.STATE["dataset_camera_latest_capture"] = record
+    rt.STATE["dataset_camera_latest_capture_time"] = float(capture_finished)
+    return True
+
+
+def latest_capture_payload(rt, sample_index):
+    payload = empty_payload(rt, sample_index, reason="")
+    if not bool(rt.STATE.get("dataset_camera_enabled", True)):
+        payload["observation.camera"]["reason"] = "disabled"
+        return payload
+    stride = max(1, int(rt.STATE.get("dataset_camera_sample_stride", 1) or 1))
+    if int(sample_index) >= 0 and int(sample_index) % stride != 0:
+        payload["observation.camera"]["reason"] = "stride_skipped"
+        return payload
+    episode_dir = str(rt.STATE.get("dataset_episode_dir", "") or "")
+    image_dir = str(rt.STATE.get("dataset_image_dir", "") or "")
+    if not episode_dir or not image_dir:
+        payload["observation.camera"]["reason"] = "missing_episode_image_dir"
+        return payload
+    latest = rt.STATE.get("dataset_camera_latest_capture")
+    if not isinstance(latest, dict):
+        payload["observation.camera"]["reason"] = "camera_latest_missing"
+        return payload
+    frames = latest.get("frames")
+    views = latest.get("views")
+    if not isinstance(frames, dict) or not isinstance(views, dict):
+        payload["observation.camera"]["reason"] = "camera_latest_invalid"
+        return payload
+
+    required = [str(x) for x in rt.DATASET_CAMERA_NAMES]
+    missing = [name for name in required if name not in frames]
+    if missing:
+        payload["observation.camera"]["reason"] = "camera_latest_missing_frames:" + ",".join(missing)
+        return payload
+
+    now = time.time()
+    capture_finished = float(latest.get("capture_finished_at", latest.get("capture_started_at", now)) or now)
+    camera_cache = episode_cache(rt, reset=False)
+    extension = str(camera_cache.get("extension", image_extension(rt)))
+    view_cache = camera_cache.get("views", {}) if isinstance(camera_cache, dict) else {}
+    payload["observation.camera"].update(
+        {
+            "available": True,
+            "reason": "ok",
+            "backend": str(latest.get("backend", backend(rt))),
+            "image_format": extension,
+            "resolution": resolution(rt),
+            "capture_seq": int(latest.get("seq", 0) or 0),
+            "capture_started_at": float(latest.get("capture_started_at", capture_finished) or capture_finished),
+            "capture_finished_at": float(capture_finished),
+            "capture_elapsed_ms": float(latest.get("capture_elapsed_ms", 0.0) or 0.0),
+            "sample_timestamp": float(now),
+            "frame_age_ms": float(max(0.0, now - capture_finished) * 1000.0),
+            "source": str(latest.get("source", "latest_cache")),
+            "views": {},
+        }
+    )
+
+    for name in required:
+        rgb = np.ascontiguousarray(frames[name][:, :, :3])
+        cached_view = view_cache.get(name, {}) if isinstance(view_cache, dict) else {}
+        filename = f"{int(sample_index):06d}.{extension}"
+        abs_dir = str(cached_view.get("abs_dir", os.path.join(image_dir, name)))
+        rel_dir = str(cached_view.get("rel_dir", f"images/{name}"))
+        abs_path = os.path.join(abs_dir, filename)
+        rel_path = f"{rel_dir}/{filename}".replace("\\", "/")
+        image_job = {
+            "kind": "image",
+            "path": abs_path,
+            "rgb": rgb.copy(),
+            "ensure_dir": False,
+        }
+        fmt = extension
+        if not rt.dataset_writer_enqueue(image_job):
+            fmt = save_rgb_image(rt, abs_path, rgb, ensure_dir=False)
+        view_payload = dict(views.get(name, {}) if isinstance(views.get(name, {}), dict) else {})
+        view_payload.update(
+            {
+                "available": True,
+                "path": rel_path,
+                "format": fmt,
+                "capture_seq": int(latest.get("seq", 0) or 0),
+                "capture_finished_at": float(capture_finished),
+                "frame_age_ms": float(max(0.0, now - capture_finished) * 1000.0),
+            }
+        )
+        payload[f"observation.images.{name}"] = rel_path
+        payload["observation.camera"]["views"][name] = view_payload
+    return payload
+
+
 async def capture_observations_viewport_async(rt, sample_index, write_files=True):
     payload = empty_payload(rt, sample_index, reason="")
     if not bool(rt.STATE.get("dataset_camera_enabled", True)):
@@ -1666,6 +1781,7 @@ async def capture_observations_viewport_async(rt, sample_index, write_files=True
         payload["observation.camera"]["reason"] = f"dataset_viewport_unavailable:{type(exc).__name__}:{exc}"
         return payload
 
+    capture_started = time.time()
     before_active = active_viewport_camera_path_snapshot()
     frames = {}
     views = {}
@@ -1737,6 +1853,7 @@ async def capture_observations_viewport_async(rt, sample_index, write_files=True
             failures.append(failure)
 
     after_active = active_viewport_camera_path_snapshot()
+    capture_finished = time.time()
     payload["observation.camera"]["views"] = views
     payload["observation.camera"]["active_viewport_before"] = before_active
     payload["observation.camera"]["active_viewport_after"] = after_active
@@ -1757,10 +1874,14 @@ async def capture_observations_viewport_async(rt, sample_index, write_files=True
         payload["observation.camera"]["reason"] = ",".join(failures or [f"missing_required_frames:{','.join(missing)}"])
         return payload
 
+    store_latest_capture(rt, frames, views, sample_index, capture_started, capture_finished, source="viewport_capture_direct")
     payload["observation.camera"]["available"] = True
     payload["observation.camera"]["reason"] = "ok"
     payload["observation.camera"]["image_format"] = image_extension(rt)
     payload["observation.camera"]["resolution"] = resolution(rt)
+    payload["observation.camera"]["capture_started_at"] = float(capture_started)
+    payload["observation.camera"]["capture_finished_at"] = float(capture_finished)
+    payload["observation.camera"]["capture_elapsed_ms"] = float(max(0.0, capture_finished - capture_started) * 1000.0)
     if not write_files:
         return payload
 
@@ -1794,6 +1915,79 @@ async def capture_observations_viewport_async(rt, sample_index, write_files=True
         )
     payload["observation.camera"]["image_format"] = extension
     return payload
+
+
+def background_interval_seconds(rt):
+    value = rt.STATE.get("dataset_camera_background_interval_s", None)
+    if value is None:
+        value = os.environ.get("EXCAVATOR_DATASET_CAMERA_BACKGROUND_INTERVAL_S", "")
+    try:
+        interval = float(value)
+    except Exception:
+        interval = 0.0
+    if interval <= 0.0:
+        try:
+            interval = float(rt.STATE.get("dataset_sample_interval", 0.20) or 0.20)
+        except Exception:
+            interval = 0.20
+    return max(0.02, float(interval))
+
+
+async def background_capture_loop(rt, label="dataset_camera_background"):
+    rt.STATE["dataset_camera_background_stop_requested"] = False
+    rt.STATE["dataset_camera_background_running"] = True
+    rt.STATE["dataset_camera_background_label"] = str(label)
+    failures = 0
+    captures = 0
+    rt.info_print(
+        "[DATASET CAMERA BACKGROUND]",
+        "started",
+        f"backend={backend(rt)}",
+        f"interval_s={background_interval_seconds(rt):.3f}",
+    )
+    try:
+        while (
+            bool(rt.STATE.get("dataset_camera_enabled", True))
+            and not bool(rt.STATE.get("dataset_camera_background_stop_requested", False))
+            and bool(rt.STATE.get("auto_collect_active", False))
+        ):
+            started = time.time()
+            payload = await capture_observations_viewport_async(rt, sample_index=-1, write_files=False)
+            camera_info = payload.get("observation.camera", {}) if isinstance(payload, dict) else {}
+            if bool(camera_info.get("available", False)):
+                captures += 1
+                rt.STATE["dataset_camera_background_captures"] = int(captures)
+                failures = 0
+            else:
+                failures += 1
+                rt.STATE["dataset_camera_background_failures"] = int(failures)
+                if failures <= 3 or failures % 30 == 0:
+                    rt.info_print(
+                        "[WARN] [DATASET CAMERA BACKGROUND]",
+                        f"capture_failed={failures}",
+                        f"reason={camera_info.get('reason', 'unknown') if isinstance(camera_info, dict) else 'payload_missing'}",
+                    )
+            elapsed = time.time() - started
+            delay = max(0.0, background_interval_seconds(rt) - elapsed)
+            if delay > 0.0:
+                await asyncio.sleep(delay)
+            else:
+                await asyncio.sleep(0)
+    except asyncio.CancelledError:
+        raise
+    finally:
+        rt.STATE["dataset_camera_background_running"] = False
+        rt.info_print(
+            "[DATASET CAMERA BACKGROUND]",
+            "stopped",
+            f"captures={int(rt.STATE.get('dataset_camera_background_captures', captures) or 0)}",
+            f"failures={int(rt.STATE.get('dataset_camera_background_failures', failures) or 0)}",
+        )
+
+
+def stop_background_capture(rt, reason=""):
+    rt.STATE["dataset_camera_background_stop_requested"] = True
+    rt.STATE["dataset_camera_background_stop_reason"] = str(reason)
 
 
 def rgb_ready(rt):
@@ -1962,7 +2156,7 @@ async def warmup_for_episode(rt, label="episode"):
 def capture_observations(rt, sample_index):
     payload = empty_payload(rt, sample_index, reason="sync_capture_disabled_use_capture_observations_async")
     if backend(rt) == "viewport_capture":
-        return payload
+        return latest_capture_payload(rt, sample_index)
     payload["observation.camera"]["views"] = {}
     if not bool(rt.STATE.get("dataset_camera_enabled", True)):
         payload["observation.camera"]["reason"] = "disabled"
@@ -2060,7 +2254,9 @@ def capture_observations(rt, sample_index):
 
 async def capture_observations_async(rt, sample_index, write_files=True):
     if backend(rt) == "viewport_capture":
-        return await capture_observations_viewport_async(rt, sample_index, write_files=write_files)
+        if write_files:
+            return latest_capture_payload(rt, sample_index)
+        return await capture_observations_viewport_async(rt, sample_index, write_files=False)
     if bool(rt.STATE.get("dataset_camera_enabled", True)):
         stride = max(1, int(rt.STATE.get("dataset_camera_sample_stride", 1) or 1))
         should_tick = int(sample_index) % stride == 0
@@ -2139,6 +2335,13 @@ def config_snapshot(rt):
         "warmup_max_frames": int(rt.STATE.get("dataset_camera_warmup_max_frames", 12) or 12),
         "viewport_wait_frames": max(0, int(rt.STATE.get("dataset_camera_viewport_wait_frames", 0) or 0)),
         "viewport_timeout_s": max(0.5, float(rt.STATE.get("dataset_camera_viewport_timeout_s", 2.0) or 2.0)),
+        "background_capture": {
+            "enabled_for_auto_collect": True,
+            "interval_s": background_interval_seconds(rt),
+            "latest_seq": int(rt.STATE.get("dataset_camera_latest_seq", 0) or 0),
+            "running": bool(rt.STATE.get("dataset_camera_background_running", False)),
+            "note": "Samples write the latest complete camera triplet and record capture timestamps; action timing is not blocked by render.",
+        },
         "replicator_tick": bool(replicator_tick_enabled(rt)),
         "syntheticdata_wait": bool(syntheticdata_wait_enabled(rt)),
         "wait_for_render": bool(camera_wait_for_render_enabled(rt)),

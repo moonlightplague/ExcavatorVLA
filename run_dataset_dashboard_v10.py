@@ -5940,6 +5940,12 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
 .cameraPreviewTitle{font-size:13px;font-weight:850;color:#101828}
 .cameraFrameControls{display:flex;align-items:center;gap:8px;min-width:320px;flex:1}
 .cameraFrameControls input[type=range]{flex:1;min-width:160px}
+.cameraPlayerControls{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.cameraPlayerBtn{min-height:28px;border:1px solid #d0d5dd;border-radius:8px;background:#fff;color:#344054;padding:0 9px;font-size:12px;font-weight:800;cursor:pointer}
+.cameraPlayerBtn:hover{background:#f8fafc}
+.cameraPlayerBtn.primary{background:#175cd3;border-color:#175cd3;color:#fff;min-width:58px}
+.cameraPlayerBtn.primary.playing{background:#b42318;border-color:#b42318}
+.cameraPlayerSpeed{height:28px;border:1px solid #d0d5dd;border-radius:8px;background:#fff;color:#344054;font-size:12px;font-weight:700;padding:0 6px}
 .cameraGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
 .cameraCard{border:1px solid #dbe3ee;border-radius:10px;background:#fff;overflow:hidden;min-width:0}
 .cameraCardHeader{display:flex;justify-content:space-between;gap:8px;padding:7px 8px;border-bottom:1px solid #eef2f6;font-size:11px;color:#475467}
@@ -6111,6 +6117,9 @@ let runRecords = [];
 let selectedRunPaths = new Set();
 let cameraFrameIndex = 0;
 let cameraPreviewTimer = null;
+let cameraPlayerTimer = null;
+let cameraPlayerPlaying = false;
+let cameraPlayerFps = 10;
 
 function $(id){return document.getElementById(id)}
 function esc(s){return String(s ?? "").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]))}
@@ -6642,8 +6651,68 @@ function cameraImageUrl(cameraKey, frameIndex){
   });
   return `/api/frame?${qs.toString()}`;
 }
+function stopCameraPlayer(){
+  cameraPlayerPlaying=false;
+  if(cameraPlayerTimer){
+    clearTimeout(cameraPlayerTimer);
+    cameraPlayerTimer=null;
+  }
+  const btn=$("cameraPlayBtn");
+  if(btn){
+    btn.textContent="Play";
+    btn.classList.remove("playing");
+  }
+}
+function updateCameraPlayButton(){
+  const btn=$("cameraPlayBtn");
+  if(!btn) return;
+  btn.textContent=cameraPlayerPlaying?"Pause":"Play";
+  btn.classList.toggle("playing",cameraPlayerPlaying);
+}
+function cameraPlayerDelayMs(){
+  const fps=Math.max(1,Math.min(60,Number(cameraPlayerFps)||10));
+  return Math.round(1000/fps);
+}
+function cameraPlayerTick(){
+  if(!cameraPlayerPlaying) return;
+  const preview=(currentRun&&currentRun._lastEpisodePreview)||{};
+  const frameCount=Number(preview.frame_count||0);
+  if(!frameCount){
+    stopCameraPlayer();
+    return;
+  }
+  updateCameraPreviewFrame((cameraFrameIndex+1)%frameCount,{immediate:true});
+  cameraPlayerTimer=setTimeout(cameraPlayerTick,cameraPlayerDelayMs());
+}
+function toggleCameraPlayer(){
+  const preview=(currentRun&&currentRun._lastEpisodePreview)||{};
+  if(!Number(preview.frame_count||0)) return;
+  cameraPlayerPlaying=!cameraPlayerPlaying;
+  updateCameraPlayButton();
+  if(cameraPlayerPlaying){
+    if(cameraPlayerTimer) clearTimeout(cameraPlayerTimer);
+    cameraPlayerTimer=setTimeout(cameraPlayerTick,cameraPlayerDelayMs());
+  }else if(cameraPlayerTimer){
+    clearTimeout(cameraPlayerTimer);
+    cameraPlayerTimer=null;
+  }
+}
+function stepCameraPreview(delta){
+  const preview=(currentRun&&currentRun._lastEpisodePreview)||{};
+  const frameCount=Number(preview.frame_count||0);
+  if(!frameCount) return;
+  updateCameraPreviewFrame((cameraFrameIndex+Number(delta)+frameCount)%frameCount,{immediate:true});
+}
+function setCameraPlayerFps(value){
+  cameraPlayerFps=Math.max(1,Math.min(60,Number(value)||10));
+  if(cameraPlayerPlaying){
+    if(cameraPlayerTimer) clearTimeout(cameraPlayerTimer);
+    cameraPlayerTimer=setTimeout(cameraPlayerTick,cameraPlayerDelayMs());
+  }
+}
 function renderCameraPreview(data){
   const box=$("cameraPreview"); if(!box) return;
+  stopCameraPlayer();
   const preview=data.camera_preview||{};
   if(currentRun) currentRun._lastEpisodePreview=preview;
   const frameCount=Number(preview.frame_count||data.sample_count||0);
@@ -6663,16 +6732,31 @@ function renderCameraPreview(data){
     return `<div class="${cls}" data-camera-key="${esc(key)}"><div class="cameraCardHeader"><span class="cameraCardTitle">${esc(cam.label||cameraDisplayName(key))} ${blackWarn}</span><span title="existing/present frames">${existing}/${present}</span></div><img id="cameraImg${idx}" src="${esc(src)}" alt="${esc(cam.label||cameraDisplayName(key))}" onerror="this.closest('.cameraCard').classList.add('missing')"><div class="cameraMissing">missing image for this camera/frame</div><div style="padding:6px 8px"><a id="cameraOpen${idx}" class="cameraOpenLink" href="${esc(src)}" target="_blank">open image</a></div></div>`;
   }).join("");
   box.innerHTML=header+`<div class="cameraGrid">${cards}</div>`;
+  const headerEl=box.querySelector(".cameraPreviewHeader");
+  const frameControls=box.querySelector(".cameraFrameControls");
+  if(headerEl&&frameControls){
+    const player=document.createElement("div");
+    player.className="cameraPlayerControls";
+    player.innerHTML=`<button id="cameraPlayBtn" class="cameraPlayerBtn primary" type="button" onclick="toggleCameraPlayer()">Play</button><button class="cameraPlayerBtn" type="button" title="Previous frame" onclick="stepCameraPreview(-1)">-1</button><button class="cameraPlayerBtn" type="button" title="Next frame" onclick="stepCameraPreview(1)">+1</button><select id="cameraPlayerFps" class="cameraPlayerSpeed" title="Playback speed" onchange="setCameraPlayerFps(this.value)"><option value="5">5 fps</option><option value="10" selected>10 fps</option><option value="15">15 fps</option><option value="30">30 fps</option></select>`;
+    headerEl.insertBefore(player,frameControls);
+    const fpsSelect=$("cameraPlayerFps");
+    if(fpsSelect) fpsSelect.value=String(cameraPlayerFps);
+  }
 }
-function updateCameraPreviewFrame(value){
+function updateCameraPreviewFrame(value,opts){
   const frameCount=Number(((currentRun&&currentRun._lastEpisodePreview)||{}).frame_count||0);
   const preview=(currentRun&&currentRun._lastEpisodePreview)||{};
   if(!frameCount) return;
   cameraFrameIndex=Math.max(0,Math.min(frameCount-1,Number(value)||0));
+  const slider=$("cameraFrameSlider"); if(slider && Number(slider.value)!==cameraFrameIndex) slider.value=String(cameraFrameIndex);
   const text=$("cameraFrameText"); if(text) text.textContent=`${cameraFrameIndex}/${Math.max(0,frameCount-1)}`;
   const meta=$("cameraFrameMeta"); if(meta) meta.textContent=cameraFrameMeta(preview,cameraFrameIndex);
   if(cameraPreviewTimer) clearTimeout(cameraPreviewTimer);
-  cameraPreviewTimer=setTimeout(()=>refreshCameraPreviewImages(cameraFrameIndex),70);
+  if(opts&&opts.immediate){
+    refreshCameraPreviewImages(cameraFrameIndex);
+  }else{
+    cameraPreviewTimer=setTimeout(()=>refreshCameraPreviewImages(cameraFrameIndex),70);
+  }
 }
 function refreshCameraPreviewImages(frameIndex){
   const preview=(currentRun&&currentRun._lastEpisodePreview)||{};

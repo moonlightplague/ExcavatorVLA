@@ -5967,6 +5967,20 @@ def compact_plan_candidate(row, include_stages=False):
     return out
 
 
+def compact_shared_plan_summary(plan, plan_debug_path=""):
+    plan = plan if isinstance(plan, dict) else {}
+    return {
+        "plan_id": str(plan.get("plan_id", "")),
+        "total_plan_cost": plan.get("total_plan_cost"),
+        "estimated_duration": plan.get("estimated_duration"),
+        "stage_count": plan.get("stage_count"),
+        "target_xyz": vec_list(plan.get("target_xyz"), 3),
+        "chosen_unload_landing_point": vec_list(plan.get("chosen_unload_landing_point"), 3),
+        "chosen_unload_release_point": vec_list(plan.get("chosen_unload_release_point"), 3),
+        "stored_full_plan_in": str(plan_debug_path or ""),
+    }
+
+
 def compact_dig_primitive_params(candidate):
     candidate = candidate if isinstance(candidate, dict) else {}
     keys = [
@@ -6235,6 +6249,13 @@ DATASET_PHASE_NAMES = [
 
 def json_sanitize(value):
     if isinstance(value, np.ndarray):
+        if int(value.size) > 4096:
+            return {
+                "omitted": "large_ndarray",
+                "shape": [int(x) for x in value.shape],
+                "dtype": str(value.dtype),
+                "size": int(value.size),
+            }
         return json_sanitize(value.tolist())
     if isinstance(value, np.bool_):
         return bool(value)
@@ -10665,6 +10686,42 @@ def dataset_record_event(event, detail="", data=None):
         info_print("[WARN] dataset event failed:", type(e).__name__, e)
 
 
+def dataset_record_stage_boundary_sample(stage_name, result, q_real=None):
+    """Write a trajectory row at stage boundaries using the latest camera cache.
+
+    Background camera capture can advance while stage bookkeeping/replanning is
+    happening, but the dashboard player only sees frames referenced by
+    trajectory rows.  This boundary row prevents visible skips between stages
+    without forcing a render tick.
+    """
+    if not bool(STATE.get("dataset_recording", False)):
+        return
+    if not bool(STATE.get("dataset_stage_boundary_samples", True)):
+        return
+    result_text = str(result or "")
+    if result_text not in {"start", "done", "failed"}:
+        return
+    try:
+        q_cmd = CTRL.q_cmd.copy()
+        q_sample_real = q_real
+        if q_sample_real is None:
+            try:
+                q_sample_real = q_real_near_command(get_real_joint_positions(), q_cmd)
+            except Exception:
+                q_sample_real = None
+        dataset_record_sample(
+            str(stage_name or "stage"),
+            q_cmd=q_cmd,
+            q_real=q_sample_real,
+            label=f"{stage_name}_{result_text}_boundary",
+            force=True,
+        )
+    except Exception as e:
+        if time.time() - float(STATE.get("dataset_last_error_time", 0.0)) > 2.0:
+            STATE["dataset_last_error_time"] = time.time()
+            info_print("[WARN] dataset stage boundary sample failed:", type(e).__name__, e)
+
+
 def auto_collect_status_text():
     run_dir = str(STATE.get("auto_collect_run_dir", ""))
     trainable = jsonl_line_count(os.path.join(run_dir, "trainable_episodes.jsonl")) if run_dir else 0
@@ -11680,6 +11737,7 @@ def record_stage_audit(stage_name, stage_index, result, reason="", q_goal=None, 
                 f"{stage_name}:{result}" + (f":{reason}" if reason else ""),
                 data=row,
             )
+            dataset_record_stage_boundary_sample(stage_name, result, q_real=q_real)
         else:
             debug_timeline_record(
                 "STAGE_AUDIT",
@@ -12636,6 +12694,7 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
         for x in STATE.get("last_dig_plan_candidates", [])
     ]
     plan_debug_path = os.path.join(episode_dir, DATASET_DEBUG_PLAN_FILE)
+    shared_plan_summary = compact_shared_plan_summary(shared_plan, plan_debug_path=plan_debug_path)
     episode_seed = stable_json_hash([STATE.get("auto_collect_run_id", ""), int(attempt_index), "episode"])
     sand_seed = stable_json_hash([STATE.get("auto_collect_run_id", ""), int(attempt_index), "sand"])
     candidate_sampling_seed = stable_json_hash([STATE.get("auto_collect_run_id", ""), int(attempt_index), "candidate_sampling"])
@@ -12711,7 +12770,8 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
         "q_initial_rad": None if q_initial_arr is None or len(q_initial_arr) < 4 else vec_list(q_initial_arr[:4], 4),
         "q_initial_deg": q_initial_deg,
         "chosen_plan": chosen_plan_compact,
-        "shared_dig_plan": shared_plan,
+        "shared_dig_plan": shared_plan_summary,
+        "plan_debug_path": plan_debug_path,
         "dig_target_candidates": STATE.get("last_auto_dig_target_scores", []),
         "unload_flat_fill_candidates": STATE.get("last_auto_unload_scores", []),
         "plan_candidates": candidates_compact,

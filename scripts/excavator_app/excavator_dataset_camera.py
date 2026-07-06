@@ -18,7 +18,7 @@ except Exception:
     Image = None
 
 
-CAMERA_MODULE_VERSION = "dataset_camera_viewport_capture_v14_linux_safe"
+CAMERA_MODULE_VERSION = "dataset_camera_viewport_capture_v15_compact_meta_noawait"
 SYNC_STEP_ERROR_TEXT = "Synchronous call to `step`"
 
 
@@ -227,6 +227,49 @@ def rgb_stats(rgb):
         "max": int(np.max(sample)) if sample.size else 0,
         "min": int(np.min(sample)) if sample.size else 0,
     }
+
+
+def compact_camera_metadata_value(value, key=""):
+    """Keep camera diagnostics JSON-safe without serializing image buffers."""
+    if isinstance(value, np.ndarray):
+        return {
+            "omitted": "ndarray",
+            "shape": [int(x) for x in value.shape],
+            "dtype": str(value.dtype),
+            "size": int(value.size),
+        }
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            name = str(k)
+            lower = name.lower()
+            if lower in ("rgb", "rgba", "image", "images", "pixels", "pixel_data", "buffer"):
+                out[name] = compact_camera_metadata_value(v, key=name)
+            else:
+                out[name] = compact_camera_metadata_value(v, key=name)
+        return out
+    if isinstance(value, (list, tuple)):
+        if len(value) > 128:
+            return {"omitted": "large_sequence", "length": int(len(value))}
+        return [compact_camera_metadata_value(v, key=key) for v in value]
+    return value
+
+
+def compact_camera_views(views):
+    if not isinstance(views, dict):
+        return {}
+    return {str(k): compact_camera_metadata_value(v, key=str(k)) for k, v in views.items()}
+
+
+def compact_capture_meta(meta):
+    if not isinstance(meta, dict):
+        return {}
+    compact = compact_camera_metadata_value(meta)
+    if isinstance(compact, dict):
+        compact.pop("rgb", None)
+    return compact
 
 
 def validate_rgb_content(rt, rgb, stats=None):
@@ -457,9 +500,10 @@ async def capture_viewport_rgb_async(rt, viewport_api, camera_path, wait_frames=
         except Exception:
             await rt.step_updates(1)
 
-    if result["rgb"] is None:
-        return None, result["error"] or "viewport_capture_no_rgb", result
-    return result["rgb"], "ok", result
+    rgb = result.get("rgb")
+    if rgb is None:
+        return None, result["error"] or "viewport_capture_no_rgb", compact_capture_meta(result)
+    return rgb, "ok", compact_capture_meta(result)
 
 
 def camera_render_product_paths(rt):
@@ -1577,6 +1621,7 @@ def episode_cache(rt, reset=False):
         "extension": extension,
         "resolution": cam_resolution,
         "views": views,
+        "written_images": {},
     }
     rt.STATE["dataset_camera_episode_cache"] = cache
     return cache
@@ -1647,10 +1692,12 @@ def store_latest_capture(rt, frames, views, sample_index, capture_started, captu
         return False
     seq = int(rt.STATE.get("dataset_camera_latest_seq", 0) or 0) + 1
     safe_frames = {name: np.ascontiguousarray(frames[name][:, :, :3]).copy() for name in required}
-    safe_views = {
-        str(name): dict(views.get(str(name), {}) if isinstance(views, dict) and isinstance(views.get(str(name), {}), dict) else {})
-        for name in required
-    }
+    safe_views = compact_camera_views(
+        {
+            str(name): views.get(str(name), {}) if isinstance(views, dict) else {}
+            for name in required
+        }
+    )
     record = {
         "seq": int(seq),
         "source": str(source),
@@ -1723,32 +1770,50 @@ def latest_capture_payload(rt, sample_index):
         }
     )
 
+    written_images = camera_cache.setdefault("written_images", {})
+    capture_seq = int(latest.get("seq", 0) or 0)
     for name in required:
         rgb = np.ascontiguousarray(frames[name][:, :, :3])
         cached_view = view_cache.get(name, {}) if isinstance(view_cache, dict) else {}
-        filename = f"{int(sample_index):06d}.{extension}"
         abs_dir = str(cached_view.get("abs_dir", os.path.join(image_dir, name)))
         rel_dir = str(cached_view.get("rel_dir", f"images/{name}"))
-        abs_path = os.path.join(abs_dir, filename)
-        rel_path = f"{rel_dir}/{filename}".replace("\\", "/")
-        image_job = {
-            "kind": "image",
-            "path": abs_path,
-            "rgb": rgb.copy(),
-            "ensure_dir": False,
-        }
-        fmt = extension
-        if not rt.dataset_writer_enqueue(image_job):
-            fmt = save_rgb_image(rt, abs_path, rgb, ensure_dir=False)
-        view_payload = dict(views.get(name, {}) if isinstance(views.get(name, {}), dict) else {})
+        reuse_key = f"{name}:{capture_seq}:{extension}"
+        reuse_entry = written_images.get(reuse_key) if isinstance(written_images, dict) else None
+        reused_image = isinstance(reuse_entry, dict) and bool(reuse_entry.get("rel_path"))
+        if reused_image:
+            rel_path = str(reuse_entry.get("rel_path", ""))
+            fmt = str(reuse_entry.get("format", extension))
+        else:
+            filename = f"{int(sample_index):06d}.{extension}"
+            abs_path = os.path.join(abs_dir, filename)
+            rel_path = f"{rel_dir}/{filename}".replace("\\", "/")
+            image_job = {
+                "kind": "image",
+                "path": abs_path,
+                "rgb": rgb.copy(),
+                "ensure_dir": False,
+            }
+            fmt = extension
+            if not rt.dataset_writer_enqueue(image_job):
+                fmt = save_rgb_image(rt, abs_path, rgb, ensure_dir=False)
+            if isinstance(written_images, dict):
+                written_images[reuse_key] = {
+                    "rel_path": rel_path,
+                    "format": fmt,
+                }
+        view_payload = compact_camera_metadata_value(
+            views.get(name, {}) if isinstance(views.get(name, {}), dict) else {},
+            key=name,
+        )
         view_payload.update(
             {
                 "available": True,
                 "path": rel_path,
                 "format": fmt,
-                "capture_seq": int(latest.get("seq", 0) or 0),
+                "capture_seq": capture_seq,
                 "capture_finished_at": float(capture_finished),
                 "frame_age_ms": float(max(0.0, now - capture_finished) * 1000.0),
+                "image_reused": bool(reused_image),
             }
         )
         payload[f"observation.images.{name}"] = rel_path
@@ -1813,7 +1878,7 @@ async def capture_observations_viewport_async(rt, sample_index, write_files=True
                 timeout_s=timeout_s,
                 update_camera=False,
             )
-            view_payload["raw_meta"] = raw_meta
+            view_payload["raw_meta"] = compact_capture_meta(raw_meta)
             if rgb_raw is None:
                 view_payload["reason"] = reason
                 return name, None, view_payload, f"{name}:{reason}"
@@ -1846,7 +1911,7 @@ async def capture_observations_viewport_async(rt, sample_index, write_files=True
 
     results = await asyncio.gather(*(capture_one(spec) for spec in specs(rt)))
     for name, frame, view_payload, failure in results:
-        views[name] = view_payload
+        views[name] = compact_camera_metadata_value(view_payload, key=name)
         if frame is not None:
             frames[name] = frame
         if failure:
@@ -1854,7 +1919,7 @@ async def capture_observations_viewport_async(rt, sample_index, write_files=True
 
     after_active = active_viewport_camera_path_snapshot()
     capture_finished = time.time()
-    payload["observation.camera"]["views"] = views
+    payload["observation.camera"]["views"] = compact_camera_views(views)
     payload["observation.camera"]["active_viewport_before"] = before_active
     payload["observation.camera"]["active_viewport_after"] = after_active
     payload["observation.camera"]["active_viewport_unchanged"] = bool(before_active == after_active)
@@ -2237,7 +2302,7 @@ async def warmup_for_episode(rt, label="episode"):
                     "frames": int(frame + 1),
                     "ready_streak": int(ready_streak),
                     "backend": "viewport_capture",
-                    "views": last_views,
+                    "views": compact_camera_views(last_views),
                     "active_viewport_unchanged": bool(camera_info.get("active_viewport_unchanged", True)),
                 }
                 rt.STATE["dataset_camera_warmup_status"] = status
@@ -2257,7 +2322,7 @@ async def warmup_for_episode(rt, label="episode"):
             "frames": int(max_frames),
             "ready_streak": int(ready_streak),
             "backend": "viewport_capture",
-            "views": last_views,
+            "views": compact_camera_views(last_views),
         }
         rt.STATE["dataset_camera_warmup_status"] = status
         rt.info_print(
@@ -2304,7 +2369,7 @@ async def warmup_for_episode(rt, label="episode"):
                 "sim_render_products": camera_sim_render_product_paths(rt),
                 "render_tick": dict(rt.STATE.get("dataset_camera_render_tick_status", {}) or {}),
                 "replicator_step": disabled_step_context(rt),
-                "views": view_stats,
+                "views": compact_camera_views(view_stats),
             }
             rt.STATE["dataset_camera_warmup_status"] = status
             rt.info_print(
@@ -2332,7 +2397,7 @@ async def warmup_for_episode(rt, label="episode"):
         "sim_render_products": camera_sim_render_product_paths(rt),
         "render_tick": dict(rt.STATE.get("dataset_camera_render_tick_status", {}) or {}),
         "replicator_step": disabled_step_context(rt),
-        "views": view_stats,
+        "views": compact_camera_views(view_stats),
     }
     rt.STATE["dataset_camera_warmup_status"] = status
     rt.info_print(

@@ -81,6 +81,12 @@ def parse_args():
     parser.add_argument("--dataset-root", default="", help="Override EXCAVATOR_DATASET_ROOT.")
     parser.add_argument("--disable-export", action="store_true", help="Disable automatic LeRobot v3 export after auto collect.")
     parser.add_argument("--export-python", default="", help="Python executable used for LeRobot export subprocess.")
+    parser.add_argument(
+        "--log-mode",
+        choices=("data", "debug", "profile"),
+        default="",
+        help="Runtime log mode: data is fastest, debug enables diagnostics/Calc Viz, profile also records timing telemetry.",
+    )
     parser.add_argument("--wait-runtime-seconds", type=float, default=180.0)
     export_group = parser.add_mutually_exclusive_group()
     export_group.add_argument("--wait-export", dest="wait_export", action="store_true", help="Wait for LeRobot export task before closing in auto-collect mode.")
@@ -143,7 +149,7 @@ def wait_task_done(simulation_app, task, label):
     if task is None or not hasattr(task, "done"):
         return
     while simulation_app.is_running() and not task.done():
-        simulation_app.update()
+        profiled_simulation_update(simulation_app, None, f"wait_task:{label}")
     if task.done():
         try:
             exc = task.exception()
@@ -151,6 +157,48 @@ def wait_task_done(simulation_app, task, label):
             exc = None
         if exc is not None:
             raise RuntimeError(f"{label} failed: {type(exc).__name__}: {exc}")
+
+
+def launcher_update_profile_threshold_ms():
+    raw = os.environ.get("EXCAVATOR_LAUNCHER_UPDATE_PROFILE_THRESHOLD_MS", "")
+    if raw != "":
+        try:
+            return max(0.0, float(raw))
+        except Exception:
+            return 0.0
+    mode = str(os.environ.get("EXCAVATOR_LOG_MODE", "data") or "data").strip().lower()
+    return 6000.0 if mode == "profile" else 0.0
+
+
+def profiled_simulation_update(simulation_app, rt=None, label="launcher"):
+    threshold_ms = launcher_update_profile_threshold_ms()
+    started = time.perf_counter() if threshold_ms > 0.0 else 0.0
+    simulation_app.update()
+    if threshold_ms <= 0.0:
+        return
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    if elapsed_ms <= threshold_ms:
+        return
+    progress = {}
+    active_task = ""
+    run_dir = ""
+    if rt is not None:
+        try:
+            progress = dict(rt.STATE.get("auto_collect_progress", {}) or {})
+            active_task = str(rt.STATE.get("active_task_name", "") or "")
+            run_dir = str(rt.STATE.get("auto_collect_run_dir", "") or "")
+        except Exception:
+            progress = {}
+    print(
+        "[LAUNCHER UPDATE SLOW]",
+        f"label={label}",
+        f"elapsed_ms={elapsed_ms:.1f}",
+        f"active_task={active_task}",
+        f"stage={progress.get('stage', '')}",
+        f"result={progress.get('result', '')}",
+        f"run_dir={run_dir}",
+        flush=True,
+    )
 
 
 def suppress_headless_log_noise():
@@ -237,11 +285,11 @@ def run_auto_collect(simulation_app, rt, success_count, max_attempts, wait_expor
     rt.request_auto_collect(success_count, max_attempts=max_attempts_arg)
 
     started = False
-    last_print = 0.0
     last_status_key = None
-    heartbeat_interval = float(os.environ.get("EXCAVATOR_AUTO_COLLECT_HEARTBEAT_SECONDS", "60") or 60)
+    heartbeat_interval = float(os.environ.get("EXCAVATOR_AUTO_COLLECT_HEARTBEAT_SECONDS", "0") or 0)
+    last_heartbeat = time.time()
     while simulation_app.is_running():
-        simulation_app.update()
+        profiled_simulation_update(simulation_app, rt, "auto_collect")
         active = bool(rt.STATE.get("auto_collect_active", False))
         task = rt.STATE.get("auto_collect_task")
         if active or task is not None:
@@ -250,14 +298,15 @@ def run_auto_collect(simulation_app, rt, success_count, max_attempts, wait_expor
         now = time.time()
         status_key = (
             bool(active),
-            int(rt.STATE.get("auto_collect_attempts", 0) or 0),
             int(rt.STATE.get("auto_collect_successes", 0) or 0),
             int(rt.STATE.get("auto_collect_rejections", 0) or 0),
             int(rt.STATE.get("auto_collect_failures", 0) or 0),
             str(rt.STATE.get("auto_collect_last_result", "") or ""),
         )
-        if status_key != last_status_key or now - last_print > heartbeat_interval:
-            last_print = now
+        heartbeat_due = heartbeat_interval > 0.0 and now - last_heartbeat > heartbeat_interval
+        if status_key != last_status_key or heartbeat_due:
+            if heartbeat_due:
+                last_heartbeat = now
             last_status_key = status_key
             print(
                 "[AUTO COLLECT]",
@@ -268,6 +317,7 @@ def run_auto_collect(simulation_app, rt, success_count, max_attempts, wait_expor
                 f"fail={rt.STATE.get('auto_collect_failures', 0)}",
                 f"target={rt.STATE.get('auto_collect_requested', success_count)}",
                 f"max_attempts={rt.STATE.get('auto_collect_max_attempts_requested', 0)}",
+                f"last={rt.STATE.get('auto_collect_last_result', '')}",
                 f"run_dir={rt.STATE.get('auto_collect_run_dir', '')}",
                 flush=True,
             )
@@ -311,6 +361,10 @@ def main():
         os.environ["EXCAVATOR_AUTO_EXPORT_LEROBOT_V3"] = "0"
     if args.export_python:
         os.environ["EXCAVATOR_LEROBOT_V3_EXPORT_PYTHON"] = args.export_python
+    # Do not inherit a stale EXCAVATOR_LOG_MODE=profile/debug from the shell.
+    # Auto collection should default to the fastest data mode unless the launch
+    # command explicitly requests diagnostics.
+    os.environ["EXCAVATOR_LOG_MODE"] = str(args.log_mode or "data")
     os.environ["EXCAVATOR_BRIDGE_HOST"] = str(args.bridge_host)
     os.environ["EXCAVATOR_BRIDGE_PORT"] = str(args.bridge_port)
 
@@ -361,6 +415,10 @@ def main():
         from excavator_app.bootstrap import run_excavator_with_sand
 
         rt = run_excavator_with_sand()
+        try:
+            rt.set_log_mode(str(args.log_mode or "data"), announce=bool(args.log_mode))
+        except Exception:
+            pass
         wait_runtime_ready(simulation_app, rt, args.wait_runtime_seconds)
         if args.sand_amount is not None and not args.random_sand_amount:
             rt.STATE["auto_scene_random_sand_amount_enabled"] = False

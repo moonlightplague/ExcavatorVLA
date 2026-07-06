@@ -45,6 +45,21 @@ LEROBOT_IMAGE_KEYS = [
     "observation.images.1",
     "observation.images.2",
 ]
+CAMERA_PREVIEW_MEANINGFUL_PHASE_PREFIXES = (
+    "pre_dig",
+    "approach_contact",
+    "insert_cut",
+    "pull_mid_cut",
+    "pull_exit_cut",
+    "curl_to_hold_material",
+    "secure_load",
+    "lift_carry",
+    "unload_to_bin",
+)
+CAMERA_PREVIEW_SKIP_INITIAL_PHASE_PREFIXES = (
+    "clearance_route",
+    "pre_dig_trace",
+)
 SUCCESS_POOL_DIRNAME = ".dashboard_success"
 LEROBOT_IMAGE_KEY_ALIASES = {
     "observation.images.0": ["observation.images.0", "observation.images.camera", "observation.images.front"],
@@ -5652,6 +5667,31 @@ def dashboard_ppm_quick_mean(path: str, sample_pixels: int = 1024) -> Optional[f
         return None
 
 
+def camera_preview_phase(sample: object) -> str:
+    if not isinstance(sample, dict):
+        return ""
+    return str(sample.get("phase") or sample.get("label") or "").strip()
+
+
+def camera_preview_phase_startswith(phase: str, prefixes: Sequence[str]) -> bool:
+    text = str(phase or "").strip().lower()
+    return any(text.startswith(str(prefix).lower()) for prefix in prefixes)
+
+
+def camera_preview_frame_has_image(
+    frame_index: int,
+    image_paths: Dict[str, List[Tuple[str, object]]],
+) -> bool:
+    idx = int(frame_index)
+    for key in LEROBOT_IMAGE_KEYS:
+        paths = image_paths.get(key) if isinstance(image_paths, dict) else None
+        if isinstance(paths, list) and 0 <= idx < len(paths):
+            path, _value = paths[idx]
+            if path and os.path.isfile(path):
+                return True
+    return False
+
+
 def build_episode_camera_preview(
     row: dict,
     trajectory: Sequence[dict],
@@ -5708,10 +5748,12 @@ def build_episode_camera_preview(
     frame_meta = []
     for frame_index, sample in enumerate(trajectory or []):
         t = safe_float_value(sample.get("t") if isinstance(sample, dict) else None, first_t)
+        phase = camera_preview_phase(sample)
         frame_meta.append({
             "index": int(frame_index),
             "t": float(t - first_t) if t is not None else None,
-            "phase": str(sample.get("phase") or sample.get("label") or "unknown") if isinstance(sample, dict) else "unknown",
+            "raw_t": float(t) if t is not None else None,
+            "phase": phase or "unknown",
         })
     first_available = 0
     for cam in cameras:
@@ -5720,6 +5762,15 @@ def build_episode_camera_preview(
             preferred_frame = cam.get("first_valid_frame")
         if preferred_frame is not None:
             first_available = int(preferred_frame or 0)
+            break
+    for frame_index, sample in enumerate(trajectory or []):
+        phase = camera_preview_phase(sample)
+        if (
+            camera_preview_phase_startswith(phase, CAMERA_PREVIEW_MEANINGFUL_PHASE_PREFIXES)
+            and not camera_preview_phase_startswith(phase, CAMERA_PREVIEW_SKIP_INITIAL_PHASE_PREFIXES)
+            and camera_preview_frame_has_image(frame_index, image_paths)
+        ):
+            first_available = int(frame_index)
             break
     return {
         "frame_count": len(trajectory or []),
@@ -5950,7 +6001,7 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
 .cameraCard{border:1px solid #dbe3ee;border-radius:10px;background:#fff;overflow:hidden;min-width:0}
 .cameraCardHeader{display:flex;justify-content:space-between;gap:8px;padding:7px 8px;border-bottom:1px solid #eef2f6;font-size:11px;color:#475467}
 .cameraCardTitle{font-weight:850;color:#101828}
-.cameraCard img{display:block;width:100%;aspect-ratio:4/3;object-fit:contain;background:#0f172a}
+.cameraCard img{display:block;width:min(100%,256px);max-width:256px;aspect-ratio:1/1;object-fit:contain;background:#0f172a;margin:0 auto}
 .cameraCard.missing img{display:none}
 .cameraMissing{display:none;min-height:160px;align-items:center;justify-content:center;padding:16px;color:#98a2b3;font-size:12px;text-align:center}
 .cameraCard.missing .cameraMissing{display:flex}
@@ -6637,7 +6688,7 @@ function cameraFrameMeta(preview, frameIndex){
   const frames=(preview&&preview.frames)||[];
   const row=frames[Number(frameIndex)||0]||{};
   const t=Number(row.t);
-  const tText=Number.isFinite(t)?`${fmt(t,2)}s`:"";
+  const tText=Number.isFinite(t)?`+${fmt(t,2)}s`:"";
   const phase=row.phase?` · ${row.phase}`:"";
   return `frame ${Number(frameIndex)||0}${tText?` · ${tText}`:""}${phase}`;
 }

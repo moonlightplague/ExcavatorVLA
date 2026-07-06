@@ -316,7 +316,7 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_camera_warmup_frames": int(os.environ.get("EXCAVATOR_DATASET_CAMERA_WARMUP_FRAMES", "3") or 3),
     "dataset_camera_warmup_ready_frames": int(os.environ.get("EXCAVATOR_DATASET_CAMERA_WARMUP_READY_FRAMES", "2") or 2),
     "dataset_camera_warmup_max_frames": int(os.environ.get("EXCAVATOR_DATASET_CAMERA_WARMUP_MAX_FRAMES", "12") or 12),
-    "dataset_camera_viewport_wait_frames": int(os.environ.get("EXCAVATOR_DATASET_CAMERA_VIEWPORT_WAIT_FRAMES", "1") or 1),
+    "dataset_camera_viewport_wait_frames": int(os.environ.get("EXCAVATOR_DATASET_CAMERA_VIEWPORT_WAIT_FRAMES", "0") or 0),
     "dataset_camera_viewport_timeout_s": float(os.environ.get("EXCAVATOR_DATASET_CAMERA_VIEWPORT_TIMEOUT_S", "2.0") or 2.0),
     "dataset_camera_warmup_status": {},
     "dataset_camera_run_warmup_status": {},

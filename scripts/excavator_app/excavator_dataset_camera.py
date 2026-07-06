@@ -292,40 +292,118 @@ def active_viewport_camera_path_snapshot():
         return ""
 
 
-def ensure_dataset_viewport(rt):
+def viewport_api_from_window(window):
+    viewport_api = getattr(window, "viewport_api", None)
+    if viewport_api is None:
+        viewport_api = getattr(window, "viewport", None)
+    return viewport_api
+
+
+def set_viewport_camera_path(viewport_api, camera_path):
+    try:
+        viewport_api.camera_path = Sdf.Path(str(camera_path))
+    except Exception:
+        viewport_api.camera_path = str(camera_path)
+
+
+def viewport_holder_info(holder):
+    if not isinstance(holder, dict):
+        return {}
+    viewports = holder.get("viewports")
+    if isinstance(viewports, dict):
+        return {
+            "mode": str(holder.get("mode", "")),
+            "count": len(viewports),
+            "views": {
+                str(name): {
+                    "name": str(view.get("name", "")),
+                    "camera_path": str(view.get("camera_path", "")),
+                    "width": int(view.get("width", 0) or 0),
+                    "height": int(view.get("height", 0) or 0),
+                    "has_window": view.get("window") is not None,
+                    "has_viewport_api": view.get("viewport_api") is not None,
+                }
+                for name, view in viewports.items()
+                if isinstance(view, dict)
+            },
+        }
+    return {
+        "mode": str(holder.get("mode", "")),
+        "name": str(holder.get("name", "")),
+        "width": int(holder.get("width", 0) or 0),
+        "height": int(holder.get("height", 0) or 0),
+        "has_window": holder.get("window") is not None,
+        "has_viewport_api": holder.get("viewport_api") is not None,
+    }
+
+
+def ensure_dataset_viewports(rt):
     holder = rt.STATE.get("dataset_viewport_capture")
-    if isinstance(holder, dict) and holder.get("viewport_api") is not None:
-        return holder["viewport_api"], holder.get("window")
+    required = [str(x) for x in rt.DATASET_CAMERA_NAMES]
+    if isinstance(holder, dict):
+        viewports = holder.get("viewports")
+        if isinstance(viewports, dict) and all(
+            isinstance(viewports.get(name), dict) and viewports.get(name, {}).get("viewport_api") is not None
+            for name in required
+        ):
+            return viewports
     try:
         from omni.kit.viewport.utility import create_viewport_window
     except Exception as exc:
         raise RuntimeError(f"create_viewport_window_unavailable:{type(exc).__name__}:{exc}")
     w, h = resolution(rt)
-    window = create_viewport_window(
-        name="ExcavatorDatasetCaptureViewport",
-        width=int(w),
-        height=int(h),
-    )
-    viewport_api = getattr(window, "viewport_api", None)
-    if viewport_api is None:
-        viewport_api = getattr(window, "viewport", None)
-    if viewport_api is None:
-        raise RuntimeError("dataset_viewport_api_unavailable")
-    try:
-        window.visible = True
-    except Exception:
-        pass
+    viewports = {}
+    for spec in specs(rt):
+        name = str(spec.get("name", ""))
+        if name not in required:
+            continue
+        camera_path = str(spec.get("path", ""))
+        window_name = f"ExcavatorDatasetCaptureViewport_{name}"
+        window = create_viewport_window(
+            name=window_name,
+            width=int(w),
+            height=int(h),
+        )
+        viewport_api = viewport_api_from_window(window)
+        if viewport_api is None:
+            raise RuntimeError(f"dataset_viewport_api_unavailable:{name}")
+        set_viewport_camera_path(viewport_api, camera_path)
+        try:
+            window.visible = True
+        except Exception:
+            pass
+        viewports[name] = {
+            "window": window,
+            "viewport_api": viewport_api,
+            "name": window_name,
+            "camera_path": camera_path,
+            "width": int(w),
+            "height": int(h),
+        }
+    missing = [name for name in required if name not in viewports]
+    if missing:
+        raise RuntimeError("dataset_viewport_missing:" + ",".join(missing))
+    first = viewports[required[0]]
     rt.STATE["dataset_viewport_capture"] = {
-        "window": window,
-        "viewport_api": viewport_api,
+        "mode": "per_camera_persistent",
+        "viewports": viewports,
+        "window": first.get("window"),
+        "viewport_api": first.get("viewport_api"),
         "name": "ExcavatorDatasetCaptureViewport",
         "width": int(w),
         "height": int(h),
     }
-    return viewport_api, window
+    return viewports
 
 
-async def capture_viewport_rgb_async(rt, viewport_api, camera_path, wait_frames=4, timeout_s=5.0):
+def ensure_dataset_viewport(rt):
+    viewports = ensure_dataset_viewports(rt)
+    first_name = str(rt.DATASET_CAMERA_NAMES[0])
+    first = viewports[first_name]
+    return first["viewport_api"], first.get("window")
+
+
+async def capture_viewport_rgb_async(rt, viewport_api, camera_path, wait_frames=0, timeout_s=2.0, update_camera=True):
     try:
         from omni.kit.viewport.utility import capture_viewport_to_buffer, next_viewport_frame_async
     except Exception as exc:
@@ -337,12 +415,10 @@ async def capture_viewport_rgb_async(rt, viewport_api, camera_path, wait_frames=
         "error": "",
         "camera_path": str(camera_path),
     }
-    try:
-        viewport_api.camera_path = Sdf.Path(str(camera_path))
-    except Exception:
-        viewport_api.camera_path = str(camera_path)
+    if update_camera:
+        set_viewport_camera_path(viewport_api, camera_path)
 
-    for _ in range(max(1, int(wait_frames))):
+    for _ in range(max(0, int(wait_frames))):
         try:
             await next_viewport_frame_async(viewport_api)
         except Exception:
@@ -538,16 +614,7 @@ def camera_fingerprint(rt, status=None):
     if not isinstance(status, dict):
         status = {}
     views = status.get("views", {}) if isinstance(status.get("views", {}), dict) else {}
-    viewport_holder = rt.STATE.get("dataset_viewport_capture")
-    viewport_info = {}
-    if isinstance(viewport_holder, dict):
-        viewport_info = {
-            "name": str(viewport_holder.get("name", "")),
-            "width": int(viewport_holder.get("width", 0) or 0),
-            "height": int(viewport_holder.get("height", 0) or 0),
-            "has_window": viewport_holder.get("window") is not None,
-            "has_viewport_api": viewport_holder.get("viewport_api") is not None,
-        }
+    viewport_info = viewport_holder_info(rt.STATE.get("dataset_viewport_capture"))
     result = {
         "module_version": CAMERA_MODULE_VERSION,
         "module_file": __file__,
@@ -1120,8 +1187,20 @@ def shutdown(rt, reason="shutdown"):
     closed = 0
     holder = rt.STATE.get("dataset_viewport_capture")
     if isinstance(holder, dict):
-        window = holder.get("window")
-        if window is not None:
+        windows = []
+        viewports = holder.get("viewports")
+        if isinstance(viewports, dict):
+            for view in viewports.values():
+                if isinstance(view, dict) and view.get("window") is not None:
+                    windows.append(view.get("window"))
+        elif holder.get("window") is not None:
+            windows.append(holder.get("window"))
+        seen = set()
+        for window in windows:
+            key = id(window)
+            if key in seen:
+                continue
+            seen.add(key)
             for method_name in ("destroy", "cleanup", "close"):
                 method = getattr(window, method_name, None)
                 if not callable(method):
@@ -1225,10 +1304,12 @@ def initialize(rt, force=False):
                 missing.append(name)
             status["views"][name] = view_status
         try:
-            ensure_dataset_viewport(rt)
+            ensure_dataset_viewports(rt)
             status["dataset_viewport"] = {
                 "available": True,
                 "name": "ExcavatorDatasetCaptureViewport",
+                "mode": "per_camera_persistent",
+                "count": len(rt.STATE.get("dataset_viewport_capture", {}).get("viewports", {}) or {}),
                 "active_viewport_camera": active_viewport_camera_path_snapshot(),
             }
         except Exception as exc:
@@ -1580,7 +1661,7 @@ async def capture_observations_viewport_async(rt, sample_index, write_files=True
         payload["observation.camera"]["views"] = status.get("views", {}) if isinstance(status, dict) else {}
         return payload
     try:
-        viewport_api, _window = ensure_dataset_viewport(rt)
+        viewports = ensure_dataset_viewports(rt)
     except Exception as exc:
         payload["observation.camera"]["reason"] = f"dataset_viewport_unavailable:{type(exc).__name__}:{exc}"
         return payload
@@ -1589,10 +1670,10 @@ async def capture_observations_viewport_async(rt, sample_index, write_files=True
     frames = {}
     views = {}
     failures = []
-    wait_frames = max(1, int(rt.STATE.get("dataset_camera_viewport_wait_frames", 1) or 1))
+    wait_frames = max(0, int(rt.STATE.get("dataset_camera_viewport_wait_frames", 0) or 0))
     timeout_s = max(0.5, float(rt.STATE.get("dataset_camera_viewport_timeout_s", 2.0) or 2.0))
 
-    for spec in specs(rt):
+    async def capture_one(spec):
         name = str(spec.get("name", ""))
         camera_path = str(spec.get("path", ""))
         view_payload = {
@@ -1602,37 +1683,37 @@ async def capture_observations_viewport_async(rt, sample_index, write_files=True
             "capture_backend": "viewport_capture",
             "pose": world_pose(rt, camera_path),
         }
+        viewport_entry = viewports.get(name) if isinstance(viewports, dict) else None
+        if not isinstance(viewport_entry, dict) or viewport_entry.get("viewport_api") is None:
+            reason = "dataset_viewport_missing"
+            view_payload["reason"] = reason
+            return name, None, view_payload, f"{name}:{reason}"
         try:
             rgb_raw, reason, raw_meta = await capture_viewport_rgb_async(
                 rt,
-                viewport_api,
+                viewport_entry["viewport_api"],
                 camera_path,
                 wait_frames=wait_frames,
                 timeout_s=timeout_s,
+                update_camera=False,
             )
             view_payload["raw_meta"] = raw_meta
             if rgb_raw is None:
                 view_payload["reason"] = reason
-                failures.append(f"{name}:{reason}")
-                views[name] = view_payload
-                continue
+                return name, None, view_payload, f"{name}:{reason}"
             rgb, norm_reason, stats = normalize_rgb_resolution(rt, rgb_raw)
             view_payload["rgb_stats"] = stats
             view_payload["normalize_reason"] = norm_reason
             if rgb is None:
                 view_payload["reason"] = norm_reason
-                failures.append(f"{name}:{norm_reason}")
-                views[name] = view_payload
-                continue
+                return name, None, view_payload, f"{name}:{norm_reason}"
             valid, valid_reason = validate_rgb_content(rt, rgb, stats)
             if not valid:
                 if str(valid_reason).startswith("black_frame"):
                     rt.STATE["dataset_camera_black_rejected"] = int(rt.STATE.get("dataset_camera_black_rejected", 0) or 0) + 1
                 view_payload["reason"] = valid_reason
-                failures.append(f"{name}:{valid_reason}")
-                views[name] = view_payload
-                continue
-            frames[name] = np.ascontiguousarray(rgb[:, :, :3])
+                return name, None, view_payload, f"{name}:{valid_reason}"
+            frame = np.ascontiguousarray(rgb[:, :, :3])
             view_payload.update(
                 {
                     "available": True,
@@ -1641,12 +1722,19 @@ async def capture_observations_viewport_async(rt, sample_index, write_files=True
                     "dtype": str(rgb.dtype),
                 }
             )
-            views[name] = view_payload
+            return name, frame, view_payload, ""
         except Exception as exc:
             reason = f"{type(exc).__name__}:{exc}"
             view_payload["reason"] = reason
-            failures.append(f"{name}:{reason}")
-            views[name] = view_payload
+            return name, None, view_payload, f"{name}:{reason}"
+
+    results = await asyncio.gather(*(capture_one(spec) for spec in specs(rt)))
+    for name, frame, view_payload, failure in results:
+        views[name] = view_payload
+        if frame is not None:
+            frames[name] = frame
+        if failure:
+            failures.append(failure)
 
     after_active = active_viewport_camera_path_snapshot()
     payload["observation.camera"]["views"] = views
@@ -2049,7 +2137,7 @@ def config_snapshot(rt):
         "warmup_frames": int(rt.STATE.get("dataset_camera_warmup_frames", 3) or 3),
         "warmup_ready_frames": int(rt.STATE.get("dataset_camera_warmup_ready_frames", 2) or 2),
         "warmup_max_frames": int(rt.STATE.get("dataset_camera_warmup_max_frames", 12) or 12),
-        "viewport_wait_frames": max(1, int(rt.STATE.get("dataset_camera_viewport_wait_frames", 1) or 1)),
+        "viewport_wait_frames": max(0, int(rt.STATE.get("dataset_camera_viewport_wait_frames", 0) or 0)),
         "viewport_timeout_s": max(0.5, float(rt.STATE.get("dataset_camera_viewport_timeout_s", 2.0) or 2.0)),
         "replicator_tick": bool(replicator_tick_enabled(rt)),
         "syntheticdata_wait": bool(syntheticdata_wait_enabled(rt)),

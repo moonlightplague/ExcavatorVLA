@@ -14518,8 +14518,108 @@ def auto_scene_robot_link_footprint_rows():
     return rows
 
 
+def auto_scene_current_truck_obb_xy():
+    baseline = auto_scene_truck_baseline()
+    if not (isinstance(baseline, dict) and baseline.get("valid")):
+        return None
+    path = str(baseline.get("path", AUTO_SCENE_TRUCK_ROOT_PATH) or AUTO_SCENE_TRUCK_ROOT_PATH)
+    try:
+        translation = np.array(get_prim_translation(path), dtype=np.float32).reshape(-1)[:3]
+    except Exception:
+        translation = np.array(baseline.get("translation", [0.0, 0.0, 0.0]), dtype=np.float32).reshape(-1)[:3]
+    if len(translation) < 2:
+        return None
+    size = np.array(baseline.get("size", [5.0, 2.5, 1.0]), dtype=np.float32).reshape(-1)[:3]
+    if len(size) < 2:
+        return None
+    base_center = np.array(baseline.get("center", translation), dtype=np.float32).reshape(-1)[:3]
+    base_translation = np.array(baseline.get("translation", base_center), dtype=np.float32).reshape(-1)[:3]
+    base_yaw = float(baseline.get("yaw_deg", 0.0) or 0.0)
+    yaw = get_prim_local_yaw_z_deg(path, default=base_yaw)
+    local_center_offset = rotate_xy_deg(base_center[:2] - base_translation[:2], -base_yaw)
+    center_xy = translation[:2] + rotate_xy_deg(local_center_offset, yaw)
+    return {
+        "center": center_xy.astype(np.float32),
+        "size": np.maximum(size[:2], np.array([0.05, 0.05], dtype=np.float32)).astype(np.float32),
+        "yaw_deg": float(yaw),
+        "path": path,
+    }
+
+
+def point_to_obb_outside_distance_xy(point_xy, center_xy, size_xy, yaw_deg):
+    p = np.array(point_xy, dtype=np.float32).reshape(-1)[:2]
+    cxy = np.array(center_xy, dtype=np.float32).reshape(-1)[:2]
+    size = np.array(size_xy, dtype=np.float32).reshape(-1)[:2]
+    if len(p) < 2 or len(cxy) < 2 or len(size) < 2:
+        return None
+    half = 0.5 * np.maximum(size, np.array([0.05, 0.05], dtype=np.float32))
+    local = rotate_xy_deg(p - cxy, -float(yaw_deg))
+    excess = np.abs(local) - half
+    outside = np.maximum(excess, 0.0)
+    outside_dist = float(np.linalg.norm(outside))
+    signed_gap = float(np.max(excess))
+    return {
+        "outside_dist_m": outside_dist,
+        "signed_gap_m": signed_gap,
+        "local_xy": vec_list(local, 3),
+        "excess_xy": vec_list(excess, 3),
+    }
+
+
+def auto_scene_current_robot_truck_obb_gate():
+    detail = {"gate": "current_robot_truck_overlap_obb_broadphase"}
+    try:
+        robot_xy = auto_scene_robot_xy()
+        truck = auto_scene_current_truck_obb_xy()
+        if truck is None:
+            detail["ok"] = False
+            detail["reason"] = "truck_obb_unavailable"
+            return None, detail
+        dist = point_to_obb_outside_distance_xy(
+            robot_xy,
+            truck.get("center"),
+            truck.get("size"),
+            truck.get("yaw_deg", 0.0),
+        )
+        if not isinstance(dist, dict):
+            detail["ok"] = False
+            detail["reason"] = "distance_unavailable"
+            return None, detail
+        robot_radius = float(AUTO_SCENE_ROBOT_SAFETY_RADIUS)
+        # This broadphase is only allowed to accept obvious separation.  Near or
+        # overlapping cases still fall back to the exact mesh/link footprint gate.
+        separation_margin = 0.10
+        separated = float(dist.get("outside_dist_m", 0.0)) > robot_radius + separation_margin
+        detail.update({
+            "ok": True,
+            "robot_xy": vec_list(robot_xy, 3),
+            "robot_radius": float(robot_radius),
+            "truck_center_xy": vec_list(truck.get("center"), 3),
+            "truck_size_xy": vec_list(truck.get("size"), 3),
+            "truck_yaw_deg": float(truck.get("yaw_deg", 0.0)),
+            "outside_dist_m": float(dist.get("outside_dist_m", 0.0)),
+            "signed_gap_m": float(dist.get("signed_gap_m", 0.0)),
+            "separation_margin_m": float(separation_margin),
+            "separated": bool(separated),
+            "decision": "separated_skip_mesh_gate" if separated else "needs_precise_mesh_gate",
+        })
+        return bool(separated), detail
+    except Exception as exc:
+        detail["ok"] = False
+        detail["reason"] = f"{type(exc).__name__}: {exc}"
+        return None, detail
+
+
 def auto_scene_current_robot_truck_overlap_detail():
     detail = {"gate": "current_robot_truck_overlap"}
+    obb_separated, obb_detail = auto_scene_current_robot_truck_obb_gate()
+    detail["obb_broadphase"] = obb_detail
+    if obb_separated is True:
+        detail["overlap"] = False
+        detail["overlap_source"] = "lightweight_obb_broadphase"
+        detail["decision"] = "ok_obb_separated_skip_mesh"
+        return False, detail
+
     truck_poly = None
     try:
         truck_poly = auto_scene_current_truck_polygon_xy()

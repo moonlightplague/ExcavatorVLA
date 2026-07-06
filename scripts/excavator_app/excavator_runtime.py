@@ -318,7 +318,8 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_camera_warmup_max_frames": int(os.environ.get("EXCAVATOR_DATASET_CAMERA_WARMUP_MAX_FRAMES", "12") or 12),
     "dataset_camera_viewport_wait_frames": int(os.environ.get("EXCAVATOR_DATASET_CAMERA_VIEWPORT_WAIT_FRAMES", "0") or 0),
     "dataset_camera_viewport_timeout_s": float(os.environ.get("EXCAVATOR_DATASET_CAMERA_VIEWPORT_TIMEOUT_S", "2.0") or 2.0),
-    "dataset_camera_background_interval_s": float(os.environ.get("EXCAVATOR_DATASET_CAMERA_BACKGROUND_INTERVAL_S", "0") or 0),
+    "dataset_camera_background_interval_s": float(os.environ.get("EXCAVATOR_DATASET_CAMERA_BACKGROUND_INTERVAL_S", "0.5") or 0.5),
+    "dataset_camera_background_min_idle_s": float(os.environ.get("EXCAVATOR_DATASET_CAMERA_BACKGROUND_MIN_IDLE_S", "0.1") or 0.1),
     "dataset_camera_warmup_status": {},
     "dataset_camera_run_warmup_status": {},
     "dataset_camera_run_warmup_run_id": "",
@@ -6630,17 +6631,9 @@ async def auto_collect_camera_preflight(label="auto_collect_camera_preflight"):
     return False
 
 
-async def dataset_camera_refresh_for_sample(label="sample"):
-    return await excavator_dataset_camera.global_tick_async(runtime_module())
-
-
 @debug_profiled("dataset_capture_camera_observations", threshold_ms=5.0)
 def dataset_capture_camera_observations(sample_index):
     return excavator_dataset_camera.capture_observations(runtime_module(), sample_index)
-
-
-async def dataset_capture_camera_observations_async(sample_index):
-    return await excavator_dataset_camera.capture_observations_async(runtime_module(), sample_index)
 
 
 def dataset_camera_start_background(label="auto_collect"):
@@ -6648,6 +6641,9 @@ def dataset_camera_start_background(label="auto_collect"):
         return None
     if not bool(STATE.get("dataset_camera_require_complete_samples", True)):
         return None
+    STATE["dataset_camera_latest_capture"] = None
+    STATE["dataset_camera_latest_capture_time"] = 0.0
+    STATE["dataset_camera_latest_seq"] = 0
     return register_async_task(
         "dataset_camera_capture",
         excavator_dataset_camera.background_capture_loop(runtime_module(), label=label),
@@ -15491,6 +15487,7 @@ async def auto_collect_one_episode():
         f"unload_point={vec_list(unload_bin_dump_point(), 3)}",
         f"unload_landing={vec_list(unload_bin_landing_point(), 3)}",
     )
+    dataset_camera_start_background(label=f"auto_collect_episode_{attempt:06d}")
     result = await execute_dig_target_ball(
         rebuild_plan=False,
         task_name=f"auto_collect_episode_{attempt:06d}",
@@ -15507,6 +15504,7 @@ async def auto_collect_one_episode():
             f"freezes={freezes}",
             f"reason={failure_reason}",
         )
+        dataset_camera_stop_background("auto_collect_episode_execution_failed")
         return auto_collect_finish_episode(meta, False, failure_reason)
     if freezes > 0:
         info_print(
@@ -15516,6 +15514,7 @@ async def auto_collect_one_episode():
             "executed=True",
             f"freezes={freezes}",
         )
+        dataset_camera_stop_background("auto_collect_episode_freeze_failed")
         return auto_collect_finish_episode(meta, False, f"execution_failed/freeze_detected:{freezes}")
     info_print(
         "[AUTO DATASET ATTEMPT]",
@@ -15523,6 +15522,7 @@ async def auto_collect_one_episode():
         "result=execution_ok",
         "executed=True",
     )
+    dataset_camera_stop_background("auto_collect_episode_finished")
     return auto_collect_finish_episode(meta, True, "ok")
 
 
@@ -15574,6 +15574,7 @@ async def auto_collect_loop(count, max_attempts=None):
     STATE["dataset_record_sample_spans"] = {}
     STATE["dataset_camera_run_warmup_status"] = {}
     STATE["dataset_camera_run_warmup_run_id"] = ""
+    dataset_camera_stop_background("auto_collect_loop_start")
     STATE["auto_scene_last_randomization"] = {}
     STATE["auto_scene_truck_baseline"] = None
     cancel_registered_task("startup_sand_reset", reason="auto_collect_loop_start")
@@ -15643,7 +15644,6 @@ async def auto_collect_loop(count, max_attempts=None):
         )
         if not camera_preflight_ok:
             return
-        dataset_camera_start_background(label=f"auto_collect_run_{STATE.get('auto_collect_run_id', '')}")
         consecutive_prepare_failed = 0
         while (
             int(STATE.get("auto_collect_successes", 0)) < target_successes

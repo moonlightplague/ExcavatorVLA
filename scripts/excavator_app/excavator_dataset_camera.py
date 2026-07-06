@@ -18,7 +18,7 @@ except Exception:
     Image = None
 
 
-CAMERA_MODULE_VERSION = "dataset_camera_viewport_capture_v15_compact_meta_noawait"
+CAMERA_MODULE_VERSION = "dataset_camera_viewport_capture_v16_throughput_nonblocking"
 SYNC_STEP_ERROR_TEXT = "Synchronous call to `step`"
 
 
@@ -59,7 +59,7 @@ def camera_wait_for_render_enabled(rt):
     state_value = rt.STATE.get("dataset_camera_wait_for_render", None)
     if state_value is not None:
         return bool(state_value)
-    return True
+    return False
 
 
 def camera_delta_time(rt):
@@ -80,11 +80,11 @@ def camera_delta_time(rt):
 def camera_rt_subframes(rt):
     value = os.environ.get("EXCAVATOR_CAMERA_RT_SUBFRAMES", "")
     if value == "":
-        value = rt.STATE.get("dataset_camera_rt_subframes", 16)
+        value = rt.STATE.get("dataset_camera_rt_subframes", 1)
     try:
         return max(1, int(value))
     except Exception:
-        return 16
+        return 1
 
 
 def reset_replicator_tick_state(rt, reason=""):
@@ -1982,7 +1982,7 @@ def background_interval_seconds(rt):
     except Exception:
         interval = 0.0
     if interval <= 0.0:
-        interval = 0.50
+        interval = 1.00
     return max(0.10, float(interval))
 
 
@@ -1995,8 +1995,28 @@ def background_min_idle_seconds(rt):
     except Exception:
         idle = 0.10
     if idle <= 0.0:
-        idle = 0.10
+        idle = 0.20
     return max(0.02, float(idle))
+
+
+def background_capture_enabled(rt):
+    value = os.environ.get("EXCAVATOR_DATASET_CAMERA_BACKGROUND_ENABLED", "")
+    if value != "":
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    state_value = rt.STATE.get("dataset_camera_background_enabled", None)
+    if state_value is not None:
+        return bool(state_value)
+    return False
+
+
+def opportunistic_capture_enabled(rt):
+    value = os.environ.get("EXCAVATOR_DATASET_CAMERA_OPPORTUNISTIC_CAPTURE", "")
+    if value != "":
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    state_value = rt.STATE.get("dataset_camera_opportunistic_capture_enabled", None)
+    if state_value is not None:
+        return bool(state_value)
+    return True
 
 
 def _finalize_pending_triplet(rt, triplet):
@@ -2190,6 +2210,33 @@ def submit_viewport_capture_triplet(rt, sample_index=-1):
         rt.STATE["dataset_camera_pending_capture"] = None
         return False, str(triplet.get("failure_reason", "no_capture_started") or "no_capture_started")
     return True, "submitted"
+
+
+def maybe_submit_opportunistic_capture(rt, sample_index=-1):
+    if not opportunistic_capture_enabled(rt):
+        return False, "opportunistic_disabled"
+    if backend(rt) != "viewport_capture":
+        return False, "backend_not_viewport_capture"
+    if not bool(rt.STATE.get("dataset_camera_enabled", True)):
+        return False, "disabled"
+    now = time.time()
+    last_submit = float(rt.STATE.get("dataset_camera_last_opportunistic_submit_time", 0.0) or 0.0)
+    latest_time = float(rt.STATE.get("dataset_camera_latest_capture_time", 0.0) or 0.0)
+    interval = background_interval_seconds(rt)
+    latest_missing = latest_time <= 0.0 or not isinstance(rt.STATE.get("dataset_camera_latest_capture"), dict)
+    if (not latest_missing) and now - last_submit < interval:
+        return False, "interval_not_due"
+    submitted, reason = submit_viewport_capture_triplet(rt, sample_index=sample_index)
+    if submitted:
+        rt.STATE["dataset_camera_last_opportunistic_submit_time"] = float(now)
+        rt.STATE["dataset_camera_opportunistic_submissions"] = int(
+            rt.STATE.get("dataset_camera_opportunistic_submissions", 0) or 0
+        ) + 1
+    elif reason != "pending_capture_in_flight":
+        rt.STATE["dataset_camera_opportunistic_failures"] = int(
+            rt.STATE.get("dataset_camera_opportunistic_failures", 0) or 0
+        ) + 1
+    return bool(submitted), str(reason)
 
 
 async def background_capture_loop(rt, label="dataset_camera_background"):
@@ -2417,6 +2464,7 @@ async def warmup_for_episode(rt, label="episode"):
 def capture_observations(rt, sample_index):
     payload = empty_payload(rt, sample_index, reason="sync_capture_uses_latest_background_frame")
     if backend(rt) == "viewport_capture":
+        maybe_submit_opportunistic_capture(rt, sample_index=sample_index)
         return latest_capture_payload(rt, sample_index)
     payload["observation.camera"]["views"] = {}
     if not bool(rt.STATE.get("dataset_camera_enabled", True)):
@@ -2567,12 +2615,14 @@ def config_snapshot(rt):
         "viewport_wait_frames": max(0, int(rt.STATE.get("dataset_camera_viewport_wait_frames", 0) or 0)),
         "viewport_timeout_s": max(0.5, float(rt.STATE.get("dataset_camera_viewport_timeout_s", 2.0) or 2.0)),
         "background_capture": {
-            "enabled_for_auto_collect": True,
+            "enabled_for_auto_collect": bool(background_capture_enabled(rt)),
             "interval_s": background_interval_seconds(rt),
             "min_idle_s": background_min_idle_seconds(rt),
             "latest_seq": int(rt.STATE.get("dataset_camera_latest_seq", 0) or 0),
             "running": bool(rt.STATE.get("dataset_camera_background_running", False)),
-            "note": "Samples write the latest complete camera triplet and record capture timestamps; action timing is not blocked by render.",
+            "opportunistic_capture": bool(opportunistic_capture_enabled(rt)),
+            "opportunistic_submissions": int(rt.STATE.get("dataset_camera_opportunistic_submissions", 0) or 0),
+            "note": "Throughput mode: background render loop is off by default; samples submit nonblocking viewport captures and write the latest complete triplet with capture timestamps.",
         },
         "replicator_tick": bool(replicator_tick_enabled(rt)),
         "syntheticdata_wait": bool(syntheticdata_wait_enabled(rt)),

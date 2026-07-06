@@ -318,8 +318,17 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_camera_warmup_max_frames": int(os.environ.get("EXCAVATOR_DATASET_CAMERA_WARMUP_MAX_FRAMES", "12") or 12),
     "dataset_camera_viewport_wait_frames": int(os.environ.get("EXCAVATOR_DATASET_CAMERA_VIEWPORT_WAIT_FRAMES", "0") or 0),
     "dataset_camera_viewport_timeout_s": float(os.environ.get("EXCAVATOR_DATASET_CAMERA_VIEWPORT_TIMEOUT_S", "2.0") or 2.0),
-    "dataset_camera_background_interval_s": float(os.environ.get("EXCAVATOR_DATASET_CAMERA_BACKGROUND_INTERVAL_S", "0.5") or 0.5),
-    "dataset_camera_background_min_idle_s": float(os.environ.get("EXCAVATOR_DATASET_CAMERA_BACKGROUND_MIN_IDLE_S", "0.1") or 0.1),
+    "dataset_camera_wait_for_render": str(os.environ.get("EXCAVATOR_CAMERA_WAIT_FOR_RENDER", "0") or "0").strip().lower()
+    in ("1", "true", "yes", "on"),
+    "dataset_camera_rt_subframes": int(os.environ.get("EXCAVATOR_CAMERA_RT_SUBFRAMES", "1") or 1),
+    "dataset_camera_background_enabled": str(os.environ.get("EXCAVATOR_DATASET_CAMERA_BACKGROUND_ENABLED", "0") or "0").strip().lower()
+    in ("1", "true", "yes", "on"),
+    "dataset_camera_opportunistic_capture_enabled": str(
+        os.environ.get("EXCAVATOR_DATASET_CAMERA_OPPORTUNISTIC_CAPTURE", "1") or "1"
+    ).strip().lower()
+    not in ("0", "false", "no", "off"),
+    "dataset_camera_background_interval_s": float(os.environ.get("EXCAVATOR_DATASET_CAMERA_BACKGROUND_INTERVAL_S", "1.0") or 1.0),
+    "dataset_camera_background_min_idle_s": float(os.environ.get("EXCAVATOR_DATASET_CAMERA_BACKGROUND_MIN_IDLE_S", "0.2") or 0.2),
     "dataset_camera_warmup_status": {},
     "dataset_camera_run_warmup_status": {},
     "dataset_camera_run_warmup_run_id": "",
@@ -6661,6 +6670,17 @@ def dataset_camera_start_background(label="auto_collect"):
     if not bool(STATE.get("dataset_camera_enabled", True)):
         return None
     if not bool(STATE.get("dataset_camera_require_complete_samples", True)):
+        return None
+    if not bool(excavator_dataset_camera.background_capture_enabled(runtime_module())):
+        STATE["dataset_camera_background_running"] = False
+        STATE["dataset_camera_background_stop_reason"] = "disabled_throughput_mode"
+        info_print(
+            "[DATASET CAMERA BACKGROUND]",
+            "skipped",
+            "reason=disabled_throughput_mode",
+            "capture=opportunistic_sample_nonblocking",
+            f"interval_s={float(STATE.get('dataset_camera_background_interval_s', 1.0) or 1.0):.3f}",
+        )
         return None
     STATE["dataset_camera_latest_capture"] = None
     STATE["dataset_camera_latest_capture_time"] = 0.0

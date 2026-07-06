@@ -18,7 +18,7 @@ except Exception:
     Image = None
 
 
-CAMERA_MODULE_VERSION = "dataset_camera_viewport_capture_v22_background_2hz"
+CAMERA_MODULE_VERSION = "dataset_camera_viewport_capture_v23_capture_1024_downsample"
 SYNC_STEP_ERROR_TEXT = "Synchronous call to `step`"
 
 
@@ -177,6 +177,27 @@ def resolution(rt):
         height = int(value[1])
     except Exception:
         width, height = rt.DATASET_CAMERA_DEFAULT_RESOLUTION
+    return [max(32, width), max(32, height)]
+
+
+def viewport_capture_resolution(rt):
+    value = os.environ.get("EXCAVATOR_DATASET_CAMERA_CAPTURE_RESOLUTION", "")
+    if not value:
+        value = rt.STATE.get("dataset_camera_viewport_capture_resolution", [1024, 1024])
+    try:
+        if isinstance(value, str):
+            text = value.strip().lower().replace("x", ",")
+            parts = [part for part in text.split(",") if part.strip()]
+            if len(parts) == 1:
+                width = height = int(float(parts[0]))
+            else:
+                width = int(float(parts[0]))
+                height = int(float(parts[1]))
+        else:
+            width = int(value[0])
+            height = int(value[1])
+    except Exception:
+        width, height = 1024, 1024
     return [max(32, width), max(32, height)]
 
 
@@ -483,18 +504,23 @@ def viewport_holder_info(holder):
 def ensure_dataset_viewports(rt):
     holder = rt.STATE.get("dataset_viewport_capture")
     required = [str(x) for x in rt.DATASET_CAMERA_NAMES]
+    w, h = viewport_capture_resolution(rt)
     if isinstance(holder, dict):
         viewports = holder.get("viewports")
-        if isinstance(viewports, dict) and all(
-            isinstance(viewports.get(name), dict) and viewports.get(name, {}).get("viewport_api") is not None
-            for name in required
+        if (
+            int(holder.get("width", 0) or 0) == int(w)
+            and int(holder.get("height", 0) or 0) == int(h)
+            and isinstance(viewports, dict)
+            and all(
+                isinstance(viewports.get(name), dict) and viewports.get(name, {}).get("viewport_api") is not None
+                for name in required
+            )
         ):
             return viewports
     try:
         from omni.kit.viewport.utility import create_viewport_window
     except Exception as exc:
         raise RuntimeError(f"create_viewport_window_unavailable:{type(exc).__name__}:{exc}")
-    w, h = resolution(rt)
     viewports = {}
     for spec in specs(rt):
         name = str(spec.get("name", ""))
@@ -2823,6 +2849,7 @@ def config_snapshot(rt):
         "available": bool(current_backend == "viewport_capture" or rep is not None),
         "backend": current_backend,
         "renderer_launch": renderer_launch,
+        "stable_render_settings": dict(rt.STATE.get("dataset_stable_render_settings", {}) or {}),
         "captureOnPlay": (rt.STATE.get("dataset_camera_capture_on_play_status") or {}).get("captureOnPlay"),
         "captureOnPlay_status": rt.STATE.get("dataset_camera_capture_on_play_status"),
         "backend_available": {
@@ -2837,6 +2864,8 @@ def config_snapshot(rt):
             "note": "viewport_capture is the production backend; replicator_rgb is retained only as an explicit diagnostic fallback.",
         },
         "resolution": resolution(rt),
+        "viewport_capture_resolution": viewport_capture_resolution(rt),
+        "viewport_capture_note": "Viewport texture is captured at this higher resolution and Lanczos-downsampled to resolution for saved training images.",
         "frequency": int(rt.STATE.get("dataset_camera_frequency", 10) or 10),
         "sample_stride": max(1, int(rt.STATE.get("dataset_camera_sample_stride", 1) or 1)),
         "require_complete_samples": bool(rt.STATE.get("dataset_camera_require_complete_samples", True)),

@@ -6169,7 +6169,7 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
       </section>
     </div>
   </section>
-  <section class="panel" style="margin-top:14px">
+  <section class="panel rawAttemptPanel" style="margin-top:14px">
     <div class="panelHeader">
       <h2>Raw selected attempt</h2>
       <div style="display:flex;align-items:center;gap:8px">
@@ -7123,6 +7123,11 @@ $("exportSuccessPoolBtn").onclick=()=>exportSuccessPool().catch(e=>setStatus(e.m
 $("loadRunBtn").onclick=()=>loadRun(false).catch(e=>setStatus(e.message,"error"));
 $("reloadBtn").onclick=()=>loadRun(true).catch(e=>setStatus(e.message,"error"));
 $("copyPathBtn").onclick=()=>navigator.clipboard&&navigator.clipboard.writeText($("runInput").value).then(()=>setStatus("Run path copied","ok")).catch(()=>setStatus("Copy failed","error"));
+$("copyRawAttemptBtn").onclick=()=>{
+  const text=$("rawBox")?.textContent||"";
+  if(!navigator.clipboard){setStatus("Clipboard unavailable","error");return;}
+  navigator.clipboard.writeText(text).then(()=>setStatus("Raw attempt copied","ok")).catch(()=>setStatus("Copy failed","error"));
+};
 $("runSelect").onchange=()=>{$("runInput").value=$("runSelect").value};
 $("selectAllRunsBtn").onclick=()=>toggleAllRuns(true);
 $("selectZeroSuccessBtn").onclick=()=>selectRuns(r=>Number(r.success||0)===0);

@@ -2670,6 +2670,7 @@ def debug_visual_root_paths():
     for root in control_roots:
         roots.extend(
             [
+                f"{root}/TargetBall",
                 f"{root}/TracePath",
                 f"{root}/LoadedRouteDebug",
                 f"{root}/UnloadPointBall",

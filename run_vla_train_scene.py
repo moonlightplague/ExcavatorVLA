@@ -174,6 +174,75 @@ def launcher_update_profile_threshold_ms():
     return 0.0
 
 
+def apply_stable_dataset_render_settings(reason="startup"):
+    """Reduce temporal render variance in captured training frames."""
+    try:
+        import carb
+    except Exception as exc:
+        print(f"[WARN] Stable render settings skipped: {type(exc).__name__}: {exc}", flush=True)
+        return {}
+    settings = carb.settings.get_settings()
+    applied = {}
+
+    def set_value(key, value):
+        try:
+            settings.set(key, value)
+            applied[str(key)] = value
+        except Exception as exc:
+            applied[str(key)] = f"{type(exc).__name__}: {exc}"
+
+    def set_bool(key, value):
+        try:
+            settings.set_bool(key, bool(value))
+            applied[str(key)] = bool(value)
+        except Exception:
+            set_value(key, bool(value))
+
+    def set_int(key, value):
+        try:
+            settings.set_int(key, int(value))
+            applied[str(key)] = int(value)
+        except Exception:
+            set_value(key, int(value))
+
+    def set_float(key, value):
+        try:
+            settings.set_float(key, float(value))
+            applied[str(key)] = float(value)
+        except Exception:
+            set_value(key, float(value))
+
+    # Keep the camera pipeline on a deterministic Kit clock and avoid temporal
+    # post effects that can make static background pixels shimmer frame-to-frame.
+    set_bool("/omni/replicator/captureOnPlay", False)
+    set_bool("/app/asyncRendering", False)
+    set_bool("/exts/isaacsim.core.throttling/enable_async", False)
+    set_bool("/app/player/useFixedTimeStepping", True)
+
+    # DLSS mode 2 is the stable/off-style mode used by the camera diagnostics.
+    set_int("/rtx/post/dlss/execMode", 2)
+    set_int("/rtx/post/aa/op", 0)
+    set_bool("/rtx/post/motionblur/enabled", False)
+    set_bool("/rtx/post/motionBlur/enabled", False)
+    set_bool("/rtx/post/tonemap/autoExposure/enabled", False)
+    set_bool("/rtx/post/histogram/enabled", False)
+    set_float("/rtx/post/tonemap/exposure", 0.0)
+    set_float("/rtx/post/tonemap/whitepoint", 1.0)
+
+    # Disable adaptive render resolution variants where available.
+    set_bool("/rtx-transient/resourcemanager/enableTextureStreaming", False)
+    set_bool("/rtx/post/dlss/autoExposure", False)
+    set_bool("/rtx/post/dlss/autoScale", False)
+
+    print(
+        "[INFO] Stable dataset render settings applied:",
+        f"reason={reason}",
+        f"count={len(applied)}",
+        flush=True,
+    )
+    return applied
+
+
 def runtime_update_snapshot(rt):
     if rt is None:
         return {}
@@ -528,11 +597,13 @@ def main():
         "physics_gpu": int(args.physics_gpu),
         "extra_args": extra_args,
     })
+    apply_stable_dataset_render_settings(reason="post_simulation_app")
     if args.headless and args.auto_collect:
         suppress_headless_log_noise()
 
     try:
         open_stage(simulation_app, args.scene)
+        apply_stable_dataset_render_settings(reason="post_open_stage")
 
         from excavator_app.bootstrap import run_excavator_with_sand
 
@@ -542,6 +613,11 @@ def main():
         except Exception:
             pass
         wait_runtime_ready(simulation_app, rt, args.wait_runtime_seconds)
+        stable_settings = apply_stable_dataset_render_settings(reason="runtime_ready")
+        try:
+            rt.STATE["dataset_stable_render_settings"] = stable_settings
+        except Exception:
+            pass
         if args.sand_amount is not None and not args.random_sand_amount:
             rt.STATE["auto_scene_random_sand_amount_enabled"] = False
             print("[INFO] Auto collect sand amount randomization disabled because --sand-amount was provided.", flush=True)

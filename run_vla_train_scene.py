@@ -167,38 +167,160 @@ def launcher_update_profile_threshold_ms():
         except Exception:
             return 0.0
     mode = str(os.environ.get("EXCAVATOR_LOG_MODE", "data") or "data").strip().lower()
-    return 6000.0 if mode == "profile" else 0.0
+    if mode == "profile":
+        return 400.0
+    if mode == "debug":
+        return 1500.0
+    return 0.0
+
+
+def runtime_update_snapshot(rt):
+    if rt is None:
+        return {}
+    try:
+        state = getattr(rt, "STATE", {}) or {}
+        progress = dict(state.get("auto_collect_progress", {}) or {})
+        step_recent = list(state.get("step_updates_recent", []) or [])
+        debug_last = dict(state.get("debug_profile_last", {}) or {})
+        sample_spans = dict(state.get("dataset_record_sample_spans", {}) or {})
+        return {
+            "active_task": str(state.get("active_task_name", "") or ""),
+            "stage": str(progress.get("stage", "") or ""),
+            "result": str(progress.get("result", "") or ""),
+            "progress_age_s": round(max(0.0, time.time() - float(progress.get("updated_at", time.time()) or time.time())), 3)
+            if progress else 0.0,
+            "attempt": int(progress.get("attempt", state.get("auto_collect_attempts", 0)) or 0),
+            "run_dir": str(state.get("auto_collect_run_dir", "") or ""),
+            "auto_collect_active": bool(state.get("auto_collect_active", False)),
+            "dataset_recording": bool(state.get("dataset_recording", False)),
+            "dataset_samples": int(state.get("dataset_samples", 0) or 0),
+            "dataset_episode": str(state.get("dataset_episode_uid", "") or ""),
+            "camera_backend": str(state.get("dataset_camera_backend", "") or ""),
+            "camera_available": bool(state.get("dataset_camera_available", False)),
+            "debug_visuals": bool(state.get("debug_visuals_visible", False)),
+            "trace_mode": int(state.get("trace_mode", 0) or 0),
+            "last_step_caller": str(step_recent[-1].get("caller", "") if step_recent else ""),
+            "last_step_frame_ms": float(step_recent[-1].get("per_frame_ms", 0.0) if step_recent else 0.0),
+            "last_profile_label": str(debug_last.get("label", "") or ""),
+            "last_profile_ms": float(debug_last.get("elapsed_ms", 0.0) or 0.0),
+            "sample_spans": sample_spans,
+        }
+    except Exception as exc:
+        return {"snapshot_error": f"{type(exc).__name__}: {exc}"}
+
+
+def record_launcher_update_profile(rt, label, elapsed_ms, threshold_ms, before, after):
+    if rt is None:
+        return
+    try:
+        state = getattr(rt, "STATE", {}) or {}
+        profile = state.get("launcher_update_profile")
+        if not isinstance(profile, dict):
+            profile = {
+                "count": 0,
+                "total_ms": 0.0,
+                "max_ms": 0.0,
+                "slow_count": 0,
+                "threshold_ms": float(threshold_ms),
+                "by_context": {},
+            }
+        profile["count"] = int(profile.get("count", 0) or 0) + 1
+        profile["total_ms"] = float(profile.get("total_ms", 0.0) or 0.0) + float(elapsed_ms)
+        profile["avg_ms"] = profile["total_ms"] / max(1, int(profile.get("count", 0) or 0))
+        profile["max_ms"] = max(float(profile.get("max_ms", 0.0) or 0.0), float(elapsed_ms))
+        if elapsed_ms >= threshold_ms:
+            profile["slow_count"] = int(profile.get("slow_count", 0) or 0) + 1
+
+        after = after if isinstance(after, dict) else {}
+        context_key = "|".join(
+            [
+                str(label or "launcher"),
+                str(after.get("stage", "")),
+                str(after.get("result", "")),
+                str(after.get("active_task", "")),
+                f"recording={bool(after.get('dataset_recording', False))}",
+                f"viz={bool(after.get('debug_visuals', False))}",
+                str(after.get("camera_backend", "")),
+            ]
+        )
+        by_context = profile.get("by_context")
+        if not isinstance(by_context, dict):
+            by_context = {}
+        row = by_context.get(context_key)
+        if not isinstance(row, dict):
+            row = {
+                "count": 0,
+                "total_ms": 0.0,
+                "max_ms": 0.0,
+                "slow_count": 0,
+                "label": str(label or ""),
+                "stage": str(after.get("stage", "")),
+                "result": str(after.get("result", "")),
+                "active_task": str(after.get("active_task", "")),
+                "dataset_recording": bool(after.get("dataset_recording", False)),
+                "debug_visuals": bool(after.get("debug_visuals", False)),
+                "camera_backend": str(after.get("camera_backend", "")),
+            }
+        row["count"] = int(row.get("count", 0) or 0) + 1
+        row["total_ms"] = float(row.get("total_ms", 0.0) or 0.0) + float(elapsed_ms)
+        row["avg_ms"] = row["total_ms"] / max(1, int(row.get("count", 0) or 0))
+        row["max_ms"] = max(float(row.get("max_ms", 0.0) or 0.0), float(elapsed_ms))
+        if elapsed_ms >= threshold_ms:
+            row["slow_count"] = int(row.get("slow_count", 0) or 0) + 1
+        by_context[context_key] = row
+        profile["by_context"] = by_context
+        state["launcher_update_profile"] = profile
+
+        if elapsed_ms >= threshold_ms:
+            entry = {
+                "t": time.time(),
+                "label": str(label or ""),
+                "elapsed_ms": round(float(elapsed_ms), 3),
+                "threshold_ms": round(float(threshold_ms), 3),
+                "before": before,
+                "after": after,
+            }
+            recent = state.get("launcher_update_recent")
+            if not isinstance(recent, list):
+                recent = []
+            recent.append(entry)
+            state["launcher_update_recent"] = recent[-64:]
+
+            now = time.time()
+            last_print = float(state.get("launcher_update_last_print_time", 0.0) or 0.0)
+            slow_count = int(profile.get("slow_count", 0) or 0)
+            if slow_count <= 5 or elapsed_ms >= threshold_ms * 4.0 or now - last_print >= 5.0:
+                state["launcher_update_last_print_time"] = now
+                print(
+                    "[LAUNCHER UPDATE SLOW]",
+                    f"label={label}",
+                    f"elapsed_ms={elapsed_ms:.1f}",
+                    f"stage={after.get('stage', '')}",
+                    f"result={after.get('result', '')}",
+                    f"active_task={after.get('active_task', '')}",
+                    f"recording={after.get('dataset_recording', False)}",
+                    f"samples={after.get('dataset_samples', 0)}",
+                    f"viz={after.get('debug_visuals', False)}",
+                    f"last_step={after.get('last_step_caller', '')}:{after.get('last_step_frame_ms', 0.0):.1f}ms",
+                    f"last_profile={after.get('last_profile_label', '')}:{after.get('last_profile_ms', 0.0):.1f}ms",
+                    flush=True,
+                )
+    except Exception:
+        pass
 
 
 def profiled_simulation_update(simulation_app, rt=None, label="launcher"):
     threshold_ms = launcher_update_profile_threshold_ms()
     started = time.perf_counter() if threshold_ms > 0.0 else 0.0
+    before = runtime_update_snapshot(rt) if threshold_ms > 0.0 else {}
     simulation_app.update()
     if threshold_ms <= 0.0:
         return
     elapsed_ms = (time.perf_counter() - started) * 1000.0
+    after = runtime_update_snapshot(rt)
+    record_launcher_update_profile(rt, label, elapsed_ms, threshold_ms, before, after)
     if elapsed_ms <= threshold_ms:
         return
-    progress = {}
-    active_task = ""
-    run_dir = ""
-    if rt is not None:
-        try:
-            progress = dict(rt.STATE.get("auto_collect_progress", {}) or {})
-            active_task = str(rt.STATE.get("active_task_name", "") or "")
-            run_dir = str(rt.STATE.get("auto_collect_run_dir", "") or "")
-        except Exception:
-            progress = {}
-    print(
-        "[LAUNCHER UPDATE SLOW]",
-        f"label={label}",
-        f"elapsed_ms={elapsed_ms:.1f}",
-        f"active_task={active_task}",
-        f"stage={progress.get('stage', '')}",
-        f"result={progress.get('result', '')}",
-        f"run_dir={run_dir}",
-        flush=True,
-    )
 
 
 def suppress_headless_log_noise():

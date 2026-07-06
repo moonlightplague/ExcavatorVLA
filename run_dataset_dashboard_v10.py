@@ -3156,7 +3156,12 @@ def dashboard_scene_from_episode(row: dict) -> Dict[str, object]:
         "unload_mesh": scene_context.get("manual_unload_selected_path"),
     }
 
-def dashboard_episode_summary(row: dict, dataset_tag: Optional[str] = None, dataset_skip_reason: str = "") -> Dict[str, object]:
+def dashboard_episode_summary(
+    row: dict,
+    dataset_tag: Optional[str] = None,
+    dataset_skip_reason: str = "",
+    runtime_s: Optional[float] = None,
+) -> Dict[str, object]:
     scene = dashboard_scene_from_episode(row)
     tag = dataset_tag or normalized_status_name(row.get("status", "unknown"))
     scene["raw_status"] = row.get("status")
@@ -3173,6 +3178,7 @@ def dashboard_episode_summary(row: dict, dataset_tag: Optional[str] = None, data
         "warning_reason": row.get("warning_reason", ""),
         "task_prompt": dashboard_episode_task_prompt(row),
         "samples": row.get("samples"),
+        "time_s": float(runtime_s if runtime_s is not None else estimate_row_runtime_s(row)),
         "freeze_count": row.get("freeze_count"),
         "max_bucket": row.get("max_bucket_from_pile_particles"),
         "lift_bucket": row.get("lift_bucket_from_pile_particles"),
@@ -3362,7 +3368,7 @@ RUN_SIZE_CACHE_FILENAME = "folder_size_cache.json"
 RUN_SIZE_CACHE_VERSION = 2
 RUN_SIZE_EXCLUDE_DIRS = {".dashboard_cache", "__pycache__"}
 RUN_DATA_SIZE_LIMIT = 8
-RUN_PAYLOAD_CACHE_VERSION = 1
+RUN_PAYLOAD_CACHE_VERSION = 3
 RUN_PAYLOAD_CACHE_DIRNAME = "run_payload_cache"
 RUN_PAYLOAD_MEMORY_CACHE: Dict[str, Dict[str, object]] = {}
 RUN_PAYLOAD_CACHE_LOCK = threading.Lock()
@@ -3371,7 +3377,7 @@ FRAME_CONTEXT_CACHE_LIMIT = 16
 FRAME_CONTEXT_CACHE: Dict[Tuple[str, str], Dict[str, object]] = {}
 FRAME_CONTEXT_CACHE_LOCK = threading.Lock()
 FRAME_IMAGE_CACHE_TTL = 60.0
-FRAME_IMAGE_CACHE_LIMIT = 96
+FRAME_IMAGE_CACHE_LIMIT = 512
 FRAME_IMAGE_CACHE: Dict[str, Dict[str, object]] = {}
 FRAME_IMAGE_CACHE_LOCK = threading.Lock()
 
@@ -5222,16 +5228,20 @@ def dashboard_run_payload_uncached(run_dir: Union[str, os.PathLike]) -> Dict[str
     dataset_metrics = compute_dataset_generation_metrics(rows)
     tag_by_episode = {}
     skip_reason_by_episode = {}
+    runtime_by_episode = {}
     for row in rows:
         trajectory = load_trajectory(row)
         tag, reason = dataset_training_tag_for_row(row, trajectory)
-        tag_by_episode[str(row.get("episode_index"))] = tag
-        skip_reason_by_episode[str(row.get("episode_index"))] = reason if tag == "skip" else ""
+        key = str(row.get("episode_index"))
+        tag_by_episode[key] = tag
+        skip_reason_by_episode[key] = reason if tag == "skip" else ""
+        runtime_by_episode[key] = estimate_row_runtime_s(row, trajectory)
     episodes = [
         dashboard_episode_summary(
             row,
             dataset_tag=tag_by_episode.get(str(row.get("episode_index"))),
             dataset_skip_reason=skip_reason_by_episode.get(str(row.get("episode_index")), ""),
+            runtime_s=runtime_by_episode.get(str(row.get("episode_index"))),
         )
         for row in rows
     ]
@@ -5857,7 +5867,7 @@ def dashboard_episode_payload(
         return {"ok": False, "reason": f"episode_not_found:{episode_index}", "run_dir": run_dir}
     trajectory = load_trajectory(selected)
     if not trajectory:
-        episode = dashboard_episode_summary(selected, dataset_tag="skip", dataset_skip_reason="trajectory_empty")
+        episode = dashboard_episode_summary(selected, dataset_tag="skip", dataset_skip_reason="trajectory_empty", runtime_s=0.0)
         empty_series = {
             "t": [], "phase": [], "bucket_from_pile": [], "bucket_total": [], "bucket_mass": [],
             "q_deg": [], "dq_deg_s": [], "ddq_deg_s2": [], "cmd_q_deg": [], "q_err_deg": [],
@@ -5881,7 +5891,7 @@ def dashboard_episode_payload(
         episode_meta = read_json(resolve_episode_file(episode_dir, row_path_value(selected, "meta")), default={}) or {}
     except Exception:
         episode_meta = {}
-    episode_summary = dashboard_episode_summary(selected)
+    episode_summary = dashboard_episode_summary(selected, runtime_s=trajectory_runtime_s(trajectory))
     episode_summary["task_prompt"] = dashboard_episode_task_prompt(selected, trajectory=trajectory, episode_meta=episode_meta)
     first_t = safe_float_value(trajectory[0].get("t"), 0.0) or 0.0
     frame_context = dashboard_store_frame_context(dashboard_build_frame_context(run_dir, episode_index, selected, trajectory))
@@ -5952,6 +5962,26 @@ def dashboard_html() -> str:
 }
 *{box-sizing:border-box}
 body{margin:0;background:linear-gradient(180deg,#eef3fb 0,#f6f8fb 220px,#f6f8fb 100%);}
+.topbarTitleRow{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.darkModeToggle{min-width:36px;width:36px;height:34px;padding:0;border-radius:999px;background:#fff;color:#111827;border:1px solid #cbd5e1;font-size:17px;line-height:1;display:inline-flex;align-items:center;justify-content:center;box-shadow:0 1px 2px rgba(16,24,40,.05)}
+.darkModeToggle:hover{background:#f8fafc}
+body.dark{background:linear-gradient(180deg,#0b1220 0,#111827 240px,#111827 100%);color:#e5e7eb;--panel:#111827;--border:#334155;--muted:#94a3b8;--ink:#f8fafc}
+body.dark .topbar{background:rgba(15,23,42,.96);border-bottom-color:#334155;box-shadow:0 6px 18px rgba(0,0,0,.30)}
+body.dark h1,body.dark h2,body.dark h3,body.dark .cameraPreviewTitle,body.dark .cameraCardTitle,body.dark .diagCardValue,body.dark .runMonitorTitle,body.dark .managerTable .nameCell{color:#f8fafc}
+body.dark .panel,body.dark .kpi,body.dark .diagCard,body.dark .subPanel,body.dark .managerPanel,body.dark .episodeSide,body.dark .timelinePaneHeader,body.dark .cameraPreview,body.dark .cameraCard,body.dark .miniChart,body.dark .finding,body.dark .action{background:#0f172a;border-color:#334155;color:#e5e7eb}
+body.dark input,body.dark select,body.dark button.secondary,body.dark .cameraPlayerBtn,body.dark .filterBtn,body.dark .runBadge,body.dark .unitLegend,body.dark .meshFrameBadge,body.dark .darkModeToggle{background:#111827;color:#e5e7eb;border-color:#475569}
+body.dark button{border-color:#334155}
+body.dark .muted,body.dark .panelHint,body.dark .filterCount,body.dark .diagCardDetail,body.dark .diagCardTitle,body.dark .sideFooter,body.dark .sideSortHint,body.dark .chartLegend,body.dark .plotNote{color:#94a3b8}
+body.dark .tableWrap,body.dark .managerTableWrap,body.dark .episodeTabsList{background:#0b1220;border-color:#334155}
+body.dark th,body.dark .episodeDataSheet th,body.dark .managerTable th{background:#111827;color:#cbd5e1;border-bottom-color:#334155}
+body.dark td,body.dark .episodeDataSheet td,body.dark .managerTable td{color:#e5e7eb;border-bottom-color:#1e293b}
+body.dark tbody tr:hover,body.dark .episodeDataSheet tbody tr:hover td{background:#172033}
+body.dark tbody tr.selected,body.dark .episodeDataSheet tbody tr.selected td,body.dark .episodeDataSheet tbody tr.selected .epCol{background:#1e3a5f}
+body.dark .episodeDataSheet .epCol{background:#0f172a;color:#f8fafc}
+body.dark .chart{background:#0f172a;border-color:#334155}body.dark svg text{fill:#cbd5e1!important}body.dark svg rect[fill="#fcfcfd"],body.dark svg rect[fill="#ffffff"]{fill:#0f172a!important}body.dark svg line[stroke="#eef2f6"]{stroke:#334155!important}body.dark svg rect[stroke="#d0d5dd"]{stroke:#475569!important}
+body.dark .empty,body.dark .reportHint,body.dark .taskPrompt,body.dark .diagStat,body.dark .transferProgress{background:#111827;border-color:#334155;color:#94a3b8}
+body.dark .barTrack,body.dark .scoreBar,body.dark .transferProgressTrack{background:#334155}
+body.dark .codeBox{background:#020617;color:#cbd5e1}
 .shell{max-width:1720px;margin:0 auto;padding:16px 18px 28px}
 .topbar{position:sticky;top:0;z-index:20;background:rgba(255,255,255,.96);backdrop-filter:blur(8px);border-bottom:1px solid var(--border);box-shadow:0 6px 18px rgba(16,24,40,.06)}
 .topbar .shell{padding-top:12px;padding-bottom:12px}
@@ -5964,7 +5994,7 @@ input,select,button{min-height:34px;border:1px solid #cbd5e1;border-radius:8px;b
 input.path{width:100%}select{width:100%}
 button{background:#1f2937;color:#fff;border-color:#1f2937;cursor:pointer;font-weight:600}
 button.secondary{background:#fff;color:#111827;border-color:#cbd5e1}.linkBtn{border:0;background:transparent;color:#175cd3;padding:0;min-height:0;font-weight:800;text-align:left;cursor:pointer}.linkBtn:hover{text-decoration:underline}
-.statusLine{margin-top:8px;display:flex;gap:10px;align-items:center;min-height:18px}.runMonitor{margin-top:9px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;color:#475467}.runMonitorTitle{font-weight:800;color:#101828}.runBadge{display:inline-flex;align-items:center;gap:6px;border:1px solid #d0d5dd;border-radius:999px;background:#fff;color:#344054;padding:4px 9px;min-height:26px;font-size:12px;cursor:pointer}.runBadge.active{border-color:#12b76a;background:#ecfdf3;color:#027a48}.runBadge.recent{border-color:#fdb022;background:#fffaeb;color:#b54708}.activityDot{width:9px;height:9px;border-radius:999px;display:inline-block;background:#98a2b3;box-shadow:0 0 0 2px rgba(152,162,179,.14)}.activityDot.active{background:#12b76a;box-shadow:0 0 0 3px rgba(18,183,106,.18)}.activityDot.recent{background:#fdb022;box-shadow:0 0 0 3px rgba(253,176,34,.18)}.activityDot.idle{background:#f04438;box-shadow:0 0 0 3px rgba(240,68,56,.14)}.activityDot.missing,.activityDot.unknown{background:#98a2b3}.managerPanel{margin-bottom:14px;padding:0}.managerPanel>summary{cursor:pointer;list-style:none;padding:14px 16px;display:flex;align-items:flex-start;justify-content:space-between;gap:14px;border-bottom:1px solid #eaecf0}.managerPanel>summary::-webkit-details-marker{display:none}.managerPanel>summary:after{content:"收起";font-size:12px;color:#667085;border:1px solid #d0d5dd;border-radius:999px;padding:3px 9px;background:#fff;flex:0 0 auto}.managerPanel:not([open])>summary{border-bottom:0}.managerPanel:not([open])>summary:after{content:"展开"}.managerBody{padding:12px 14px 14px}.managerToolbar{display:flex;flex-wrap:nowrap;overflow-x:auto;gap:8px;align-items:center;margin-bottom:10px;padding-bottom:2px}.managerToolbar button{flex:0 0 auto}.managerToolbar input.path{flex:1 0 360px;min-width:260px}.managerToolbar .danger{background:#b42318;border-color:#b42318;color:#fff}.managerToolbar .warn{background:#b54708;border-color:#b54708;color:#fff}.managerSummary{font-size:12px;color:#475467;margin-bottom:8px;min-height:18px}.managerTableWrap{max-height:260px;overflow:auto;border:1px solid #eaecf0;border-radius:10px;background:#fff}.managerTable{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.managerTable th,.managerTable td{padding:7px 8px;border-bottom:1px solid #eef2f6;white-space:nowrap;vertical-align:middle}.managerTable th{position:sticky;top:0;background:#f8fafc;z-index:2;text-transform:uppercase;letter-spacing:.04em;font-size:10.5px;color:#475467}.managerTable .nameCell{font-weight:800;color:#101828}.managerTable .num{text-align:right;font-variant-numeric:tabular-nums}.managerTable .zeroSuccess{color:#b42318;font-weight:850}.managerTable .successRun{color:#067647;font-weight:850}.managerTable .dataSizeCell{max-width:280px;overflow:hidden;text-overflow:ellipsis}.ok{color:#047857}.error{color:#b91c1c}.muted{color:var(--muted);font-size:12px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.small{font-size:12px}.nowrap{white-space:nowrap}
+.statusLine{margin-top:8px;display:flex;gap:10px;align-items:center;min-height:18px}.runMonitor{margin-top:9px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;color:#475467}.runMonitorTitle{font-weight:800;color:#101828}.runBadge{display:inline-flex;align-items:center;gap:6px;border:1px solid #d0d5dd;border-radius:999px;background:#fff;color:#344054;padding:4px 9px;min-height:26px;font-size:12px;cursor:pointer}.runBadge.active{border-color:#12b76a;background:#ecfdf3;color:#027a48}.runBadge.recent{border-color:#fdb022;background:#fffaeb;color:#b54708}.activityDot{width:9px;height:9px;border-radius:999px;display:inline-block;background:#98a2b3;box-shadow:0 0 0 2px rgba(152,162,179,.14)}.activityDot.active{background:#12b76a;box-shadow:0 0 0 3px rgba(18,183,106,.18)}.activityDot.recent{background:#fdb022;box-shadow:0 0 0 3px rgba(253,176,34,.18)}.activityDot.idle{background:#f04438;box-shadow:0 0 0 3px rgba(240,68,56,.14)}.activityDot.missing,.activityDot.unknown{background:#98a2b3}.managerPanel{margin-bottom:14px;padding:0}.managerPanel>summary{cursor:pointer;list-style:none;padding:14px 16px;display:flex;align-items:flex-start;justify-content:space-between;gap:14px;border-bottom:1px solid #eaecf0;position:relative}.managerPanel>summary::-webkit-details-marker{display:none}.managerPanel>summary:after{content:"";width:10px;height:10px;border-right:2px solid #667085;border-bottom:2px solid #667085;transform:rotate(-45deg);transition:transform .2s ease;flex:0 0 auto;margin-top:4px}.managerPanel[open]>summary:after{transform:rotate(45deg);margin-top:7px}.managerPanel:not([open])>summary{border-bottom:0}.managerBody{padding:12px 14px 14px}.managerToolbar{display:flex;flex-wrap:nowrap;overflow-x:auto;gap:8px;align-items:center;margin-bottom:10px;padding-bottom:2px}.managerToolbar button{flex:0 0 auto}.managerToolbar input.path{flex:1 0 360px;min-width:260px}.managerToolbar .danger{background:#b42318;border-color:#b42318;color:#fff}.managerToolbar .warn{background:#b54708;border-color:#b54708;color:#fff}.managerSummary{font-size:12px;color:#475467;margin-bottom:8px;min-height:18px}.managerTableWrap{max-height:260px;overflow:auto;border:1px solid #eaecf0;border-radius:10px;background:#fff;scrollbar-width:none;-ms-overflow-style:none}.managerTableWrap::-webkit-scrollbar{display:none}.managerTable{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.managerTable th,.managerTable td{padding:7px 8px;border-bottom:1px solid #eef2f6;white-space:nowrap;vertical-align:middle}.managerTable th{position:sticky;top:0;background:#f8fafc;z-index:2;text-transform:uppercase;letter-spacing:.04em;font-size:10.5px;color:#475467}.managerTable .nameCell{font-weight:800;color:#101828}.managerTable .num{text-align:right;font-variant-numeric:tabular-nums}.managerTable .zeroSuccess{color:#b42318;font-weight:850}.managerTable .successRun{color:#067647;font-weight:850}.managerTable .dataSizeCell{max-width:280px;overflow:hidden;text-overflow:ellipsis}.ok{color:#047857}.error{color:#b91c1c}.muted{color:var(--muted);font-size:12px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.small{font-size:12px}.nowrap{white-space:nowrap}
 .grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:14px;align-items:start}
 .panel{background:var(--panel);border:1px solid var(--border);border-radius:14px;box-shadow:0 1px 2px rgba(16,24,40,.04);padding:14px;min-width:0;overflow:hidden}
 .panelHeader{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:10px}.panelHint{font-size:12px;color:#667085;line-height:1.35}
@@ -5980,7 +6010,7 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
 
 /* v4 layout fixes */
 .statusFilterBar{margin-top:10px;border-top:1px solid #eaecf0;padding-top:10px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
-.statusFilterTitle{font-size:12px;color:#475467;font-weight:700;margin-right:4px}.statusFilter{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.filterBtn{min-height:28px;border:1px solid #d0d5dd;border-radius:999px;background:#fff;color:#344054;padding:0 10px;font-size:12px;font-weight:700;cursor:pointer}.filterBtn.active{color:#fff;border-color:transparent}.filterBtn.all.active{background:#344054}.filterBtn.trainable.active,.filterBtn.success.active{background:#067647}.filterBtn.rejected.active{background:#d92d20}.filterBtn.failed.active,.filterBtn.fail.active{background:#f79009;color:#111827}.filterBtn.diagnostic.active{background:#6941c6}.filterBtn.planning.active{background:#175cd3}.filterBtn.skip.active{background:#475467}.filterBtn.unknown.active{background:#667085}.filterCount{font-size:12px;color:#667085;white-space:nowrap}.chartMeta{font-size:11px;color:#667085;line-height:1.35;margin-top:6px}.miniChartGrid{display:grid;grid-template-columns:1fr;gap:10px}.miniChart{border:1px solid #eaecf0;border-radius:12px;background:#fcfcfd;padding:10px;min-width:0}.miniChart h3{margin:0 0 6px;font-size:12px;color:#344054;text-transform:none;letter-spacing:0}.miniChart .chart{max-height:165px}.smallChartBox{min-height:0}.pill.failed,.pill.fail{background:#fff7ed;color:#c2410c}.pill.rejected{background:#fef3f2;color:#b42318}.pill.diagnostic{background:#f4f3ff;color:#5925dc}.pill.skip{background:#f2f4f7;color:#344054}.episodeInspector{display:grid;grid-template-columns:minmax(560px,42%) minmax(0,1fr);gap:14px;align-items:start;min-height:0}.episodeSide{background:#f8fafc;border:1px solid #eaecf0;border-radius:12px;padding:10px;display:flex;flex-direction:column;min-height:0;height:var(--episodeAsideHeight,640px);max-height:var(--episodeAsideHeight,640px);overflow:hidden;align-self:start}.sideTabsToolbar{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:8px}.sideSortHint{font-size:11px;color:#667085;line-height:1.35;text-align:right;max-width:190px}.episodeTabsList{flex:1;min-height:0;overflow:auto;scrollbar-width:none;-ms-overflow-style:none;border:1px solid #eaecf0;border-radius:10px;background:#fff}.episodeTabsList::-webkit-scrollbar{display:none;width:0;height:0}.episodeDataSheet{min-width:980px;width:100%;border-collapse:separate;border-spacing:0;font-size:11.5px;line-height:1.25}.episodeDataSheet th,.episodeDataSheet td{padding:7px 8px;border-bottom:1px solid #eef2f6;white-space:nowrap;vertical-align:middle}.episodeDataSheet th{position:sticky;top:0;z-index:4;background:#f8fafc;color:#475467;text-transform:uppercase;letter-spacing:.04em;font-size:10.5px}.episodeDataSheet th.sortable{cursor:pointer;color:#175cd3;user-select:none}.episodeDataSheet th.sortable:hover{background:#eff8ff}.episodeDataSheet tbody tr{cursor:pointer}.episodeDataSheet tbody tr:hover td{background:#f8fafc}.episodeDataSheet tbody tr.selected td{background:#e0f2fe}.episodeDataSheet .epCol{position:sticky;left:0;z-index:3;background:#fff;font-weight:800;color:#101828}.episodeDataSheet th.epCol{z-index:5;background:#f8fafc}.episodeDataSheet tbody tr:hover .epCol{background:#f8fafc}.episodeDataSheet tbody tr.selected .epCol{background:#e0f2fe}.episodeDataSheet .num{text-align:right;font-variant-numeric:tabular-nums}.episodeDataSheet .reasonCell{max-width:360px;overflow:hidden;text-overflow:ellipsis}.sideFooter{font-size:11px;color:#98a2b3;margin-top:7px;line-height:1.35}.timelinePane{min-width:0;display:flex;flex-direction:column;height:auto;align-self:start}.timelinePaneHeader{position:relative;top:auto;z-index:2;background:#fff;border:1px solid #eaecf0;border-radius:12px;padding:10px 12px;margin-bottom:16px}.timelinePaneHeader + .timelineGrid{margin-top:0}#bucketChart{margin-top:0}.timelineChart svg{display:block}.timelineGrid{gap:12px;min-width:0}.timelineChart .chart{min-height:230px}.unitLegend{border:1px solid #d0d5dd;border-radius:999px;padding:2px 7px;background:#fff;color:#475467;font-weight:700}.plotNote{font-size:11px;color:#667085;margin-top:6px;line-height:1.35}.densityBadge{display:inline-block;margin-left:6px;border:1px solid #d0d5dd;border-radius:999px;padding:1px 6px;font-size:10px;color:#475467;background:#fff}.meshFrameBadge{display:inline-block;border:1px solid #d0d5dd;border-radius:999px;padding:2px 7px;background:#fff;color:#475467;font-size:11px;margin-top:6px}
+.statusFilterTitle{font-size:12px;color:#475467;font-weight:700;margin-right:4px}.statusFilter{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.filterBtn{min-height:28px;border:1px solid #d0d5dd;border-radius:999px;background:#fff;color:#344054;padding:0 10px;font-size:12px;font-weight:700;cursor:pointer}.filterBtn.active{color:#fff;border-color:transparent}.filterBtn.all.active{background:#344054}.filterBtn.trainable.active,.filterBtn.success.active{background:#067647}.filterBtn.rejected.active{background:#d92d20}.filterBtn.failed.active,.filterBtn.fail.active{background:#f79009;color:#111827}.filterBtn.diagnostic.active{background:#6941c6}.filterBtn.planning.active{background:#175cd3}.filterBtn.skip.active{background:#475467}.filterBtn.unknown.active{background:#667085}.filterCount{font-size:12px;color:#667085;white-space:nowrap}.chartMeta{font-size:11px;color:#667085;line-height:1.35;margin-top:6px}.miniChartGrid{display:grid;grid-template-columns:1fr;gap:10px}.miniChart{border:1px solid #eaecf0;border-radius:12px;background:#fcfcfd;padding:10px;min-width:0}.miniChart h3{margin:0 0 6px;font-size:12px;color:#344054;text-transform:none;letter-spacing:0}.miniChart .chart{max-height:165px}.smallChartBox{min-height:0}.pill.failed,.pill.fail{background:#fff7ed;color:#c2410c}.pill.rejected{background:#fef3f2;color:#b42318}.pill.diagnostic{background:#f4f3ff;color:#5925dc}.pill.skip{background:#f2f4f7;color:#344054}.episodeInspector{display:grid;grid-template-columns:minmax(560px,42%) minmax(0,1fr);gap:14px;align-items:start;min-height:0}.episodeSide{background:#f8fafc;border:1px solid #eaecf0;border-radius:12px;padding:10px;display:flex;flex-direction:column;min-height:0;height:var(--episodeAsideHeight,640px);max-height:var(--episodeAsideHeight,640px);overflow:hidden;align-self:start}.sideTabsToolbar{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:8px}.sideSortHint{font-size:11px;color:#667085;line-height:1.35;text-align:right;max-width:190px}.episodeTabsList{flex:1;min-height:0;overflow:auto;scrollbar-width:none;-ms-overflow-style:none;border:1px solid #eaecf0;border-radius:10px;background:#fff}.episodeTabsList::-webkit-scrollbar{display:none;width:0;height:0}.episodeDataSheet{min-width:1080px;width:100%;border-collapse:separate;border-spacing:0;font-size:11.5px;line-height:1.25}.episodeDataSheet th,.episodeDataSheet td{padding:7px 8px;border-bottom:1px solid #eef2f6;white-space:nowrap;vertical-align:middle}.episodeDataSheet th{position:sticky;top:0;z-index:4;background:#f8fafc;color:#475467;text-transform:uppercase;letter-spacing:.04em;font-size:10.5px}.episodeDataSheet th.sortable{cursor:pointer;color:#175cd3;user-select:none}.episodeDataSheet th.sortable:hover{background:#eff8ff}.episodeDataSheet tbody tr{cursor:pointer}.episodeDataSheet tbody tr:hover td{background:#f8fafc}.episodeDataSheet tbody tr.selected td{background:#e0f2fe}.episodeDataSheet .epCol{position:sticky;left:0;z-index:3;background:#fff;font-weight:800;color:#101828}.episodeDataSheet th.epCol{z-index:5;background:#f8fafc}.episodeDataSheet tbody tr:hover .epCol{background:#f8fafc}.episodeDataSheet tbody tr.selected .epCol{background:#e0f2fe}.episodeDataSheet .num{text-align:right;font-variant-numeric:tabular-nums}.episodeDataSheet .reasonCell{max-width:360px;overflow:hidden;text-overflow:ellipsis}.sideFooter{font-size:11px;color:#98a2b3;margin-top:7px;line-height:1.35}.timelinePane{min-width:0;display:flex;flex-direction:column;height:auto;align-self:start}.timelinePaneHeader{position:relative;top:auto;z-index:2;background:#fff;border:1px solid #eaecf0;border-radius:12px;padding:10px 12px;margin-bottom:16px}.timelinePaneHeader + .timelineGrid{margin-top:0}#bucketChart{margin-top:0}.timelineChart svg{display:block}.timelineSvgClickable{cursor:crosshair}.timelineCursor,.cameraTimelineCursor{pointer-events:none}.timelineGrid{gap:12px;min-width:0}.timelineChart .chart{min-height:230px}.unitLegend{border:1px solid #d0d5dd;border-radius:999px;padding:2px 7px;background:#fff;color:#475467;font-weight:700}.plotNote{font-size:11px;color:#667085;margin-top:6px;line-height:1.35}.densityBadge{display:inline-block;margin-left:6px;border:1px solid #d0d5dd;border-radius:999px;padding:1px 6px;font-size:10px;color:#475467;background:#fff}.meshFrameBadge{display:inline-block;border:1px solid #d0d5dd;border-radius:999px;padding:2px 7px;background:#fff;color:#475467;font-size:11px;margin-top:6px}
 @media(max-width:1280px){.episodeInspector{grid-template-columns:1fr;min-height:0}.episodeSide{height:min(560px,var(--episodeAsideHeight,560px));max-height:min(560px,var(--episodeAsideHeight,560px))}.timelinePaneHeader{position:static}.miniChartGrid{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:760px){.miniChartGrid{grid-template-columns:1fr}.statusFilterBar{align-items:flex-start}.episodeTabMetrics{grid-template-columns:repeat(2,1fr)}}
 
@@ -5988,6 +6018,7 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
 .taskPromptLabel{font-weight:800;color:#175cd3;margin-right:6px}
 .cameraPreview{border:1px solid #eaecf0;border-radius:12px;background:#f8fafc;padding:10px;margin-bottom:14px}
 .cameraPreviewHeader{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:8px}
+.cameraTimeline{margin:8px 0 10px}.cameraTimeline svg{display:block;width:100%;height:auto;border:1px solid #edf2f7;border-radius:10px;background:#fff;cursor:crosshair}body.dark .cameraTimeline svg{background:#0f172a;border-color:#334155}
 .cameraPreviewTitle{font-size:13px;font-weight:850;color:#101828}
 .cameraFrameControls{display:flex;align-items:center;gap:8px;min-width:320px;flex:1}
 .cameraFrameControls input[type=range]{flex:1;min-width:160px}
@@ -6011,7 +6042,7 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
 
 /* v8 diagnosis refactor */
 .triageGrid{display:grid;grid-template-columns:minmax(380px,1.35fr) minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:stretch}
-.compactScore{min-height:132px}.runtimePieCard{min-height:132px}.runtimePieCard .diagStats{grid-template-columns:repeat(4,minmax(0,1fr));margin-top:4px}.runtimePieCard .diagStatValue{font-size:15px}.pieWrap{display:grid;grid-template-columns:130px 1fr;gap:10px;align-items:center}.pieLegend{display:grid;gap:5px;font-size:11px;color:#475467}.pieLegendRow{display:flex;align-items:center;justify-content:space-between;gap:8px}.pieSwatch{width:9px;height:9px;border-radius:99px;display:inline-block;margin-right:5px}.pieSvg{width:130px;height:130px;display:block}.datasetScore{font-size:12px;color:#667085;margin-top:6px}.compactScore{min-height:132px}.compactScore .scoreNumber{font-size:46px}.diagCard{border:1px solid #e5e7eb;border-radius:14px;background:#fff;padding:13px;min-width:0;display:flex;flex-direction:column;gap:8px}.diagCardTitle{font-size:11px;color:#667085;text-transform:uppercase;letter-spacing:.05em;font-weight:800}.diagCardValue{font-size:20px;line-height:1.15;font-weight:850;color:#101828;overflow-wrap:anywhere}.diagCardDetail{font-size:12px;line-height:1.4;color:#667085}.diagCard.bad{border-left:4px solid #d92d20}.diagCard.warn{border-left:4px solid #f79009}.diagCard.good{border-left:4px solid #067647}.diagCard.info{border-left:4px solid #175cd3}.diagStats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-top:auto}.diagStat{border:1px solid #eef2f6;border-radius:10px;background:#f8fafc;padding:7px}.diagStatLabel{font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.04em}.diagStatValue{font-size:17px;font-weight:800;color:#101828}.actionsStrip{margin-top:12px;border-top:1px solid #eaecf0;padding-top:10px;display:grid;grid-template-columns:130px 1fr;gap:12px;align-items:start}.actionsStrip h3{margin-top:4px}.actionsInline{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.actionsInline .action{margin:0;min-height:52px;background:#fcfcfd}.detailsPanel{padding:0}.detailsPanel>summary{cursor:pointer;list-style:none;padding:14px 16px;font-weight:850;color:#101828;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #eaecf0}.detailsPanel>summary::-webkit-details-marker{display:none}.detailsPanel>summary:after{content:"展开";font-size:12px;color:#667085;border:1px solid #d0d5dd;border-radius:999px;padding:3px 9px;background:#fff}.detailsPanel[open]>summary:after{content:"收起"}.diagDetailsGrid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:14px;padding:14px}.diagDetailsGrid>.span3{grid-column:span 3}.diagDetailsGrid>.span4{grid-column:span 4}.diagDetailsGrid>.span6{grid-column:span 6}.diagDetailsGrid>.span12{grid-column:span 12}.subPanel{border:1px solid #eaecf0;border-radius:12px;background:#fff;padding:12px;min-width:0;overflow:hidden}.subPanel h2{font-size:14px;margin:0}.qualityNote{font-size:11px;color:#667085;line-height:1.35;margin-top:6px}
+.compactScore{min-height:132px}.runtimePieCard{min-height:132px}.runtimePieCard .diagStats{grid-template-columns:repeat(4,minmax(0,1fr));margin-top:4px}.runtimePieCard .diagStatValue{font-size:15px}.pieWrap{display:grid;grid-template-columns:130px 1fr;gap:10px;align-items:center}.pieLegend{display:grid;gap:5px;font-size:11px;color:#475467}.pieLegendRow{display:flex;align-items:center;justify-content:space-between;gap:8px}.pieSwatch{width:9px;height:9px;border-radius:99px;display:inline-block;margin-right:5px}.pieSvg{width:130px;height:130px;display:block}.pieCenter{fill:#fff;opacity:.96}.body.dark .pieSvg .pieCenter,.dark .pieSvg .pieCenter,body.dark .pieSvg .pieCenter{fill:#0f172a}.datasetScore{font-size:12px;color:#667085;margin-top:6px}.compactScore{min-height:132px}.compactScore .scoreNumber{font-size:46px}.diagCard{border:1px solid #e5e7eb;border-radius:14px;background:#fff;padding:13px;min-width:0;display:flex;flex-direction:column;gap:8px}.diagCardTitle{font-size:11px;color:#667085;text-transform:uppercase;letter-spacing:.05em;font-weight:800}.diagCardValue{font-size:20px;line-height:1.15;font-weight:850;color:#101828;overflow-wrap:anywhere}.diagCardDetail{font-size:12px;line-height:1.4;color:#667085}.diagCard.bad{border-left:4px solid #d92d20}.diagCard.warn{border-left:4px solid #f79009}.diagCard.good{border-left:4px solid #067647}.diagCard.info{border-left:4px solid #175cd3}.diagStats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-top:auto}.diagStat{border:1px solid #eef2f6;border-radius:10px;background:#f8fafc;padding:7px}.diagStatLabel{font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.04em}.diagStatValue{font-size:17px;font-weight:800;color:#101828}.actionsStrip{margin-top:12px;border-top:1px solid #eaecf0;padding-top:10px;display:grid;grid-template-columns:130px 1fr;gap:12px;align-items:start}.actionsStrip h3{margin-top:4px}.actionsInline{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.actionsInline .action{margin:0;min-height:52px;background:#fcfcfd}.detailsPanel{padding:0}.detailsPanel>summary{cursor:pointer;list-style:none;padding:14px 16px;font-weight:850;color:#101828;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #eaecf0}.detailsPanel>summary::-webkit-details-marker{display:none}.detailsPanel>summary:after{content:"展开";font-size:12px;color:#667085;border:1px solid #d0d5dd;border-radius:999px;padding:3px 9px;background:#fff}.detailsPanel[open]>summary:after{content:"收起"}.diagDetailsGrid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:14px;padding:14px}.diagDetailsGrid>.span3{grid-column:span 3}.diagDetailsGrid>.span4{grid-column:span 4}.diagDetailsGrid>.span6{grid-column:span 6}.diagDetailsGrid>.span12{grid-column:span 12}.subPanel{border:1px solid #eaecf0;border-radius:12px;background:#fff;padding:12px;min-width:0;overflow:hidden}.subPanel h2{font-size:14px;margin:0}.qualityNote{font-size:11px;color:#667085;line-height:1.35;margin-top:6px}
 @media(max-width:1280px){.triageGrid{grid-template-columns:1fr 1fr}.actionsInline{grid-template-columns:1fr}.actionsStrip{grid-template-columns:1fr}.diagDetailsGrid>.span3,.diagDetailsGrid>.span4,.diagDetailsGrid>.span6{grid-column:span 12}}
 @media(max-width:720px){.triageGrid{grid-template-columns:1fr}.diagStats{grid-template-columns:1fr}}
 .transferProgress{margin:8px 0 10px;border:1px solid #dbe3ee;border-radius:10px;background:#f8fafc;padding:8px 10px}.transferProgressMeta{display:flex;justify-content:space-between;gap:10px;font-size:12px;color:#475467;margin-bottom:6px}.transferProgressTrack{height:8px;border-radius:999px;background:#e5e7eb;overflow:hidden}.transferProgressFill{height:100%;border-radius:999px;background:#12b76a;transition:width .22s ease}.transferProgressFill.busy{background:linear-gradient(90deg,#12b76a,#60a5fa,#12b76a);background-size:180% 100%;animation:progressSlide 1.1s linear infinite}@keyframes progressSlide{from{background-position:0 0}to{background-position:180% 0}}
@@ -6021,7 +6052,7 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
 <body>
 <header class="topbar">
   <div class="shell">
-    <h1>Excavator Training Dataset Generation Dashboard</h1>
+    <div class="topbarTitleRow"><h1>Excavator Training Dataset Generation Dashboard</h1><button id="darkModeToggle" class="darkModeToggle" type="button" title="Toggle dark mode" aria-label="Toggle dark mode">🌙</button></div>
     <div class="controls rootControls">
       <label for="rootInput">Dataset root</label>
       <input id="rootInput" class="path" value="excavator_auto_dataset">
@@ -6048,8 +6079,7 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
 <main class="shell">
   <details class="panel managerPanel" open>
     <summary>
-      <div><h2>Run folder manager</h2><div class="panelHint">选择 0 success run 移入 trash，或复制/剪切 success records 到 .dashboard_success。</div></div>
-      <div class="panelHint">删除默认移动到 dataset_root/.dashboard_trash</div>
+      <div><h2>Run folder manager</h2></div>
     </summary>
     <div class="managerBody">
       <div class="managerToolbar">
@@ -6073,17 +6103,13 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
   </details>
   <section class="panel hero">
     <div class="panelHeader">
-      <div><h2>Run diagnosis</h2><div class="panelHint">面向训练数据生成：先看可训练数据量、skip/无效样本、真正阻塞和质量信号。成功样本的空 reason 不再显示为 ok 失败。</div></div>
+      <div><h2>Run diagnosis</h2></div>
       <div id="reportHint" class="reportHint"></div>
     </div>
     <div class="triageGrid">
       <div id="runtimePieCard" class="diagCard runtimePieCard"></div>
       <div id="topBlockerCard" class="diagCard"></div>
       <div id="qualitySignalCard" class="diagCard"></div>
-    </div>
-    <div class="actionsStrip">
-      <h3>Next actions</h3>
-      <div id="actionsList" class="actionsInline"></div>
     </div>
   </section>
 
@@ -6092,7 +6118,7 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
     <section class="panel span5"><div class="panelHeader"><h2>Blocker reason Pareto</h2><span class="panelHint">only rejected / failed / diagnostic; excludes ok</span></div><div id="reasonBars" class="barRows"></div></section>
     <section class="panel span4"><div class="panelHeader"><h2>Quality signals</h2><span class="panelHint">score_low / spill / low bin grouped</span></div><div id="qualityBars" class="barRows"></div><div class="qualityNote">带数值的 warning 会按类别聚合，例如 score_low:35.0 → quality/score_low。</div></section>
     <details class="panel span12 detailsPanel">
-      <summary>Training/export diagnostics <span class="panelHint">readiness gates, material stats, schema, non-quality warnings</span></summary>
+      <summary><span>Training/export diagnostics</span><span class="panelHint">readiness gates, material stats, schema, non-quality warnings</span></summary>
       <div class="diagDetailsGrid">
         <section class="subPanel span6"><div class="panelHeader"><h2>Readiness gates</h2><span class="panelHint">training export blockers</span></div><div class="tableWrap"><table id="gatesTable"></table></div></section>
         <section class="subPanel span6"><div class="panelHeader"><h2>Material / score statistics</h2><span class="panelHint">median and range</span></div><div class="tableWrap"><table id="materialTable" class="metricsTable"></table></div></section>
@@ -6116,7 +6142,7 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
   </section>
 
   <section class="panel" style="margin-top:14px">
-    <div class="panelHeader"><div><h2>Episode inspection</h2><div class="panelHint">左侧 datasheet 无可见滚动条但可滚动；高度跟随右侧 timeline plots，不再由左侧撑出空白。</div></div></div>
+    <div class="panelHeader"><div><h2>Episode inspection</h2></div></div>
     <div class="episodeInspector">
       <aside class="episodeSide">
         <div class="sideTabsToolbar">
@@ -6144,7 +6170,13 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
     </div>
   </section>
   <section class="panel" style="margin-top:14px">
-    <div class="panelHeader"><h2>Raw selected attempt</h2><span class="panelHint">debug only</span></div>
+    <div class="panelHeader">
+      <h2>Raw selected attempt</h2>
+      <div style="display:flex;align-items:center;gap:8px">
+        <button type="button" class="secondary" id="copyRawAttemptBtn">Copy raw</button>
+        <span class="panelHint">debug only</span>
+      </div>
+    </div>
     <pre id="rawBox" class="codeBox">{}</pre>
   </section>
 </main>
@@ -6171,6 +6203,8 @@ let cameraPreviewTimer = null;
 let cameraPlayerTimer = null;
 let cameraPlayerPlaying = false;
 let cameraPlayerFps = 10;
+let darkModeEnabled = false;
+let timelineDragState = {active:false, svg:null, moved:false, suppressClick:false};
 
 function $(id){return document.getElementById(id)}
 function esc(s){return String(s ?? "").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]))}
@@ -6197,7 +6231,21 @@ function fmt(v,d=1){const n=Number(v); if(!Number.isFinite(n)) return ""; if(Mat
 function fmtAxis(v){const n=Number(v); if(!Number.isFinite(n)) return ""; if(Math.abs(n)>=10000) return n.toFixed(0); if(Math.abs(n)>=1000) return n.toFixed(0); if(Math.abs(n)>=10) return n.toFixed(1); return n.toFixed(2)}
 function pct(v){const n=Number(v); return Number.isFinite(n)?`${(n*100).toFixed(1)}%`:""}
 function shortText(s,n){s=String(s||""); return s.length>n?s.slice(0,n-1)+"…":s}
-function basename(path){return String(path||"").split(/[\\/]/).pop()}
+function basename(path){return String(path||"").split(/[\/]/).pop()}
+function applyDarkMode(enabled){
+  darkModeEnabled=!!enabled;
+  document.body.classList.toggle("dark", darkModeEnabled);
+  const btn=$("darkModeToggle");
+  if(btn){btn.textContent=darkModeEnabled?"☀️":"🌙"; btn.title=darkModeEnabled?"Switch to light mode":"Switch to dark mode";}
+  try{localStorage.setItem("excavatorDashboardDarkMode", darkModeEnabled?"1":"0");}catch(_e){}
+}
+function toggleDarkMode(){applyDarkMode(!darkModeEnabled)}
+function initDarkMode(){
+  let stored="";
+  try{stored=localStorage.getItem("excavatorDashboardDarkMode")||"";}catch(_e){}
+  const preferDark=window.matchMedia&&window.matchMedia("(prefers-color-scheme: dark)").matches;
+  applyDarkMode(stored?stored==="1":preferDark);
+}
 
 function pathSepForBase(base){
   const text=String(base||'');
@@ -6464,7 +6512,6 @@ function renderRun(data){
   renderTopBlocker(diagnosis, blockerRows);
   renderQualitySignal(diagnosis, qualityRows);
   renderRuntimePie("runtimePieCard", data.tag_runtime_seconds || datasetMetrics.tag_runtime_seconds || {}, datasetMetrics, diagnosis, {attempts, trainable, rejected, failed, diagnostic, skip});
-  renderActions("actionsList", (diagnosis.recommendations||[]).slice(0,3));
   renderGates(diagnosis.readiness_gates||[]);
   renderMaterialTable(diagnosis.material_table||[]);
   renderSchemaTables(diagnosis.field_coverage||{}, diagnosis.camera_coverage||{});
@@ -6544,7 +6591,7 @@ function pieMarkup(entries, unit){
     angle+=slice;
   }
   const legend=entries.sort((a,b)=>b.value-a.value).map(item=>`<div class="pieLegendRow"><span><span class="pieSwatch" style="background:${statusColor(item.key)}"></span>${esc(item.key)}</span><b>${fmt(item.value,1)}${esc(unit)}</b></div>`).join("");
-  return `<div class="pieWrap"><svg class="pieSvg" viewBox="0 0 128 128" role="img">${paths}<circle cx="${cx}" cy="${cy}" r="25" fill="#fff" opacity=".96"></circle></svg><div class="pieLegend">${legend}</div></div>`;
+  return `<div class="pieWrap"><svg class="pieSvg" viewBox="0 0 128 128" role="img">${paths}<circle class="pieCenter" cx="${cx}" cy="${cy}" r="25"></circle></svg><div class="pieLegend">${legend}</div></div>`;
 }
 function renderKPIs(items){const el=$("kpiCards"); if(!el) return; el.innerHTML=(items||[]).map(it=>`<div class="kpi ${esc(it.cls||"")}"><div class="kpiLabel">${esc(it.label)}</div><div class="kpiValue">${esc(it.value)}</div><div class="kpiSub">${esc(it.sub||"")}</div></div>`).join("")}
 function renderReadiness(diagnosis, topBlocker){const score=Number(diagnosis.readiness_score||0); const blocker=topBlocker?`blocker: ${shortText(topBlocker,26)}`:"no blocker"; $("readinessCard").innerHTML=`<div class="scoreLabel">Training readiness</div><div class="scoreNumber">${fmt(score,0)}</div><div class="scoreBar"><div class="scoreFill" style="width:${Math.max(0,Math.min(100,score))}%"></div></div><div class="chips"><span class="chip">${esc(blocker)}</span><span class="chip">${(diagnosis.readiness_gates||[]).length} gates</span></div>`}
@@ -6553,7 +6600,7 @@ function renderTriageSummary(diagnosis, c){const problem=Number(diagnosis.proble
 function renderTopBlocker(diagnosis, rows){const top=(diagnosis.top_problem_reason&&diagnosis.top_problem_reason.key)?diagnosis.top_problem_reason:(rows||[])[0]; if(!top||!top.key){renderDiagCard("topBlockerCard","good","Top blocker","None","Failure Pareto excludes trainable/success ok rows. No rejected/failed blocker is currently dominant.",[]);return} const count=Number(top.count||0); const denom=Number(diagnosis.problem_attempts||diagnosis.attempts||count||1); const cls=count>=Math.max(1,denom/2)?"bad":"warn"; renderDiagCard("topBlockerCard",cls,"Top blocker",shortText(top.key,58),`${count}/${denom} problem episode(s). This is the first item to debug; it is not an \"ok\" status.`,[{label:"count",value:count},{label:"share",value:pct(count/Math.max(1,denom))},{label:"scope",value:"problem-only"}])}
 function renderQualitySignal(diagnosis, rows){const top=(diagnosis.top_quality_signal&&diagnosis.top_quality_signal.key)?diagnosis.top_quality_signal:(rows||[])[0]; if(!top||!top.key){renderDiagCard("qualitySignalCard","good","Quality signal","No dominant signal","score_low / spill / low bin are grouped separately from failure blockers.",[]);return} const count=Number(top.count||0); const cls=String(top.key).includes("spill")||String(top.key).includes("low")?"warn":"info"; renderDiagCard("qualitySignalCard",cls,"Quality signal",shortText(top.key,58),`${count} episode(s). Median bin/spill live here with the quality signal instead of in the KPI strip.`,[{label:"median score",value:fmt(diagnosis.score_median,1)||"—"},{label:"median bin",value:`${fmt(diagnosis.final_bin_median,1)||"0"} particles`},{label:"median spill",value:`${fmt(diagnosis.final_spill_median,0)||"0"} particles`}])}
 function renderFindings(id, rows){const el=$(id); if(!el) return; el.innerHTML=(rows||[]).length?(rows||[]).map(r=>`<div class="finding sev-${esc(r.severity||"info")}"><div class="findingTitle">${esc(r.title||r.key||"finding")}</div><div class="findingDetail">${esc(r.detail||r.message||"")}</div></div>`).join(""):'<div class="empty">no findings</div>'}
-function renderActions(id, rows){$(id).innerHTML=(rows||[]).length?(rows||[]).map((r,i)=>`<div class="action"><b>${i+1}.</b> ${esc(r)}</div>`).join(""):'<div class="empty">no actions</div>'}
+function renderActions(id, rows){const el=$(id); if(!el) return; el.innerHTML=(rows||[]).length?(rows||[]).map((r,i)=>`<div class="action"><b>${i+1}.</b> ${esc(r)}</div>`).join(""):'<div class="empty">no actions</div>'}
 function renderBarList(id, rows, opts={}){const el=$(id); if(!el) return; const data=(rows||[]).map(r=>({key:String(r.key??r[0]??""), count:Number(r.count??r[1]??0), status:r.status})).filter(r=>Number.isFinite(r.count)&&r.count>=0); if(!data.length){el.innerHTML='<div class="empty">no data</div>';return} const max=Math.max(...data.map(r=>r.count),1); el.innerHTML=data.map(r=>{const color=opts.colorByStatus?statusColor(r.status||r.key):(opts.quality?"#7a5af8":opts.warn?"#b54708":opts.info?"#175cd3":"#344054"); return `<div class="barRow"><div class="barLabel" title="${esc(r.key)}">${esc(shortText(r.key,48))}</div><div class="barTrack"><div class="barFill" style="width:${Math.max(1,100*r.count/max)}%;background:${color}"></div></div><div class="barVal">${esc(r.count)}</div></div>`}).join("")}
 function renderGates(rows){const html=['<thead><tr><th>Gate</th><th>Status</th><th>Detail</th></tr></thead><tbody>']; for(const g of rows||[]){const st=g.status||g.state||""; const cls=st==="pass"?"gate-pass":st==="warn"?"gate-warn":"gate-fail"; html.push(`<tr><td>${esc(g.name||g.key||"")}</td><td><span class="${cls}">${esc(st)}</span></td><td>${esc(g.detail||g.reason||"")}</td></tr>`)} html.push('</tbody>'); $("gatesTable").innerHTML=rows&&rows.length?html.join(""):'<tbody><tr><td class="muted">no gates</td></tr></tbody>'}
 function renderMaterialTable(rows){const html=['<thead><tr><th>Metric</th><th>Count</th><th>Min</th><th>Median</th><th>Mean</th><th>Max</th></tr></thead><tbody>']; for(const r of rows||[]){html.push(`<tr><td>${esc(r.key||r.metric||"")}</td><td>${esc(r.count??"")}</td><td>${fmt(r.min,1)}</td><td>${fmt(r.median,1)}</td><td>${fmt(r.mean,1)}</td><td>${fmt(r.max,1)}</td></tr>`)} html.push('</tbody>'); $("materialTable").innerHTML=rows&&rows.length?html.join(""):'<tbody><tr><td class="muted">no stats</td></tr></tbody>'}
@@ -6659,10 +6706,10 @@ function renderEpisodes(episodes){
   markSelectedTab(currentEpisodeIndex);
   syncEpisodeInspectorHeight();
 }
-function episodeSortLabel(key){return ({episode_index:"Ep",score:"Score",max_bucket:"Bucket",lift_bucket:"Lift",final_bin:"Bin",final_spill:"Spill",robot_yaw:"Robot yaw",truck_yaw:"Truck yaw",samples:"Samples",freeze_count:"Freeze"})[key]||key}
+function episodeSortLabel(key){return ({episode_index:"Ep",time_s:"Time",score:"Score",max_bucket:"Bucket",lift_bucket:"Lift",final_bin:"Bin",final_spill:"Spill",robot_yaw:"Robot yaw",truck_yaw:"Truck yaw",samples:"Samples",freeze_count:"Freeze"})[key]||key}
 function sortHeader(key,label,cls=""){const arrow=episodeSort.key===key?(episodeSort.dir>0?" ▲":" ▼"):""; return `<th class="sortable ${esc(cls)}" onclick="sortEpisodes('${esc(key)}')" title="Click to sort by ${esc(label)}">${esc(label)}${arrow}</th>`}
-function episodeTableHtml(rows){const head=`<thead><tr>${sortHeader("episode_index","Ep","epCol")}<th>Status</th>${sortHeader("score","Score","num")}${sortHeader("max_bucket","Bucket","num")}${sortHeader("lift_bucket","Lift","num")}${sortHeader("final_bin","Bin","num")}${sortHeader("final_spill","Spill","num")}${sortHeader("robot_yaw","Robot yaw","num")}${sortHeader("truck_yaw","Truck yaw","num")}<th>Reason</th></tr></thead>`; const body=rows.map(ep=>episodeRowHtml(ep)).join(""); return `<table id="episodeTable" class="episodeDataSheet">${head}<tbody>${body}</tbody></table>`}
-function episodeRowHtml(ep){const s=ep.scene||{}; const status=statusKey(ep.status); const reason=ep.reason||ep.warning_reason||""; return `<tr data-ep="${esc(ep.episode_index)}" onclick="loadEpisode('${esc(ep.episode_index)}')"><td class="epCol">${esc(ep.episode_index)}</td><td><span class="pill ${esc(status)}">${esc(status)}</span></td><td class="num">${fmt(ep.score,1)}</td><td class="num">${esc(ep.max_bucket??"")}</td><td class="num">${esc(ep.lift_bucket??"")}</td><td class="num">${esc(ep.final_bin??"")}</td><td class="num">${esc(ep.final_spill??"")}</td><td class="num">${fmt(s.robot_body_yaw_deg,1)}</td><td class="num">${fmt(s.truck_yaw_deg,1)}</td><td class="reasonCell" title="${esc(reason)}">${esc(shortText(reason||"no reason",150))}</td></tr>`}
+function episodeTableHtml(rows){const head=`<thead><tr>${sortHeader("episode_index","Ep","epCol")}<th>Status</th>${sortHeader("time_s","Time","num")}${sortHeader("score","Score","num")}${sortHeader("max_bucket","Bucket","num")}${sortHeader("lift_bucket","Lift","num")}${sortHeader("final_bin","Bin","num")}${sortHeader("final_spill","Spill","num")}${sortHeader("robot_yaw","Robot yaw","num")}${sortHeader("truck_yaw","Truck yaw","num")}<th>Reason</th></tr></thead>`; const body=rows.map(ep=>episodeRowHtml(ep)).join(""); return `<table id="episodeTable" class="episodeDataSheet">${head}<tbody>${body}</tbody></table>`}
+function episodeRowHtml(ep){const s=ep.scene||{}; const status=statusKey(ep.status); const reason=ep.reason||ep.warning_reason||""; const time=Number(ep.time_s); const timeText=Number.isFinite(time)?`${fmt(time,2)}s`:""; return `<tr data-ep="${esc(ep.episode_index)}" onclick="loadEpisode('${esc(ep.episode_index)}')"><td class="epCol">${esc(ep.episode_index)}</td><td><span class="pill ${esc(status)}">${esc(status)}</span></td><td class="num">${esc(timeText)}</td><td class="num">${fmt(ep.score,1)}</td><td class="num">${esc(ep.max_bucket??"")}</td><td class="num">${esc(ep.lift_bucket??"")}</td><td class="num">${esc(ep.final_bin??"")}</td><td class="num">${esc(ep.final_spill??"")}</td><td class="num">${fmt(s.robot_body_yaw_deg,1)}</td><td class="num">${fmt(s.truck_yaw_deg,1)}</td><td class="reasonCell" title="${esc(reason)}">${esc(shortText(reason||"no reason",150))}</td></tr>`}
 function sortEpisodes(key){if(episodeSort.key===key){episodeSort.dir*=-1}else{episodeSort={key,dir:key==="episode_index"?1:-1}} renderEpisodes(filteredEpisodes())}
 function sortValue(ep,key){if(key==="robot_yaw") return numericOrNull((ep.scene||{}).robot_body_yaw_deg); if(key==="truck_yaw") return numericOrNull((ep.scene||{}).truck_yaw_deg); return numericOrNull(ep[key])}
 function numericOrNull(v){const n=Number(v); return Number.isFinite(n)?n:null}
@@ -6673,6 +6720,7 @@ function renderEpisode(data){
   const promptEl=$("episodeTaskPrompt"); const promptText=String(ep.task_prompt||"").trim(); if(promptEl){promptEl.style.display=promptText?"block":"none"; promptEl.innerHTML=promptText?`<span class="taskPromptLabel">Task prompt</span>${esc(promptText)}`:"";}
   renderCameraPreview(data);
   const s=data.series||{}; drawLineChart("bucketChart","Bucket sand holding",s.t,[{name:"bucket_from_pile",values:s.bucket_from_pile},{name:"bucket_total",values:s.bucket_total}],data.stage_spans,"particles"); drawVectorChart("qChart","Joint angles",s.t,s.q_deg,data.stage_spans,"deg"); drawVectorChart("dqChart","Joint velocity",s.t,s.dq_deg_s,data.stage_spans,"deg/s"); drawVectorChart("ddqChart","Joint acceleration",s.t,s.ddq_deg_s2,data.stage_spans,"deg/s²"); drawVectorChart("effortChart","Measured joint effort",s.t,s.effort,data.stage_spans,"effort");
+  updateTimelineCursors();
   markSelectedTab(ep.episode_index);
   syncEpisodeInspectorHeight();
 }
@@ -6692,13 +6740,17 @@ function cameraFrameMeta(preview, frameIndex){
   const phase=row.phase?` · ${row.phase}`:"";
   return `frame ${Number(frameIndex)||0}${tText?` · ${tText}`:""}${phase}`;
 }
+function frameCacheToken(){
+  const cache=(currentRun&&currentRun.analysis_cache)||{};
+  return String(cache.signature_hash || (currentRun&&currentRun.generated_at) || "frames");
+}
 function cameraImageUrl(cameraKey, frameIndex){
   const qs=new URLSearchParams({
     run_dir:(currentRun&&currentRun.run_dir)||$("runInput").value||"",
     episode_index:String(currentEpisodeIndex ?? ""),
     camera:String(cameraKey),
     frame_index:String(frameIndex),
-    _:String(Date.now())
+    v:frameCacheToken()
   });
   return `/api/frame?${qs.toString()}`;
 }
@@ -6761,6 +6813,135 @@ function setCameraPlayerFps(value){
     cameraPlayerTimer=setTimeout(cameraPlayerTick,cameraPlayerDelayMs());
   }
 }
+
+function currentCameraTime(){
+  const preview=(currentRun&&currentRun._lastEpisodePreview)||{};
+  const frames=preview.frames||[];
+  const row=frames[cameraFrameIndex]||{};
+  const t=Number(row.t);
+  return Number.isFinite(t)?t:0;
+}
+function nearestCameraFrameByTime(timeValue){
+  const preview=(currentRun&&currentRun._lastEpisodePreview)||{};
+  const frames=preview.frames||[];
+  if(!frames.length) return 0;
+  const target=Number(timeValue);
+  if(!Number.isFinite(target)) return cameraFrameIndex;
+  let best=0,bestDist=Infinity;
+  frames.forEach((row,i)=>{
+    const t=Number(row&&row.t);
+    if(!Number.isFinite(t)) return;
+    const d=Math.abs(t-target);
+    if(d<bestDist){best=i;bestDist=d;}
+  });
+  return best;
+}
+function jumpCameraToTime(timeValue, opts={}){
+  const idx=nearestCameraFrameByTime(timeValue);
+  updateCameraPreviewFrame(idx,{immediate:true});
+}
+function timelineSvgMoveToEvent(evt){
+  const svg=evt&&evt.currentTarget || timelineDragState.svg;
+  if(!svg) return;
+  const left=Number(svg.dataset.left||88);
+  const width=Number(svg.dataset.plotWidth||858);
+  const x0=Number(svg.dataset.x0||0);
+  const x1=Number(svg.dataset.x1||0);
+  if(!Number.isFinite(width)||width<=0||!Number.isFinite(x0)||!Number.isFinite(x1)) return;
+  const rect=svg.getBoundingClientRect();
+  const vb=svg.viewBox&&svg.viewBox.baseVal;
+  const viewW=vb&&vb.width?vb.width:rect.width;
+  const x=(evt.clientX-rect.left)*viewW/Math.max(1,rect.width);
+  const ratio=Math.max(0,Math.min(1,(x-left)/width));
+  jumpCameraToTime(x0+(x1-x0)*ratio,{immediate:true});
+}
+function timelineSvgMouseDown(evt){
+  if(evt.button!==0) return;
+  timelineDragState.active=true;
+  timelineDragState.svg=evt.currentTarget;
+  timelineDragState.moved=false;
+  timelineDragState.suppressClick=false;
+  evt.preventDefault();
+  timelineSvgMoveToEvent(evt);
+}
+function timelineSvgMouseMove(evt){
+  if(!timelineDragState.active||evt.buttons!==1) return;
+  timelineDragState.moved=true;
+  evt.preventDefault();
+  timelineSvgMoveToEvent(evt);
+}
+function timelineSvgMouseUp(evt){
+  if(!timelineDragState.active) return;
+  timelineDragState.active=false;
+  timelineDragState.suppressClick=timelineDragState.moved;
+  timelineDragState.svg=null;
+}
+document.addEventListener("mousemove", evt=>{
+  if(!timelineDragState.active||evt.buttons!==1) return;
+  timelineDragState.moved=true;
+  evt.preventDefault();
+  timelineSvgMoveToEvent({currentTarget:timelineDragState.svg, clientX:evt.clientX, clientY:evt.clientY});
+});
+document.addEventListener("mouseup", ()=>{
+  if(!timelineDragState.active) return;
+  timelineDragState.active=false;
+  timelineDragState.suppressClick=timelineDragState.moved;
+  timelineDragState.svg=null;
+});
+function timelineSvgClick(evt){
+  if(timelineDragState.suppressClick){timelineDragState.suppressClick=false; return;}
+  timelineSvgMoveToEvent(evt);
+}
+function cameraTimelineMarkup(preview, spans){
+  const f=chartFrame(980,112);
+  const frames=(preview&&preview.frames)||[];
+  const times=frames.map(r=>Number(r&&r.t)).filter(Number.isFinite);
+  const x0=times.length?Math.min(...times):0;
+  const x1=times.length?Math.max(...times):Math.max(1,Number(preview&&preview.frame_count||1)/Math.max(1,cameraPlayerFps));
+  const sx=x=>f.l+(Number(x)-x0)/(x1-x0||1)*f.pw;
+  const parts=[`<div class="cameraTimeline"><svg class="timelineSvgClickable" viewBox="0 0 ${f.w} ${f.h}" data-left="${f.l}" data-plot-width="${f.pw}" data-x0="${x0}" data-x1="${x1}" onmousedown="timelineSvgMouseDown(event)" onmousemove="timelineSvgMouseMove(event)" onmouseup="timelineSvgMouseUp(event)" onclick="timelineSvgClick(event)" role="img">`];
+  parts.push(`<text x="14" y="23" font-size="13" font-weight="850" fill="#101828">Camera timeline</text>`);
+  parts.push(`<text x="150" y="23" font-size="11" fill="#667085">${esc(cameraFrameMeta(preview, cameraFrameIndex))}</text>`);
+  drawStageRects(parts,spans||[],sx,36,38);
+  parts.push(`<rect x="${f.l}" y="36" width="${f.pw}" height="38" fill="none" stroke="#d0d5dd"/>`);
+  for(let i=0;i<=4;i++){
+    const x=f.l+f.pw*i/4;
+    const t=x0+(x1-x0)*i/4;
+    parts.push(`<line x1="${x.toFixed(1)}" y1="36" x2="${x.toFixed(1)}" y2="78" stroke="#eef2f6"/>`);
+    parts.push(`<text x="${x.toFixed(1)}" y="96" text-anchor="middle" font-size="11" fill="#667085">${fmtAxis(t)}s</text>`);
+  }
+  const cx=sx(currentCameraTime());
+  parts.push(`<line class="cameraTimelineCursor" data-left="${f.l}" data-plot-width="${f.pw}" data-x0="${x0}" data-x1="${x1}" x1="${cx.toFixed(1)}" y1="32" x2="${cx.toFixed(1)}" y2="82" stroke="#f04438" stroke-width="2.2"/>`);
+  parts.push(`</svg></div>`);
+  return parts.join("");
+}
+function updateTimelineCursors(){
+  const t=currentCameraTime();
+  document.querySelectorAll(".timelineCursor,.cameraTimelineCursor").forEach(line=>{
+    const left=Number(line.dataset.left||88);
+    const width=Number(line.dataset.plotWidth||858);
+    const x0=Number(line.dataset.x0||0);
+    const x1=Number(line.dataset.x1||0);
+    const ratio=(t-x0)/(x1-x0||1);
+    const x=left+Math.max(0,Math.min(1,ratio))*width;
+    line.setAttribute("x1",x.toFixed(1));
+    line.setAttribute("x2",x.toFixed(1));
+  });
+}
+function prefetchCameraFrames(startFrame, count=6){
+  const preview=(currentRun&&currentRun._lastEpisodePreview)||{};
+  const cameras=preview.cameras||[];
+  const frameCount=Number(preview.frame_count||0);
+  if(!frameCount) return;
+  for(let step=1; step<=count; step++){
+    const frame=(Number(startFrame)+step)%frameCount;
+    for(const cam of cameras){
+      if(!cam.available) continue;
+      const img=new Image();
+      img.src=cameraImageUrl(cam.key,frame);
+    }
+  }
+}
 function renderCameraPreview(data){
   const box=$("cameraPreview"); if(!box) return;
   stopCameraPlayer();
@@ -6774,7 +6955,7 @@ function renderCameraPreview(data){
   }
   const preferred=Number(preview.initial_frame_index||0);
   cameraFrameIndex=Math.max(0, Math.min(frameCount-1, Number.isFinite(preferred)?preferred:0));
-  const header=`<div class="cameraPreviewHeader"><div><div class="cameraPreviewTitle">Camera preview · Cam 0/1/2</div><div id="cameraFrameMeta" class="muted">${esc(cameraFrameMeta(preview,cameraFrameIndex))}</div></div><div class="cameraFrameControls"><span class="muted nowrap">frame</span><input id="cameraFrameSlider" type="range" min="0" max="${Math.max(0,frameCount-1)}" value="${cameraFrameIndex}" oninput="updateCameraPreviewFrame(this.value)"><span id="cameraFrameText" class="mono small nowrap">${cameraFrameIndex}/${Math.max(0,frameCount-1)}</span></div></div>`;
+  const header=`<div class="cameraPreviewHeader"><div class="cameraFrameControls"><span class="muted nowrap">frame</span><input id="cameraFrameSlider" type="range" min="0" max="${Math.max(0,frameCount-1)}" value="${cameraFrameIndex}" oninput="updateCameraPreviewFrame(this.value)"><span id="cameraFrameText" class="mono small nowrap">${cameraFrameIndex}/${Math.max(0,frameCount-1)}</span></div></div>`;
   const cards=cameras.map((cam,idx)=>{
     const key=cam.key; const available=!!cam.available; const existing=Number(cam.existing_frames||0); const present=Number(cam.present_frames||0);
     const cls=available?"cameraCard":"cameraCard missing";
@@ -6782,7 +6963,8 @@ function renderCameraPreview(data){
     const blackWarn=cam.looks_all_black?`<span class="pill failed" title="sampled frames are black">black</span>`:"";
     return `<div class="${cls}" data-camera-key="${esc(key)}"><div class="cameraCardHeader"><span class="cameraCardTitle">${esc(cam.label||cameraDisplayName(key))} ${blackWarn}</span><span title="existing/present frames">${existing}/${present}</span></div><img id="cameraImg${idx}" src="${esc(src)}" alt="${esc(cam.label||cameraDisplayName(key))}" onerror="this.closest('.cameraCard').classList.add('missing')"><div class="cameraMissing">missing image for this camera/frame</div><div style="padding:6px 8px"><a id="cameraOpen${idx}" class="cameraOpenLink" href="${esc(src)}" target="_blank">open image</a></div></div>`;
   }).join("");
-  box.innerHTML=header+`<div class="cameraGrid">${cards}</div>`;
+  const timeline=cameraTimelineMarkup(preview, data.stage_spans||[]);
+  box.innerHTML=header+timeline+`<div class="cameraGrid">${cards}</div>`;
   const headerEl=box.querySelector(".cameraPreviewHeader");
   const frameControls=box.querySelector(".cameraFrameControls");
   if(headerEl&&frameControls){
@@ -6802,6 +6984,8 @@ function updateCameraPreviewFrame(value,opts){
   const slider=$("cameraFrameSlider"); if(slider && Number(slider.value)!==cameraFrameIndex) slider.value=String(cameraFrameIndex);
   const text=$("cameraFrameText"); if(text) text.textContent=`${cameraFrameIndex}/${Math.max(0,frameCount-1)}`;
   const meta=$("cameraFrameMeta"); if(meta) meta.textContent=cameraFrameMeta(preview,cameraFrameIndex);
+  updateTimelineCursors();
+  prefetchCameraFrames(cameraFrameIndex, cameraPlayerPlaying?10:4);
   if(cameraPreviewTimer) clearTimeout(cameraPreviewTimer);
   if(opts&&opts.immediate){
     refreshCameraPreviewImages(cameraFrameIndex);
@@ -6817,7 +7001,7 @@ function refreshCameraPreviewImages(frameIndex){
     if(!img || !cam.available) return;
     const url=cameraImageUrl(cam.key,frameIndex);
     const card=img.closest(".cameraCard"); if(card) card.classList.remove("missing");
-    img.src=url;
+    if(img.getAttribute("src")!==url) img.src=url;
     if(open) open.href=url;
   });
 }
@@ -6826,7 +7010,7 @@ function chartFrame(width=760,height=220){const l=88,r=34,t=36,b=58; return {w:w
 function extent(vals){const arr=numeric(vals).filter(v=>Math.abs(v)<1e12); if(!arr.length)return[0,1]; let lo=Math.min(...arr),hi=Math.max(...arr); if(Math.abs(hi-lo)<1e-9){lo-=1;hi+=1} const pad=(hi-lo)*0.08; return[lo-pad,hi+pad]}
 function drawAxes(parts,f,x0,x1,y0,y1,opts={}){parts.push(`<rect x="${f.l}" y="${f.t}" width="${f.pw}" height="${f.ph}" fill="#fcfcfd" stroke="#d0d5dd"/>`); for(let i=0;i<=4;i++){const x=f.l+f.pw*i/4,y=f.t+f.ph*i/4; parts.push(`<line x1="${x.toFixed(1)}" y1="${f.t}" x2="${x.toFixed(1)}" y2="${f.t+f.ph}" stroke="#eef2f6"/>`); parts.push(`<line x1="${f.l}" y1="${y.toFixed(1)}" x2="${f.l+f.pw}" y2="${y.toFixed(1)}" stroke="#eef2f6"/>`)} const xs=opts.xSuffix||""; parts.push(`<text x="${f.l}" y="${f.h-22}" font-size="11" fill="#667085">${fmtAxis(x0)}${esc(xs)}</text>`); parts.push(`<text x="${f.l+f.pw}" y="${f.h-22}" text-anchor="end" font-size="11" fill="#667085">${fmtAxis(x1)}${esc(xs)}</text>`); parts.push(`<text x="${f.l-8}" y="${f.t+f.ph}" text-anchor="end" font-size="11" fill="#667085">${fmtAxis(y0)}</text>`); parts.push(`<text x="${f.l-8}" y="${f.t+10}" text-anchor="end" font-size="11" fill="#667085">${fmtAxis(y1)}</text>`)}
 function drawStageRects(parts,spans,scaleX,top,height){const seen=new Map(); let next=0; for(const span of spans||[]){if(!seen.has(span.stage))seen.set(span.stage,stagePalette[next++%stagePalette.length]); const x=scaleX(span.start),w=Math.max(1,scaleX(span.end)-x); parts.push(`<rect x="${x.toFixed(1)}" y="${top}" width="${w.toFixed(1)}" height="${height}" fill="${seen.get(span.stage)}" opacity="0.44"><title>${esc(span.stage)}</title></rect>`)}}
-function drawLineChart(targetId,title,xs,lines,spans,unit){const f=chartFrame(980,270); xs=xs||[]; const xVals=numeric(xs); const x0=xVals.length?Math.min(...xVals):0,x1=xVals.length?Math.max(...xVals):1; const allY=[]; for(const line of lines){for(const v of line.values||[]) if(finite(Number(v))) allY.push(Number(v))} const [y0,y1]=extent(allY); const sx=x=>f.l+(Number(x)-x0)/(x1-x0||1)*f.pw; const sy=y=>f.t+f.ph-(Number(y)-y0)/(y1-y0||1)*f.ph; const parts=[`<svg class="chart" viewBox="0 0 ${f.w} ${f.h}" role="img">`,`<text x="14" y="22" font-size="15" font-weight="750" fill="#101828">${esc(title)}</text>`]; drawStageRects(parts,spans,sx,f.t,f.ph); drawAxes(parts,f,x0,x1,y0,y1,{xSuffix:"s"}); lines.forEach((line,li)=>{const pts=[];(line.values||[]).forEach((v,i)=>{if(finite(Number(v))&&finite(Number(xs[i])))pts.push(`${sx(xs[i]).toFixed(1)},${sy(v).toFixed(1)}`)}); if(pts.length) parts.push(`<polyline points="${pts.join(" ")}" fill="none" stroke="${lineColors[li%lineColors.length]}" stroke-width="1.9"/>`)}); parts.push(`</svg>`); const unitBadge=unit?`<span class="legendItem unitLegend">unit: ${esc(unit)}</span>`:""; const legend=`<div class="chartLegend">${unitBadge}${lines.map((line,li)=>`<span class="legendItem"><span class="legendDot" style="background:${lineColors[li%lineColors.length]}"></span>${esc(line.name)}</span>`).join("")}</div>`; $(targetId).innerHTML=parts.join("")+legend}
+function drawLineChart(targetId,title,xs,lines,spans,unit){const f=chartFrame(980,270); xs=xs||[]; const xVals=numeric(xs); const x0=xVals.length?Math.min(...xVals):0,x1=xVals.length?Math.max(...xVals):1; const allY=[]; for(const line of lines){for(const v of line.values||[]) if(finite(Number(v))) allY.push(Number(v))} const [y0,y1]=extent(allY); const sx=x=>f.l+(Number(x)-x0)/(x1-x0||1)*f.pw; const sy=y=>f.t+f.ph-(Number(y)-y0)/(y1-y0||1)*f.ph; const currentX=sx(currentCameraTime()); const parts=[`<svg class="chart timelineSvgClickable" viewBox="0 0 ${f.w} ${f.h}" data-left="${f.l}" data-plot-width="${f.pw}" data-x0="${x0}" data-x1="${x1}" onmousedown="timelineSvgMouseDown(event)" onmousemove="timelineSvgMouseMove(event)" onmouseup="timelineSvgMouseUp(event)" onclick="timelineSvgClick(event)" role="img">`,`<text x="14" y="22" font-size="15" font-weight="750" fill="#101828">${esc(title)}</text>`]; let lx=230; if(unit){parts.push(`<rect x="${lx}" y="9" width="${Math.max(48,unit.length*7+26)}" height="18" rx="9" fill="#ffffff" stroke="#d0d5dd"/><text x="${lx+10}" y="22" font-size="11" font-weight="750" fill="#475467">unit: ${esc(unit)}</text>`); lx+=Math.max(58,unit.length*7+36);} lines.forEach((line,li)=>{const color=lineColors[li%lineColors.length]; parts.push(`<circle cx="${lx}" cy="17" r="4.5" fill="${color}"/><text x="${lx+8}" y="21" font-size="11" fill="#475467">${esc(line.name)}</text>`); lx+=Math.max(76,String(line.name||"").length*6+22);}); drawAxes(parts,f,x0,x1,y0,y1,{xSuffix:"s"}); drawStageRects(parts,spans,sx,f.t,f.ph); lines.forEach((line,li)=>{const pts=[];(line.values||[]).forEach((v,i)=>{if(finite(Number(v))&&finite(Number(xs[i])))pts.push(`${sx(xs[i]).toFixed(1)},${sy(v).toFixed(1)}`)}); if(pts.length) parts.push(`<polyline points="${pts.join(" ")}" fill="none" stroke="${lineColors[li%lineColors.length]}" stroke-width="1.9"/>`)}); parts.push(`<line class="timelineCursor" data-left="${f.l}" data-plot-width="${f.pw}" data-x0="${x0}" data-x1="${x1}" x1="${currentX.toFixed(1)}" y1="${f.t}" x2="${currentX.toFixed(1)}" y2="${f.t+f.ph}" stroke="#f04438" stroke-width="2.1" stroke-dasharray="4 3"/>`); parts.push(`</svg>`); $(targetId).innerHTML=parts.join("")}
 function drawVectorChart(targetId,title,xs,vectors,spans,unit){drawLineChart(targetId,title,xs,jointNames.map((name,j)=>({name,values:(vectors||[]).map(row=>Array.isArray(row)?row[j]:null)})),spans,unit)}
 
 function cleanPolygon(poly){if(!Array.isArray(poly))return[]; const out=[]; for(const pt of poly){if(Array.isArray(pt)&&finite(Number(pt[0]))&&finite(Number(pt[1]))) out.push([Number(pt[0]),Number(pt[1])])} return out}
@@ -6948,6 +7132,8 @@ $("refreshSelectedSizesBtn").onclick=()=>refreshSelectedSizes().catch(e=>setStat
 $("deleteSelectedRunsBtn").onclick=()=>deleteSelectedZeroSuccessRuns().catch(e=>setStatus(e.message,"error"));
 $("copySuccessBtn").onclick=()=>transferSuccessRecords("copy", false).catch(e=>setStatus(e.message,"error"));
 $("moveSuccessBtn").onclick=()=>transferSuccessRecords("move", false).catch(e=>setStatus(e.message,"error"));
+$("darkModeToggle").onclick=()=>toggleDarkMode();
+initDarkMode();
 const episodeSortSelect=$("episodeSortSelect"); if(episodeSortSelect) episodeSortSelect.onchange=()=>refreshFilteredViews();
 $("rootInput").addEventListener("input", ()=>syncSuccessPoolPath());
 $("rootInput").addEventListener("keydown", e=>{if(e.key==="Enter") loadRuns().then(()=>loadRun()).catch(err=>setStatus(err.message,"error"))});
@@ -6982,10 +7168,10 @@ def serve_dashboard(
         def log_message(self, fmt, *args):
             return
 
-        def send_bytes(self, data: bytes, content_type: str = "application/json", status: int = 200):
+        def send_bytes(self, data: bytes, content_type: str = "application/json", status: int = 200, cache_control: str = "no-store"):
             self.send_response(status)
             self.send_header("Content-Type", content_type)
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", cache_control)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -7032,7 +7218,11 @@ def serve_dashboard(
                     if not result.get("ok"):
                         self.send_json({"error": result.get("error", "frame_not_found")}, status=int(result.get("status", 404) or 404))
                         return
-                    self.send_bytes(result.get("data", b""), str(result.get("content_type") or "application/octet-stream"))
+                    self.send_bytes(
+                        result.get("data", b""),
+                        str(result.get("content_type") or "application/octet-stream"),
+                        cache_control="public, max-age=3600, immutable",
+                    )
                     return
                 self.send_json({"error": "not_found"}, status=404)
             except Exception as exc:

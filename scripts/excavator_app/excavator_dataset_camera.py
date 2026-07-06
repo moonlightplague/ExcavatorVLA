@@ -79,7 +79,7 @@ def camera_allow_frame_reuse(rt):
     state_value = rt.STATE.get("dataset_camera_allow_reuse", None)
     if state_value is not None:
         return bool(state_value)
-    return True
+    return False
 
 
 def set_dataset_viewports_visible(rt, visible):
@@ -1880,7 +1880,8 @@ def latest_capture_payload(rt, sample_index):
     capture_seq = int(latest.get("seq", 0) or 0)
     last_payload_seq = int(rt.STATE.get("dataset_camera_last_payload_capture_seq", 0) or 0)
     allow_reuse = bool(camera_allow_frame_reuse(rt))
-    if (not allow_reuse) and capture_seq <= last_payload_seq:
+    fresh_for_payload = capture_seq > last_payload_seq
+    if (not allow_reuse) and not fresh_for_payload:
         payload["observation.camera"].update(
             {
                 "available": False,
@@ -1888,6 +1889,7 @@ def latest_capture_payload(rt, sample_index):
                 "capture_seq": int(capture_seq),
                 "last_payload_capture_seq": int(last_payload_seq),
                 "reuse_blocked": True,
+                "fresh_frame": False,
             }
         )
         return payload
@@ -1933,10 +1935,13 @@ def latest_capture_payload(rt, sample_index):
                 "capture_finished_at": float(capture_finished),
                 "frame_age_ms": float(max(0.0, now - capture_finished) * 1000.0),
                 "image_reused": bool(reused_image),
+                "fresh_frame": bool(fresh_for_payload),
             }
         )
         payload[f"observation.images.{name}"] = rel_path
         payload["observation.camera"]["views"][name] = view_payload
+    payload["observation.camera"]["fresh_frame"] = bool(fresh_for_payload)
+    payload["observation.camera"]["last_payload_capture_seq"] = int(last_payload_seq)
     rt.STATE["dataset_camera_last_payload_capture_seq"] = int(capture_seq)
     return payload
 

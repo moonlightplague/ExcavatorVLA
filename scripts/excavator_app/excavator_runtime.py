@@ -10819,7 +10819,8 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False,
             if not camera_ok:
                 dropped = int(STATE.get("dataset_camera_dropped_incomplete_samples", 0) or 0) + 1
                 STATE["dataset_camera_dropped_incomplete_samples"] = dropped
-                if dropped <= 3 or dropped % 30 == 0:
+                no_fresh_camera = str(camera_reason or "").startswith("camera_no_fresh_frame:")
+                if (not no_fresh_camera) and (dropped <= 3 or dropped % 30 == 0):
                     info_print(
                         "[DATASET CAMERA DROP]",
                         f"episode={STATE.get('dataset_episode_uid', '')}",
@@ -11407,6 +11408,8 @@ def auto_collect_write_run_summary():
             "control_step_frames_env": str(CONTROL_STEP_FRAMES_ENV_RAW or ""),
             "debug_profile_summary": dict(STATE.get("debug_profile_summary", {}) or {}),
             "debug_profile_recent": list(STATE.get("debug_profile_recent", []) or [])[-64:],
+            "launcher_update_profile": dict(STATE.get("launcher_update_profile", {}) or {}),
+            "launcher_update_recent": list(STATE.get("launcher_update_recent", []) or [])[-64:],
             "plan_build_summary": dict(STATE.get("plan_build_summary", {}) or {}),
             "dataset_record_sample_spans": dict(STATE.get("dataset_record_sample_spans", {}) or {}),
             "step_updates_profile": dict(STATE.get("step_updates_profile", {}) or {}),

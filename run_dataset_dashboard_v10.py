@@ -39,6 +39,7 @@ SEGMENT_FILES = {
 LEROBOT_EXPORT_SCHEMA = "excavator_lerobot_export_v3"
 LEROBOT_CODEBASE_VERSION = "v3.0"
 LEROBOT_DEFAULT_EXPORT_DIRNAME = "lerobot_v3"
+EXPORT_TIME_POLICY_FILENAME = "export_time_policy.json"
 LEROBOT_IMAGE_SHAPE = [256, 256, 3]
 LEROBOT_IMAGE_KEYS = [
     "observation.images.0",
@@ -4312,19 +4313,92 @@ def dashboard_success_pool_export_manifest_path(run_dir: Union[str, os.PathLike]
     return os.path.join(os.path.abspath(str(run_dir)), LEROBOT_DEFAULT_EXPORT_DIRNAME, "manifest.json")
 
 
+def dashboard_export_time_policy_path(run_dir: Union[str, os.PathLike]) -> str:
+    return os.path.join(os.path.abspath(str(run_dir)), EXPORT_TIME_POLICY_FILENAME)
+
+
+def normalize_export_time_policy(policy: object) -> Dict[str, object]:
+    data = policy if isinstance(policy, dict) else {}
+    try:
+        speed_scale = float(data.get("speed_scale", 1.0))
+    except Exception:
+        speed_scale = 1.0
+    if not math.isfinite(speed_scale) or speed_scale <= 0:
+        speed_scale = 1.0
+    mode = str(data.get("time_mode") or "uniform_fps").strip() or "uniform_fps"
+    base_fps_value = data.get("base_fps", None)
+    try:
+        base_fps = float(base_fps_value) if base_fps_value not in (None, "") else None
+    except Exception:
+        base_fps = None
+    if base_fps is not None and (not math.isfinite(base_fps) or base_fps <= 0):
+        base_fps = None
+    return {
+        "version": 1,
+        "speed_scale": float(speed_scale),
+        "time_mode": mode,
+        "base_fps": base_fps,
+    }
+
+
+def default_export_time_policy() -> Dict[str, object]:
+    return normalize_export_time_policy({})
+
+
+def export_time_policy_hash(policy: object) -> str:
+    normalized = normalize_export_time_policy(policy)
+    payload = json.dumps(normalized, ensure_ascii=True, sort_keys=True, default=str)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def export_time_policy_is_default(policy: object) -> bool:
+    return normalize_export_time_policy(policy) == default_export_time_policy()
+
+
+def load_dashboard_export_time_policy(run_dir: Union[str, os.PathLike]) -> Dict[str, object]:
+    path = dashboard_export_time_policy_path(run_dir)
+    exists = os.path.isfile(path)
+    raw = read_json(path, default={}) if exists else {}
+    normalized = normalize_export_time_policy(raw)
+    return {
+        "path": path,
+        "exists": exists,
+        "policy": normalized,
+        "hash": export_time_policy_hash(normalized),
+        "is_default": export_time_policy_is_default(normalized),
+    }
+
+
+def manifest_time_policy_hash(manifest: dict) -> str:
+    for key in ["time_policy_hash", "export_time_policy_hash"]:
+        text = str(manifest.get(key) or "").strip()
+        if text:
+            return text
+    for key in ["time_policy", "export_time_policy"]:
+        policy = manifest.get(key)
+        if isinstance(policy, dict):
+            return export_time_policy_hash(policy)
+    return ""
+
+
 def dashboard_success_pool_export_lookup(run_dir: Union[str, os.PathLike]) -> Dict[str, object]:
     """Return manifest lookup tables used to mark .dashboard_success rows as export-ready."""
     manifest_path = dashboard_success_pool_export_manifest_path(run_dir)
+    current_time_policy = load_dashboard_export_time_policy(run_dir)
     manifest = read_json(manifest_path, default={}) or {}
     if not isinstance(manifest, dict) or not os.path.isfile(manifest_path):
         return {
             "has_manifest": False,
             "manifest_path": manifest_path,
+            "current_time_policy": current_time_policy,
+            "time_policy_mismatch": False,
             "summary": {
                 "has_manifest": False,
                 "ready": 0,
                 "not_ready": 0,
                 "reason": "lerobot_v3_manifest_missing",
+                "current_time_policy": current_time_policy.get("policy", {}),
+                "current_time_policy_hash": current_time_policy.get("hash", ""),
             },
             "by_source_signature": {},
             "by_source_key": {},
@@ -4338,6 +4412,13 @@ def dashboard_success_pool_export_lookup(run_dir: Union[str, os.PathLike]) -> Di
     by_raw_episode: Dict[str, dict] = {}
     ready = 0
     not_ready = 0
+    manifest_policy_hash = manifest_time_policy_hash(manifest)
+    current_policy_hash = str(current_time_policy.get("hash") or "")
+    current_policy_is_default = bool(current_time_policy.get("is_default"))
+    time_policy_mismatch = bool(
+        (manifest_policy_hash and current_policy_hash and manifest_policy_hash != current_policy_hash)
+        or (not manifest_policy_hash and not current_policy_is_default)
+    )
     for entry in episodes:
         if not isinstance(entry, dict):
             continue
@@ -4364,6 +4445,9 @@ def dashboard_success_pool_export_lookup(run_dir: Union[str, os.PathLike]) -> Di
         "has_manifest": True,
         "manifest_path": manifest_path,
         "manifest": manifest,
+        "current_time_policy": current_time_policy,
+        "manifest_time_policy_hash": manifest_policy_hash,
+        "time_policy_mismatch": time_policy_mismatch,
         "by_source_signature": by_source_signature,
         "by_source_key": by_source_key,
         "by_raw_episode": by_raw_episode,
@@ -4379,6 +4463,10 @@ def dashboard_success_pool_export_lookup(run_dir: Union[str, os.PathLike]) -> Di
             "reused_video_jobs": int(manifest.get("reused_video_jobs") or 0),
             "encoded_video_jobs": int(manifest.get("encoded_video_jobs") or 0),
             "total_video_jobs": int(manifest.get("total_video_jobs") or 0),
+            "current_time_policy": current_time_policy.get("policy", {}),
+            "current_time_policy_hash": current_policy_hash,
+            "manifest_time_policy_hash": manifest_policy_hash,
+            "time_policy_mismatch": time_policy_mismatch,
         },
     }
 
@@ -4386,9 +4474,9 @@ def dashboard_success_pool_export_lookup(run_dir: Union[str, os.PathLike]) -> Di
 def dashboard_row_export_status(row: dict, export_lookup: Dict[str, object]) -> Dict[str, object]:
     if not export_lookup.get("has_manifest"):
         return {
-            "export_ready": None,
-            "export_status": "unknown",
-            "export_reason": str((export_lookup.get("summary") or {}).get("reason") or "not_exported"),
+            "export_ready": False,
+            "export_status": "missing",
+            "export_reason": str((export_lookup.get("summary") or {}).get("reason") or "not_exported_or_missing_manifest"),
             "export_manifest_path": export_lookup.get("manifest_path", ""),
         }
     entry = None
@@ -4416,11 +4504,16 @@ def dashboard_row_export_status(row: dict, export_lookup: Dict[str, object]) -> 
     if not isinstance(entry, dict):
         return {
             "export_ready": False,
-            "export_status": "not_ready",
-            "export_reason": "not_exported_or_stale",
+            "export_status": "missing",
+            "export_reason": "not_exported_or_missing_episode_manifest",
             "export_manifest_path": export_lookup.get("manifest_path", ""),
         }
     ready = entry.get("export_ready") is True
+    entry_policy_hash = manifest_time_policy_hash(entry)
+    current_hash = str((export_lookup.get("current_time_policy") or {}).get("hash") or "")
+    time_policy_mismatch = bool(export_lookup.get("time_policy_mismatch"))
+    if entry_policy_hash and current_hash:
+        time_policy_mismatch = entry_policy_hash != current_hash
     reasons = entry.get("not_ready_reasons")
     if isinstance(reasons, list):
         reason_text = "; ".join(str(item) for item in reasons if str(item))
@@ -4428,6 +4521,18 @@ def dashboard_row_export_status(row: dict, export_lookup: Dict[str, object]) -> 
         reason_text = str(reasons or "")
     videos = entry.get("videos") if isinstance(entry.get("videos"), dict) else {}
     available_videos = sum(1 for value in videos.values() if isinstance(value, dict) and value.get("available") is True)
+    if ready and time_policy_mismatch:
+        manifest_hash = entry_policy_hash or str(export_lookup.get("manifest_time_policy_hash") or "")
+        return {
+            "export_ready": False,
+            "export_status": "time_policy_mismatch",
+            "export_reason": f"time_policy_mismatch current={current_hash[:8] or 'default'} manifest={manifest_hash[:8] or 'none'}",
+            "export_manifest_path": export_lookup.get("manifest_path", ""),
+            "export_episode_index": entry.get("episode_index"),
+            "export_video_layout": entry.get("video_layout", ""),
+            "export_video_count": available_videos,
+            "export_config_hash": entry.get("export_config_hash", ""),
+        }
     return {
         "export_ready": bool(ready),
         "export_status": "ready" if ready else "not_ready",
@@ -5264,6 +5369,7 @@ def dashboard_run_payload_signature(run_dir: Union[str, os.PathLike]) -> Dict[st
     ]:
         files[f"root/{filename}"] = stat_signature(os.path.join(run_abs, filename))
     files["export/manifest"] = stat_signature(dashboard_success_pool_export_manifest_path(run_abs))
+    files["export/time_policy"] = stat_signature(dashboard_export_time_policy_path(run_abs))
     signature: Dict[str, object] = {
         "cache_version": RUN_PAYLOAD_CACHE_VERSION,
         "run_dir": run_abs,
@@ -6187,7 +6293,7 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
 .transferProgress{margin:8px 0 10px;border:1px solid #dbe3ee;border-radius:10px;background:#f8fafc;padding:8px 10px}.transferProgressMeta{display:flex;justify-content:space-between;gap:10px;font-size:12px;color:#475467;margin-bottom:6px}.transferProgressTrack{height:8px;border-radius:999px;background:#e5e7eb;overflow:hidden}.transferProgressFill{height:100%;border-radius:999px;background:#12b76a;transition:width .22s ease}.transferProgressFill.busy{background:linear-gradient(90deg,#12b76a,#60a5fa,#12b76a);background-size:180% 100%;animation:progressSlide 1.1s linear infinite}@keyframes progressSlide{from{background-position:0 0}to{background-position:180% 0}}
 
 .terminalPanel{margin-bottom:14px}.terminalPanel .panelHeader,.rawAttemptPanel .panelHeader{margin-bottom:8px}.terminalActions,.rawAttemptActions{display:flex;align-items:center;gap:8px}.terminalBox{max-height:180px;min-height:72px}.rawAttemptActions:after{content:"debug only";font-size:12px;color:#667085}
-.epCellInner{display:inline-flex;align-items:center;gap:6px}.exportReadyDot{width:8px;height:8px;border-radius:999px;display:inline-block;box-shadow:0 0 0 2px #fff,0 0 0 3px #d0d5dd;flex:0 0 auto}.exportReadyDot.ready{background:#12b76a;box-shadow:0 0 0 2px #fff,0 0 0 3px rgba(18,183,106,.35)}.exportReadyDot.notReady{background:#f04438;box-shadow:0 0 0 2px #fff,0 0 0 3px rgba(240,68,56,.32)}.exportReadyDot.unknown{background:#98a2b3}
+.epCellInner{display:inline-flex;align-items:center;gap:6px}.exportReadyDot{width:8px;height:8px;border-radius:999px;display:inline-block;box-shadow:0 0 0 2px #fff,0 0 0 3px #d0d5dd;flex:0 0 auto}.exportReadyDot.ready{background:#12b76a;box-shadow:0 0 0 2px #fff,0 0 0 3px rgba(18,183,106,.35)}.exportReadyDot.notReady{background:#f04438;box-shadow:0 0 0 2px #fff,0 0 0 3px rgba(240,68,56,.32)}.exportReadyDot.stale{background:#f79009;box-shadow:0 0 0 2px #fff,0 0 0 3px rgba(247,144,9,.34)}.exportReadyDot.unknown{background:#98a2b3}
 body main details>summary:after,.managerPanel>summary:after,.detailsPanel>summary:after{content:""!important;width:10px!important;height:10px!important;border:0!important;border-right:2px solid #667085!important;border-bottom:2px solid #667085!important;border-radius:0!important;padding:0!important;background:transparent!important;transform:rotate(-45deg);transition:transform .2s ease;flex:0 0 auto;margin-top:4px}body main details[open]>summary:after,.managerPanel[open]>summary:after,.detailsPanel[open]>summary:after{content:""!important;transform:rotate(45deg);margin-top:7px}
 
 </style>
@@ -6878,7 +6984,7 @@ function renderEpisodes(episodes){
   const sorted=[...(episodes||[])].sort((a,b)=>{const av=sortValue(a,episodeSort.key), bv=sortValue(b,episodeSort.key); if(av===bv) return Number(a.episode_index||0)-Number(b.episode_index||0); if(av===null)return 1; if(bv===null)return -1; return (av<bv?-1:1)*episodeSort.dir});
   const label=episodeSortLabel(episodeSort.key); const arrow=episodeSort.dir>0?"↑":"↓";
   const hasExportFields=sorted.some(ep=>Object.prototype.hasOwnProperty.call(ep,"export_ready"));
-  const exportMeta=hasExportFields?` · export ready ${sorted.filter(ep=>ep.export_ready===true).length}, pending ${sorted.filter(ep=>ep.export_ready===false).length}, unknown ${sorted.filter(ep=>ep.export_ready!==true&&ep.export_ready!==false).length}`:"";
+  const exportMeta=hasExportFields?` · export ready ${sorted.filter(ep=>ep.export_ready===true).length}, stale ${sorted.filter(ep=>ep.export_status==="time_policy_mismatch").length}, missing ${sorted.filter(ep=>ep.export_ready===false&&ep.export_status!=="time_policy_mismatch").length}, unknown ${sorted.filter(ep=>ep.export_ready!==true&&ep.export_ready!==false).length}`:"";
   $("episodeSideMeta").textContent=`${sorted.length} shown · sorted by ${label} ${arrow}${exportMeta}`;
   if(!sorted.length){$("episodeTabs").innerHTML='<div class="empty">No attempts match the current status filter.</div>'; syncEpisodeInspectorHeight(); return}
   $("episodeTabs").innerHTML=episodeTableHtml(sorted);
@@ -6889,9 +6995,10 @@ function episodeSortLabel(key){return ({episode_index:"Ep",time_s:"Time",score:"
 function sortHeader(key,label,cls=""){const arrow=episodeSort.key===key?(episodeSort.dir>0?" ▲":" ▼"):""; return `<th class="sortable ${esc(cls)}" onclick="sortEpisodes('${esc(key)}')" title="Click to sort by ${esc(label)}">${esc(label)}${arrow}</th>`}
 function episodeTableHtml(rows){const head=`<thead><tr>${sortHeader("episode_index","Ep","epCol")}<th>Status</th>${sortHeader("time_s","Time","num")}${sortHeader("score","Score","num")}${sortHeader("max_bucket","Bucket","num")}${sortHeader("lift_bucket","Lift","num")}${sortHeader("final_bin","Bin","num")}${sortHeader("final_spill","Spill","num")}${sortHeader("robot_yaw","Robot yaw","num")}${sortHeader("truck_yaw","Truck yaw","num")}<th>Reason</th></tr></thead>`; const body=rows.map(ep=>episodeRowHtml(ep)).join(""); return `<table id="episodeTable" class="episodeDataSheet">${head}<tbody>${body}</tbody></table>`}
 function exportReadyState(ep){
-  if(ep.export_ready===true) return {cls:"ready", title:`VLA export ready${ep.export_video_count!=null?` · videos=${ep.export_video_count}`:""}`};
-  if(ep.export_ready===false) return {cls:"notReady", title:`VLA export not ready · ${ep.export_reason||"not exported or stale"}`};
-  return {cls:"unknown", title:`VLA export unknown · ${ep.export_reason||"load .dashboard_success or export first"}`};
+  if(ep.export_status==="time_policy_mismatch") return {cls:"stale", title:`VLA export stale: time_policy mismatch - ${ep.export_reason||"re-export required"}`};
+  if(ep.export_ready===true) return {cls:"ready", title:`VLA export ready${ep.export_video_count!=null?` - videos=${ep.export_video_count}`:""}`};
+  if(ep.export_ready===false) return {cls:"notReady", title:`VLA export missing/not ready - ${ep.export_reason||"not exported or missing"}`};
+  return {cls:"unknown", title:`VLA export unknown - ${ep.export_reason||"load .dashboard_success or export first"}`};
 }
 function episodeRowHtml(ep){const s=ep.scene||{}; const status=statusKey(ep.status); const reason=ep.reason||ep.warning_reason||""; const time=Number(ep.time_s); const timeText=Number.isFinite(time)?`${fmt(time,2)}s`:""; const exportState=exportReadyState(ep); const epCell=`<span class="epCellInner"><span>${esc(ep.episode_index)}</span><span class="exportReadyDot ${esc(exportState.cls)}" title="${esc(exportState.title)}"></span></span>`; return `<tr data-ep="${esc(ep.episode_index)}" onclick="loadEpisode('${esc(ep.episode_index)}')"><td class="epCol">${epCell}</td><td><span class="pill ${esc(status)}">${esc(status)}</span></td><td class="num">${esc(timeText)}</td><td class="num">${fmt(ep.score,1)}</td><td class="num">${esc(ep.max_bucket??"")}</td><td class="num">${esc(ep.lift_bucket??"")}</td><td class="num">${esc(ep.final_bin??"")}</td><td class="num">${esc(ep.final_spill??"")}</td><td class="num">${fmt(s.robot_body_yaw_deg,1)}</td><td class="num">${fmt(s.truck_yaw_deg,1)}</td><td class="reasonCell" title="${esc(reason)}">${esc(shortText(reason||"no reason",150))}</td></tr>`}
 function sortEpisodes(key){if(episodeSort.key===key){episodeSort.dir*=-1}else{episodeSort={key,dir:key==="episode_index"?1:-1}} renderEpisodes(filteredEpisodes())}

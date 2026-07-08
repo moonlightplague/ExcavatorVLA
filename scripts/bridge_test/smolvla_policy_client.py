@@ -246,16 +246,18 @@ def main():
             camera_rgbs = decode_camera_images(reply, np_module=np)
             rgb0 = camera_rgbs.get("0", rgb)
             rgb1 = camera_rgbs.get("1", rgb)
+            rgb2 = camera_rgbs.get("2", rgb)
             image0 = rgb_to_tensor(rgb0, device)
             image1 = rgb_to_tensor(rgb1, device)
+            image2 = rgb_to_tensor(rgb2, device)
             state = make_state(reply, device)
 
             batch = {
                 # Match training dataset keys
                 "observation.state": state,
-                "observation.images.0": image0,
-                "observation.images.1": image1,
-                # "observation.images.2": image,
+                "observation.images.camera1": image0,
+                "observation.images.camera2": image1,
+                "observation.images.camera3": image2,
 
                 # Raw task string used by LeRobot preprocessor-style pipelines
                 "task": [args.task],

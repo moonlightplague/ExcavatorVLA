@@ -31,7 +31,9 @@ SEGMENT_FILES = {
 LEROBOT_EXPORT_SCHEMA = "excavator_lerobot_export_v3"
 LEROBOT_CODEBASE_VERSION = "v3.0"
 LEROBOT_DEFAULT_EXPORT_DIRNAME = "lerobot_v3"
+EXPORT_TIME_POLICY_FILENAME = "export_time_policy.json"
 LEROBOT_IMAGE_SHAPE = [256, 256, 3]
+LEROBOT_VIDEO_KEYFRAME_INTERVAL = 4
 LEROBOT_IMAGE_KEYS = [
     "observation.images.0",
     "observation.images.1",
@@ -1125,6 +1127,282 @@ def infer_export_fps(run_dir: Union[str, os.PathLike], explicit_fps: Optional[fl
     return 10.0
 
 
+def normalize_export_time_policy(policy: object) -> Dict[str, object]:
+    data = policy if isinstance(policy, dict) else {}
+    try:
+        speed_scale = float(data.get("speed_scale", 1.0))
+    except Exception:
+        speed_scale = 1.0
+    if not math.isfinite(speed_scale) or speed_scale <= 0:
+        speed_scale = 1.0
+    time_mode = str(data.get("time_mode") or "uniform_fps").strip() or "uniform_fps"
+    if time_mode not in {"uniform_fps", "scaled_raw"}:
+        time_mode = "uniform_fps"
+    try:
+        base_fps = float(data.get("base_fps")) if data.get("base_fps") not in (None, "") else None
+    except Exception:
+        base_fps = None
+    if base_fps is not None and (not math.isfinite(base_fps) or base_fps <= 0):
+        base_fps = None
+    return {
+        "version": 1,
+        "speed_scale": float(speed_scale),
+        "time_mode": time_mode,
+        "base_fps": base_fps,
+    }
+
+
+def default_export_time_policy() -> Dict[str, object]:
+    return normalize_export_time_policy({})
+
+
+def export_time_policy_hash(policy: object) -> str:
+    normalized = normalize_export_time_policy(policy)
+    payload = json.dumps(normalized, ensure_ascii=True, sort_keys=True, default=str)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def export_time_policy_is_default(policy: object) -> bool:
+    return normalize_export_time_policy(policy) == default_export_time_policy()
+
+
+def export_time_policy_path(run_dir: Union[str, os.PathLike]) -> str:
+    return os.path.join(os.path.abspath(str(run_dir)), EXPORT_TIME_POLICY_FILENAME)
+
+
+def load_export_time_policy(run_dir: Union[str, os.PathLike], explicit_policy: object = None) -> Dict[str, object]:
+    raw = explicit_policy
+    if raw is None:
+        raw = read_json(export_time_policy_path(run_dir), default={}) or {}
+    policy = normalize_export_time_policy(raw)
+    return {
+        "policy": policy,
+        "hash": export_time_policy_hash(policy),
+        "path": export_time_policy_path(run_dir),
+        "is_default": export_time_policy_is_default(policy),
+    }
+
+
+def effective_export_fps(base_fps: float, policy: object) -> float:
+    normalized = normalize_export_time_policy(policy)
+    base = float(normalized.get("base_fps") or base_fps or 10.0)
+    if not math.isfinite(base) or base <= 0:
+        base = 10.0
+    return max(0.001, base * float(normalized.get("speed_scale") or 1.0))
+
+
+def _unwrap_angle_series(values: Sequence[Optional[Sequence[float]]], dim: int) -> List[List[Optional[float]]]:
+    out: List[List[Optional[float]]] = []
+    prev: List[Optional[float]] = [None] * int(dim)
+    offsets = [0.0] * int(dim)
+    two_pi = 2.0 * math.pi
+    for row in values:
+        current: List[Optional[float]] = []
+        src = list(row or [])
+        for i in range(int(dim)):
+            value = src[i] if i < len(src) else None
+            try:
+                v = float(value)  # type: ignore[arg-type]
+            except Exception:
+                current.append(None)
+                continue
+            if prev[i] is not None:
+                delta = v + offsets[i] - float(prev[i])
+                while delta > math.pi:
+                    offsets[i] -= two_pi
+                    delta -= two_pi
+                while delta < -math.pi:
+                    offsets[i] += two_pi
+                    delta += two_pi
+            unwrapped = v + offsets[i]
+            prev[i] = unwrapped
+            current.append(float(unwrapped))
+        out.append(current)
+    return out
+
+
+def _finite_difference_vectors(values: Sequence[Sequence[Optional[float]]], timestamps: Sequence[float], dim: int) -> List[List[Optional[float]]]:
+    count = len(values)
+    if count <= 0:
+        return []
+    out: List[List[Optional[float]]] = []
+    for i in range(count):
+        if count == 1:
+            out.append([0.0] * int(dim))
+            continue
+        prev_i = max(0, i - 1)
+        next_i = min(count - 1, i + 1)
+        if i == 0:
+            prev_i, next_i = 0, 1
+        elif i == count - 1:
+            prev_i, next_i = count - 2, count - 1
+        dt = float(timestamps[next_i]) - float(timestamps[prev_i])
+        if abs(dt) < 1e-9:
+            out.append([0.0] * int(dim))
+            continue
+        row: List[Optional[float]] = []
+        prev_row = list(values[prev_i] or [])
+        next_row = list(values[next_i] or [])
+        for j in range(int(dim)):
+            a = prev_row[j] if j < len(prev_row) else None
+            b = next_row[j] if j < len(next_row) else None
+            try:
+                row.append((float(b) - float(a)) / dt)  # type: ignore[arg-type]
+            except Exception:
+                row.append(None)
+        out.append(row)
+    return out
+
+
+def _rewrap_angles(values: Sequence[Optional[float]]) -> List[Optional[float]]:
+    out: List[Optional[float]] = []
+    for value in values:
+        if value is None:
+            out.append(None)
+            continue
+        try:
+            v = float(value)
+            out.append(float((v + math.pi) % (2.0 * math.pi) - math.pi))
+        except Exception:
+            out.append(None)
+    return out
+
+
+def _vector_with_fallback(primary: object, fallback: object = None, length: Optional[int] = None) -> Optional[List[float]]:
+    vec = vector_or_none(primary, length)
+    if vec is not None:
+        return vec
+    return vector_or_none(fallback, length)
+
+
+def _set_state_named_values(
+    state: Optional[List[float]],
+    state_names: Sequence[str],
+    replacements: Dict[str, Sequence[Optional[float]]],
+) -> Optional[List[float]]:
+    if state is None:
+        return None
+    out = list(state)
+    lower_names = [str(name).strip().lower() for name in state_names]
+    for group, values in replacements.items():
+        vals = list(values or [])
+        for axis_i, axis_name in enumerate(["swing", "boom", "arm", "bucket"]):
+            if axis_i >= len(vals) or vals[axis_i] is None:
+                continue
+            candidates: List[str] = []
+            if group == "q":
+                candidates = [axis_name]
+            elif group == "dq":
+                candidates = [
+                    f"{axis_name}_velocity",
+                    f"{axis_name}_vel",
+                    f"{axis_name}_dq",
+                    f"d{axis_name}",
+                    f"{axis_name}_angle_velocity",
+                ]
+            elif group == "ddq":
+                candidates = [
+                    f"{axis_name}_acceleration",
+                    f"{axis_name}_accel",
+                    f"{axis_name}_ddq",
+                    f"dd{axis_name}",
+                    f"{axis_name}_angle_acceleration",
+                ]
+            for candidate in candidates:
+                if candidate in lower_names:
+                    idx = lower_names.index(candidate)
+                    if idx < len(out):
+                        out[idx] = float(vals[axis_i])  # type: ignore[arg-type]
+                    break
+    return out
+
+
+def apply_export_time_policy_to_trajectory(
+    trajectory: Sequence[dict],
+    policy: object = None,
+    base_fps: float = 10.0,
+    state_names: Optional[Sequence[str]] = None,
+    action_names: Optional[Sequence[str]] = None,
+) -> Dict[str, object]:
+    samples = [dict(sample) for sample in (trajectory or []) if isinstance(sample, dict)]
+    normalized = normalize_export_time_policy(policy)
+    raw_first_t = safe_float_value(samples[0].get("t"), 0.0) if samples else 0.0
+    raw_first_t = float(raw_first_t or 0.0)
+    effective_fps_value = effective_export_fps(base_fps, normalized)
+    speed_scale = float(normalized.get("speed_scale") or 1.0)
+    raw_times: List[float] = []
+    new_times: List[float] = []
+    for index, sample in enumerate(samples):
+        raw_t = safe_float_value(sample.get("t"), raw_first_t) or raw_first_t
+        raw_times.append(float(raw_t) - raw_first_t)
+        if normalized.get("time_mode") == "scaled_raw":
+            new_times.append(float(raw_t - raw_first_t) / speed_scale)
+        else:
+            new_times.append(float(index) / float(effective_fps_value))
+    dim = 4
+    q_raw = [_vector_with_fallback(sample.get("obs.q"), sample.get("goal.q"), dim) for sample in samples]
+    q_cmd_raw = [_vector_with_fallback(sample.get("obs.q_cmd"), sample.get("goal.q"), dim) for sample in samples]
+    raw_action = [vector_or_none(sample.get("action"), dim) for sample in samples]
+    q_unwrapped = _unwrap_angle_series(q_raw, dim)
+    q_cmd_unwrapped = _unwrap_angle_series(q_cmd_raw, dim)
+    dq = _finite_difference_vectors(q_unwrapped, new_times, dim)
+    ddq = _finite_difference_vectors(dq, new_times, dim)
+    if any(vec is not None for vec in q_cmd_raw):
+        action = _finite_difference_vectors(q_cmd_unwrapped, new_times, dim)
+    else:
+        action = []
+        for vec in raw_action:
+            src = list(vec or [])
+            row: List[Optional[float]] = []
+            for axis_i in range(dim):
+                try:
+                    row.append(float(src[axis_i]) * speed_scale)
+                except Exception:
+                    row.append(0.0)
+            action.append(row)
+    action_ddq = _finite_difference_vectors(action, new_times, dim)
+    state_names_list = list(state_names or [])
+    transformed: List[dict] = []
+    for index, sample in enumerate(samples):
+        out = dict(sample)
+        out["t_raw"] = sample.get("t")
+        out["t"] = float(new_times[index])
+        out["export_time_policy"] = dict(normalized)
+        q_wrapped = _rewrap_angles(q_unwrapped[index])
+        q_cmd_wrapped = _rewrap_angles(q_cmd_unwrapped[index])
+        if all(value is not None for value in q_wrapped):
+            out["obs.q"] = [float(value) for value in q_wrapped]  # type: ignore[arg-type]
+        if all(value is not None for value in q_cmd_wrapped):
+            out["obs.q_cmd"] = [float(value) for value in q_cmd_wrapped]  # type: ignore[arg-type]
+        out["obs.dq"] = [float(value or 0.0) for value in dq[index]]
+        out["obs.ddq"] = [float(value or 0.0) for value in ddq[index]]
+        out["action"] = [float(value or 0.0) for value in action[index]]
+        out["action.ddq"] = [float(value or 0.0) for value in action_ddq[index]]
+        state = vector_or_none(out.get("observation.state")) or vector_or_none(out.get("obs.state"))
+        updated_state = _set_state_named_values(
+            state,
+            state_names_list,
+            {"q": q_wrapped, "dq": dq[index], "ddq": ddq[index]},
+        )
+        if updated_state is not None:
+            if "observation.state" in out:
+                out["observation.state"] = updated_state
+            if "obs.state" in out:
+                out["obs.state"] = updated_state
+        transformed.append(out)
+    return {
+        "samples": transformed,
+        "time_policy": normalized,
+        "time_policy_hash": export_time_policy_hash(normalized),
+        "base_fps": float(base_fps or 10.0),
+        "effective_fps": float(effective_fps_value),
+        "speed_scale": speed_scale,
+        "time_mode": normalized.get("time_mode"),
+        "raw_duration_s": float(raw_times[-1]) if raw_times else 0.0,
+        "duration_s": float(new_times[-1]) if new_times else 0.0,
+    }
+
+
 GENERIC_LEROBOT_TASK_TEXT = "Dig soil from the marked area and dump it into the target container."
 
 
@@ -1377,7 +1655,22 @@ def try_encode_mp4_imageio(
     interval = _frame_progress_interval(total)
     try:
         ensure_dir(os.path.dirname(output_path) or ".")
-        writer = imageio.get_writer(output_path, fps=float(fps), codec="libx264", quality=8, macro_block_size=1)
+        keyint = max(1, int(LEROBOT_VIDEO_KEYFRAME_INTERVAL))
+        writer = imageio.get_writer(
+            output_path,
+            fps=float(fps),
+            codec="libx264",
+            quality=8,
+            macro_block_size=1,
+            output_params=[
+                "-g",
+                str(keyint),
+                "-keyint_min",
+                str(keyint),
+                "-sc_threshold",
+                "0",
+            ],
+        )
         try:
             for frame_i, image_path in enumerate(image_paths, 1):
                 writer.append_data(resize_rgb_frame(imageio.imread(image_path), target_size=target_size))
@@ -1390,7 +1683,7 @@ def try_encode_mp4_imageio(
                     )
         finally:
             writer.close()
-        return True, "ok"
+        return True, f"ok:keyframe_interval={keyint}"
     except Exception as exc:
         return False, f"imageio_mp4_failed:{type(exc).__name__}:{exc}"
 
@@ -1755,6 +2048,8 @@ def collect_lerobot_rows(
     run_dir: Union[str, os.PathLike],
     split: str = "trainable",
     limit_episodes: Optional[int] = None,
+    time_policy: object = None,
+    base_fps: float = 10.0,
 ) -> Dict[str, object]:
     run_dir = str(run_dir)
     episode_rows = load_index(run_dir, split)
@@ -1808,6 +2103,14 @@ def collect_lerobot_rows(
         meta = read_json(resolve_episode_file(episode_dir, row_path_value(episode, "meta")), default={}) or {}
         if not trajectory:
             continue
+        transformed = apply_export_time_policy_to_trajectory(
+            trajectory,
+            policy=time_policy,
+            base_fps=base_fps,
+            state_names=state_names,
+            action_names=action_names,
+        )
+        trajectory = list(transformed.get("samples") or [])
         export_episode_index = len(episodes)
         first_t = safe_float_value(trajectory[0].get("t"), 0.0) or 0.0
         episode_start_frame = global_frame
@@ -1902,6 +2205,8 @@ def collect_lerobot_rows(
                 "source_key": episode.get("dashboard_transfer_source_key")
                 or episode.get("source_key")
                 or "",
+                "duration_s": float(transformed.get("duration_s") or 0.0),
+                "raw_duration_s": float(transformed.get("raw_duration_s") or 0.0),
             }
         )
         episode_image_paths.append(current_episode_image_paths)
@@ -1948,6 +2253,7 @@ def export_lerobot_dataset(
     require_standard: bool = False,
     require_vla: bool = False,
     reuse_from_dir: Optional[Union[str, os.PathLike]] = None,
+    time_policy: object = None,
     progress_callback=None,
 ) -> Dict[str, object]:
     def progress(percent: float, message: str, current: Optional[int] = None, total: Optional[int] = None) -> None:
@@ -1982,8 +2288,21 @@ def export_lerobot_dataset(
     except Exception as exc:
         raise RuntimeError(f"pandas is required for strict LeRobot v3 export: {type(exc).__name__}:{exc}") from exc
 
-    progress(5.0, "collecting trainable rows and validating camera files")
-    collected = collect_lerobot_rows(run_dir, split=split, limit_episodes=limit_episodes)
+    base_export_fps = infer_export_fps(run_dir, fps)
+    time_policy_info = load_export_time_policy(run_dir, explicit_policy=time_policy)
+    normalized_time_policy = dict(time_policy_info.get("policy") or default_export_time_policy())
+    export_fps = effective_export_fps(base_export_fps, normalized_time_policy)
+    progress(
+        5.0,
+        f"collecting trainable rows and validating camera files; speed_scale={normalized_time_policy.get('speed_scale', 1.0)} effective_fps={export_fps:.3f}",
+    )
+    collected = collect_lerobot_rows(
+        run_dir,
+        split=split,
+        limit_episodes=limit_episodes,
+        time_policy=normalized_time_policy,
+        base_fps=base_export_fps,
+    )
     rows: List[dict] = list(collected["rows"])  # type: ignore[arg-type]
     if not rows:
         raise ValueError(f"no exportable frames found for split={split}")
@@ -1993,14 +2312,17 @@ def export_lerobot_dataset(
     episodes_dir = ensure_dir(os.path.join(meta_dir, "episodes", "chunk-000"))
     ensure_dir(os.path.join(export_dir, "videos"))
 
-    export_fps = int(round(infer_export_fps(run_dir, fps)))
     if export_fps <= 0:
-        export_fps = 10
+        export_fps = 10.0
     video_results = {}
     image_features = list(LEROBOT_IMAGE_KEYS)
     export_config = {
         "video_layout": "per_episode",
-        "fps": int(export_fps),
+        "fps": float(export_fps),
+        "video_keyframe_interval": int(LEROBOT_VIDEO_KEYFRAME_INTERVAL),
+        "base_fps": float(base_export_fps),
+        "time_policy": normalized_time_policy,
+        "time_policy_hash": str(time_policy_info.get("hash") or export_time_policy_hash(normalized_time_policy)),
         "image_features": list(image_features),
         "image_shape": list(LEROBOT_IMAGE_SHAPE),
         "source_split": split,
@@ -2028,6 +2350,7 @@ def export_lerobot_dataset(
             "layout": "per_episode",
             "frames": 0,
             "shape": LEROBOT_IMAGE_SHAPE,
+            "keyframe_interval": int(LEROBOT_VIDEO_KEYFRAME_INTERVAL),
             "episode_files": [],
         }
     episode_video_manifest: List[dict] = []
@@ -2045,6 +2368,7 @@ def export_lerobot_dataset(
         }
         for key in image_features:
             paths = list(episode_paths_by_key.get(key, []) or [])
+            episode_duration_s = float(current_episode.get("duration_s") or (float(len(paths)) / float(export_fps)))
             job_start = video_start_percent + (video_end_percent - video_start_percent) * (completed_video_jobs / total_video_jobs)
             job_end = video_start_percent + (video_end_percent - video_start_percent) * ((completed_video_jobs + 1) / total_video_jobs)
             if not paths or not any(paths):
@@ -2064,10 +2388,11 @@ def export_lerobot_dataset(
                     "encoder": "reused",
                     "path": rel_video_path,
                     "frames": len(paths),
+                    "keyframe_interval": int(LEROBOT_VIDEO_KEYFRAME_INTERVAL),
                     "chunk_index": 0,
                     "file_index": int(episode_i),
                     "from_timestamp": 0.0,
-                    "to_timestamp": float(len(paths)) / float(export_fps),
+                    "to_timestamp": episode_duration_s,
                     "reused_from": relpath_posix(reused_src, reuse_dir),
                 }
                 video_results[key]["frames"] = int(video_results[key].get("frames", 0) or 0) + len(paths)
@@ -2097,10 +2422,12 @@ def export_lerobot_dataset(
                     "encoder": encoder,
                     "path": rel_video_path,
                     "frames": len(paths),
+                    "keyframe_interval": int(LEROBOT_VIDEO_KEYFRAME_INTERVAL),
+                    "encode_reason": reason,
                     "chunk_index": 0,
                     "file_index": int(episode_i),
                     "from_timestamp": 0.0,
-                    "to_timestamp": float(len(paths)) / float(export_fps),
+                    "to_timestamp": episode_duration_s,
                 }
                 video_results[key]["frames"] = int(video_results[key].get("frames", 0) or 0) + len(paths)
                 video_results[key]["episode_files"].append(entry)
@@ -2144,7 +2471,7 @@ def export_lerobot_dataset(
             "index": int(row["index"]),
             "episode_index": int(row["episode_index"]),
             "frame_index": frame_index,
-            "timestamp": float(frame_index) / float(export_fps),
+            "timestamp": float(row.get("timestamp", float(frame_index) / float(export_fps))),
             "task_index": int(row["task_index"]),
             "observation.state": row["observation.state"],
             "action": row["action"],
@@ -2186,7 +2513,9 @@ def export_lerobot_dataset(
             meta_row[f"videos/{key}/chunk_index"] = 0
             meta_row[f"videos/{key}/file_index"] = int(episode.get("episode_index", 0))
             meta_row[f"videos/{key}/from_timestamp"] = 0.0
-            meta_row[f"videos/{key}/to_timestamp"] = float(int(episode.get("length", 0))) / float(export_fps)
+            meta_row[f"videos/{key}/to_timestamp"] = float(
+                episode.get("duration_s") or (float(int(episode.get("length", 0))) / float(export_fps))
+            )
         episode_meta_rows.append(meta_row)
     episodes_path = os.path.join(episodes_dir, "file-000.parquet")
     episodes_df = pd.DataFrame(episode_meta_rows)
@@ -2281,6 +2610,8 @@ def export_lerobot_dataset(
                 "export_status": "ready" if not missing_or_failed else "not_ready",
                 "not_ready_reasons": missing_or_failed,
                 "export_config_hash": export_config_hash,
+                "time_policy": normalized_time_policy,
+                "time_policy_hash": str(time_policy_info.get("hash") or export_time_policy_hash(normalized_time_policy)),
             }
         )
 
@@ -2298,6 +2629,11 @@ def export_lerobot_dataset(
         "created_at": time.time(),
         "export_config": export_config,
         "export_config_hash": export_config_hash,
+        "time_policy": normalized_time_policy,
+        "time_policy_hash": str(time_policy_info.get("hash") or export_time_policy_hash(normalized_time_policy)),
+        "base_fps": float(base_export_fps),
+        "effective_fps": float(export_fps),
+        "video_keyframe_interval": int(LEROBOT_VIDEO_KEYFRAME_INTERVAL),
         "reuse_from_dir": reuse_dir,
         "reused_video_jobs": int(reused_video_jobs),
         "encoded_video_jobs": int(encoded_video_jobs),
@@ -2383,6 +2719,7 @@ def print_lerobot_export(
     overwrite: bool = False,
     require_standard: bool = False,
     require_vla: bool = False,
+    time_policy: object = None,
 ) -> None:
     result = export_lerobot_dataset(
         run_dir,
@@ -2393,6 +2730,7 @@ def print_lerobot_export(
         overwrite=overwrite,
         require_standard=require_standard,
         require_vla=require_vla,
+        time_policy=time_policy,
     )
     try:
         write_json(os.path.join(os.path.abspath(str(run_dir)), "lerobot_v3_export.json"), result)
@@ -3229,6 +3567,9 @@ if __name__ == "__main__":
     parser.add_argument("--export-dir", default=None, help="Output directory for --export-lerobot. Defaults to run_dir/lerobot_v3.")
     parser.add_argument("--export-split", default="trainable", help="Episode index split to export, default: trainable.")
     parser.add_argument("--export-fps", type=float, default=None, help="Video fps for exported camera streams; defaults to camera_config frequency.")
+    parser.add_argument("--export-speed-scale", type=float, default=None, help="Speed multiplier for export timestamps and recomputed dq/ddq/action.")
+    parser.add_argument("--export-time-mode", default="uniform_fps", choices=["uniform_fps", "scaled_raw"], help="Time policy for export rows.")
+    parser.add_argument("--export-base-fps", type=float, default=None, help="Base fps before speed scaling; defaults to camera_config frequency.")
     parser.add_argument("--export-limit", type=int, default=None, help="Limit exported episodes for smoke tests.")
     parser.add_argument("--export-overwrite", action="store_true", help="Delete and rebuild the export directory if it already exists.")
     parser.add_argument("--export-require-standard", action="store_true", help="Fail if parquet/mp4 standard export cannot be produced.")
@@ -3254,6 +3595,13 @@ if __name__ == "__main__":
         print_plots(run_dir, output_dir=args.plot_dir)
         did_action = True
     if args.export_lerobot or args.export_lerobot_v3:
+        export_time_policy = None
+        if args.export_speed_scale is not None or args.export_base_fps is not None or args.export_time_mode != "uniform_fps":
+            export_time_policy = {
+                "speed_scale": args.export_speed_scale if args.export_speed_scale is not None else 1.0,
+                "time_mode": args.export_time_mode,
+                "base_fps": args.export_base_fps,
+            }
         print_lerobot_export(
             run_dir,
             output_dir=args.export_dir,
@@ -3263,6 +3611,7 @@ if __name__ == "__main__":
             overwrite=args.export_overwrite,
             require_standard=args.export_require_standard,
             require_vla=args.export_require_vla,
+            time_policy=export_time_policy,
         )
         did_action = True
     if args.analysis:

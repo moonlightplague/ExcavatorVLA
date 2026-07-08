@@ -1892,901 +1892,15 @@ def safe_copy_file(src: str, dst: str) -> bool:
     return True
 
 
+def _require_shared_dataset_tool(name: str):
+    tool = getattr(shared_dataset_tools, name, None) if shared_dataset_tools is not None else None
+    if tool is None:
+        raise RuntimeError(f"shared VLA exporter unavailable: excavator_dataset_tools.{name}")
+    return tool
+
+
 def infer_export_fps(run_dir: Union[str, os.PathLike], explicit_fps: Optional[float] = None) -> float:
-    if explicit_fps is not None and float(explicit_fps) > 0:
-        return float(explicit_fps)
-    camera_config = read_json(os.path.join(str(run_dir), "camera_config.json"), default={}) or {}
-    try:
-        fps = float(camera_config.get("frequency", 10) or 10)
-        if fps > 0:
-            return fps
-    except Exception:
-        pass
-    return 10.0
-
-
-def lerobot_task_text(sample: dict, episode_meta: dict) -> str:
-    for value in [
-        sample.get("task"),
-        episode_meta.get("task"),
-        episode_meta.get("dataset_task_text"),
-    ]:
-        text = str(value or "").strip()
-        if text:
-            return text
-    return "Dig soil from the marked area and dump it into the target container."
-
-
-def try_write_parquet(rows: Sequence[dict], path: str) -> Tuple[bool, str]:
-    if not rows:
-        return False, "no_rows"
-    try:
-        import pyarrow as pa  # type: ignore
-        import pyarrow.parquet as pq  # type: ignore
-    except Exception as exc:
-        return False, f"pyarrow_unavailable:{type(exc).__name__}:{exc}"
-    try:
-        ensure_dir(os.path.dirname(path) or ".")
-        table = pa.Table.from_pylist(list(rows))
-        pq.write_table(table, path)
-        return True, "ok"
-    except Exception as exc:
-        return False, f"parquet_write_failed:{type(exc).__name__}:{exc}"
-
-
-def try_write_dataframe_parquet(df, path: str, index: bool = False) -> Tuple[bool, str]:
-    try:
-        ensure_dir(os.path.dirname(path) or ".")
-        df.to_parquet(path, index=index)
-        return True, "ok"
-    except Exception as exc:
-        return False, f"dataframe_parquet_write_failed:{type(exc).__name__}:{exc}"
-
-
-def resize_rgb_frame(frame, target_size: Optional[Tuple[int, int]] = None):
-    if target_size is None:
-        return frame
-    height, width = int(frame.shape[0]), int(frame.shape[1])
-    target_width, target_height = int(target_size[0]), int(target_size[1])
-    channels = int(frame.shape[2]) if len(frame.shape) >= 3 else 1
-    if width == target_width and height == target_height and channels == 3:
-        return frame
-    try:
-        from PIL import Image  # type: ignore
-    except Exception as exc:
-        raise RuntimeError(f"pillow_unavailable_for_resize:{type(exc).__name__}:{exc}") from exc
-    image = Image.fromarray(frame)
-    if image.mode != "RGB":
-        image = image.convert("RGB")
-    resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
-    image = image.resize((target_width, target_height), resample)
-    try:
-        import numpy as np  # type: ignore
-    except Exception as exc:
-        raise RuntimeError(f"numpy_unavailable_for_resize:{type(exc).__name__}:{exc}") from exc
-    return np.asarray(image)
-
-
-def _call_frame_progress(progress_callback, done: int, total: int, message: str) -> None:
-    if not progress_callback:
-        return
-    try:
-        progress_callback(int(done), int(max(1, total)), str(message or ""))
-    except Exception:
-        pass
-
-
-def _frame_progress_interval(total: int) -> int:
-    # Around 120 updates at most per stream.  This keeps the dashboard responsive
-    # without spamming the HTTP job state for large video exports.
-    return max(1, int(max(1, total) // 120))
-
-
-def try_encode_mp4_imageio(
-    image_paths: Sequence[str],
-    output_path: str,
-    fps: float,
-    target_size: Optional[Tuple[int, int]] = None,
-    progress_callback=None,
-    progress_label: str = "",
-) -> Tuple[bool, str]:
-    try:
-        import imageio.v2 as imageio  # type: ignore
-    except Exception as exc:
-        return False, f"imageio_unavailable:{type(exc).__name__}:{exc}"
-    total = len(image_paths)
-    interval = _frame_progress_interval(total)
-    try:
-        ensure_dir(os.path.dirname(output_path) or ".")
-        writer = imageio.get_writer(output_path, fps=float(fps), codec="libx264", quality=8, macro_block_size=1)
-        try:
-            for frame_i, image_path in enumerate(image_paths, 1):
-                writer.append_data(resize_rgb_frame(imageio.imread(image_path), target_size=target_size))
-                if frame_i == 1 or frame_i == total or frame_i % interval == 0:
-                    _call_frame_progress(
-                        progress_callback,
-                        frame_i,
-                        total,
-                        f"encoding {progress_label or os.path.basename(os.path.dirname(output_path))} with imageio: {frame_i}/{total}",
-                    )
-        finally:
-            writer.close()
-        return True, "ok"
-    except Exception as exc:
-        return False, f"imageio_mp4_failed:{type(exc).__name__}:{exc}"
-
-
-def try_encode_mp4_cv2(
-    image_paths: Sequence[str],
-    output_path: str,
-    fps: float,
-    target_size: Optional[Tuple[int, int]] = None,
-    progress_callback=None,
-    progress_label: str = "",
-) -> Tuple[bool, str]:
-    try:
-        import cv2  # type: ignore
-    except Exception as exc:
-        return False, f"cv2_unavailable:{type(exc).__name__}:{exc}"
-    total = len(image_paths)
-    interval = _frame_progress_interval(total)
-    try:
-        first = cv2.imread(str(image_paths[0]), cv2.IMREAD_COLOR)
-        if first is None:
-            return False, "cv2_first_frame_unreadable"
-        height, width = int(first.shape[0]), int(first.shape[1])
-        if target_size is not None:
-            width, height = int(target_size[0]), int(target_size[1])
-        ensure_dir(os.path.dirname(output_path) or ".")
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(output_path, fourcc, float(fps), (width, height))
-        if not writer.isOpened():
-            return False, "cv2_writer_not_opened"
-        try:
-            for frame_i, image_path in enumerate(image_paths, 1):
-                frame = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-                if frame is None:
-                    return False, f"cv2_frame_unreadable:{image_path}"
-                if int(frame.shape[1]) != width or int(frame.shape[0]) != height:
-                    frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
-                writer.write(frame)
-                if frame_i == 1 or frame_i == total or frame_i % interval == 0:
-                    _call_frame_progress(
-                        progress_callback,
-                        frame_i,
-                        total,
-                        f"encoding {progress_label or os.path.basename(os.path.dirname(output_path))} with cv2: {frame_i}/{total}",
-                    )
-        finally:
-            writer.release()
-        return True, "ok"
-    except Exception as exc:
-        return False, f"cv2_mp4_failed:{type(exc).__name__}:{exc}"
-
-
-def encode_mp4(
-    image_paths: Sequence[str],
-    output_path: str,
-    fps: float,
-    target_size: Optional[Tuple[int, int]] = None,
-    progress_callback=None,
-    progress_label: str = "",
-) -> Tuple[bool, str, str]:
-    if not image_paths:
-        return False, "none", "no_images"
-    missing = [path for path in image_paths if not path or not os.path.isfile(path)]
-    if missing:
-        return False, "none", f"missing_images:{len(missing)}"
-    ok, reason = try_encode_mp4_imageio(
-        image_paths,
-        output_path,
-        fps,
-        target_size=target_size,
-        progress_callback=progress_callback,
-        progress_label=progress_label,
-    )
-    if ok:
-        return True, "imageio", reason
-    first_reason = reason
-    ok, reason = try_encode_mp4_cv2(
-        image_paths,
-        output_path,
-        fps,
-        target_size=target_size,
-        progress_callback=progress_callback,
-        progress_label=progress_label,
-    )
-    if ok:
-        return True, "cv2", reason
-    return False, "none", f"{first_reason}; {reason}"
-
-
-def copy_image_fallback(
-    image_paths: Sequence[str],
-    export_dir: str,
-    image_key: str,
-    rows: List[dict],
-) -> Tuple[bool, str, List[str]]:
-    if not image_paths:
-        return False, "no_images", []
-    missing = [path for path in image_paths if not path or not os.path.isfile(path)]
-    if missing:
-        return False, f"missing_images:{len(missing)}", []
-    target_dir = os.path.join(export_dir, "images", "chunk-000", image_key, "file-000")
-    copied = []
-    for frame_index, src in enumerate(image_paths):
-        ext = os.path.splitext(src)[1].lower() or ".png"
-        dst = os.path.join(target_dir, f"{frame_index:06d}{ext}")
-        if not safe_copy_file(src, dst):
-            return False, f"copy_failed:{src}", copied
-        rel = relpath_posix(dst, export_dir)
-        rows[frame_index][image_key] = rel
-        copied.append(rel)
-    return True, "ok", copied
-
-
-def merge_image_storage(current: str, new_value: str) -> str:
-    current = str(current or "none")
-    new_value = str(new_value or "none")
-    if current == "none":
-        return new_value
-    if current == new_value:
-        return current
-    return "mixed"
-
-
-def vector_stats_for_rows(rows: Sequence[dict], key: str, dim: int) -> Dict[str, object]:
-    vectors = []
-    for row in rows:
-        vec = vector_or_none(row.get(key), dim)
-        if vec is not None:
-            vectors.append(vec)
-    if not vectors:
-        return {"count": [0]}
-    count = len(vectors)
-    mins = [float("inf")] * dim
-    maxs = [float("-inf")] * dim
-    sums = [0.0] * dim
-    sums_sq = [0.0] * dim
-    for vec in vectors:
-        for index, value in enumerate(vec):
-            mins[index] = min(mins[index], value)
-            maxs[index] = max(maxs[index], value)
-            sums[index] += value
-            sums_sq[index] += value * value
-    means = [value / count for value in sums]
-    stds = []
-    for index in range(dim):
-        variance = max(0.0, (sums_sq[index] / count) - (means[index] * means[index]))
-        std = math.sqrt(variance)
-        stds.append(1.0 if std < 1.0e-6 else std)
-    return {
-        "count": [count],
-        "mean": means,
-        "std": stds,
-        "min": mins,
-        "max": maxs,
-    }
-
-
-def scalar_stats_for_rows(rows: Sequence[dict], key: str) -> Dict[str, object]:
-    values = []
-    for row in rows:
-        value = row.get(key)
-        try:
-            values.append(float(value))
-        except Exception:
-            continue
-    if not values:
-        return {"count": [0]}
-    count = len(values)
-    minv = min(values)
-    maxv = max(values)
-    meanv = sum(values) / max(1, count)
-    mean_sq = sum(value * value for value in values) / max(1, count)
-    std = math.sqrt(max(0.0, mean_sq - meanv * meanv))
-    if std < 1.0e-6:
-        std = 1.0
-    return {
-        "count": [count],
-        "mean": [meanv],
-        "std": [std],
-        "min": [minv],
-        "max": [maxv],
-    }
-
-
-def visual_identity_stats() -> Dict[str, object]:
-    return {
-        "count": [0],
-        "mean": [0.485, 0.456, 0.406],
-        "std": [0.229, 0.224, 0.225],
-        "min": [0.0, 0.0, 0.0],
-        "max": [1.0, 1.0, 1.0],
-    }
-
-
-def build_lerobot_v3_stats(
-    rows: Sequence[dict],
-    state_dim: int,
-    action_dim: int,
-    effort_dim: Optional[int] = None,
-    image_keys: Optional[Sequence[str]] = None,
-) -> Dict[str, object]:
-    stats = {
-        "observation.state": vector_stats_for_rows(rows, "observation.state", state_dim),
-        "action": vector_stats_for_rows(rows, "action", action_dim),
-    }
-    if effort_dim is not None and effort_dim > 0:
-        stats["observation.effort"] = vector_stats_for_rows(rows, "observation.effort", effort_dim)
-    for key in ["timestamp", "frame_index", "episode_index", "index", "task_index"]:
-        stats[key] = scalar_stats_for_rows(rows, key)
-    for key in (list(image_keys) if image_keys is not None else LEROBOT_IMAGE_KEYS):
-        stats[str(key)] = visual_identity_stats()
-    return stats
-
-
-def lerobot_v3_required_paths(export_dir: str, image_keys: Sequence[str]) -> List[str]:
-    required = [
-        os.path.join(export_dir, "meta", "info.json"),
-        os.path.join(export_dir, "meta", "tasks.parquet"),
-        os.path.join(export_dir, "meta", "episodes", "chunk-000", "file-000.parquet"),
-        os.path.join(export_dir, "data", "chunk-000", "file-000.parquet"),
-    ]
-    for key in image_keys:
-        required.append(os.path.join(export_dir, "videos", key, "chunk-000", "file-000.mp4"))
-    return required
-
-
-def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Dict[str, object]:
-    required = lerobot_v3_required_paths(export_dir, image_keys)
-    missing = [relpath_posix(path, export_dir) for path in required if not os.path.exists(path)]
-    info = read_json(os.path.join(export_dir, "meta", "info.json"), default={}) or {}
-    reasons = []
-    if missing:
-        reasons.append(f"missing:{','.join(missing)}")
-    if info.get("codebase_version") != LEROBOT_CODEBASE_VERSION:
-        reasons.append("info/codebase_version_not_v3")
-    if info.get("video_path") != "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4":
-        reasons.append("info/video_path_not_v3")
-    if info.get("data_path") != "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet":
-        reasons.append("info/data_path_not_v3")
-    features = info.get("features", {}) if isinstance(info.get("features"), dict) else {}
-    stats = read_json(os.path.join(export_dir, "meta", "stats.json"), default={}) or {}
-    if not isinstance(stats, dict):
-        reasons.append("stats/not_dict")
-        stats = {}
-    if "task" in features:
-        reasons.append("info/features_contains_task")
-    required_stats = [
-        "observation.state",
-        "action",
-        "timestamp",
-        "frame_index",
-        "episode_index",
-        "index",
-        "task_index",
-    ]
-    if "observation.effort" in features:
-        required_stats.append("observation.effort")
-    for key in image_keys:
-        ft = features.get(key, {}) if isinstance(features.get(key), dict) else {}
-        if ft.get("dtype") != "video":
-            reasons.append(f"{key}/dtype_not_video")
-        if list(ft.get("shape", [])) != LEROBOT_IMAGE_SHAPE:
-            reasons.append(f"{key}/shape_not_256")
-        if "storage" in ft:
-            reasons.append(f"{key}/storage_should_be_absent")
-        required_stats.append(key)
-    for key in required_stats:
-        row = stats.get(key)
-        if not isinstance(row, dict):
-            reasons.append(f"stats/missing_{key}")
-            continue
-        for stat_name in ["mean", "std", "min", "max"]:
-            if stat_name not in row:
-                reasons.append(f"stats/{key}_missing_{stat_name}")
-    episodes_path = os.path.join(export_dir, "meta", "episodes", "chunk-000", "file-000.parquet")
-    if os.path.exists(episodes_path):
-        try:
-            import pandas as pd  # type: ignore
-
-            episodes_df = pd.read_parquet(episodes_path)
-            for key in image_keys:
-                for suffix in ["chunk_index", "file_index", "from_timestamp", "to_timestamp"]:
-                    column = f"videos/{key}/{suffix}"
-                    if column not in episodes_df.columns:
-                        reasons.append(f"episodes/missing_{column}")
-        except Exception as exc:
-            reasons.append(f"episodes/read_failed:{type(exc).__name__}:{exc}")
-    return {
-        "ok": not reasons,
-        "reasons": reasons,
-        "missing": missing,
-    }
-
-
-def collect_lerobot_rows(
-    run_dir: Union[str, os.PathLike],
-    split: str = "trainable",
-    limit_episodes: Optional[int] = None,
-) -> Dict[str, object]:
-    run_dir = str(run_dir)
-    if is_dashboard_success_pool_dir(run_dir):
-        reconcile_success_pool_indexes(run_dir, recover_orphan_folders=True)
-    episode_rows = load_index(run_dir, split)
-    if limit_episodes is not None:
-        episode_rows = episode_rows[: max(0, int(limit_episodes))]
-    run_meta = read_json(os.path.join(run_dir, "run_meta.json"), default={}) or {}
-    state_names = run_meta.get("state_names") or [
-        "base_x",
-        "base_y",
-        "base_yaw",
-        "swing",
-        "boom",
-        "arm",
-        "bucket",
-        "bucket_load_estimate",
-        "bucket_tip_x",
-        "bucket_tip_y",
-        "bucket_tip_z",
-        "bucket_load_x",
-        "bucket_load_y",
-        "bucket_load_z",
-    ]
-    action_names = run_meta.get("action_names") or [
-        "swing_cmd_velocity",
-        "boom_cmd_velocity",
-        "arm_cmd_velocity",
-        "bucket_cmd_velocity",
-    ]
-    effort_names = run_meta.get("effort_names") or [
-        "swing_measured_effort",
-        "boom_measured_effort",
-        "arm_measured_effort",
-        "bucket_measured_effort",
-    ]
-    rows = []
-    episodes = []
-    episode_stats = []
-    tasks_by_text: Dict[str, int] = {}
-    image_paths = {key: [] for key in LEROBOT_IMAGE_KEYS}
-    skipped_frames = 0
-    skipped_state_action_frames = 0
-    skipped_missing_camera_frames = 0
-    missing_camera_by_key: Counter = Counter()
-    missing_camera_examples: List[dict] = []
-    global_frame = 0
-    for source_episode_index, episode in enumerate(episode_rows):
-        trajectory = load_trajectory(episode)
-        episode_dir = episode_dir_from_row(episode)
-        meta = read_json(row_path_value(episode, "meta"), default={}) or {}
-        if not trajectory:
-            continue
-        export_episode_index = len(episodes)
-        first_t = safe_float_value(trajectory[0].get("t"), 0.0) or 0.0
-        episode_start_frame = global_frame
-        episode_length = 0
-        task_index = 0
-        task_text = ""
-        score = safe_float_value(episode.get("score"), None)
-        for sample in trajectory:
-            state = vector_or_none(sample.get("observation.state"), len(state_names))
-            if state is None:
-                state = vector_or_none(sample.get("obs.state"), len(state_names))
-            action = vector_or_none(sample.get("action"), len(action_names))
-            if state is None or action is None:
-                skipped_frames += 1
-                skipped_state_action_frames += 1
-                continue
-            resolved_images: Dict[str, Tuple[object, str]] = {}
-            missing_image_keys: List[str] = []
-            for key in LEROBOT_IMAGE_KEYS:
-                image_value = sample_image_value(sample, key)
-                abs_image = resolve_episode_file(episode_dir, image_value)
-                if abs_image and os.path.isfile(abs_image):
-                    resolved_images[key] = (image_value, abs_image)
-                else:
-                    missing_image_keys.append(key)
-                    missing_camera_by_key[key] += 1
-            if missing_image_keys:
-                skipped_frames += 1
-                skipped_missing_camera_frames += 1
-                if len(missing_camera_examples) < 20:
-                    missing_camera_examples.append(
-                        {
-                            "source_episode_index": int(source_episode_index),
-                            "raw_episode_index": episode.get("episode_index"),
-                            "raw_episode_id": episode.get("episode_id", ""),
-                            "raw_sample_index": sample.get("i"),
-                            "phase": str(sample.get("phase", "")),
-                            "missing": list(missing_image_keys),
-                        }
-                    )
-                continue
-            effort = vector_or_none(sample.get("observation.effort"), len(effort_names))
-            task_text = lerobot_task_text(sample, meta)
-            if task_text not in tasks_by_text:
-                tasks_by_text[task_text] = len(tasks_by_text)
-            task_index = tasks_by_text[task_text]
-            sample_t = safe_float_value(sample.get("t"), first_t) or first_t
-            row = {
-                "index": global_frame,
-                "episode_index": export_episode_index,
-                "frame_index": episode_length,
-                "timestamp": float(sample_t - first_t),
-                "task_index": int(task_index),
-                "task": task_text,
-                "observation.state": state,
-                "action": action,
-                "observation.effort": effort,
-                "phase": str(sample.get("phase", "")),
-                "raw_episode_index": episode.get("episode_index"),
-                "raw_episode_id": episode.get("episode_id", sample.get("id", "")),
-                "raw_sample_index": sample.get("i"),
-            }
-            for key in LEROBOT_IMAGE_KEYS:
-                image_value, abs_image = resolved_images[key]
-                image_paths[key].append(abs_image)
-                row[key] = image_value
-                row[f"{key}.available"] = True
-            rows.append(row)
-            episode_length += 1
-            global_frame += 1
-        if episode_length <= 0:
-            continue
-        episodes.append(
-            {
-                "episode_index": export_episode_index,
-                "tasks": [int(task_index)],
-                "length": int(episode_length),
-                "raw_episode_index": episode.get("episode_index"),
-                "raw_episode_id": episode.get("episode_id", ""),
-                "status": episode.get("status", ""),
-                "score": score,
-                "from_frame": int(episode_start_frame),
-                "to_frame": int(episode_start_frame + episode_length),
-            }
-        )
-        episode_stats.append(
-            {
-                "episode_index": export_episode_index,
-                "length": int(episode_length),
-                "score": score,
-                "max_bucket_from_pile_particles": episode.get("max_bucket_from_pile_particles"),
-                "lift_bucket_from_pile_particles": episode.get("lift_bucket_from_pile_particles"),
-                "final_bin_from_pile_particles": episode.get("final_bin_from_pile_particles"),
-                "final_spill_from_pile_particles": episode.get("final_spill_from_pile_particles"),
-                "freeze_count": episode.get("freeze_count"),
-            }
-        )
-    tasks = [{"task_index": index, "task": text} for text, index in sorted(tasks_by_text.items(), key=lambda item: item[1])]
-    return {
-        "rows": rows,
-        "episodes": episodes,
-        "episode_stats": episode_stats,
-        "tasks": tasks,
-        "image_paths": image_paths,
-        "state_names": state_names,
-        "action_names": action_names,
-        "effort_names": effort_names,
-        "run_meta": run_meta,
-        "skipped_frames": skipped_frames,
-        "skipped_state_action_frames": skipped_state_action_frames,
-        "skipped_missing_camera_frames": skipped_missing_camera_frames,
-        "missing_camera_by_key": dict(missing_camera_by_key),
-        "missing_camera_examples": missing_camera_examples,
-        "source_episode_count": len(episode_rows),
-    }
-
-
-def _legacy_export_lerobot_dataset(
-    run_dir: Union[str, os.PathLike],
-    output_dir: Optional[Union[str, os.PathLike]] = None,
-    split: str = "trainable",
-    fps: Optional[float] = None,
-    limit_episodes: Optional[int] = None,
-    overwrite: bool = False,
-    require_standard: bool = False,
-    require_vla: bool = False,
-    progress_callback=None,
-) -> Dict[str, object]:
-    def progress(percent: float, message: str, current: Optional[int] = None, total: Optional[int] = None) -> None:
-        if not progress_callback:
-            return
-        try:
-            progress_callback(float(max(0.0, min(100.0, percent))), str(message or ""), current, total)
-        except Exception:
-            pass
-
-    run_dir = os.path.abspath(str(run_dir))
-    progress(1.0, "checking source run folder")
-    if not os.path.isdir(run_dir):
-        raise FileNotFoundError(run_dir)
-    export_dir = os.path.abspath(str(output_dir or os.path.join(run_dir, LEROBOT_DEFAULT_EXPORT_DIRNAME)))
-    progress(2.0, "preparing export directory")
-    if os.path.exists(export_dir):
-        if not overwrite:
-            raise FileExistsError(f"{export_dir} already exists; pass --export-overwrite to rebuild it")
-        if os.path.normcase(export_dir) == os.path.normcase(run_dir):
-            raise ValueError("refusing to overwrite run_dir as export_dir")
-        shutil.rmtree(export_dir)
-    ensure_dir(export_dir)
-
-    try:
-        import pandas as pd  # type: ignore
-    except Exception as exc:
-        raise RuntimeError(f"pandas is required for strict LeRobot v3 export: {type(exc).__name__}:{exc}") from exc
-
-    progress(5.0, "collecting trainable rows and validating camera files")
-    collected = collect_lerobot_rows(run_dir, split=split, limit_episodes=limit_episodes)
-    rows: List[dict] = list(collected["rows"])  # type: ignore[arg-type]
-    if not rows:
-        raise ValueError(f"no exportable frames found for split={split}")
-
-    meta_dir = ensure_dir(os.path.join(export_dir, "meta"))
-    data_dir = ensure_dir(os.path.join(export_dir, "data", "chunk-000"))
-    episodes_dir = ensure_dir(os.path.join(meta_dir, "episodes", "chunk-000"))
-    ensure_dir(os.path.join(export_dir, "videos"))
-
-    export_fps = int(round(infer_export_fps(run_dir, fps)))
-    if export_fps <= 0:
-        export_fps = 10
-    video_results = {}
-    image_features = list(LEROBOT_IMAGE_KEYS)
-    image_paths: Dict[str, List[str]] = collected["image_paths"]  # type: ignore[assignment]
-    image_frame_counts = {key: len(image_paths.get(key, []) or []) for key in image_features}
-    image_missing_file_counts = {
-        key: len([path for path in (image_paths.get(key, []) or []) if not path or not os.path.isfile(path)])
-        for key in image_features
-    }
-    progress(12.0, "camera preflight: " + ", ".join(f"{key}={image_frame_counts.get(key, 0)}" for key in image_features))
-    for camera_i, key in enumerate(image_features):
-        paths = image_paths.get(key, [])
-        start_percent = 15.0 + camera_i * 20.0
-        end_percent = 15.0 + (camera_i + 1) * 20.0
-        if not paths or not any(paths):
-            video_results[key] = {"available": False, "reason": "no_images", "frames": 0}
-            progress(end_percent, f"{key}: no images")
-            continue
-        video_path = os.path.join(export_dir, "videos", key, "chunk-000", "file-000.mp4")
-
-        def camera_progress(done: int, total: int, message: str, _start=start_percent, _end=end_percent):
-            ratio = float(done) / float(max(1, total))
-            progress(_start + (_end - _start) * ratio, message, int(done), int(max(1, total)))
-
-        progress(start_percent, f"encoding {key}: 0/{len(paths)}", 0, len(paths))
-        ok, encoder, reason = encode_mp4(
-            paths,
-            video_path,
-            export_fps,
-            target_size=(LEROBOT_IMAGE_SHAPE[1], LEROBOT_IMAGE_SHAPE[0]),
-            progress_callback=camera_progress,
-            progress_label=key,
-        )
-        if ok:
-            video_results[key] = {
-                "available": True,
-                "encoder": encoder,
-                "path": relpath_posix(video_path, export_dir),
-                "frames": len(paths),
-                "shape": LEROBOT_IMAGE_SHAPE,
-            }
-            progress(end_percent, f"encoded {key}: {len(paths)} frames", len(paths), len(paths))
-            continue
-        video_results[key] = {
-            "available": False,
-            "reason": reason,
-            "frames": len(paths),
-        }
-        progress(end_percent, f"{key}: video encode failed: {reason}", len(paths), len(paths))
-
-    progress(78.0, "building parquet tables and metadata")
-    tasks = collected["tasks"]
-    episodes = collected["episodes"]
-    state_names = list(collected["state_names"])  # type: ignore[arg-type]
-    action_names = list(collected["action_names"])  # type: ignore[arg-type]
-    effort_names = list(collected.get("effort_names", []))  # type: ignore[arg-type]
-    effort_dim = len(effort_names)
-    effort_available = bool(
-        effort_dim > 0
-        and rows
-        and all(vector_or_none(row.get("observation.effort"), effort_dim) is not None for row in rows)
-    )
-    task_text_by_index = {int(task["task_index"]): str(task["task"]) for task in tasks}  # type: ignore[index]
-
-    data_rows = []
-    for row in rows:
-        frame_index = int(row["frame_index"])
-        data_row = {
-            "index": int(row["index"]),
-            "episode_index": int(row["episode_index"]),
-            "frame_index": frame_index,
-            "timestamp": float(frame_index) / float(export_fps),
-            "task_index": int(row["task_index"]),
-            "observation.state": row["observation.state"],
-            "action": row["action"],
-        }
-        if effort_available:
-            data_row["observation.effort"] = row["observation.effort"]
-        data_rows.append(data_row)
-    parquet_path = os.path.join(data_dir, "file-000.parquet")
-    data_df = pd.DataFrame(data_rows)
-    parquet_ok, parquet_reason = try_write_dataframe_parquet(data_df, parquet_path, index=False)
-    progress(82.0, "wrote data parquet" if parquet_ok else f"data parquet failed: {parquet_reason}")
-
-    tasks_path = os.path.join(meta_dir, "tasks.parquet")
-    tasks_df = pd.DataFrame(
-        {"task_index": [int(task["task_index"]) for task in tasks]},  # type: ignore[index]
-        index=pd.Index([str(task["task"]) for task in tasks]),  # type: ignore[index]
-    )
-    tasks_ok, tasks_reason = try_write_dataframe_parquet(tasks_df, tasks_path, index=True)
-    progress(84.0, "wrote tasks parquet" if tasks_ok else f"tasks parquet failed: {tasks_reason}")
-
-    episode_meta_rows = []
-    for episode in episodes:  # type: ignore[assignment]
-        task_indices = [int(value) for value in episode.get("tasks", [])]
-        episode_task_texts = [task_text_by_index.get(index, "") for index in task_indices]
-        start = int(episode.get("from_frame", 0))
-        end = int(episode.get("to_frame", start + int(episode.get("length", 0))))
-        meta_row = {
-            "episode_index": int(episode.get("episode_index", 0)),
-            "tasks": episode_task_texts,
-            "length": int(episode.get("length", 0)),
-            "dataset_from_index": start,
-            "dataset_to_index": end,
-            "meta/episodes/chunk_index": 0,
-            "meta/episodes/file_index": 0,
-            "data/chunk_index": 0,
-            "data/file_index": 0,
-        }
-        for key in LEROBOT_IMAGE_KEYS:
-            meta_row[f"videos/{key}/chunk_index"] = 0
-            meta_row[f"videos/{key}/file_index"] = 0
-            meta_row[f"videos/{key}/from_timestamp"] = float(start) / float(export_fps)
-            meta_row[f"videos/{key}/to_timestamp"] = float(end) / float(export_fps)
-        episode_meta_rows.append(meta_row)
-    episodes_path = os.path.join(episodes_dir, "file-000.parquet")
-    episodes_df = pd.DataFrame(episode_meta_rows)
-    episodes_ok, episodes_reason = try_write_dataframe_parquet(episodes_df, episodes_path, index=False)
-    progress(86.0, "wrote episode metadata" if episodes_ok else f"episode metadata failed: {episodes_reason}")
-
-    features = {
-        "observation.state": {
-            "dtype": "float32",
-            "shape": [len(state_names)],
-            "names": state_names,
-        },
-        "action": {
-            "dtype": "float32",
-            "shape": [len(action_names)],
-            "names": action_names,
-        },
-        "timestamp": {"dtype": "float32", "shape": [1], "names": None},
-        "frame_index": {"dtype": "int64", "shape": [1], "names": None},
-        "episode_index": {"dtype": "int64", "shape": [1], "names": None},
-        "index": {"dtype": "int64", "shape": [1], "names": None},
-        "task_index": {"dtype": "int64", "shape": [1], "names": None},
-    }
-    if effort_available:
-        features["observation.effort"] = {
-            "dtype": "float32",
-            "shape": [effort_dim],
-            "names": effort_names,
-        }
-    for key in image_features:
-        features[key] = {
-            "dtype": "video",
-            "shape": list(LEROBOT_IMAGE_SHAPE),
-            "names": ["height", "width", "channels"],
-        }
-
-    info = {
-        "codebase_version": LEROBOT_CODEBASE_VERSION,
-        "robot_type": "excavator",
-        "total_episodes": len(episodes),
-        "total_frames": len(data_rows),
-        "total_tasks": len(tasks),
-        "chunks_size": 1000,
-        "data_files_size_in_mb": 100,
-        "video_files_size_in_mb": 200,
-        "fps": export_fps,
-        "splits": {"train": f"0:{len(episodes)}"},
-        "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
-        "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
-        "features": features,
-    }
-    write_json(os.path.join(meta_dir, "info.json"), info)
-    progress(90.0, "wrote info.json")
-
-    stats = build_lerobot_v3_stats(
-        data_rows,
-        len(state_names),
-        len(action_names),
-        effort_dim if effort_available else None,
-        image_features,
-    )
-    write_json(os.path.join(meta_dir, "stats.json"), stats)
-    progress(93.0, "wrote stats.json")
-
-    video_ready = all(video_results.get(key, {}).get("available") is True for key in image_features)
-    parquet_ready = bool(parquet_ok and tasks_ok and episodes_ok)
-    progress(95.0, "validating LeRobot/VLA export")
-    validation = validate_lerobot_v3_export(export_dir, image_features)
-    vla_training_ready = bool(parquet_ready and video_ready and validation["ok"])
-    manifest = {
-        "schema": LEROBOT_EXPORT_SCHEMA,
-        "codebase_version": LEROBOT_CODEBASE_VERSION,
-        "export_dir": export_dir,
-        "source_run_dir": run_dir,
-        "source_split": split,
-        "created_at": time.time(),
-        "standard_lerobot_ready": vla_training_ready,
-        "state_action_ready": bool(parquet_ok),
-        "effort_available": bool(effort_available),
-        "vla_training_ready": vla_training_ready,
-        "parquet": {
-            "data_available": parquet_ok,
-            "tasks_available": tasks_ok,
-            "episodes_available": episodes_ok,
-            "path": relpath_posix(parquet_path, export_dir) if parquet_ok else None,
-            "data_reason": parquet_reason,
-            "tasks_reason": tasks_reason,
-            "episodes_reason": episodes_reason,
-        },
-        "videos": video_results,
-        "image_frame_counts": image_frame_counts,
-        "image_missing_file_counts": image_missing_file_counts,
-        "validation": validation,
-        "fps": export_fps,
-        "total_frames": len(data_rows),
-        "total_episodes": len(episodes),
-        "total_tasks": len(tasks),
-        "skipped_frames": collected["skipped_frames"],
-        "skipped_state_action_frames": collected.get("skipped_state_action_frames", 0),
-        "skipped_missing_camera_frames": collected.get("skipped_missing_camera_frames", 0),
-        "missing_camera_by_key": collected.get("missing_camera_by_key", {}),
-        "missing_camera_examples": collected.get("missing_camera_examples", []),
-        "notes": [
-            "Original auto-collection debug data remains outside this subfolder.",
-            "This folder follows the LeRobot v3.0 offline layout for VLA/SmolVLA training.",
-            "Camera streams are observation.images.0, observation.images.1, observation.images.2.",
-            "Rows missing any camera frame are skipped during export so state/action/video stay aligned.",
-            "If vla_training_ready is false, install pandas/pyarrow plus a video encoder, then rerun the exporter.",
-        ],
-    }
-    write_json(os.path.join(export_dir, "manifest.json"), manifest)
-    readme = [
-        "# Excavator LeRobot v3 Export",
-        "",
-        f"Source run: `{run_dir}`",
-        f"Split: `{split}`",
-        f"Frames: `{len(data_rows)}`",
-        f"Episodes: `{len(episodes)}`",
-        f"FPS: `{export_fps}`",
-        f"LeRobot v3 / VLA ready: `{vla_training_ready}`",
-        "",
-        "This subfolder is generated from the raw auto-collection run and keeps trainable data separate from debug logs.",
-        "",
-        "Files:",
-        "- `meta/info.json`: feature schema and dataset totals",
-        "- `meta/tasks.parquet`: task text index to task_index mapping",
-        "- `meta/episodes/chunk-000/file-000.parquet`: episode metadata and video/data chunk indices",
-        "- `meta/stats.json`: state/action/effort/scalar statistics plus video normalization entries",
-        "- `data/chunk-000/file-000.parquet`: frame table",
-        "- `observation.effort` is included in the frame table only when Isaac measured joint efforts were available for every exported frame.",
-        "- `videos/observation.images.0/chunk-000/file-000.mp4`: camera 0 stream",
-        "- `videos/observation.images.1/chunk-000/file-000.mp4`: camera 1 stream",
-        "- `videos/observation.images.2/chunk-000/file-000.mp4`: camera 2 stream",
-        "",
-    ]
-    write_text(os.path.join(export_dir, "README.md"), "\n".join(readme))
-    progress(98.0, "VLA export ready" if vla_training_ready else "VLA export incomplete; see manifest.validation")
-    if require_standard and not vla_training_ready:
-        raise RuntimeError(f"LeRobot export incomplete: {json.dumps(manifest, ensure_ascii=True)}")
-    if require_vla and not vla_training_ready:
-        raise RuntimeError(f"VLA export incomplete: {json.dumps(manifest, ensure_ascii=True)}")
-    return manifest
+    return float(_require_shared_dataset_tool("infer_export_fps")(run_dir, explicit_fps))
 
 
 def export_lerobot_dataset(
@@ -2799,11 +1913,9 @@ def export_lerobot_dataset(
     require_standard: bool = False,
     require_vla: bool = False,
     progress_callback=None,
+    time_policy: object = None,
 ) -> Dict[str, object]:
-    shared_exporter = getattr(shared_dataset_tools, "export_lerobot_dataset", None) if shared_dataset_tools is not None else None
-    if shared_exporter is None:
-        raise RuntimeError("shared VLA exporter unavailable: excavator_dataset_tools.export_lerobot_dataset")
-    return shared_exporter(
+    return _require_shared_dataset_tool("export_lerobot_dataset")(
         run_dir,
         output_dir=output_dir,
         split=split,
@@ -2813,6 +1925,7 @@ def export_lerobot_dataset(
         require_standard=require_standard,
         require_vla=require_vla,
         progress_callback=progress_callback,
+        time_policy=time_policy,
     )
 
 
@@ -2825,6 +1938,7 @@ def print_lerobot_export(
     overwrite: bool = False,
     require_standard: bool = False,
     require_vla: bool = False,
+    time_policy: object = None,
 ) -> None:
     result = export_lerobot_dataset(
         run_dir,
@@ -2835,13 +1949,13 @@ def print_lerobot_export(
         overwrite=overwrite,
         require_standard=require_standard,
         require_vla=require_vla,
+        time_policy=time_policy,
     )
     try:
         write_json(os.path.join(os.path.abspath(str(run_dir)), "lerobot_v3_export.json"), result)
     except Exception:
         pass
     print("[LEROBOT EXPORT]", json.dumps(result, ensure_ascii=True, indent=2))
-
 
 def nested_dict_value(data: object, path: Sequence[str], default=None):
     cur = data
@@ -2955,8 +2069,8 @@ def sample_has_state_action(sample: dict) -> bool:
 def sample_has_required_cameras(sample: dict) -> bool:
     if not isinstance(sample, dict):
         return False
-    # For dashboard-level triage we check whether camera fields are present; export still
-    # does the stricter file-exists check in collect_lerobot_rows().
+    # Dashboard triage checks whether camera fields are present; the shared exporter
+    # performs the stricter file-exists validation.
     return all(bool(sample_image_value(sample, key)) for key in LEROBOT_IMAGE_KEYS)
 
 
@@ -4326,6 +3440,8 @@ def normalize_export_time_policy(policy: object) -> Dict[str, object]:
     if not math.isfinite(speed_scale) or speed_scale <= 0:
         speed_scale = 1.0
     mode = str(data.get("time_mode") or "uniform_fps").strip() or "uniform_fps"
+    if mode not in {"uniform_fps", "scaled_raw"}:
+        mode = "uniform_fps"
     base_fps_value = data.get("base_fps", None)
     try:
         base_fps = float(base_fps_value) if base_fps_value not in (None, "") else None
@@ -4366,6 +3482,116 @@ def load_dashboard_export_time_policy(run_dir: Union[str, os.PathLike]) -> Dict[
         "policy": normalized,
         "hash": export_time_policy_hash(normalized),
         "is_default": export_time_policy_is_default(normalized),
+    }
+
+
+def save_dashboard_export_time_policy(run_dir: Union[str, os.PathLike], policy: object = None) -> Dict[str, object]:
+    run_abs = os.path.abspath(str(run_dir))
+    normalized = normalize_export_time_policy(policy)
+    path = dashboard_export_time_policy_path(run_abs)
+    ensure_dir(os.path.dirname(path))
+    write_json(path, normalized)
+    with FRAME_CONTEXT_CACHE_LOCK:
+        FRAME_CONTEXT_CACHE.clear()
+    return {
+        "ok": True,
+        "path": path,
+        "exists": True,
+        "policy": normalized,
+        "hash": export_time_policy_hash(normalized),
+        "is_default": export_time_policy_is_default(normalized),
+    }
+
+
+def dashboard_effective_export_fps(run_dir: Union[str, os.PathLike], policy: object = None, explicit_fps: Optional[float] = None) -> float:
+    normalized = normalize_export_time_policy(policy)
+    try:
+        base = infer_export_fps(run_dir, explicit_fps)
+        return float(_require_shared_dataset_tool("effective_export_fps")(base, normalized))
+    except Exception:
+        return 10.0 * float(normalized.get("speed_scale") or 1.0)
+
+
+def dashboard_time_policy_for_run(run_dir: Union[str, os.PathLike]) -> Dict[str, object]:
+    if not is_dashboard_success_pool_dir(run_dir):
+        return {
+            "path": dashboard_export_time_policy_path(run_dir),
+            "exists": False,
+            "policy": default_export_time_policy(),
+            "hash": export_time_policy_hash(default_export_time_policy()),
+            "is_default": True,
+        }
+    return load_dashboard_export_time_policy(run_dir)
+
+
+def dashboard_apply_export_time_policy(
+    run_dir: Union[str, os.PathLike],
+    trajectory: Sequence[dict],
+    row: Optional[dict] = None,
+) -> Dict[str, object]:
+    info = dashboard_time_policy_for_run(run_dir)
+    policy = dict(info.get("policy") or default_export_time_policy())
+    try:
+        run_meta = read_json(os.path.join(os.path.abspath(str(run_dir)), "run_meta.json"), default={}) or {}
+        if row is not None:
+            try:
+                episode_dir = episode_dir_from_row(row, run_dir=run_dir)
+                episode_meta = read_json(resolve_episode_file(episode_dir, row_path_value(row, "meta")), default={}) or {}
+                if isinstance(episode_meta.get("run_meta"), dict):
+                    run_meta.update(episode_meta.get("run_meta") or {})
+            except Exception:
+                pass
+        base_fps = infer_export_fps(run_dir, policy.get("base_fps"))
+        result = _require_shared_dataset_tool("apply_export_time_policy_to_trajectory")(
+            trajectory,
+            policy=policy,
+            base_fps=base_fps,
+            state_names=run_meta.get("state_names"),
+            action_names=run_meta.get("action_names"),
+        )
+        out = dict(result)
+        out["time_policy"] = policy
+        out["time_policy_hash"] = export_time_policy_hash(policy)
+        out["base_fps"] = float(out.get("base_fps") or base_fps or 10.0)
+        out["effective_fps"] = float(out.get("effective_fps") or dashboard_effective_export_fps(run_dir, policy, explicit_fps=base_fps))
+        out["is_default"] = bool(info.get("is_default"))
+        out["path"] = info.get("path", "")
+        return out
+    except Exception as exc:
+        return {
+            "samples": list(trajectory or []),
+            "time_policy": policy,
+            "time_policy_hash": export_time_policy_hash(policy),
+            "base_fps": 10.0,
+            "effective_fps": dashboard_effective_export_fps(run_dir, policy),
+            "duration_s": trajectory_runtime_s(trajectory),
+            "raw_duration_s": trajectory_runtime_s(trajectory),
+            "error": f"{type(exc).__name__}: {exc}",
+            "is_default": bool(info.get("is_default")),
+            "path": info.get("path", ""),
+        }
+
+
+def dashboard_export_time_runtime(run_dir: Union[str, os.PathLike], trajectory: Sequence[dict]) -> Dict[str, object]:
+    info = dashboard_time_policy_for_run(run_dir)
+    policy = dict(info.get("policy") or default_export_time_policy())
+    speed = float(policy.get("speed_scale") or 1.0)
+    raw_duration = trajectory_runtime_s(trajectory)
+    effective_fps_value = dashboard_effective_export_fps(run_dir, policy)
+    if not trajectory:
+        duration = 0.0
+    elif policy.get("time_mode") == "scaled_raw":
+        duration = raw_duration / max(0.001, speed)
+    else:
+        duration = float(max(0, len(trajectory) - 1)) / float(max(0.001, effective_fps_value))
+    return {
+        "policy": policy,
+        "time_policy_hash": export_time_policy_hash(policy),
+        "effective_fps": effective_fps_value,
+        "base_fps": policy.get("base_fps"),
+        "duration_s": float(duration),
+        "raw_duration_s": float(raw_duration),
+        "is_default": bool(info.get("is_default")),
     }
 
 
@@ -5154,6 +4380,7 @@ def dashboard_export_success_pool(
     overwrite: bool = True,
     fps: Optional[float] = None,
     require_vla: bool = False,
+    time_policy: object = None,
     progress_callback=None,
 ) -> Dict[str, object]:
     root = os.path.abspath(str(dataset_root or "excavator_auto_dataset"))
@@ -5175,6 +4402,7 @@ def dashboard_export_success_pool(
     if not rows:
         raise ValueError(f"no success pool trainable rows found: {pool_dir}")
     progress(4.0, f"success pool rows={len(rows)}; recovered={reconcile_result.get('recovered_orphan_folders', 0)}")
+    policy_info = save_dashboard_export_time_policy(pool_dir, time_policy if time_policy is not None else load_dashboard_export_time_policy(pool_dir).get("policy", {}))
     final_export_dir = os.path.join(pool_dir, LEROBOT_DEFAULT_EXPORT_DIRNAME)
     staging_export_dir = unique_path(os.path.join(pool_dir, f".{LEROBOT_DEFAULT_EXPORT_DIRNAME}_staging_{time.strftime('%Y%m%d_%H%M%S')}"))
     try:
@@ -5191,6 +4419,7 @@ def dashboard_export_success_pool(
             require_standard=False,
             require_vla=require_vla,
             reuse_from_dir=final_export_dir if os.path.isdir(final_export_dir) else None,
+            time_policy=policy_info.get("policy"),
             progress_callback=progress,
         )
         progress(99.0, "publishing final lerobot_v3 folder")
@@ -5203,6 +4432,8 @@ def dashboard_export_success_pool(
         result["export_dir"] = final_export_dir
         result["staging_export_dir"] = staging_export_dir
         result["success_pool_reconcile"] = reconcile_result
+        result["time_policy"] = policy_info.get("policy")
+        result["time_policy_hash"] = policy_info.get("hash")
         write_json(os.path.join(final_export_dir, "manifest.json"), result)
         progress(100.0, "VLA export complete", 1, 1)
         return result
@@ -5213,7 +4444,13 @@ def dashboard_export_success_pool(
         raise
 
 
-def dashboard_start_success_pool_export_job(dataset_root: Union[str, os.PathLike], overwrite: bool = True, fps: Optional[float] = None, require_vla: bool = True) -> Dict[str, object]:
+def dashboard_start_success_pool_export_job(
+    dataset_root: Union[str, os.PathLike],
+    overwrite: bool = True,
+    fps: Optional[float] = None,
+    require_vla: bool = True,
+    time_policy: object = None,
+) -> Dict[str, object]:
     root = os.path.abspath(str(dataset_root or "excavator_auto_dataset"))
 
     def worker(job_id: str):
@@ -5227,7 +4464,7 @@ def dashboard_start_success_pool_export_job(dataset_root: Union[str, os.PathLike
             )
 
         progress(0.0, "starting .dashboard_success VLA export", 0, 100)
-        result = dashboard_export_success_pool(root, overwrite=overwrite, fps=fps, require_vla=require_vla, progress_callback=progress)
+        result = dashboard_export_success_pool(root, overwrite=overwrite, fps=fps, require_vla=require_vla, time_policy=time_policy, progress_callback=progress)
         if require_vla and not result.get("vla_training_ready"):
             raise RuntimeError(f"VLA export incomplete: {json.dumps(result, ensure_ascii=True)}")
         return result
@@ -5391,13 +4628,19 @@ def clone_jsonable(data: object) -> object:
     return json.loads(json.dumps(data, ensure_ascii=True, default=str))
 
 
-def cached_dashboard_run_payload(run_dir: str, signature: Dict[str, object]) -> Optional[Dict[str, object]]:
+def cached_dashboard_run_payload(run_dir: str, signature: Dict[str, object], timing_ms: Optional[Dict[str, float]] = None) -> Optional[Dict[str, object]]:
     signature_hash = str(signature.get("signature_hash") or "")
     cache_key = os.path.normcase(os.path.abspath(str(run_dir or "")))
+    t0 = time.perf_counter()
     with RUN_PAYLOAD_CACHE_LOCK:
         cached = RUN_PAYLOAD_MEMORY_CACHE.get(cache_key)
+    if timing_ms is not None:
+        timing_ms["memory_cache_ms"] = round((time.perf_counter() - t0) * 1000.0, 3)
     if isinstance(cached, dict) and cached.get("signature_hash") == signature_hash and isinstance(cached.get("payload"), dict):
+        t_clone = time.perf_counter()
         payload = clone_jsonable(cached.get("payload"))  # type: ignore[assignment]
+        if timing_ms is not None:
+            timing_ms["memory_clone_ms"] = round((time.perf_counter() - t_clone) * 1000.0, 3)
         if isinstance(payload, dict):
             payload["analysis_cache"] = {
                 "hit": True,
@@ -5405,10 +4648,14 @@ def cached_dashboard_run_payload(run_dir: str, signature: Dict[str, object]) -> 
                 "signature_hash": signature_hash,
                 "cache_path": cached.get("cache_path", ""),
                 "created_at": cached.get("created_at", 0.0),
+                "timing_ms": dict(timing_ms or {}),
             }
             return payload
     cache_path = dashboard_run_payload_cache_path(run_dir)
+    t_disk = time.perf_counter()
     disk = read_json(cache_path, default={}) or {}
+    if timing_ms is not None:
+        timing_ms["disk_cache_read_ms"] = round((time.perf_counter() - t_disk) * 1000.0, 3)
     if (
         isinstance(disk, dict)
         and int(disk.get("version", 0) or 0) == RUN_PAYLOAD_CACHE_VERSION
@@ -5417,7 +4664,10 @@ def cached_dashboard_run_payload(run_dir: str, signature: Dict[str, object]) -> 
     ):
         with RUN_PAYLOAD_CACHE_LOCK:
             RUN_PAYLOAD_MEMORY_CACHE[cache_key] = dict(disk)
+        t_clone = time.perf_counter()
         payload = clone_jsonable(disk.get("payload"))  # type: ignore[assignment]
+        if timing_ms is not None:
+            timing_ms["disk_clone_ms"] = round((time.perf_counter() - t_clone) * 1000.0, 3)
         if isinstance(payload, dict):
             payload["analysis_cache"] = {
                 "hit": True,
@@ -5425,6 +4675,7 @@ def cached_dashboard_run_payload(run_dir: str, signature: Dict[str, object]) -> 
                 "signature_hash": signature_hash,
                 "cache_path": cache_path,
                 "created_at": disk.get("created_at", 0.0),
+                "timing_ms": dict(timing_ms or {}),
             }
             return payload
     return None
@@ -5470,13 +4721,28 @@ def dashboard_run_payload_uncached(run_dir: Union[str, os.PathLike]) -> Dict[str
     tag_by_episode = {}
     skip_reason_by_episode = {}
     runtime_by_episode = {}
+    time_policy_by_episode = {}
+    success_pool_mode = is_dashboard_success_pool_dir(run_dir)
     for row in rows:
         trajectory = load_trajectory(row)
         tag, reason = dataset_training_tag_for_row(row, trajectory)
         key = str(row.get("episode_index"))
         tag_by_episode[key] = tag
         skip_reason_by_episode[key] = reason if tag == "skip" else ""
-        runtime_by_episode[key] = estimate_row_runtime_s(row, trajectory)
+        if success_pool_mode and trajectory:
+            transformed = dashboard_export_time_runtime(run_dir, trajectory)
+            runtime_by_episode[key] = float(transformed.get("duration_s") or 0.0)
+            time_policy_by_episode[key] = {
+                "policy": transformed.get("policy", default_export_time_policy()),
+                "time_policy_hash": transformed.get("time_policy_hash", ""),
+                "effective_fps": transformed.get("effective_fps"),
+                "base_fps": transformed.get("base_fps"),
+                "duration_s": transformed.get("duration_s"),
+                "raw_duration_s": transformed.get("raw_duration_s"),
+                "error": transformed.get("error", ""),
+            }
+        else:
+            runtime_by_episode[key] = estimate_row_runtime_s(row, trajectory)
     episodes = []
     for row in rows:
         key = str(row.get("episode_index"))
@@ -5486,6 +4752,8 @@ def dashboard_run_payload_uncached(run_dir: Union[str, os.PathLike]) -> Dict[str
             dataset_skip_reason=skip_reason_by_episode.get(key, ""),
             runtime_s=runtime_by_episode.get(key),
         )
+        if key in time_policy_by_episode:
+            episode["export_time_policy"] = time_policy_by_episode.get(key)
         if is_dashboard_success_pool_dir(run_dir):
             episode.update(dashboard_row_export_status(row, success_export_lookup))
         episodes.append(episode)
@@ -5524,14 +4792,29 @@ def dashboard_run_payload_uncached(run_dir: Union[str, os.PathLike]) -> Dict[str
 
 def dashboard_run_payload(run_dir: Union[str, os.PathLike], force_refresh: bool = False) -> Dict[str, object]:
     run_dir = os.path.abspath(str(run_dir))
+    timing_ms: Dict[str, float] = {}
+    total_t0 = time.perf_counter()
     if not force_refresh:
+        signature_t0 = time.perf_counter()
         signature = dashboard_run_payload_signature(run_dir)
-        cached = cached_dashboard_run_payload(run_dir, signature)
+        timing_ms["signature_ms"] = round((time.perf_counter() - signature_t0) * 1000.0, 3)
+        cached = cached_dashboard_run_payload(run_dir, signature, timing_ms=timing_ms)
         if cached is not None:
+            cache = cached.get("analysis_cache") if isinstance(cached, dict) else None
+            if isinstance(cache, dict):
+                timing_ms["total_ms"] = round((time.perf_counter() - total_t0) * 1000.0, 3)
+                cache["timing_ms"] = dict(timing_ms)
             return cached
+    rebuild_t0 = time.perf_counter()
     payload = dashboard_run_payload_uncached(run_dir)
+    timing_ms["rebuild_ms"] = round((time.perf_counter() - rebuild_t0) * 1000.0, 3)
+    signature_t0 = time.perf_counter()
     signature = dashboard_run_payload_signature(run_dir)
+    timing_ms["post_rebuild_signature_ms"] = round((time.perf_counter() - signature_t0) * 1000.0, 3)
+    save_t0 = time.perf_counter()
     cache_path = save_dashboard_run_payload_cache(run_dir, signature, payload)
+    timing_ms["cache_save_ms"] = round((time.perf_counter() - save_t0) * 1000.0, 3)
+    timing_ms["total_ms"] = round((time.perf_counter() - total_t0) * 1000.0, 3)
     payload["analysis_cache"] = {
         "hit": False,
         "source": "rebuilt",
@@ -5539,6 +4822,7 @@ def dashboard_run_payload(run_dir: Union[str, os.PathLike], force_refresh: bool 
         "cache_path": cache_path,
         "created_at": time.time(),
         "force_refresh": bool(force_refresh),
+        "timing_ms": dict(timing_ms),
     }
     return payload
 
@@ -6110,8 +5394,10 @@ def dashboard_episode_payload(
     selected, _rows = dashboard_find_episode_row(run_dir, episode_index)
     if selected is None:
         return {"ok": False, "reason": f"episode_not_found:{episode_index}", "run_dir": run_dir}
-    trajectory = load_trajectory(selected)
-    if not trajectory:
+    raw_trajectory = load_trajectory(selected)
+    time_transform = dashboard_apply_export_time_policy(run_dir, raw_trajectory, selected)
+    trajectory = list(time_transform.get("samples") or raw_trajectory)
+    if not raw_trajectory:
         episode = dashboard_episode_summary(selected, dataset_tag="skip", dataset_skip_reason="trajectory_empty", runtime_s=0.0)
         empty_series = {
             "t": [], "phase": [], "bucket_from_pile": [], "bucket_total": [], "bucket_mass": [],
@@ -6129,6 +5415,7 @@ def dashboard_episode_payload(
             "joint_names": ["swing", "boom", "arm", "bucket"],
             "series": empty_series,
             "camera_preview": {"frame_count": 0, "initial_frame_index": 0, "cameras": [], "frames": []},
+            "time_policy": time_transform,
         }
     episode_meta = {}
     try:
@@ -6138,6 +5425,15 @@ def dashboard_episode_payload(
         episode_meta = {}
     episode_summary = dashboard_episode_summary(selected, runtime_s=trajectory_runtime_s(trajectory))
     episode_summary["task_prompt"] = dashboard_episode_task_prompt(selected, trajectory=trajectory, episode_meta=episode_meta)
+    episode_summary["export_time_policy"] = {
+        "policy": time_transform.get("time_policy", default_export_time_policy()),
+        "time_policy_hash": time_transform.get("time_policy_hash", ""),
+        "base_fps": time_transform.get("base_fps"),
+        "effective_fps": time_transform.get("effective_fps"),
+        "duration_s": time_transform.get("duration_s"),
+        "raw_duration_s": time_transform.get("raw_duration_s"),
+        "error": time_transform.get("error", ""),
+    }
     first_t = safe_float_value(trajectory[0].get("t"), 0.0) or 0.0
     frame_context = dashboard_store_frame_context(dashboard_build_frame_context(run_dir, episode_index, selected, trajectory))
     indices = downsample_indices(len(trajectory), max_points)
@@ -6183,6 +5479,7 @@ def dashboard_episode_payload(
         "stage_spans": contiguous_stage_spans(trajectory, first_t),
         "joint_names": ["swing", "boom", "arm", "bucket"],
         "series": series,
+        "time_policy": episode_summary["export_time_policy"],
         "camera_preview": build_episode_camera_preview(
             selected,
             trajectory,
@@ -6272,9 +5569,9 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
 .cameraPlayerBtn:hover{background:#f8fafc}
 .cameraPlayerBtn.primary{background:#175cd3;border-color:#175cd3;color:#fff;min-width:58px}
 .cameraPlayerBtn.primary.playing{background:#b42318;border-color:#b42318}
-.cameraPlayerSpeed{height:28px;border:1px solid #d0d5dd;border-radius:8px;background:#fff;color:#344054;font-size:12px;font-weight:700;padding:0 6px}
 .cameraGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
 .cameraCard{border:1px solid #dbe3ee;border-radius:10px;background:#fff;overflow:hidden;min-width:0}
+.cameraCard.loading img{opacity:.74}
 .cameraCardHeader{display:flex;justify-content:space-between;gap:8px;padding:7px 8px;border-bottom:1px solid #eef2f6;font-size:11px;color:#475467}
 .cameraCardTitle{font-weight:850;color:#101828}
 .cameraCard img{display:block;width:min(100%,256px);max-width:256px;aspect-ratio:1/1;object-fit:contain;background:#0f172a;margin:0 auto}
@@ -6294,6 +5591,7 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
 
 .terminalPanel{margin-bottom:14px}.terminalPanel .panelHeader,.rawAttemptPanel .panelHeader{margin-bottom:8px}.terminalActions,.rawAttemptActions{display:flex;align-items:center;gap:8px}.terminalBox{max-height:180px;min-height:72px}.rawAttemptActions:after{content:"debug only";font-size:12px;color:#667085}
 .epCellInner{display:inline-flex;align-items:center;gap:6px}.exportReadyDot{width:8px;height:8px;border-radius:999px;display:inline-block;box-shadow:0 0 0 2px #fff,0 0 0 3px #d0d5dd;flex:0 0 auto}.exportReadyDot.ready{background:#12b76a;box-shadow:0 0 0 2px #fff,0 0 0 3px rgba(18,183,106,.35)}.exportReadyDot.notReady{background:#f04438;box-shadow:0 0 0 2px #fff,0 0 0 3px rgba(240,68,56,.32)}.exportReadyDot.stale{background:#f79009;box-shadow:0 0 0 2px #fff,0 0 0 3px rgba(247,144,9,.34)}.exportReadyDot.unknown{background:#98a2b3}
+.modalOverlay{position:fixed;inset:0;z-index:1000;background:rgba(15,23,42,.48);display:none;align-items:center;justify-content:center;padding:18px}.modalOverlay.open{display:flex}.modalOverlay.loading{cursor:wait}.modalCard{width:min(560px,calc(100vw - 36px));background:#fff;border:1px solid #d0d5dd;border-radius:14px;box-shadow:0 24px 72px rgba(16,24,40,.32);padding:16px;color:#101828}.modalOverlay.loading .modalCard{box-shadow:0 24px 72px rgba(16,24,40,.36),0 0 0 3px rgba(23,92,211,.14)}.modalCard h2{margin:0 0 4px}.modalIntro{font-size:12px;color:#667085;line-height:1.45;margin:0 0 12px}.modalGrid{display:grid;grid-template-columns:150px minmax(0,1fr);gap:9px 10px;align-items:center}.modalGrid input,.modalGrid select{width:100%}.modalNote{margin-top:10px;border:1px solid #eaecf0;border-radius:10px;background:#f8fafc;padding:9px 10px;font-size:12px;color:#475467;line-height:1.45}.modalActions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-top:14px}.modalActions .danger{background:#b42318;border-color:#b42318;color:#fff}body.dark .modalCard{background:#0f172a;border-color:#334155;color:#e5e7eb}body.dark .modalNote{background:#111827;border-color:#334155;color:#94a3b8}
 body main details>summary:after,.managerPanel>summary:after,.detailsPanel>summary:after{content:""!important;width:10px!important;height:10px!important;border:0!important;border-right:2px solid #667085!important;border-bottom:2px solid #667085!important;border-radius:0!important;padding:0!important;background:transparent!important;transform:rotate(-45deg);transition:transform .2s ease;flex:0 0 auto;margin-top:4px}body main details[open]>summary:after,.managerPanel[open]>summary:after,.detailsPanel[open]>summary:after{content:""!important;transform:rotate(45deg);margin-top:7px}
 
 </style>
@@ -6437,6 +5735,28 @@ body main details>summary:after,.managerPanel>summary:after,.detailsPanel>summar
     <pre id="rawBox" class="codeBox">{}</pre>
   </section>
 </main>
+<div id="exportTimeModal" class="modalOverlay" role="dialog" aria-modal="true" aria-labelledby="exportTimeTitle">
+  <div class="modalCard">
+    <h2 id="exportTimeTitle">VLA export time scale</h2>
+    <p class="modalIntro">Set the training-time playback speed before exporting. Preview applies the same timestamp/action/dq/ddq recomputation used by the exporter.</p>
+    <div class="modalGrid">
+      <label for="exportSpeedScaleInput">Speed scale</label>
+      <input id="exportSpeedScaleInput" type="number" min="0.01" step="0.1" value="1">
+      <label for="exportTimeModeSelect">Time mode</label>
+      <select id="exportTimeModeSelect">
+        <option value="uniform_fps">Uniform export FPS</option>
+        <option value="scaled_raw">Scaled raw timestamps</option>
+      </select>
+    </div>
+    <div id="exportTimePolicyPreview" class="modalNote">1x export uses the original timeline.</div>
+    <div class="modalActions">
+      <button type="button" class="secondary" id="cancelExportTimeBtn">Cancel</button>
+      <button type="button" class="secondary" id="resetTimePolicyBtn">Reset 1x</button>
+      <button type="button" class="secondary" id="applyTimePreviewBtn">Apply preview</button>
+      <button type="button" id="exportTimeNowBtn">Export now</button>
+    </div>
+  </div>
+</div>
 <script>
 
 const jointNames = ["swing","boom","arm","bucket"];
@@ -6459,9 +5779,15 @@ let cameraFrameIndex = 0;
 let cameraPreviewTimer = null;
 let cameraPlayerTimer = null;
 let cameraPlayerPlaying = false;
-let cameraPlayerFps = 10;
+const CAMERA_PLAYER_FIXED_FPS = 10;
+let cameraPreviewLoadSeq = 0;
+const cameraFrameImageCache = new Map();
+const cameraFrameImageCacheOrder = [];
+const cameraFrameImageCacheLimit = 360;
 let darkModeEnabled = false;
 let timelineDragState = {active:false, svg:null, moved:false, suppressClick:false};
+let exportTimeModalOpen = false;
+let currentExportTimePolicy = {version:1, speed_scale:1.0, time_mode:"uniform_fps", base_fps:null};
 
 function $(id){return document.getElementById(id)}
 function esc(s){return String(s ?? "").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]))}
@@ -6478,6 +5804,101 @@ function terminalWrite(text, cls="muted"){
 function setStatus(text, cls="muted"){const el=$("status"); if(el){el.className=cls; el.textContent=text} terminalWrite(text,cls)}
 async function api(path, params){const qs=new URLSearchParams(params||{}); const r=await fetch(path+"?"+qs.toString()); if(!r.ok) throw new Error(await r.text()); return await r.json()}
 async function postJSON(path, payload){let r; try{r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload||{})});}catch(err){throw new Error(`Failed to fetch ${path}: ${err.message||err}`);} if(!r.ok) throw new Error(await r.text()); return await r.json()}
+function normalizeExportTimePolicyJS(policy){
+  const p=policy&&typeof policy==="object"?policy:{};
+  let speed=Number(p.speed_scale);
+  if(!Number.isFinite(speed)||speed<=0) speed=1;
+  let mode=String(p.time_mode||"uniform_fps");
+  if(!["uniform_fps","scaled_raw"].includes(mode)) mode="uniform_fps";
+  let base=p.base_fps;
+  base=(base===null||base===undefined||base==="")?null:Number(base);
+  if(base!==null && (!Number.isFinite(base)||base<=0)) base=null;
+  return {version:1, speed_scale:speed, time_mode:mode, base_fps:base};
+}
+function currentRunTimePolicyInfo(){
+  const info=(((currentRun||{}).diagnosis||{}).success_export||{}).current_time_policy;
+  if(info&&typeof info==="object") return info;
+  return {policy:{version:1,speed_scale:1,time_mode:"uniform_fps",base_fps:null},hash:"",is_default:true};
+}
+function fillExportTimePolicyInputs(policy){
+  const p=normalizeExportTimePolicyJS(policy);
+  currentExportTimePolicy=p;
+  const speed=$("exportSpeedScaleInput"), mode=$("exportTimeModeSelect");
+  if(speed) speed.value=String(p.speed_scale);
+  if(mode) mode.value=p.time_mode;
+  updateExportTimePolicyPreview();
+}
+function readExportTimePolicyInputs(){
+  return normalizeExportTimePolicyJS({
+    speed_scale:$("exportSpeedScaleInput")?.value,
+    time_mode:$("exportTimeModeSelect")?.value,
+    base_fps:null
+  });
+}
+function exportTimePolicyText(policy, effectiveFps){
+  const p=normalizeExportTimePolicyJS(policy);
+  const eff=Number(effectiveFps);
+  return `${fmt(p.speed_scale,3)}x, mode=${p.time_mode}${Number.isFinite(eff)?`, effective_fps=${fmt(eff,3)}`:""}`;
+}
+function updateExportTimePolicyPreview(extra){
+  const p=readExportTimePolicyInputs();
+  currentExportTimePolicy=p;
+  const base=Number(p.base_fps);
+  const effective=(Number.isFinite(base)&&base>0)?base*p.speed_scale:null;
+  const el=$("exportTimePolicyPreview");
+  if(el){
+    el.textContent=(extra?`${extra} `:"")+`Preview/export policy: ${exportTimePolicyText(p,effective)}. Timestamps are rewritten; joint velocity, acceleration and action are recomputed from the rewritten timeline.`;
+  }
+}
+function showExportTimeModal(){
+  syncSuccessPoolPath();
+  const info=currentRunTimePolicyInfo();
+  fillExportTimePolicyInputs((info&&info.policy)||currentExportTimePolicy);
+  const modal=$("exportTimeModal");
+  if(modal){modal.classList.add("open"); exportTimeModalOpen=true;}
+}
+function hideExportTimeModal(){
+  const modal=$("exportTimeModal");
+  if(modal){modal.classList.remove("open"); exportTimeModalOpen=false;}
+}
+function setExportModalBusy(busy, message){
+  const modal=$("exportTimeModal");
+  if(modal) modal.classList.toggle("loading",!!busy);
+  ["cancelExportTimeBtn","resetTimePolicyBtn","applyTimePreviewBtn","exportTimeNowBtn","exportSpeedScaleInput","exportTimeModeSelect"].forEach(id=>{
+    const el=$(id); if(el) el.disabled=!!busy;
+  });
+  const apply=$("applyTimePreviewBtn");
+  if(apply) apply.textContent=busy?"Applying...":"Apply preview";
+  const exportNow=$("exportTimeNowBtn");
+  if(exportNow) exportNow.textContent=busy?"Working...":"Export now";
+  if(message) updateExportTimePolicyPreview(message);
+}
+async function saveExportTimePolicyForPreview(reset=false, reload=true){
+  syncSuccessPoolPath();
+  const policy=reset?{speed_scale:1,time_mode:"uniform_fps",base_fps:null}:readExportTimePolicyInputs();
+  const result=await postJSON("/api/manage/export_time_policy", {root:$("rootInput").value, reset:!!reset, time_policy:policy});
+  currentExportTimePolicy=normalizeExportTimePolicyJS(result.policy||policy);
+  fillExportTimePolicyInputs(currentExportTimePolicy);
+  updateExportTimePolicyPreview(`Saved.`);
+  if(!reload) return result;
+  $("runInput").value=result.pool_dir||successPoolPath();
+  await loadRun(true);
+  if(currentEpisodeIndex!==null && currentEpisodeIndex!==undefined){
+    await loadEpisode(currentEpisodeIndex);
+  }
+  return result;
+}
+async function applyTimePreviewAndClose(){
+  setExportModalBusy(true,"Applying preview...");
+  try{
+    await saveExportTimePolicyForPreview(false, true);
+    setExportModalBusy(false,"Preview applied.");
+    hideExportTimeModal();
+  }catch(err){
+    setExportModalBusy(false,"Preview failed.");
+    throw err;
+  }
+}
 function finite(v){return typeof v==="number" && Number.isFinite(v)}
 function number(v){const n=Number(v); return Number.isFinite(n)?n:null}
 function numeric(values){return (values||[]).map(v=>Number(v)).filter(v=>Number.isFinite(v))}
@@ -6614,7 +6035,7 @@ function renderRunManager(runs){
   const summary=$("managerSummary");
   if(summary) summary.textContent=`folders=${runs.length}; selected=${selected}; 0-success=${zero.length}; success>0=${successRuns.length}; catch-up=${catchupRuns.length}; cached/displayed size=${humanBytes(totalSize)} · sizes are cache-first; refresh selected for exact scan`;
   if(!runs.length){table.innerHTML='<tbody><tr><td class="muted">no run folders</td></tr></tbody>';return;}
-  const rows=[`<thead><tr><th><input type="checkbox" onchange="toggleAllRuns(this.checked)"></th><th>State</th><th>Run</th><th>Catch-up</th><th class="num">Attempts</th><th class="num">Success</th><th class="num">Trainable</th><th class="num">Rejected</th><th class="num">Failed</th><th>Run size</th><th>data* size</th><th>Latest write</th></tr></thead><tbody>`];
+  const rows=[`<thead><tr><th><input type="checkbox" data-action="toggle-all-runs"></th><th>State</th><th>Run</th><th>Catch-up</th><th class="num">Attempts</th><th class="num">Success</th><th class="num">Trainable</th><th class="num">Rejected</th><th class="num">Failed</th><th>Run size</th><th>data* size</th><th>Latest write</th></tr></thead><tbody>`];
   for(const run of runs){
     const activity=run.activity||{};
     const state=activity.state||"unknown";
@@ -6625,9 +6046,9 @@ function renderRunManager(runs){
     const catchup=run.success_catchup || {};
     const catchupText=catchup.active ? `success-index · raw all=${((catchup.raw_counts||{}).all ?? 0)} raw trainable=${((catchup.raw_counts||{}).trainable ?? 0)}` : "normal";
     rows.push(`<tr>
-      <td><input type="checkbox" ${checked} onchange="toggleRunSelection(${esc(JSON.stringify(run.path))}, this.checked)"></td>
+      <td><input type="checkbox" ${checked} data-action="toggle-run-selection" data-run-path="${esc(run.path)}"></td>
       <td title="${esc(activeTitle)}"><span class="activityDot ${esc(state)}"></span> ${esc(state)}</td>
-      <td class="nameCell" title="${esc(run.path)}"><button type="button" class="linkBtn" onclick="chooseRun(${esc(JSON.stringify(run.path))})">${esc(run.name)}</button></td>
+      <td class="nameCell" title="${esc(run.path)}"><button type="button" class="linkBtn" data-action="choose-run" data-run-path="${esc(run.path)}">${esc(run.name)}</button></td>
       <td title="${esc(catchup.message||catchup.reason||'')}">${catchup.active?'<span class="pill diagnostic">catch-up</span>':'<span class="muted">normal</span>'}<div class="muted">${esc(catchupText)}</div></td>
       <td class="num">${esc(run.attempts ?? "-")}</td>
       <td class="num ${successCls}">${esc(success)}</td>
@@ -6709,22 +6130,28 @@ async function loadSuccessPool(){
   await loadRun();
 }
 async function exportSuccessPool(){
+  showExportTimeModal();
+}
+async function exportSuccessPoolWithPolicy(){
   syncSuccessPoolPath();
   const root=$('rootInput').value;
   const pool=successPoolPath();
-  if(!confirm(`Export .dashboard_success to LeRobot/VLA?\n\nSource:\n${pool}\n\nOutput will be rebuilt at:\n${joinOne(pool,'lerobot_v3')}`)) return;
+  const policy=readExportTimePolicyInputs();
+  await saveExportTimePolicyForPreview(false, false);
+  hideExportTimeModal();
   setStatus('Starting .dashboard_success VLA export...');
   setTransferProgress('starting VLA export', 0, true);
-  const job=await postJSON('/api/manage/export_success_vla', {root, overwrite:true, require_vla:true});
+  const job=await postJSON('/api/manage/export_success_vla', {root, overwrite:true, require_vla:true, time_policy:policy});
   if(!job.job_id){throw new Error(job.error || 'export_success_vla job did not start');}
   await pollDashboardJob(job.job_id, async (result)=>{
     const videoSummary=Object.entries(result.videos||{}).map(([k,v])=>`${k}:${v&&v.available?'ok':'fail'}`).join(', ');
     const encoded=Number(result.encoded_video_jobs||0);
     const reused=Number(result.reused_video_jobs||0);
     const totalJobs=Number(result.total_video_jobs||0);
+    const policyText=exportTimePolicyText(result.time_policy||policy,result.effective_fps||result.fps);
     const jobSummary=totalJobs?`encoded=${encoded}, reused=${reused}/${totalJobs}`:`encoded=${encoded}, reused=${reused}`;
-    setTransferProgress(`Export complete: ${result.total_episodes||0} episodes, ${result.total_frames||0} frames, ${jobSummary}`, 100, false);
-    setStatus(`Export complete: ready=${!!result.vla_training_ready}; ${jobSummary}; videos=${videoSummary}; dir=${result.export_dir||''}`, result.vla_training_ready?'ok':'error');
+    setTransferProgress(`Export complete: ${result.total_episodes||0} episodes, ${result.total_frames||0} frames, ${jobSummary}, ${policyText}`, 100, false);
+    setStatus(`Export complete: ready=${!!result.vla_training_ready}; ${policyText}; ${jobSummary}; videos=${videoSummary}; dir=${result.export_dir||''}`, result.vla_training_ready?'ok':'error');
     $('runInput').value=pool;
     await loadRun(true);
   });
@@ -6742,7 +6169,7 @@ function renderRunMonitor(data){
   const subtitle=`<span class="muted">green = updated within ${ageText(windowS)}; recent=${recentCount}; idle=${idleCount}</span>`;
   const badges=activeRuns.map(run=>{
     const latest=run.latest_file ? ` · ${shortText(run.latest_file,42)}` : "";
-    return `<button type="button" class="runBadge active" onclick="chooseRun(${esc(JSON.stringify(run.path))})" title="${esc(run.path||"")}"><span class="activityDot active"></span>${esc(run.name||"")} <span class="muted">${esc(ageText(run.age_s))} · attempts=${esc(run.attempts ?? "-")} success=${esc(run.success ?? 0)} trainable=${esc(run.trainable ?? "-")} size=${esc(run.size_human||"-")}${esc(latest)}</span></button>`;
+    return `<button type="button" class="runBadge active" data-action="choose-run" data-run-path="${esc(run.path||"")}" title="${esc(run.path||"")}"><span class="activityDot active"></span>${esc(run.name||"")} <span class="muted">${esc(ageText(run.age_s))} · attempts=${esc(run.attempts ?? "-")} success=${esc(run.success ?? 0)} trainable=${esc(run.trainable ?? "-")} size=${esc(run.size_human||"-")}${esc(latest)}</span></button>`;
   }).join("");
   el.innerHTML=title + subtitle + (badges || `<span class="runBadge"><span class="activityDot idle"></span>no run folder updated recently</span>`);
 }
@@ -6756,15 +6183,32 @@ function chooseRun(path){
 async function loadRun(force=false){
   const runDir=$("runInput").value || $("runSelect").value;
   if(!runDir){setStatus("Choose a run folder first", "error"); return}
-  setStatus(force ? "Refreshing run analysis..." : "Loading run analysis cache...");
-  const data=await api("/api/run", {run_dir:runDir, force:force ? "1" : "0", _:Date.now()});
+  const started=performance.now();
+  setStatus(force ? "Refreshing run analysis..." : "Checking run analysis cache...");
+  const slowTimer=setTimeout(()=>setStatus(force ? "Still refreshing run analysis..." : "Still checking run analysis cache..."),1500);
+  const rebuildTimer=setTimeout(()=>setStatus("Cache miss or large run: rebuilding analysis cache..."),4200);
+  let data;
+  try{
+    data=await api("/api/run", {run_dir:runDir, force:force ? "1" : "0", _:Date.now()});
+  }finally{
+    clearTimeout(slowTimer);
+    clearTimeout(rebuildTimer);
+  }
+  const wallMs=performance.now()-started;
   currentRun=data; currentEpisodeIndex=null;
   renderRun(data);
   const cache=data.analysis_cache || {};
+  const timing=cache.timing_ms||{};
+  const timingBits=[];
+  if(Number.isFinite(Number(timing.signature_ms))) timingBits.push(`signature=${fmt(Number(timing.signature_ms),0)}ms`);
+  if(Number.isFinite(Number(timing.disk_cache_read_ms))) timingBits.push(`disk=${fmt(Number(timing.disk_cache_read_ms),0)}ms`);
+  if(Number.isFinite(Number(timing.memory_clone_ms))) timingBits.push(`clone=${fmt(Number(timing.memory_clone_ms),0)}ms`);
+  if(Number.isFinite(Number(timing.rebuild_ms))) timingBits.push(`rebuild=${fmt(Number(timing.rebuild_ms),0)}ms`);
+  const timingText=timingBits.length?` (${timingBits.join(", ")})`:` (${fmt(wallMs,0)}ms)`;
   if(cache.hit){
-    setStatus(`Run loaded from ${cache.source || "analysis"} cache`, "ok");
+    setStatus(`Run loaded from ${cache.source || "analysis"} cache${timingText}`, "ok");
   }else{
-    setStatus(force ? "Run refreshed and cached" : "Run analyzed and cached", "ok");
+    setStatus(`${force ? "Run refreshed and cached" : "Run analyzed and cached"}${timingText}`, "ok");
   }
   const eps=filteredEpisodes();
   if(eps.length) loadEpisode(eps[0].episode_index);
@@ -6899,7 +6343,7 @@ function setupStatusFilter(episodes){
   const buttons=[`<button class="filterBtn all active" data-status="__all__">All</button>`];
   for(const st of availableStatuses){const label=shortText(st,28); buttons.push(`<button class="filterBtn ${esc(st)} active" data-status="${esc(st)}" title="${esc(st)}"><span style="display:inline-block;width:8px;height:8px;border-radius:9px;background:${statusColor(st)};margin-right:5px"></span>${esc(label)} ${counts.get(st)||0}</button>`)}
   el.innerHTML=buttons.join("");
-  for(const btn of el.querySelectorAll(".filterBtn")){btn.onclick=()=>toggleStatusFilter(btn.dataset.status)}
+  for(const btn of el.querySelectorAll(".filterBtn")){btn.addEventListener("click",()=>toggleStatusFilter(btn.dataset.status))}
   updateFilterUI();
 }
 function statusOrder(s){return {trainable:1,success:2,rejected:3,failed:4,diagnostic:5,planning:6,skip:7,unknown:99}[statusKey(s)]||50}
@@ -6992,7 +6436,7 @@ function renderEpisodes(episodes){
   syncEpisodeInspectorHeight();
 }
 function episodeSortLabel(key){return ({episode_index:"Ep",time_s:"Time",score:"Score",max_bucket:"Bucket",lift_bucket:"Lift",final_bin:"Bin",final_spill:"Spill",robot_yaw:"Robot yaw",truck_yaw:"Truck yaw",samples:"Samples",freeze_count:"Freeze"})[key]||key}
-function sortHeader(key,label,cls=""){const arrow=episodeSort.key===key?(episodeSort.dir>0?" ▲":" ▼"):""; return `<th class="sortable ${esc(cls)}" onclick="sortEpisodes('${esc(key)}')" title="Click to sort by ${esc(label)}">${esc(label)}${arrow}</th>`}
+function sortHeader(key,label,cls=""){const arrow=episodeSort.key===key?(episodeSort.dir>0?" ▲":" ▼"):""; return `<th class="sortable ${esc(cls)}" data-action="sort-episodes" data-sort-key="${esc(key)}" title="Click to sort by ${esc(label)}">${esc(label)}${arrow}</th>`}
 function episodeTableHtml(rows){const head=`<thead><tr>${sortHeader("episode_index","Ep","epCol")}<th>Status</th>${sortHeader("time_s","Time","num")}${sortHeader("score","Score","num")}${sortHeader("max_bucket","Bucket","num")}${sortHeader("lift_bucket","Lift","num")}${sortHeader("final_bin","Bin","num")}${sortHeader("final_spill","Spill","num")}${sortHeader("robot_yaw","Robot yaw","num")}${sortHeader("truck_yaw","Truck yaw","num")}<th>Reason</th></tr></thead>`; const body=rows.map(ep=>episodeRowHtml(ep)).join(""); return `<table id="episodeTable" class="episodeDataSheet">${head}<tbody>${body}</tbody></table>`}
 function exportReadyState(ep){
   if(ep.export_status==="time_policy_mismatch") return {cls:"stale", title:`VLA export stale: time_policy mismatch - ${ep.export_reason||"re-export required"}`};
@@ -7000,7 +6444,7 @@ function exportReadyState(ep){
   if(ep.export_ready===false) return {cls:"notReady", title:`VLA export missing/not ready - ${ep.export_reason||"not exported or missing"}`};
   return {cls:"unknown", title:`VLA export unknown - ${ep.export_reason||"load .dashboard_success or export first"}`};
 }
-function episodeRowHtml(ep){const s=ep.scene||{}; const status=statusKey(ep.status); const reason=ep.reason||ep.warning_reason||""; const time=Number(ep.time_s); const timeText=Number.isFinite(time)?`${fmt(time,2)}s`:""; const exportState=exportReadyState(ep); const epCell=`<span class="epCellInner"><span>${esc(ep.episode_index)}</span><span class="exportReadyDot ${esc(exportState.cls)}" title="${esc(exportState.title)}"></span></span>`; return `<tr data-ep="${esc(ep.episode_index)}" onclick="loadEpisode('${esc(ep.episode_index)}')"><td class="epCol">${epCell}</td><td><span class="pill ${esc(status)}">${esc(status)}</span></td><td class="num">${esc(timeText)}</td><td class="num">${fmt(ep.score,1)}</td><td class="num">${esc(ep.max_bucket??"")}</td><td class="num">${esc(ep.lift_bucket??"")}</td><td class="num">${esc(ep.final_bin??"")}</td><td class="num">${esc(ep.final_spill??"")}</td><td class="num">${fmt(s.robot_body_yaw_deg,1)}</td><td class="num">${fmt(s.truck_yaw_deg,1)}</td><td class="reasonCell" title="${esc(reason)}">${esc(shortText(reason||"no reason",150))}</td></tr>`}
+function episodeRowHtml(ep){const s=ep.scene||{}; const status=statusKey(ep.status); const reason=ep.reason||ep.warning_reason||""; const time=Number(ep.time_s); const timeText=Number.isFinite(time)?`${fmt(time,2)}s`:""; const exportState=exportReadyState(ep); const epCell=`<span class="epCellInner"><span>${esc(ep.episode_index)}</span><span class="exportReadyDot ${esc(exportState.cls)}" title="${esc(exportState.title)}"></span></span>`; return `<tr data-ep="${esc(ep.episode_index)}"><td class="epCol">${epCell}</td><td><span class="pill ${esc(status)}">${esc(status)}</span></td><td class="num">${esc(timeText)}</td><td class="num">${fmt(ep.score,1)}</td><td class="num">${esc(ep.max_bucket??"")}</td><td class="num">${esc(ep.lift_bucket??"")}</td><td class="num">${esc(ep.final_bin??"")}</td><td class="num">${esc(ep.final_spill??"")}</td><td class="num">${fmt(s.robot_body_yaw_deg,1)}</td><td class="num">${fmt(s.truck_yaw_deg,1)}</td><td class="reasonCell" title="${esc(reason)}">${esc(shortText(reason||"no reason",150))}</td></tr>`}
 function sortEpisodes(key){if(episodeSort.key===key){episodeSort.dir*=-1}else{episodeSort={key,dir:key==="episode_index"?1:-1}} renderEpisodes(filteredEpisodes())}
 function sortValue(ep,key){if(key==="robot_yaw") return numericOrNull((ep.scene||{}).robot_body_yaw_deg); if(key==="truck_yaw") return numericOrNull((ep.scene||{}).truck_yaw_deg); return numericOrNull(ep[key])}
 function numericOrNull(v){const n=Number(v); return Number.isFinite(n)?n:null}
@@ -7008,6 +6452,11 @@ function markSelectedTab(index){document.querySelectorAll("#episodeTabs tr[data-
 
 function renderEpisode(data){
   const ep=data.episode||{}; $("episodeTitle").textContent=`Attempt ${ep.episode_index} timeline`; $("episodeMeta").textContent=`${statusKey(ep.status)} · score=${fmt(ep.score,1)} · samples=${data.sample_count} · shown=${data.returned_points} · ${shortText(ep.dataset_skip_reason || ep.reason||ep.warning_reason||"",260)}`; $("rawBox").textContent=JSON.stringify({episode:ep,stage_spans:data.stage_spans,camera_preview:data.camera_preview},null,2);
+  const tp=data.time_policy||ep.export_time_policy||{};
+  const tpPolicy=normalizeExportTimePolicyJS(tp.policy||tp.time_policy||{});
+  const tpInfo=`speed=${fmt(tpPolicy.speed_scale,3)}x${tp.effective_fps?`, fps=${fmt(tp.effective_fps,3)}`:""}`;
+  $("episodeMeta").textContent=`${statusKey(ep.status)} | score=${fmt(ep.score,1)} | samples=${data.sample_count} | shown=${data.returned_points} | ${tpInfo} | ${shortText(ep.dataset_skip_reason || ep.reason||ep.warning_reason||"",260)}`;
+  $("rawBox").textContent=JSON.stringify({episode:ep,time_policy:data.time_policy,stage_spans:data.stage_spans,camera_preview:data.camera_preview},null,2);
   const promptEl=$("episodeTaskPrompt"); const promptText=String(ep.task_prompt||"").trim(); if(promptEl){promptEl.style.display=promptText?"block":"none"; promptEl.innerHTML=promptText?`<span class="taskPromptLabel">Task prompt</span>${esc(promptText)}`:"";}
   renderCameraPreview(data);
   const s=data.series||{}; drawLineChart("bucketChart","Bucket sand holding",s.t,[{name:"bucket_from_pile",values:s.bucket_from_pile},{name:"bucket_total",values:s.bucket_total}],data.stage_spans,"particles"); drawVectorChart("qChart","Joint angles",s.t,s.q_deg,data.stage_spans,"deg"); drawVectorChart("dqChart","Joint velocity",s.t,s.dq_deg_s,data.stage_spans,"deg/s"); drawVectorChart("ddqChart","Joint acceleration",s.t,s.ddq_deg_s2,data.stage_spans,"deg/s²"); drawVectorChart("effortChart","Measured joint effort",s.t,s.effort,data.stage_spans,"effort");
@@ -7025,11 +6474,20 @@ function cameraDisplayName(key){
 }
 function cameraFrameMeta(preview, frameIndex){
   const frames=(preview&&preview.frames)||[];
-  const row=frames[Number(frameIndex)||0]||{};
+  const idx=Number(frameIndex)||0;
+  const row=frames[idx]||{};
+  const tp=(preview&&preview.time_policy)||{};
+  const policy=normalizeExportTimePolicyJS(tp.policy||tp.time_policy||tp||{});
+  const mode=String(policy.time_mode||"");
   const t=Number(row.t);
-  const tText=Number.isFinite(t)?`+${fmt(t,2)}s`:"";
+  const rawT=Number(row.raw_t);
+  let label="t";
+  if(mode==="uniform_fps") label="uniform t";
+  else if(mode==="scaled_raw") label="scaled t";
+  const tText=Number.isFinite(t)?`${label}=${fmt(t,2)}s`:"";
+  const rawText=(Number.isFinite(rawT)&&Number.isFinite(t)&&Math.abs(rawT-t)>1e-4)?` · raw=${fmt(rawT,2)}s`:"";
   const phase=row.phase?` · ${row.phase}`:"";
-  return `frame ${Number(frameIndex)||0}${tText?` · ${tText}`:""}${phase}`;
+  return `frame ${idx}${tText?` · ${tText}`:""}${rawText}${phase}`;
 }
 function frameCacheToken(){
   const cache=(currentRun&&currentRun.analysis_cache)||{};
@@ -7064,7 +6522,7 @@ function updateCameraPlayButton(){
   btn.classList.toggle("playing",cameraPlayerPlaying);
 }
 function cameraPlayerDelayMs(){
-  const fps=Math.max(1,Math.min(60,Number(cameraPlayerFps)||10));
+  const fps=Math.max(1,Math.min(60,Number(CAMERA_PLAYER_FIXED_FPS)||10));
   return Math.round(1000/fps);
 }
 function cameraPlayerTick(){
@@ -7096,13 +6554,6 @@ function stepCameraPreview(delta){
   const frameCount=Number(preview.frame_count||0);
   if(!frameCount) return;
   updateCameraPreviewFrame((cameraFrameIndex+Number(delta)+frameCount)%frameCount,{immediate:true});
-}
-function setCameraPlayerFps(value){
-  cameraPlayerFps=Math.max(1,Math.min(60,Number(value)||10));
-  if(cameraPlayerPlaying){
-    if(cameraPlayerTimer) clearTimeout(cameraPlayerTimer);
-    cameraPlayerTimer=setTimeout(cameraPlayerTick,cameraPlayerDelayMs());
-  }
 }
 
 function currentCameraTime(){
@@ -7183,16 +6634,27 @@ function timelineSvgClick(evt){
   if(timelineDragState.suppressClick){timelineDragState.suppressClick=false; return;}
   timelineSvgMoveToEvent(evt);
 }
+function bindTimelineSvgInteractions(container){
+  const root=container||document;
+  root.querySelectorAll(".timelineSvgClickable").forEach(svg=>{
+    if(svg.dataset.boundTimelineEvents==="1") return;
+    svg.dataset.boundTimelineEvents="1";
+    svg.addEventListener("mousedown",timelineSvgMouseDown);
+    svg.addEventListener("mousemove",timelineSvgMouseMove);
+    svg.addEventListener("mouseup",timelineSvgMouseUp);
+    svg.addEventListener("click",timelineSvgClick);
+  });
+}
 function cameraTimelineMarkup(preview, spans){
   const f=chartFrame(980,112);
   const frames=(preview&&preview.frames)||[];
   const times=frames.map(r=>Number(r&&r.t)).filter(Number.isFinite);
   const x0=times.length?Math.min(...times):0;
-  const x1=times.length?Math.max(...times):Math.max(1,Number(preview&&preview.frame_count||1)/Math.max(1,cameraPlayerFps));
+  const x1=times.length?Math.max(...times):Math.max(1,Number(preview&&preview.frame_count||1)/Math.max(1,CAMERA_PLAYER_FIXED_FPS));
   const sx=x=>f.l+(Number(x)-x0)/(x1-x0||1)*f.pw;
-  const parts=[`<div class="cameraTimeline"><svg class="timelineSvgClickable" viewBox="0 0 ${f.w} ${f.h}" data-left="${f.l}" data-plot-width="${f.pw}" data-x0="${x0}" data-x1="${x1}" onmousedown="timelineSvgMouseDown(event)" onmousemove="timelineSvgMouseMove(event)" onmouseup="timelineSvgMouseUp(event)" onclick="timelineSvgClick(event)" role="img">`];
+  const parts=[`<div class="cameraTimeline"><svg class="timelineSvgClickable" viewBox="0 0 ${f.w} ${f.h}" data-left="${f.l}" data-plot-width="${f.pw}" data-x0="${x0}" data-x1="${x1}" role="img">`];
   parts.push(`<text x="14" y="23" font-size="13" font-weight="850" fill="#101828">Camera timeline</text>`);
-  parts.push(`<text x="150" y="23" font-size="11" fill="#667085">${esc(cameraFrameMeta(preview, cameraFrameIndex))}</text>`);
+  parts.push(`<text id="cameraTimelineFrameMeta" x="150" y="23" font-size="11" fill="#667085">${esc(cameraFrameMeta(preview, cameraFrameIndex))}</text>`);
   drawStageRects(parts,spans||[],sx,36,38);
   parts.push(`<rect x="${f.l}" y="36" width="${f.pw}" height="38" fill="none" stroke="#d0d5dd"/>`);
   for(let i=0;i<=4;i++){
@@ -7219,6 +6681,26 @@ function updateTimelineCursors(){
     line.setAttribute("x2",x.toFixed(1));
   });
 }
+function trimCameraFrameImageCache(){
+  while(cameraFrameImageCacheOrder.length>cameraFrameImageCacheLimit){
+    const key=cameraFrameImageCacheOrder.shift();
+    if(key) cameraFrameImageCache.delete(key);
+  }
+}
+function cachedCameraImagePromise(url){
+  if(cameraFrameImageCache.has(url)) return cameraFrameImageCache.get(url);
+  const promise=new Promise(resolve=>{
+    const img=new Image();
+    img.addEventListener("load",()=>resolve({ok:true,url,img}),{once:true});
+    img.addEventListener("error",()=>resolve({ok:false,url,img}),{once:true});
+    img.decoding="async";
+    img.src=url;
+  });
+  cameraFrameImageCache.set(url,promise);
+  cameraFrameImageCacheOrder.push(url);
+  trimCameraFrameImageCache();
+  return promise;
+}
 function prefetchCameraFrames(startFrame, count=6){
   const preview=(currentRun&&currentRun._lastEpisodePreview)||{};
   const cameras=preview.cameras||[];
@@ -7228,15 +6710,47 @@ function prefetchCameraFrames(startFrame, count=6){
     const frame=(Number(startFrame)+step)%frameCount;
     for(const cam of cameras){
       if(!cam.available) continue;
-      const img=new Image();
-      img.src=cameraImageUrl(cam.key,frame);
+      cachedCameraImagePromise(cameraImageUrl(cam.key,frame));
     }
   }
+}
+function bindCameraPreviewControls(container){
+  const root=container||document;
+  const slider=root.querySelector("#cameraFrameSlider");
+  if(slider && slider.dataset.boundCameraPreview!=="1"){
+    slider.dataset.boundCameraPreview="1";
+    slider.addEventListener("input",()=>updateCameraPreviewFrame(slider.value));
+  }
+  const play=root.querySelector("#cameraPlayBtn");
+  if(play && play.dataset.boundCameraPreview!=="1"){
+    play.dataset.boundCameraPreview="1";
+    play.addEventListener("click",toggleCameraPlayer);
+  }
+  const prev=root.querySelector("#cameraPrevBtn");
+  if(prev && prev.dataset.boundCameraPreview!=="1"){
+    prev.dataset.boundCameraPreview="1";
+    prev.addEventListener("click",()=>stepCameraPreview(-1));
+  }
+  const next=root.querySelector("#cameraNextBtn");
+  if(next && next.dataset.boundCameraPreview!=="1"){
+    next.dataset.boundCameraPreview="1";
+    next.addEventListener("click",()=>stepCameraPreview(1));
+  }
+  root.querySelectorAll(".cameraCard img").forEach(img=>{
+    if(img.dataset.boundCameraPreview==="1") return;
+    img.dataset.boundCameraPreview="1";
+    img.addEventListener("error",()=>{
+      const card=img.closest(".cameraCard");
+      if(card) card.classList.add("missing");
+    });
+  });
+  bindTimelineSvgInteractions(root);
 }
 function renderCameraPreview(data){
   const box=$("cameraPreview"); if(!box) return;
   stopCameraPlayer();
   const preview=data.camera_preview||{};
+  preview.time_policy=data.time_policy||{};
   if(currentRun) currentRun._lastEpisodePreview=preview;
   const frameCount=Number(preview.frame_count||data.sample_count||0);
   const cameras=preview.cameras||[];
@@ -7246,13 +6760,13 @@ function renderCameraPreview(data){
   }
   const preferred=Number(preview.initial_frame_index||0);
   cameraFrameIndex=Math.max(0, Math.min(frameCount-1, Number.isFinite(preferred)?preferred:0));
-  const header=`<div class="cameraPreviewHeader"><div class="cameraFrameControls"><span class="muted nowrap">frame</span><input id="cameraFrameSlider" type="range" min="0" max="${Math.max(0,frameCount-1)}" value="${cameraFrameIndex}" oninput="updateCameraPreviewFrame(this.value)"><span id="cameraFrameText" class="mono small nowrap">${cameraFrameIndex}/${Math.max(0,frameCount-1)}</span></div></div>`;
+  const header=`<div class="cameraPreviewHeader"><div class="cameraFrameControls"><span class="muted nowrap">frame</span><input id="cameraFrameSlider" type="range" min="0" max="${Math.max(0,frameCount-1)}" value="${cameraFrameIndex}"><span id="cameraFrameText" class="mono small nowrap">${cameraFrameIndex}/${Math.max(0,frameCount-1)}</span></div></div>`;
   const cards=cameras.map((cam,idx)=>{
     const key=cam.key; const available=!!cam.available; const existing=Number(cam.existing_frames||0); const present=Number(cam.present_frames||0);
     const cls=available?"cameraCard":"cameraCard missing";
     const src=available?cameraImageUrl(key,cameraFrameIndex):"";
     const blackWarn=cam.looks_all_black?`<span class="pill failed" title="sampled frames are black">black</span>`:"";
-    return `<div class="${cls}" data-camera-key="${esc(key)}"><div class="cameraCardHeader"><span class="cameraCardTitle">${esc(cam.label||cameraDisplayName(key))} ${blackWarn}</span><span title="existing/present frames">${existing}/${present}</span></div><img id="cameraImg${idx}" src="${esc(src)}" alt="${esc(cam.label||cameraDisplayName(key))}" onerror="this.closest('.cameraCard').classList.add('missing')"><div class="cameraMissing">missing image for this camera/frame</div><div style="padding:6px 8px"><a id="cameraOpen${idx}" class="cameraOpenLink" href="${esc(src)}" target="_blank">open image</a></div></div>`;
+    return `<div class="${cls}" data-camera-key="${esc(key)}"><div class="cameraCardHeader"><span class="cameraCardTitle">${esc(cam.label||cameraDisplayName(key))} ${blackWarn}</span><span title="existing/present frames">${existing}/${present}</span></div><img id="cameraImg${idx}" src="${esc(src)}" alt="${esc(cam.label||cameraDisplayName(key))}"><div class="cameraMissing">missing image for this camera/frame</div><div style="padding:6px 8px"><a id="cameraOpen${idx}" class="cameraOpenLink" href="${esc(src)}" target="_blank">open image</a></div></div>`;
   }).join("");
   const timeline=cameraTimelineMarkup(preview, data.stage_spans||[]);
   box.innerHTML=header+timeline+`<div class="cameraGrid">${cards}</div>`;
@@ -7261,11 +6775,11 @@ function renderCameraPreview(data){
   if(headerEl&&frameControls){
     const player=document.createElement("div");
     player.className="cameraPlayerControls";
-    player.innerHTML=`<button id="cameraPlayBtn" class="cameraPlayerBtn primary" type="button" onclick="toggleCameraPlayer()">Play</button><button class="cameraPlayerBtn" type="button" title="Previous frame" onclick="stepCameraPreview(-1)">-1</button><button class="cameraPlayerBtn" type="button" title="Next frame" onclick="stepCameraPreview(1)">+1</button><select id="cameraPlayerFps" class="cameraPlayerSpeed" title="Playback speed" onchange="setCameraPlayerFps(this.value)"><option value="5">5 fps</option><option value="10" selected>10 fps</option><option value="15">15 fps</option><option value="30">30 fps</option></select>`;
+    player.innerHTML=`<button id="cameraPlayBtn" class="cameraPlayerBtn primary" type="button">Play</button><button id="cameraPrevBtn" class="cameraPlayerBtn" type="button" title="Previous frame">-1</button><button id="cameraNextBtn" class="cameraPlayerBtn" type="button" title="Next frame">+1</button>`;
     headerEl.insertBefore(player,frameControls);
-    const fpsSelect=$("cameraPlayerFps");
-    if(fpsSelect) fpsSelect.value=String(cameraPlayerFps);
   }
+  bindCameraPreviewControls(box);
+  prefetchCameraFrames(cameraFrameIndex, 8);
 }
 function updateCameraPreviewFrame(value,opts){
   const frameCount=Number(((currentRun&&currentRun._lastEpisodePreview)||{}).frame_count||0);
@@ -7275,6 +6789,7 @@ function updateCameraPreviewFrame(value,opts){
   const slider=$("cameraFrameSlider"); if(slider && Number(slider.value)!==cameraFrameIndex) slider.value=String(cameraFrameIndex);
   const text=$("cameraFrameText"); if(text) text.textContent=`${cameraFrameIndex}/${Math.max(0,frameCount-1)}`;
   const meta=$("cameraFrameMeta"); if(meta) meta.textContent=cameraFrameMeta(preview,cameraFrameIndex);
+  const timelineMeta=$("cameraTimelineFrameMeta"); if(timelineMeta) timelineMeta.textContent=cameraFrameMeta(preview,cameraFrameIndex);
   updateTimelineCursors();
   prefetchCameraFrames(cameraFrameIndex, cameraPlayerPlaying?10:4);
   if(cameraPreviewTimer) clearTimeout(cameraPreviewTimer);
@@ -7287,13 +6802,28 @@ function updateCameraPreviewFrame(value,opts){
 function refreshCameraPreviewImages(frameIndex){
   const preview=(currentRun&&currentRun._lastEpisodePreview)||{};
   const cameras=preview.cameras||[];
-  cameras.forEach((cam,idx)=>{
-    const img=$("cameraImg"+idx), open=$("cameraOpen"+idx);
-    if(!img || !cam.available) return;
+  const seq=++cameraPreviewLoadSeq;
+  const jobs=cameras.map((cam,idx)=>{
+    if(!cam.available) return Promise.resolve({idx,cam,url:"",ok:false});
     const url=cameraImageUrl(cam.key,frameIndex);
-    const card=img.closest(".cameraCard"); if(card) card.classList.remove("missing");
-    if(img.getAttribute("src")!==url) img.src=url;
-    if(open) open.href=url;
+    const img=$("cameraImg"+idx);
+    const card=img&&img.closest(".cameraCard");
+    if(card) card.classList.add("loading");
+    return cachedCameraImagePromise(url).then(result=>({idx,cam,url,ok:!!(result&&result.ok)}));
+  });
+  Promise.all(jobs).then(results=>{
+    if(seq!==cameraPreviewLoadSeq) return;
+    results.forEach(({idx,cam,url,ok})=>{
+      const img=$("cameraImg"+idx), open=$("cameraOpen"+idx);
+      if(!img || !cam.available) return;
+      const card=img.closest(".cameraCard");
+      if(card){
+        card.classList.remove("loading");
+        card.classList.toggle("missing",!ok);
+      }
+      if(ok && img.getAttribute("src")!==url) img.src=url;
+      if(open) open.href=url;
+    });
   });
 }
 
@@ -7301,7 +6831,7 @@ function chartFrame(width=760,height=220){const l=88,r=34,t=36,b=58; return {w:w
 function extent(vals){const arr=numeric(vals).filter(v=>Math.abs(v)<1e12); if(!arr.length)return[0,1]; let lo=Math.min(...arr),hi=Math.max(...arr); if(Math.abs(hi-lo)<1e-9){lo-=1;hi+=1} const pad=(hi-lo)*0.08; return[lo-pad,hi+pad]}
 function drawAxes(parts,f,x0,x1,y0,y1,opts={}){parts.push(`<rect x="${f.l}" y="${f.t}" width="${f.pw}" height="${f.ph}" fill="#fcfcfd" stroke="#d0d5dd"/>`); for(let i=0;i<=4;i++){const x=f.l+f.pw*i/4,y=f.t+f.ph*i/4; parts.push(`<line x1="${x.toFixed(1)}" y1="${f.t}" x2="${x.toFixed(1)}" y2="${f.t+f.ph}" stroke="#eef2f6"/>`); parts.push(`<line x1="${f.l}" y1="${y.toFixed(1)}" x2="${f.l+f.pw}" y2="${y.toFixed(1)}" stroke="#eef2f6"/>`)} const xs=opts.xSuffix||""; parts.push(`<text x="${f.l}" y="${f.h-22}" font-size="11" fill="#667085">${fmtAxis(x0)}${esc(xs)}</text>`); parts.push(`<text x="${f.l+f.pw}" y="${f.h-22}" text-anchor="end" font-size="11" fill="#667085">${fmtAxis(x1)}${esc(xs)}</text>`); parts.push(`<text x="${f.l-8}" y="${f.t+f.ph}" text-anchor="end" font-size="11" fill="#667085">${fmtAxis(y0)}</text>`); parts.push(`<text x="${f.l-8}" y="${f.t+10}" text-anchor="end" font-size="11" fill="#667085">${fmtAxis(y1)}</text>`)}
 function drawStageRects(parts,spans,scaleX,top,height){const seen=new Map(); let next=0; for(const span of spans||[]){if(!seen.has(span.stage))seen.set(span.stage,stagePalette[next++%stagePalette.length]); const x=scaleX(span.start),w=Math.max(1,scaleX(span.end)-x); parts.push(`<rect x="${x.toFixed(1)}" y="${top}" width="${w.toFixed(1)}" height="${height}" fill="${seen.get(span.stage)}" opacity="0.44"><title>${esc(span.stage)}</title></rect>`)}}
-function drawLineChart(targetId,title,xs,lines,spans,unit){const f=chartFrame(980,270); xs=xs||[]; const xVals=numeric(xs); const x0=xVals.length?Math.min(...xVals):0,x1=xVals.length?Math.max(...xVals):1; const allY=[]; for(const line of lines){for(const v of line.values||[]) if(finite(Number(v))) allY.push(Number(v))} const [y0,y1]=extent(allY); const sx=x=>f.l+(Number(x)-x0)/(x1-x0||1)*f.pw; const sy=y=>f.t+f.ph-(Number(y)-y0)/(y1-y0||1)*f.ph; const currentX=sx(currentCameraTime()); const parts=[`<svg class="chart timelineSvgClickable" viewBox="0 0 ${f.w} ${f.h}" data-left="${f.l}" data-plot-width="${f.pw}" data-x0="${x0}" data-x1="${x1}" onmousedown="timelineSvgMouseDown(event)" onmousemove="timelineSvgMouseMove(event)" onmouseup="timelineSvgMouseUp(event)" onclick="timelineSvgClick(event)" role="img">`,`<text x="14" y="22" font-size="15" font-weight="750" fill="#101828">${esc(title)}</text>`]; let lx=230; if(unit){parts.push(`<rect x="${lx}" y="9" width="${Math.max(48,unit.length*7+26)}" height="18" rx="9" fill="#ffffff" stroke="#d0d5dd"/><text x="${lx+10}" y="22" font-size="11" font-weight="750" fill="#475467">unit: ${esc(unit)}</text>`); lx+=Math.max(58,unit.length*7+36);} lines.forEach((line,li)=>{const color=lineColors[li%lineColors.length]; parts.push(`<circle cx="${lx}" cy="17" r="4.5" fill="${color}"/><text x="${lx+8}" y="21" font-size="11" fill="#475467">${esc(line.name)}</text>`); lx+=Math.max(76,String(line.name||"").length*6+22);}); drawAxes(parts,f,x0,x1,y0,y1,{xSuffix:"s"}); drawStageRects(parts,spans,sx,f.t,f.ph); lines.forEach((line,li)=>{const pts=[];(line.values||[]).forEach((v,i)=>{if(finite(Number(v))&&finite(Number(xs[i])))pts.push(`${sx(xs[i]).toFixed(1)},${sy(v).toFixed(1)}`)}); if(pts.length) parts.push(`<polyline points="${pts.join(" ")}" fill="none" stroke="${lineColors[li%lineColors.length]}" stroke-width="1.9"/>`)}); parts.push(`<line class="timelineCursor" data-left="${f.l}" data-plot-width="${f.pw}" data-x0="${x0}" data-x1="${x1}" x1="${currentX.toFixed(1)}" y1="${f.t}" x2="${currentX.toFixed(1)}" y2="${f.t+f.ph}" stroke="#f04438" stroke-width="2.1" stroke-dasharray="4 3"/>`); parts.push(`</svg>`); $(targetId).innerHTML=parts.join("")}
+function drawLineChart(targetId,title,xs,lines,spans,unit){const f=chartFrame(980,270); xs=xs||[]; const xVals=numeric(xs); const x0=xVals.length?Math.min(...xVals):0,x1=xVals.length?Math.max(...xVals):1; const allY=[]; for(const line of lines){for(const v of line.values||[]) if(finite(Number(v))) allY.push(Number(v))} const [y0,y1]=extent(allY); const sx=x=>f.l+(Number(x)-x0)/(x1-x0||1)*f.pw; const sy=y=>f.t+f.ph-(Number(y)-y0)/(y1-y0||1)*f.ph; const currentX=sx(currentCameraTime()); const parts=[`<svg class="chart timelineSvgClickable" viewBox="0 0 ${f.w} ${f.h}" data-left="${f.l}" data-plot-width="${f.pw}" data-x0="${x0}" data-x1="${x1}" role="img">`,`<text x="14" y="22" font-size="15" font-weight="750" fill="#101828">${esc(title)}</text>`]; let lx=230; if(unit){parts.push(`<rect x="${lx}" y="9" width="${Math.max(48,unit.length*7+26)}" height="18" rx="9" fill="#ffffff" stroke="#d0d5dd"/><text x="${lx+10}" y="22" font-size="11" font-weight="750" fill="#475467">unit: ${esc(unit)}</text>`); lx+=Math.max(58,unit.length*7+36);} lines.forEach((line,li)=>{const color=lineColors[li%lineColors.length]; parts.push(`<circle cx="${lx}" cy="17" r="4.5" fill="${color}"/><text x="${lx+8}" y="21" font-size="11" fill="#475467">${esc(line.name)}</text>`); lx+=Math.max(76,String(line.name||"").length*6+22);}); drawAxes(parts,f,x0,x1,y0,y1,{xSuffix:"s"}); drawStageRects(parts,spans,sx,f.t,f.ph); lines.forEach((line,li)=>{const pts=[];(line.values||[]).forEach((v,i)=>{if(finite(Number(v))&&finite(Number(xs[i])))pts.push(`${sx(xs[i]).toFixed(1)},${sy(v).toFixed(1)}`)}); if(pts.length) parts.push(`<polyline points="${pts.join(" ")}" fill="none" stroke="${lineColors[li%lineColors.length]}" stroke-width="1.9"/>`)}); parts.push(`<line class="timelineCursor" data-left="${f.l}" data-plot-width="${f.pw}" data-x0="${x0}" data-x1="${x1}" x1="${currentX.toFixed(1)}" y1="${f.t}" x2="${currentX.toFixed(1)}" y2="${f.t+f.ph}" stroke="#f04438" stroke-width="2.1" stroke-dasharray="4 3"/>`); parts.push(`</svg>`); const target=$(targetId); if(target){target.innerHTML=parts.join(""); bindTimelineSvgInteractions(target);}}
 function drawVectorChart(targetId,title,xs,vectors,spans,unit){drawLineChart(targetId,title,xs,jointNames.map((name,j)=>({name,values:(vectors||[]).map(row=>Array.isArray(row)?row[j]:null)})),spans,unit)}
 
 function cleanPolygon(poly){if(!Array.isArray(poly))return[]; const out=[]; for(const pt of poly){if(Array.isArray(pt)&&finite(Number(pt[0]))&&finite(Number(pt[1]))) out.push([Number(pt[0]),Number(pt[1])])} return out}
@@ -7408,30 +6938,73 @@ function syncEpisodeInspectorHeight(){
   });
 }
 
-$("loadRunsBtn").onclick=()=>loadRuns().catch(e=>setStatus(e.message,"error"));
-$("loadSuccessPoolBtn").onclick=()=>loadSuccessPool().catch(e=>setStatus(e.message,"error"));
-$("exportSuccessPoolBtn").onclick=()=>exportSuccessPool().catch(e=>setStatus(e.message,"error"));
-$("loadRunBtn").onclick=()=>loadRun(false).catch(e=>setStatus(e.message,"error"));
-$("reloadBtn").onclick=()=>loadRun(true).catch(e=>setStatus(e.message,"error"));
-$("copyPathBtn").onclick=()=>navigator.clipboard&&navigator.clipboard.writeText($("runInput").value).then(()=>setStatus("Run path copied","ok")).catch(()=>setStatus("Copy failed","error"));
-$("clearTerminalBtn").onclick=()=>{const box=$("terminalBox"); if(box) box.textContent=""; terminalWrite("terminal cleared","muted");};
-$("copyRawAttemptBtn").onclick=()=>{
+document.addEventListener("click", evt=>{
+  const target=evt.target;
+  if(!target || !target.closest) return;
+  const chooseRunBtn=target.closest('[data-action="choose-run"]');
+  if(chooseRunBtn){
+    evt.preventDefault();
+    chooseRun(chooseRunBtn.dataset.runPath||"");
+    return;
+  }
+  const sortBtn=target.closest('[data-action="sort-episodes"]');
+  if(sortBtn){
+    evt.preventDefault();
+    sortEpisodes(sortBtn.dataset.sortKey||"episode_index");
+    return;
+  }
+  const episodeRow=target.closest("#episodeTabs tr[data-ep]");
+  if(episodeRow){
+    evt.preventDefault();
+    loadEpisode(episodeRow.dataset.ep).catch(e=>setStatus(e.message,"error"));
+  }
+});
+document.addEventListener("change", evt=>{
+  const target=evt.target;
+  if(!target || !target.matches) return;
+  if(target.matches('[data-action="toggle-all-runs"]')){
+    toggleAllRuns(!!target.checked);
+    return;
+  }
+  if(target.matches('[data-action="toggle-run-selection"]')){
+    toggleRunSelection(target.dataset.runPath||"", !!target.checked);
+  }
+});
+
+function bindStaticControl(id,event,handler){
+  const el=$(id);
+  if(el) el.addEventListener(event,handler);
+}
+bindStaticControl("loadRunsBtn","click",()=>loadRuns().catch(e=>setStatus(e.message,"error")));
+bindStaticControl("loadSuccessPoolBtn","click",()=>loadSuccessPool().catch(e=>setStatus(e.message,"error")));
+bindStaticControl("exportSuccessPoolBtn","click",()=>exportSuccessPool().catch(e=>setStatus(e.message,"error")));
+bindStaticControl("loadRunBtn","click",()=>loadRun(false).catch(e=>setStatus(e.message,"error")));
+bindStaticControl("reloadBtn","click",()=>loadRun(true).catch(e=>setStatus(e.message,"error")));
+bindStaticControl("copyPathBtn","click",()=>navigator.clipboard&&navigator.clipboard.writeText($("runInput").value).then(()=>setStatus("Run path copied","ok")).catch(()=>setStatus("Copy failed","error")));
+bindStaticControl("clearTerminalBtn","click",()=>{const box=$("terminalBox"); if(box) box.textContent=""; terminalWrite("terminal cleared","muted");});
+bindStaticControl("copyRawAttemptBtn","click",()=>{
   const text=$("rawBox")?.textContent||"";
   if(!navigator.clipboard){setStatus("Clipboard unavailable","error");return;}
   navigator.clipboard.writeText(text).then(()=>setStatus("Raw attempt copied","ok")).catch(()=>setStatus("Copy failed","error"));
-};
-$("runSelect").onchange=()=>{$("runInput").value=$("runSelect").value};
-$("selectAllRunsBtn").onclick=()=>toggleAllRuns(true);
-$("selectZeroSuccessBtn").onclick=()=>selectRuns(r=>Number(r.success||0)===0);
-$("selectSuccessRunsBtn").onclick=()=>selectRuns(r=>Number(r.success||0)>0);
-$("clearRunSelectionBtn").onclick=()=>toggleAllRuns(false);
-$("refreshSelectedSizesBtn").onclick=()=>refreshSelectedSizes().catch(e=>setStatus(e.message,"error"));
-$("deleteSelectedRunsBtn").onclick=()=>deleteSelectedZeroSuccessRuns().catch(e=>setStatus(e.message,"error"));
-$("copySuccessBtn").onclick=()=>transferSuccessRecords("copy", false).catch(e=>setStatus(e.message,"error"));
-$("moveSuccessBtn").onclick=()=>transferSuccessRecords("move", false).catch(e=>setStatus(e.message,"error"));
-$("darkModeToggle").onclick=()=>toggleDarkMode();
+});
+bindStaticControl("runSelect","change",()=>{$("runInput").value=$("runSelect").value});
+bindStaticControl("selectAllRunsBtn","click",()=>toggleAllRuns(true));
+bindStaticControl("selectZeroSuccessBtn","click",()=>selectRuns(r=>Number(r.success||0)===0));
+bindStaticControl("selectSuccessRunsBtn","click",()=>selectRuns(r=>Number(r.success||0)>0));
+bindStaticControl("clearRunSelectionBtn","click",()=>toggleAllRuns(false));
+bindStaticControl("refreshSelectedSizesBtn","click",()=>refreshSelectedSizes().catch(e=>setStatus(e.message,"error")));
+bindStaticControl("deleteSelectedRunsBtn","click",()=>deleteSelectedZeroSuccessRuns().catch(e=>setStatus(e.message,"error")));
+bindStaticControl("copySuccessBtn","click",()=>transferSuccessRecords("copy", false).catch(e=>setStatus(e.message,"error")));
+bindStaticControl("moveSuccessBtn","click",()=>transferSuccessRecords("move", false).catch(e=>setStatus(e.message,"error")));
+bindStaticControl("cancelExportTimeBtn","click",()=>hideExportTimeModal());
+bindStaticControl("resetTimePolicyBtn","click",()=>saveExportTimePolicyForPreview(true, true).catch(e=>setStatus(e.message,"error")));
+bindStaticControl("applyTimePreviewBtn","click",()=>applyTimePreviewAndClose().catch(e=>setStatus(e.message,"error")));
+bindStaticControl("exportTimeNowBtn","click",()=>exportSuccessPoolWithPolicy().catch(e=>setStatus(e.message,"error")));
+["exportSpeedScaleInput","exportTimeModeSelect"].forEach(id=>{const el=$(id); if(el) el.addEventListener("input",()=>updateExportTimePolicyPreview());});
+bindStaticControl("exportTimeModal","click", e=>{const modal=$("exportTimeModal"); if(e.target===modal && !modal.classList.contains("loading")) hideExportTimeModal();});
+bindStaticControl("darkModeToggle","click",()=>toggleDarkMode());
 initDarkMode();
-const episodeSortSelect=$("episodeSortSelect"); if(episodeSortSelect) episodeSortSelect.onchange=()=>refreshFilteredViews();
+const episodeSortSelect=$("episodeSortSelect"); if(episodeSortSelect) episodeSortSelect.addEventListener("change",()=>refreshFilteredViews());
 $("rootInput").addEventListener("input", ()=>syncSuccessPoolPath());
 $("rootInput").addEventListener("keydown", e=>{if(e.key==="Enter") loadRuns().then(()=>loadRun()).catch(err=>setStatus(err.message,"error"))});
 $("runInput").addEventListener("keydown", e=>{if(e.key==="Enter") loadRun().catch(err=>setStatus(err.message,"error"))});
@@ -7573,12 +7146,26 @@ def serve_dashboard(
                         fps = float(fps_value) if fps_value not in (None, "") else None
                     except Exception:
                         fps = None
+                    time_policy = body.get("time_policy")
                     result = dashboard_start_success_pool_export_job(
                         root,
                         overwrite=bool(body.get("overwrite", True)),
                         fps=fps,
                         require_vla=bool(body.get("require_vla", True)),
+                        time_policy=time_policy,
                     )
+                    self.send_json(result)
+                    return
+                if parsed.path == "/api/manage/export_time_policy":
+                    root = normalize_dashboard_client_path(body.get("root") or default_root)
+                    pool_dir = dashboard_success_pool_dir(root)
+                    if not os.path.isdir(pool_dir):
+                        self.send_json({"error": f"success_pool_not_found:{pool_dir}"}, status=404)
+                        return
+                    policy = default_export_time_policy() if body.get("reset") else body.get("time_policy")
+                    result = save_dashboard_export_time_policy(pool_dir, policy)
+                    result["effective_fps"] = dashboard_effective_export_fps(pool_dir, result.get("policy"))
+                    result["pool_dir"] = pool_dir
                     self.send_json(result)
                     return
                 self.send_json({"error": "not_found"}, status=404)

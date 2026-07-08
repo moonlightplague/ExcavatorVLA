@@ -1907,7 +1907,6 @@ def export_lerobot_dataset(
     run_dir: Union[str, os.PathLike],
     output_dir: Optional[Union[str, os.PathLike]] = None,
     split: str = "trainable",
-    fps: Optional[float] = None,
     limit_episodes: Optional[int] = None,
     overwrite: bool = False,
     require_standard: bool = False,
@@ -1919,7 +1918,6 @@ def export_lerobot_dataset(
         run_dir,
         output_dir=output_dir,
         split=split,
-        fps=fps,
         limit_episodes=limit_episodes,
         overwrite=overwrite,
         require_standard=require_standard,
@@ -1933,7 +1931,6 @@ def print_lerobot_export(
     run_dir: Union[str, os.PathLike],
     output_dir: Optional[Union[str, os.PathLike]] = None,
     split: str = "trainable",
-    fps: Optional[float] = None,
     limit_episodes: Optional[int] = None,
     overwrite: bool = False,
     require_standard: bool = False,
@@ -1944,7 +1941,6 @@ def print_lerobot_export(
         run_dir,
         output_dir=output_dir,
         split=split,
-        fps=fps,
         limit_episodes=limit_episodes,
         overwrite=overwrite,
         require_standard=require_standard,
@@ -2476,6 +2472,7 @@ RUN_SIZE_EXCLUDE_DIRS = {".dashboard_cache", "__pycache__"}
 RUN_DATA_SIZE_LIMIT = 8
 RUN_PAYLOAD_CACHE_VERSION = 3
 RUN_PAYLOAD_CACHE_DIRNAME = "run_payload_cache"
+RUN_EPISODE_ANALYSIS_CACHE_DIRNAME = "run_episode_analysis_cache"
 RUN_PAYLOAD_MEMORY_CACHE: Dict[str, Dict[str, object]] = {}
 RUN_PAYLOAD_CACHE_LOCK = threading.Lock()
 FRAME_CONTEXT_CACHE_TTL = 120.0
@@ -3141,7 +3138,103 @@ def aggregate_row_source_key(row: dict) -> str:
     key = str(row.get("dashboard_transfer_source_key") or "").strip()
     if key:
         return key
-    return dashboard_transfer_source_key(row.get("source_run_dir", ""), row, row.get("source_episode_dir", ""))
+    if row.get("source_run_dir") or row.get("source_episode_dir"):
+        return dashboard_transfer_source_key(row.get("source_run_dir", ""), row, row.get("source_episode_dir", ""))
+    return ""
+
+
+def norm_episode_dir_key(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return os.path.normcase(os.path.abspath(text))
+    except Exception:
+        return os.path.normcase(text)
+
+
+def success_transfer_cache_by_dest(cache: Dict[str, dict]) -> Dict[str, dict]:
+    by_dest: Dict[str, dict] = {}
+
+    def entry_score(entry: dict) -> int:
+        source_run = str(entry.get("source_run_dir") or "")
+        source_key = str(entry.get("source_key") or "")
+        score = 0
+        if entry.get("source_signature_hash"):
+            score += 100
+        if source_run:
+            score += 10
+        if SUCCESS_POOL_DIRNAME not in source_run and not source_key.startswith("|"):
+            score += 5
+        return score
+
+    def keep_best(key: str, entry: dict) -> None:
+        old = by_dest.get(key)
+        if old is None or entry_score(entry) > entry_score(old):
+            by_dest[key] = entry
+
+    for entry in (cache or {}).values():
+        if not isinstance(entry, dict):
+            continue
+        dest = norm_episode_dir_key(entry.get("transferred_episode_dir") or entry.get("dest_episode_dir"))
+        if dest:
+            keep_best(dest, entry)
+        folder = str(entry.get("folder_name") or "").strip()
+        if folder:
+            keep_best(os.path.normcase(folder), entry)
+    return by_dest
+
+
+def hydrate_success_pool_row_from_transfer_cache(row: dict, by_dest: Dict[str, dict]) -> Tuple[dict, bool]:
+    out = dict(row)
+    dest = norm_episode_dir_key(out.get("transferred_episode_dir") or out.get("dest_episode_dir") or episode_dir_from_row(out))
+    entry = by_dest.get(dest)
+    if entry is None and dest:
+        entry = by_dest.get(os.path.normcase(os.path.basename(dest)))
+    if not isinstance(entry, dict):
+        return out, False
+    changed = False
+    pool_row = entry.get("pool_row") if isinstance(entry.get("pool_row"), dict) else {}
+
+    def fill(field: str, value: object) -> None:
+        nonlocal changed
+        if out.get(field) in (None, "") and value not in (None, ""):
+            out[field] = value
+            changed = True
+
+    def replace_fake(field: str, value: object) -> None:
+        nonlocal changed
+        current = str(out.get(field) or "")
+        new_value = str(value or "")
+        if not new_value:
+            return
+        fake_current = current.startswith("|") or SUCCESS_POOL_DIRNAME in current
+        if fake_current and current != new_value:
+            out[field] = value
+            changed = True
+
+    fill("source_run_name", entry.get("source_run_name") or pool_row.get("source_run_name"))
+    fill("source_run_dir", entry.get("source_run_dir") or pool_row.get("source_run_dir"))
+    fill("source_episode_index", entry.get("source_episode_index") or pool_row.get("source_episode_index"))
+    fill("source_episode_id", entry.get("source_episode_id") or pool_row.get("source_episode_id"))
+    fill("source_episode_dir", entry.get("source_episode_dir") or pool_row.get("source_episode_dir"))
+    fill("dashboard_transfer_source_key", entry.get("source_key") or pool_row.get("dashboard_transfer_source_key"))
+    replace_fake("dashboard_transfer_source_key", entry.get("source_key") or pool_row.get("dashboard_transfer_source_key"))
+    fill(
+        "dashboard_transfer_source_signature_hash",
+        entry.get("source_signature_hash") or pool_row.get("dashboard_transfer_source_signature_hash"),
+    )
+    fill(
+        "dashboard_transfer_source_latest_mtime_ns",
+        entry.get("latest_mtime_ns") or pool_row.get("dashboard_transfer_source_latest_mtime_ns"),
+    )
+    fill("dashboard_transfer_runtime_id", pool_row.get("dashboard_transfer_runtime_id"))
+    fill("dashboard_transfer_mode", pool_row.get("dashboard_transfer_mode"))
+    signature = pool_row.get("dashboard_transfer_source_signature")
+    if isinstance(signature, dict) and not isinstance(out.get("dashboard_transfer_source_signature"), dict):
+        out["dashboard_transfer_source_signature"] = signature
+        changed = True
+    return out, changed
 
 
 def rewrite_row_paths_after_episode_relocation(row: dict, old_dir: str, new_dir: str) -> dict:
@@ -3242,6 +3335,9 @@ def build_existing_success_source_cache(pool_dir: str, aggregate_rows: Sequence[
         key = aggregate_row_source_key(row)
         if not key:
             continue
+        source_hash = row.get("dashboard_transfer_source_signature_hash", "")
+        if not source_hash and not (row.get("source_run_dir") or row.get("source_episode_dir")):
+            continue
         cache[key] = {
             "source_key": key,
             "source_run_name": row.get("source_run_name", ""),
@@ -3254,7 +3350,7 @@ def build_existing_success_source_cache(pool_dir: str, aggregate_rows: Sequence[
             "pool_episode_index": row.get("episode_index"),
             "pool_episode_id": row.get("episode_id", ""),
             "pool_row": dict(row),
-            "source_signature_hash": row.get("dashboard_transfer_source_signature_hash", ""),
+            "source_signature_hash": source_hash,
             "latest_mtime_ns": row.get("dashboard_transfer_source_latest_mtime_ns", 0),
             "created_from_existing_index": True,
         }
@@ -3439,21 +3535,11 @@ def normalize_export_time_policy(policy: object) -> Dict[str, object]:
         speed_scale = 1.0
     if not math.isfinite(speed_scale) or speed_scale <= 0:
         speed_scale = 1.0
-    mode = str(data.get("time_mode") or "uniform_fps").strip() or "uniform_fps"
-    if mode not in {"uniform_fps", "scaled_raw"}:
-        mode = "uniform_fps"
-    base_fps_value = data.get("base_fps", None)
-    try:
-        base_fps = float(base_fps_value) if base_fps_value not in (None, "") else None
-    except Exception:
-        base_fps = None
-    if base_fps is not None and (not math.isfinite(base_fps) or base_fps <= 0):
-        base_fps = None
     return {
         "version": 1,
         "speed_scale": float(speed_scale),
-        "time_mode": mode,
-        "base_fps": base_fps,
+        "time_mode": "uniform_fps",
+        "base_fps": None,
     }
 
 
@@ -3489,6 +3575,18 @@ def save_dashboard_export_time_policy(run_dir: Union[str, os.PathLike], policy: 
     run_abs = os.path.abspath(str(run_dir))
     normalized = normalize_export_time_policy(policy)
     path = dashboard_export_time_policy_path(run_abs)
+    existing = read_json(path, default={}) if os.path.isfile(path) else {}
+    existing_normalized = normalize_export_time_policy(existing)
+    if os.path.isfile(path) and existing_normalized == normalized:
+        return {
+            "ok": True,
+            "path": path,
+            "exists": True,
+            "policy": normalized,
+            "hash": export_time_policy_hash(normalized),
+            "is_default": export_time_policy_is_default(normalized),
+            "unchanged": True,
+        }
     ensure_dir(os.path.dirname(path))
     write_json(path, normalized)
     with FRAME_CONTEXT_CACHE_LOCK:
@@ -3575,13 +3673,10 @@ def dashboard_apply_export_time_policy(
 def dashboard_export_time_runtime(run_dir: Union[str, os.PathLike], trajectory: Sequence[dict]) -> Dict[str, object]:
     info = dashboard_time_policy_for_run(run_dir)
     policy = dict(info.get("policy") or default_export_time_policy())
-    speed = float(policy.get("speed_scale") or 1.0)
     raw_duration = trajectory_runtime_s(trajectory)
     effective_fps_value = dashboard_effective_export_fps(run_dir, policy)
     if not trajectory:
         duration = 0.0
-    elif policy.get("time_mode") == "scaled_raw":
-        duration = raw_duration / max(0.001, speed)
     else:
         duration = float(max(0, len(trajectory) - 1)) / float(max(0.001, effective_fps_value))
     return {
@@ -3611,13 +3706,21 @@ def dashboard_success_pool_export_lookup(run_dir: Union[str, os.PathLike]) -> Di
     """Return manifest lookup tables used to mark .dashboard_success rows as export-ready."""
     manifest_path = dashboard_success_pool_export_manifest_path(run_dir)
     current_time_policy = load_dashboard_export_time_policy(run_dir)
+    current_export_config_hash = ""
+    try:
+        config_builder = _require_shared_dataset_tool("lerobot_export_config_for_run")
+        current_export_config_hash = str(config_builder(run_dir, time_policy=current_time_policy.get("policy", {})).get("export_config_hash") or "")
+    except Exception:
+        current_export_config_hash = ""
     manifest = read_json(manifest_path, default={}) or {}
     if not isinstance(manifest, dict) or not os.path.isfile(manifest_path):
         return {
             "has_manifest": False,
             "manifest_path": manifest_path,
             "current_time_policy": current_time_policy,
+            "current_export_config_hash": current_export_config_hash,
             "time_policy_mismatch": False,
+            "export_config_mismatch": False,
             "summary": {
                 "has_manifest": False,
                 "ready": 0,
@@ -3644,6 +3747,11 @@ def dashboard_success_pool_export_lookup(run_dir: Union[str, os.PathLike]) -> Di
     time_policy_mismatch = bool(
         (manifest_policy_hash and current_policy_hash and manifest_policy_hash != current_policy_hash)
         or (not manifest_policy_hash and not current_policy_is_default)
+    )
+    manifest_config_hash = str(manifest.get("export_config_hash") or "")
+    export_config_mismatch = bool(
+        (manifest_config_hash and current_export_config_hash and manifest_config_hash != current_export_config_hash)
+        or (not manifest_config_hash and bool(current_export_config_hash))
     )
     for entry in episodes:
         if not isinstance(entry, dict):
@@ -3672,8 +3780,11 @@ def dashboard_success_pool_export_lookup(run_dir: Union[str, os.PathLike]) -> Di
         "manifest_path": manifest_path,
         "manifest": manifest,
         "current_time_policy": current_time_policy,
+        "current_export_config_hash": current_export_config_hash,
         "manifest_time_policy_hash": manifest_policy_hash,
+        "manifest_export_config_hash": manifest_config_hash,
         "time_policy_mismatch": time_policy_mismatch,
+        "export_config_mismatch": export_config_mismatch,
         "by_source_signature": by_source_signature,
         "by_source_key": by_source_key,
         "by_raw_episode": by_raw_episode,
@@ -3692,7 +3803,10 @@ def dashboard_success_pool_export_lookup(run_dir: Union[str, os.PathLike]) -> Di
             "current_time_policy": current_time_policy.get("policy", {}),
             "current_time_policy_hash": current_policy_hash,
             "manifest_time_policy_hash": manifest_policy_hash,
+            "current_export_config_hash": current_export_config_hash,
+            "manifest_export_config_hash": manifest_config_hash,
             "time_policy_mismatch": time_policy_mismatch,
+            "export_config_mismatch": export_config_mismatch,
         },
     }
 
@@ -3747,12 +3861,24 @@ def dashboard_row_export_status(row: dict, export_lookup: Dict[str, object]) -> 
         reason_text = str(reasons or "")
     videos = entry.get("videos") if isinstance(entry.get("videos"), dict) else {}
     available_videos = sum(1 for value in videos.values() if isinstance(value, dict) and value.get("available") is True)
-    if ready and time_policy_mismatch:
+    entry_config_hash = str(entry.get("export_config_hash") or "")
+    current_config_hash = str(export_lookup.get("current_export_config_hash") or "")
+    export_config_mismatch = bool(export_lookup.get("export_config_mismatch"))
+    if entry_config_hash and current_config_hash:
+        export_config_mismatch = entry_config_hash != current_config_hash
+    if ready and (time_policy_mismatch or export_config_mismatch):
         manifest_hash = entry_policy_hash or str(export_lookup.get("manifest_time_policy_hash") or "")
+        manifest_config_hash = entry_config_hash or str(export_lookup.get("manifest_export_config_hash") or "")
+        reason_kind = "time_policy_mismatch" if time_policy_mismatch else "export_config_mismatch"
         return {
             "export_ready": False,
-            "export_status": "time_policy_mismatch",
-            "export_reason": f"time_policy_mismatch current={current_hash[:8] or 'default'} manifest={manifest_hash[:8] or 'none'}",
+            "export_status": reason_kind,
+            "export_reason": (
+                f"{reason_kind} current_time={current_hash[:8] or 'default'} "
+                f"manifest_time={manifest_hash[:8] or 'none'} "
+                f"current_config={current_config_hash[:8] or 'none'} "
+                f"manifest_config={manifest_config_hash[:8] or 'none'}"
+            ),
             "export_manifest_path": export_lookup.get("manifest_path", ""),
             "export_episode_index": entry.get("episode_index"),
             "export_video_layout": entry.get("video_layout", ""),
@@ -3972,9 +4098,21 @@ def reconcile_success_pool_indexes(pool_dir: Union[str, os.PathLike], recover_or
             seen_ids.add(str(row.get("episode_id") or ""))
             next_index += 1
             recovered += 1
+    hydrated_from_cache = 0
+    transfer_cache = load_success_transfer_cache(pool_dir)
+    if transfer_cache:
+        by_dest = success_transfer_cache_by_dest(transfer_cache)
+        hydrated: List[dict] = []
+        for row in aggregate:
+            fixed, row_changed = hydrate_success_pool_row_from_transfer_cache(row, by_dest)
+            hydrated.append(fixed)
+            if row_changed:
+                hydrated_from_cache += 1
+        aggregate = hydrated
     changed = bool(
         sanitized
         or recovered
+        or hydrated_from_cache
         or len(aggregate) != initial_trainable_rows
         or (aggregate and not os.path.exists(index_path(pool_dir, "trainable")))
     )
@@ -3989,6 +4127,7 @@ def reconcile_success_pool_indexes(pool_dir: Union[str, os.PathLike], recover_or
         "recovered_orphan_folders": recovered,
         "incomplete_or_unreadable_folders": incomplete_folders,
         "sanitized_rows": sanitized,
+        "hydrated_rows_from_transfer_cache": hydrated_from_cache,
         "duplicate_index_rows_dropped": duplicate_rows,
         "episodes_root": episodes_root,
     }
@@ -4378,7 +4517,6 @@ def dashboard_start_success_transfer_job(dataset_root: Union[str, os.PathLike], 
 def dashboard_export_success_pool(
     dataset_root: Union[str, os.PathLike],
     overwrite: bool = True,
-    fps: Optional[float] = None,
     require_vla: bool = False,
     time_policy: object = None,
     progress_callback=None,
@@ -4414,7 +4552,6 @@ def dashboard_export_success_pool(
             pool_dir,
             output_dir=staging_export_dir,
             split="trainable",
-            fps=fps,
             overwrite=True,
             require_standard=False,
             require_vla=require_vla,
@@ -4447,7 +4584,6 @@ def dashboard_export_success_pool(
 def dashboard_start_success_pool_export_job(
     dataset_root: Union[str, os.PathLike],
     overwrite: bool = True,
-    fps: Optional[float] = None,
     require_vla: bool = True,
     time_policy: object = None,
 ) -> Dict[str, object]:
@@ -4464,7 +4600,7 @@ def dashboard_start_success_pool_export_job(
             )
 
         progress(0.0, "starting .dashboard_success VLA export", 0, 100)
-        result = dashboard_export_success_pool(root, overwrite=overwrite, fps=fps, require_vla=require_vla, time_policy=time_policy, progress_callback=progress)
+        result = dashboard_export_success_pool(root, overwrite=overwrite, require_vla=require_vla, time_policy=time_policy, progress_callback=progress)
         if require_vla and not result.get("vla_training_ready"):
             raise RuntimeError(f"VLA export incomplete: {json.dumps(result, ensure_ascii=True)}")
         return result
@@ -4592,6 +4728,7 @@ def dashboard_run_payload_cache_path(run_dir: Union[str, os.PathLike]) -> str:
 
 def dashboard_run_payload_signature(run_dir: Union[str, os.PathLike]) -> Dict[str, object]:
     run_abs = os.path.abspath(str(run_dir or ""))
+    is_success_pool = is_dashboard_success_pool_dir(run_abs)
     files: Dict[str, object] = {}
     for key, filename in INDEX_FILES.items():
         files[f"index/{key}"] = stat_signature(os.path.join(run_abs, filename))
@@ -4610,12 +4747,12 @@ def dashboard_run_payload_signature(run_dir: Union[str, os.PathLike]) -> Dict[st
     signature: Dict[str, object] = {
         "cache_version": RUN_PAYLOAD_CACHE_VERSION,
         "run_dir": run_abs,
-        "run_stat": stat_signature(run_abs),
-        "folder_signature": folder_signature(run_abs),
+        "run_stat": {"exists": os.path.isdir(run_abs)} if is_success_pool else stat_signature(run_abs),
+        "folder_signature": {"path_mtime": 0.0, "latest_mtime": 0.0} if is_success_pool else folder_signature(run_abs),
         "files": files,
-        "is_success_pool": is_dashboard_success_pool_dir(run_abs),
+        "is_success_pool": is_success_pool,
     }
-    if is_dashboard_success_pool_dir(run_abs):
+    if is_success_pool:
         # Direct directory listing only.  This detects new/orphan/removed pool
         # episode folders without walking camera/image trees or reading trajectories.
         signature["success_pool_episode_dirs"] = direct_child_dirs_signature(os.path.join(run_abs, "episodes"))
@@ -4702,13 +4839,194 @@ def save_dashboard_run_payload_cache(run_dir: str, signature: Dict[str, object],
     return cache_path
 
 
+def dashboard_episode_analysis_cache_path(run_dir: Union[str, os.PathLike]) -> str:
+    run_abs = os.path.abspath(str(run_dir or ""))
+    dataset_root = dashboard_run_cache_dataset_root(run_abs)
+    digest = hashlib.sha1(os.path.normcase(run_abs).encode("utf-8", errors="replace")).hexdigest()
+    return os.path.join(dataset_root, RUN_SIZE_CACHE_DIRNAME, RUN_EPISODE_ANALYSIS_CACHE_DIRNAME, f"{digest}.json")
+
+
+def load_dashboard_episode_analysis_cache(run_dir: Union[str, os.PathLike]) -> Dict[str, dict]:
+    payload = read_json(dashboard_episode_analysis_cache_path(run_dir), default={}) or {}
+    if not isinstance(payload, dict) or int(payload.get("version", 0) or 0) != RUN_PAYLOAD_CACHE_VERSION:
+        return {}
+    entries = payload.get("entries") if isinstance(payload.get("entries"), dict) else {}
+    return {str(key): value for key, value in entries.items() if isinstance(value, dict)}
+
+
+def save_dashboard_episode_analysis_cache(run_dir: Union[str, os.PathLike], entries: Dict[str, dict]) -> str:
+    cache_path = dashboard_episode_analysis_cache_path(run_dir)
+    ensure_dir(os.path.dirname(cache_path))
+    write_json(
+        cache_path,
+        {
+            "version": RUN_PAYLOAD_CACHE_VERSION,
+            "created_at": time.time(),
+            "run_dir": os.path.abspath(str(run_dir or "")),
+            "entries": entries,
+        },
+    )
+    return cache_path
+
+
+def dashboard_episode_analysis_signature(
+    run_dir: Union[str, os.PathLike],
+    row: dict,
+    time_policy_hash: str = "",
+) -> Dict[str, object]:
+    run_abs = os.path.abspath(str(run_dir or ""))
+    episode_dir = episode_dir_from_row(row, run_dir=run_abs)
+    files: Dict[str, object] = {"episode_dir": stat_signature(episode_dir)}
+    for key in ["trajectory", "meta", "score"]:
+        value = row_path_value(row, key)
+        files[key] = stat_signature(resolve_episode_file(episode_dir, value)) if value else {"exists": False, "mtime_ns": 0, "size": 0}
+    row_payload = json.dumps(row, ensure_ascii=True, sort_keys=True, default=str)
+    signature = {
+        "cache_version": RUN_PAYLOAD_CACHE_VERSION,
+        "run_dir": run_abs,
+        "episode_index": row.get("episode_index"),
+        "episode_id": row.get("episode_id", ""),
+        "row_hash": hashlib.sha1(row_payload.encode("utf-8", errors="replace")).hexdigest(),
+        "files": files,
+        "time_policy_hash": str(time_policy_hash or ""),
+        "is_success_pool": is_dashboard_success_pool_dir(run_abs),
+    }
+    payload = json.dumps(signature, ensure_ascii=True, sort_keys=True, default=str)
+    signature["signature_hash"] = hashlib.sha1(payload.encode("utf-8")).hexdigest()
+    return signature
+
+
+def dashboard_compute_episode_analysis(
+    run_dir: Union[str, os.PathLike],
+    row: dict,
+    success_pool_mode: bool,
+) -> Dict[str, object]:
+    trajectory = load_trajectory(row)
+    tag, reason = dataset_training_tag_for_row(row, trajectory)
+    if success_pool_mode and trajectory:
+        transformed = dashboard_export_time_runtime(run_dir, trajectory)
+        runtime_s = float(transformed.get("duration_s") or 0.0)
+        time_policy = {
+            "policy": transformed.get("policy", default_export_time_policy()),
+            "time_policy_hash": transformed.get("time_policy_hash", ""),
+            "effective_fps": transformed.get("effective_fps"),
+            "base_fps": transformed.get("base_fps"),
+            "duration_s": transformed.get("duration_s"),
+            "raw_duration_s": transformed.get("raw_duration_s"),
+            "error": transformed.get("error", ""),
+        }
+    else:
+        runtime_s = estimate_row_runtime_s(row, trajectory)
+        time_policy = None
+    frames = len(trajectory) if trajectory else int(safe_float_value(row.get("samples"), 0.0) or 0)
+    episode = dashboard_episode_summary(
+        row,
+        dataset_tag=tag,
+        dataset_skip_reason=reason if tag == "skip" else "",
+        runtime_s=runtime_s,
+    )
+    if time_policy is not None:
+        episode["export_time_policy"] = time_policy
+    return {
+        "tag": tag,
+        "skip_reason": reason if tag == "skip" else "",
+        "raw_status": normalized_status_name(row.get("status", "unknown")),
+        "runtime_s": float(runtime_s),
+        "frames": int(max(0, frames)),
+        "episode": episode,
+        "time_policy": time_policy,
+    }
+
+
+def dashboard_dataset_metrics_from_episode_analyses(rows: Sequence[dict], analyses: Sequence[dict]) -> Dict[str, object]:
+    tag_counts: Counter = Counter()
+    raw_status_counts: Counter = Counter()
+    skip_reasons: Counter = Counter()
+    tag_runtime: Counter = Counter()
+    total_frames = 0
+    usable_frames = 0
+    skip_examples: List[dict] = []
+    for row, analysis in zip(rows, analyses):
+        tag = str(analysis.get("tag") or normalized_status_name(row.get("status", "unknown")))
+        raw_status = str(analysis.get("raw_status") or normalized_status_name(row.get("status", "unknown")))
+        reason = str(analysis.get("skip_reason") or "")
+        runtime = safe_float_value(analysis.get("runtime_s"), 0.0) or 0.0
+        frames = int(safe_float_value(analysis.get("frames"), row.get("samples", 0)) or 0)
+        tag_counts[tag] += 1
+        raw_status_counts[raw_status] += 1
+        tag_runtime[tag] += float(runtime)
+        total_frames += int(max(0, frames))
+        if tag in {"trainable", "success"}:
+            usable_frames += int(max(0, frames))
+        if tag == "skip":
+            skip_reasons[reason] += 1
+            if len(skip_examples) < 12:
+                skip_examples.append({
+                    "episode_index": row.get("episode_index"),
+                    "episode_id": row.get("episode_id", ""),
+                    "raw_status": raw_status,
+                    "skip_reason": reason,
+                    "samples": row.get("samples"),
+                })
+    total_runtime = sum(float(value) for value in tag_runtime.values())
+    return {
+        "tag_counts": dict(tag_counts),
+        "raw_status_counts": dict(raw_status_counts),
+        "skip_reasons": top_counter(skip_reasons, 16),
+        "skip_examples": skip_examples,
+        "skipped_episodes": int(tag_counts.get("skip", 0)),
+        "total_frames": int(total_frames),
+        "usable_frames": int(usable_frames),
+        "usable_frame_ratio": float(usable_frames) / float(max(1, total_frames)),
+        "tag_runtime_seconds": {key: round(float(value), 3) for key, value in tag_runtime.items()},
+        "total_runtime_seconds": round(float(total_runtime), 3),
+        "data_efficiency_score": round(100.0 * float(usable_frames) / float(max(1, total_frames)), 2),
+    }
+
+
+def dashboard_episode_analyses_for_rows(
+    run_dir: Union[str, os.PathLike],
+    rows: Sequence[dict],
+    success_pool_mode: bool,
+    time_policy_hash: str = "",
+) -> Tuple[List[dict], Dict[str, object]]:
+    cache = load_dashboard_episode_analysis_cache(run_dir)
+    next_cache: Dict[str, dict] = {}
+    analyses: List[dict] = []
+    hits = 0
+    misses = 0
+    for row in rows:
+        signature = dashboard_episode_analysis_signature(run_dir, row, time_policy_hash=time_policy_hash)
+        signature_hash = str(signature.get("signature_hash") or "")
+        entry = cache.get(signature_hash)
+        if isinstance(entry, dict) and isinstance(entry.get("analysis"), dict):
+            analysis = clone_jsonable(entry.get("analysis"))  # type: ignore[assignment]
+            hits += 1
+        else:
+            analysis = dashboard_compute_episode_analysis(run_dir, row, success_pool_mode)
+            misses += 1
+        next_cache[signature_hash] = {
+            "signature_hash": signature_hash,
+            "signature": signature,
+            "analysis": analysis,
+            "updated_at": time.time(),
+        }
+        analyses.append(analysis)
+    cache_path = save_dashboard_episode_analysis_cache(run_dir, next_cache)
+    return analyses, {
+        "cache_path": cache_path,
+        "hits": hits,
+        "misses": misses,
+        "entries": len(next_cache),
+    }
+
+
 def dashboard_run_payload_uncached(run_dir: Union[str, os.PathLike]) -> Dict[str, object]:
     run_dir = os.path.abspath(str(run_dir))
     success_pool_reconcile = maybe_reconcile_success_pool_for_dashboard(run_dir)
     report = analyze_run(run_dir, include_timeline=False)
     compact = compact_analysis(report)
     rows, success_catchup = load_dashboard_all_rows(run_dir)
-    dataset_metrics = compute_dataset_generation_metrics(rows)
     success_export_lookup = (
         dashboard_success_pool_export_lookup(run_dir)
         if is_dashboard_success_pool_dir(run_dir)
@@ -4718,42 +5036,19 @@ def dashboard_run_payload_uncached(run_dir: Union[str, os.PathLike]) -> Dict[str
             "summary": {"has_manifest": False, "reason": "not_success_pool"},
         }
     )
-    tag_by_episode = {}
-    skip_reason_by_episode = {}
-    runtime_by_episode = {}
-    time_policy_by_episode = {}
     success_pool_mode = is_dashboard_success_pool_dir(run_dir)
-    for row in rows:
-        trajectory = load_trajectory(row)
-        tag, reason = dataset_training_tag_for_row(row, trajectory)
-        key = str(row.get("episode_index"))
-        tag_by_episode[key] = tag
-        skip_reason_by_episode[key] = reason if tag == "skip" else ""
-        if success_pool_mode and trajectory:
-            transformed = dashboard_export_time_runtime(run_dir, trajectory)
-            runtime_by_episode[key] = float(transformed.get("duration_s") or 0.0)
-            time_policy_by_episode[key] = {
-                "policy": transformed.get("policy", default_export_time_policy()),
-                "time_policy_hash": transformed.get("time_policy_hash", ""),
-                "effective_fps": transformed.get("effective_fps"),
-                "base_fps": transformed.get("base_fps"),
-                "duration_s": transformed.get("duration_s"),
-                "raw_duration_s": transformed.get("raw_duration_s"),
-                "error": transformed.get("error", ""),
-            }
-        else:
-            runtime_by_episode[key] = estimate_row_runtime_s(row, trajectory)
+    current_policy_info = success_export_lookup.get("current_time_policy") if isinstance(success_export_lookup, dict) else {}
+    current_policy_hash = str(current_policy_info.get("hash", "") if isinstance(current_policy_info, dict) else "")
+    analyses, episode_cache = dashboard_episode_analyses_for_rows(
+        run_dir,
+        rows,
+        success_pool_mode=success_pool_mode,
+        time_policy_hash=current_policy_hash,
+    )
+    dataset_metrics = dashboard_dataset_metrics_from_episode_analyses(rows, analyses)
     episodes = []
-    for row in rows:
-        key = str(row.get("episode_index"))
-        episode = dashboard_episode_summary(
-            row,
-            dataset_tag=tag_by_episode.get(key),
-            dataset_skip_reason=skip_reason_by_episode.get(key, ""),
-            runtime_s=runtime_by_episode.get(key),
-        )
-        if key in time_policy_by_episode:
-            episode["export_time_policy"] = time_policy_by_episode.get(key)
+    for row, analysis in zip(rows, analyses):
+        episode = clone_jsonable(analysis.get("episode") or dashboard_episode_summary(row))  # type: ignore[assignment]
         if is_dashboard_success_pool_dir(run_dir):
             episode.update(dashboard_row_export_status(row, success_export_lookup))
         episodes.append(episode)
@@ -4769,6 +5064,7 @@ def dashboard_run_payload_uncached(run_dir: Union[str, os.PathLike]) -> Dict[str
     diagnosis["success_catchup"] = success_catchup
     diagnosis["success_pool_reconcile"] = success_pool_reconcile
     diagnosis["success_export"] = success_export_lookup.get("summary", {})
+    diagnosis["episode_analysis_cache"] = episode_cache
     compact = dict(compact)
     compact_counts = dict(compact.get("counts", {}) if isinstance(compact.get("counts"), dict) else {})
     compact_counts["skip"] = int(status_counts.get("skip", 0))
@@ -5742,11 +6038,6 @@ body main details>summary:after,.managerPanel>summary:after,.detailsPanel>summar
     <div class="modalGrid">
       <label for="exportSpeedScaleInput">Speed scale</label>
       <input id="exportSpeedScaleInput" type="number" min="0.01" step="0.1" value="1">
-      <label for="exportTimeModeSelect">Time mode</label>
-      <select id="exportTimeModeSelect">
-        <option value="uniform_fps">Uniform export FPS</option>
-        <option value="scaled_raw">Scaled raw timestamps</option>
-      </select>
     </div>
     <div id="exportTimePolicyPreview" class="modalNote">1x export uses the original timeline.</div>
     <div class="modalActions">
@@ -5808,12 +6099,7 @@ function normalizeExportTimePolicyJS(policy){
   const p=policy&&typeof policy==="object"?policy:{};
   let speed=Number(p.speed_scale);
   if(!Number.isFinite(speed)||speed<=0) speed=1;
-  let mode=String(p.time_mode||"uniform_fps");
-  if(!["uniform_fps","scaled_raw"].includes(mode)) mode="uniform_fps";
-  let base=p.base_fps;
-  base=(base===null||base===undefined||base==="")?null:Number(base);
-  if(base!==null && (!Number.isFinite(base)||base<=0)) base=null;
-  return {version:1, speed_scale:speed, time_mode:mode, base_fps:base};
+  return {version:1, speed_scale:speed, time_mode:"uniform_fps", base_fps:null};
 }
 function currentRunTimePolicyInfo(){
   const info=(((currentRun||{}).diagnosis||{}).success_export||{}).current_time_policy;
@@ -5823,31 +6109,26 @@ function currentRunTimePolicyInfo(){
 function fillExportTimePolicyInputs(policy){
   const p=normalizeExportTimePolicyJS(policy);
   currentExportTimePolicy=p;
-  const speed=$("exportSpeedScaleInput"), mode=$("exportTimeModeSelect");
+  const speed=$("exportSpeedScaleInput");
   if(speed) speed.value=String(p.speed_scale);
-  if(mode) mode.value=p.time_mode;
   updateExportTimePolicyPreview();
 }
 function readExportTimePolicyInputs(){
   return normalizeExportTimePolicyJS({
     speed_scale:$("exportSpeedScaleInput")?.value,
-    time_mode:$("exportTimeModeSelect")?.value,
     base_fps:null
   });
 }
-function exportTimePolicyText(policy, effectiveFps){
+function exportTimePolicyText(policy){
   const p=normalizeExportTimePolicyJS(policy);
-  const eff=Number(effectiveFps);
-  return `${fmt(p.speed_scale,3)}x, mode=${p.time_mode}${Number.isFinite(eff)?`, effective_fps=${fmt(eff,3)}`:""}`;
+  return `${fmt(p.speed_scale,3)}x, uniform export time`;
 }
 function updateExportTimePolicyPreview(extra){
   const p=readExportTimePolicyInputs();
   currentExportTimePolicy=p;
-  const base=Number(p.base_fps);
-  const effective=(Number.isFinite(base)&&base>0)?base*p.speed_scale:null;
   const el=$("exportTimePolicyPreview");
   if(el){
-    el.textContent=(extra?`${extra} `:"")+`Preview/export policy: ${exportTimePolicyText(p,effective)}. Timestamps are rewritten; joint velocity, acceleration and action are recomputed from the rewritten timeline.`;
+    el.textContent=(extra?`${extra} `:"")+`Preview/export policy: ${exportTimePolicyText(p)}. Timestamps use the exporter uniform timeline; joint velocity, acceleration and action are recomputed from that timeline.`;
   }
 }
 function showExportTimeModal(){
@@ -5864,7 +6145,7 @@ function hideExportTimeModal(){
 function setExportModalBusy(busy, message){
   const modal=$("exportTimeModal");
   if(modal) modal.classList.toggle("loading",!!busy);
-  ["cancelExportTimeBtn","resetTimePolicyBtn","applyTimePreviewBtn","exportTimeNowBtn","exportSpeedScaleInput","exportTimeModeSelect"].forEach(id=>{
+  ["cancelExportTimeBtn","resetTimePolicyBtn","applyTimePreviewBtn","exportTimeNowBtn","exportSpeedScaleInput"].forEach(id=>{
     const el=$(id); if(el) el.disabled=!!busy;
   });
   const apply=$("applyTimePreviewBtn");
@@ -5882,7 +6163,7 @@ async function saveExportTimePolicyForPreview(reset=false, reload=true){
   updateExportTimePolicyPreview(`Saved.`);
   if(!reload) return result;
   $("runInput").value=result.pool_dir||successPoolPath();
-  await loadRun(true);
+  await loadRun(false);
   if(currentEpisodeIndex!==null && currentEpisodeIndex!==undefined){
     await loadEpisode(currentEpisodeIndex);
   }
@@ -6148,12 +6429,12 @@ async function exportSuccessPoolWithPolicy(){
     const encoded=Number(result.encoded_video_jobs||0);
     const reused=Number(result.reused_video_jobs||0);
     const totalJobs=Number(result.total_video_jobs||0);
-    const policyText=exportTimePolicyText(result.time_policy||policy,result.effective_fps||result.fps);
+    const policyText=exportTimePolicyText(result.time_policy||policy);
     const jobSummary=totalJobs?`encoded=${encoded}, reused=${reused}/${totalJobs}`:`encoded=${encoded}, reused=${reused}`;
     setTransferProgress(`Export complete: ${result.total_episodes||0} episodes, ${result.total_frames||0} frames, ${jobSummary}, ${policyText}`, 100, false);
     setStatus(`Export complete: ready=${!!result.vla_training_ready}; ${policyText}; ${jobSummary}; videos=${videoSummary}; dir=${result.export_dir||''}`, result.vla_training_ready?'ok':'error');
     $('runInput').value=pool;
-    await loadRun(true);
+    await loadRun(false);
   });
 }
 
@@ -6186,7 +6467,7 @@ async function loadRun(force=false){
   const started=performance.now();
   setStatus(force ? "Refreshing run analysis..." : "Checking run analysis cache...");
   const slowTimer=setTimeout(()=>setStatus(force ? "Still refreshing run analysis..." : "Still checking run analysis cache..."),1500);
-  const rebuildTimer=setTimeout(()=>setStatus("Cache miss or large run: rebuilding analysis cache..."),4200);
+  const rebuildTimer=setTimeout(()=>setStatus(force ? "Large run: still refreshing analysis..." : "Large run: still loading analysis cache..."),4200);
   let data;
   try{
     data=await api("/api/run", {run_dir:runDir, force:force ? "1" : "0", _:Date.now()});
@@ -6428,7 +6709,8 @@ function renderEpisodes(episodes){
   const sorted=[...(episodes||[])].sort((a,b)=>{const av=sortValue(a,episodeSort.key), bv=sortValue(b,episodeSort.key); if(av===bv) return Number(a.episode_index||0)-Number(b.episode_index||0); if(av===null)return 1; if(bv===null)return -1; return (av<bv?-1:1)*episodeSort.dir});
   const label=episodeSortLabel(episodeSort.key); const arrow=episodeSort.dir>0?"↑":"↓";
   const hasExportFields=sorted.some(ep=>Object.prototype.hasOwnProperty.call(ep,"export_ready"));
-  const exportMeta=hasExportFields?` · export ready ${sorted.filter(ep=>ep.export_ready===true).length}, stale ${sorted.filter(ep=>ep.export_status==="time_policy_mismatch").length}, missing ${sorted.filter(ep=>ep.export_ready===false&&ep.export_status!=="time_policy_mismatch").length}, unknown ${sorted.filter(ep=>ep.export_ready!==true&&ep.export_ready!==false).length}`:"";
+  const staleExportStatuses=new Set(["time_policy_mismatch","export_config_mismatch"]);
+  const exportMeta=hasExportFields?` · export ready ${sorted.filter(ep=>ep.export_ready===true).length}, stale ${sorted.filter(ep=>staleExportStatuses.has(ep.export_status)).length}, missing ${sorted.filter(ep=>ep.export_ready===false&&!staleExportStatuses.has(ep.export_status)).length}, unknown ${sorted.filter(ep=>ep.export_ready!==true&&ep.export_ready!==false).length}`:"";
   $("episodeSideMeta").textContent=`${sorted.length} shown · sorted by ${label} ${arrow}${exportMeta}`;
   if(!sorted.length){$("episodeTabs").innerHTML='<div class="empty">No attempts match the current status filter.</div>'; syncEpisodeInspectorHeight(); return}
   $("episodeTabs").innerHTML=episodeTableHtml(sorted);
@@ -6439,7 +6721,7 @@ function episodeSortLabel(key){return ({episode_index:"Ep",time_s:"Time",score:"
 function sortHeader(key,label,cls=""){const arrow=episodeSort.key===key?(episodeSort.dir>0?" ▲":" ▼"):""; return `<th class="sortable ${esc(cls)}" data-action="sort-episodes" data-sort-key="${esc(key)}" title="Click to sort by ${esc(label)}">${esc(label)}${arrow}</th>`}
 function episodeTableHtml(rows){const head=`<thead><tr>${sortHeader("episode_index","Ep","epCol")}<th>Status</th>${sortHeader("time_s","Time","num")}${sortHeader("score","Score","num")}${sortHeader("max_bucket","Bucket","num")}${sortHeader("lift_bucket","Lift","num")}${sortHeader("final_bin","Bin","num")}${sortHeader("final_spill","Spill","num")}${sortHeader("robot_yaw","Robot yaw","num")}${sortHeader("truck_yaw","Truck yaw","num")}<th>Reason</th></tr></thead>`; const body=rows.map(ep=>episodeRowHtml(ep)).join(""); return `<table id="episodeTable" class="episodeDataSheet">${head}<tbody>${body}</tbody></table>`}
 function exportReadyState(ep){
-  if(ep.export_status==="time_policy_mismatch") return {cls:"stale", title:`VLA export stale: time_policy mismatch - ${ep.export_reason||"re-export required"}`};
+  if(ep.export_status==="time_policy_mismatch"||ep.export_status==="export_config_mismatch") return {cls:"stale", title:`VLA export stale: settings mismatch - ${ep.export_reason||"re-export required"}`};
   if(ep.export_ready===true) return {cls:"ready", title:`VLA export ready${ep.export_video_count!=null?` - videos=${ep.export_video_count}`:""}`};
   if(ep.export_ready===false) return {cls:"notReady", title:`VLA export missing/not ready - ${ep.export_reason||"not exported or missing"}`};
   return {cls:"unknown", title:`VLA export unknown - ${ep.export_reason||"load .dashboard_success or export first"}`};
@@ -6454,7 +6736,7 @@ function renderEpisode(data){
   const ep=data.episode||{}; $("episodeTitle").textContent=`Attempt ${ep.episode_index} timeline`; $("episodeMeta").textContent=`${statusKey(ep.status)} · score=${fmt(ep.score,1)} · samples=${data.sample_count} · shown=${data.returned_points} · ${shortText(ep.dataset_skip_reason || ep.reason||ep.warning_reason||"",260)}`; $("rawBox").textContent=JSON.stringify({episode:ep,stage_spans:data.stage_spans,camera_preview:data.camera_preview},null,2);
   const tp=data.time_policy||ep.export_time_policy||{};
   const tpPolicy=normalizeExportTimePolicyJS(tp.policy||tp.time_policy||{});
-  const tpInfo=`speed=${fmt(tpPolicy.speed_scale,3)}x${tp.effective_fps?`, fps=${fmt(tp.effective_fps,3)}`:""}`;
+  const tpInfo=`speed=${fmt(tpPolicy.speed_scale,3)}x, uniform time`;
   $("episodeMeta").textContent=`${statusKey(ep.status)} | score=${fmt(ep.score,1)} | samples=${data.sample_count} | shown=${data.returned_points} | ${tpInfo} | ${shortText(ep.dataset_skip_reason || ep.reason||ep.warning_reason||"",260)}`;
   $("rawBox").textContent=JSON.stringify({episode:ep,time_policy:data.time_policy,stage_spans:data.stage_spans,camera_preview:data.camera_preview},null,2);
   const promptEl=$("episodeTaskPrompt"); const promptText=String(ep.task_prompt||"").trim(); if(promptEl){promptEl.style.display=promptText?"block":"none"; promptEl.innerHTML=promptText?`<span class="taskPromptLabel">Task prompt</span>${esc(promptText)}`:"";}
@@ -6483,7 +6765,6 @@ function cameraFrameMeta(preview, frameIndex){
   const rawT=Number(row.raw_t);
   let label="t";
   if(mode==="uniform_fps") label="uniform t";
-  else if(mode==="scaled_raw") label="scaled t";
   const tText=Number.isFinite(t)?`${label}=${fmt(t,2)}s`:"";
   const rawText=(Number.isFinite(rawT)&&Number.isFinite(t)&&Math.abs(rawT-t)>1e-4)?` · raw=${fmt(rawT,2)}s`:"";
   const phase=row.phase?` · ${row.phase}`:"";
@@ -7000,7 +7281,7 @@ bindStaticControl("cancelExportTimeBtn","click",()=>hideExportTimeModal());
 bindStaticControl("resetTimePolicyBtn","click",()=>saveExportTimePolicyForPreview(true, true).catch(e=>setStatus(e.message,"error")));
 bindStaticControl("applyTimePreviewBtn","click",()=>applyTimePreviewAndClose().catch(e=>setStatus(e.message,"error")));
 bindStaticControl("exportTimeNowBtn","click",()=>exportSuccessPoolWithPolicy().catch(e=>setStatus(e.message,"error")));
-["exportSpeedScaleInput","exportTimeModeSelect"].forEach(id=>{const el=$(id); if(el) el.addEventListener("input",()=>updateExportTimePolicyPreview());});
+["exportSpeedScaleInput"].forEach(id=>{const el=$(id); if(el) el.addEventListener("input",()=>updateExportTimePolicyPreview());});
 bindStaticControl("exportTimeModal","click", e=>{const modal=$("exportTimeModal"); if(e.target===modal && !modal.classList.contains("loading")) hideExportTimeModal();});
 bindStaticControl("darkModeToggle","click",()=>toggleDarkMode());
 initDarkMode();
@@ -7141,16 +7422,10 @@ def serve_dashboard(
                     return
                 if parsed.path == "/api/manage/export_success_vla":
                     root = normalize_dashboard_client_path(body.get("root") or default_root)
-                    fps_value = body.get("fps")
-                    try:
-                        fps = float(fps_value) if fps_value not in (None, "") else None
-                    except Exception:
-                        fps = None
                     time_policy = body.get("time_policy")
                     result = dashboard_start_success_pool_export_job(
                         root,
                         overwrite=bool(body.get("overwrite", True)),
-                        fps=fps,
                         require_vla=bool(body.get("require_vla", True)),
                         time_policy=time_policy,
                     )
@@ -7221,7 +7496,6 @@ if __name__ == "__main__":
     parser.add_argument("--export-lerobot-v3", action="store_true", help="Alias for --export-lerobot.")
     parser.add_argument("--export-dir", default=None, help="Output directory for --export-lerobot. Defaults to run_dir/lerobot_v3.")
     parser.add_argument("--export-split", default="trainable", help="Episode index split to export, default: trainable.")
-    parser.add_argument("--export-fps", type=float, default=None, help="Video fps for exported camera streams; defaults to camera_config frequency.")
     parser.add_argument("--export-limit", type=int, default=None, help="Limit exported episodes for smoke tests.")
     parser.add_argument("--export-overwrite", action="store_true", help="Delete and rebuild the export directory if it already exists.")
     parser.add_argument("--export-require-standard", action="store_true", help="Fail if parquet/mp4 standard export cannot be produced.")
@@ -7251,7 +7525,6 @@ if __name__ == "__main__":
             run_dir,
             output_dir=args.export_dir,
             split=args.export_split,
-            fps=args.export_fps,
             limit_episodes=args.export_limit,
             overwrite=args.export_overwrite,
             require_standard=args.export_require_standard,

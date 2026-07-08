@@ -34,6 +34,8 @@ LEROBOT_DEFAULT_EXPORT_DIRNAME = "lerobot_v3"
 EXPORT_TIME_POLICY_FILENAME = "export_time_policy.json"
 LEROBOT_IMAGE_SHAPE = [256, 256, 3]
 LEROBOT_VIDEO_KEYFRAME_INTERVAL = 4
+SUCCESS_POOL_DIRNAME = ".dashboard_success"
+SUCCESS_TRANSFER_CACHE_FILENAME = "transfer_source_cache.json"
 LEROBOT_IMAGE_KEYS = [
     "observation.images.0",
     "observation.images.1",
@@ -1102,6 +1104,143 @@ def resolve_episode_file(episode_dir: str, value: object) -> str:
     return normalized
 
 
+def is_dashboard_success_pool_dir(path: Union[str, os.PathLike]) -> bool:
+    return os.path.basename(os.path.normpath(str(path or ""))) == SUCCESS_POOL_DIRNAME
+
+
+def _norm_episode_dir_key(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return os.path.normcase(os.path.abspath(text))
+    except Exception:
+        return os.path.normcase(text)
+
+
+def _success_transfer_cache_path(pool_dir: Union[str, os.PathLike]) -> str:
+    return os.path.join(str(pool_dir), SUCCESS_TRANSFER_CACHE_FILENAME)
+
+
+def _success_transfer_cache_by_dest(pool_dir: Union[str, os.PathLike]) -> Dict[str, dict]:
+    payload = read_json(_success_transfer_cache_path(pool_dir), default={}) or {}
+    sources = payload.get("sources") if isinstance(payload, dict) else None
+    if not isinstance(sources, dict):
+        return {}
+    out: Dict[str, dict] = {}
+
+    def entry_score(entry: dict) -> int:
+        source_run = str(entry.get("source_run_dir") or "")
+        source_key = str(entry.get("source_key") or "")
+        score = 0
+        if entry.get("source_signature_hash"):
+            score += 100
+        if source_run:
+            score += 10
+        if SUCCESS_POOL_DIRNAME not in source_run and not source_key.startswith("|"):
+            score += 5
+        return score
+
+    def keep_best(key: str, entry: dict) -> None:
+        old = out.get(key)
+        if old is None or entry_score(entry) > entry_score(old):
+            out[key] = entry
+
+    for entry in sources.values():
+        if not isinstance(entry, dict):
+            continue
+        dest = _norm_episode_dir_key(entry.get("transferred_episode_dir") or entry.get("dest_episode_dir"))
+        if dest:
+            keep_best(dest, entry)
+        folder = str(entry.get("folder_name") or "").strip()
+        if folder:
+            keep_best(os.path.normcase(folder), entry)
+    return out
+
+
+def _hydrate_success_pool_row_from_cache(row: dict, by_dest: Dict[str, dict], run_dir: Union[str, os.PathLike]) -> Tuple[dict, bool]:
+    out = dict(row)
+    dest = _norm_episode_dir_key(out.get("transferred_episode_dir") or out.get("dest_episode_dir") or episode_dir_from_row(out, run_dir=run_dir))
+    entry = by_dest.get(dest)
+    if entry is None and dest:
+        entry = by_dest.get(os.path.normcase(os.path.basename(dest)))
+    if not isinstance(entry, dict):
+        return out, False
+    pool_row = entry.get("pool_row") if isinstance(entry.get("pool_row"), dict) else {}
+    changed = False
+
+    def fill(field: str, value: object) -> None:
+        nonlocal changed
+        if out.get(field) in (None, "") and value not in (None, ""):
+            out[field] = value
+            changed = True
+
+    def replace_fake(field: str, value: object) -> None:
+        nonlocal changed
+        current = str(out.get(field) or "")
+        new_value = str(value or "")
+        if not new_value:
+            return
+        fake_current = current.startswith("|") or SUCCESS_POOL_DIRNAME in current
+        if fake_current and current != new_value:
+            out[field] = value
+            changed = True
+
+    fill("source_run_name", entry.get("source_run_name") or pool_row.get("source_run_name"))
+    fill("source_run_dir", entry.get("source_run_dir") or pool_row.get("source_run_dir"))
+    fill("source_episode_index", entry.get("source_episode_index") or pool_row.get("source_episode_index"))
+    fill("source_episode_id", entry.get("source_episode_id") or pool_row.get("source_episode_id"))
+    fill("source_episode_dir", entry.get("source_episode_dir") or pool_row.get("source_episode_dir"))
+    fill("dashboard_transfer_source_key", entry.get("source_key") or pool_row.get("dashboard_transfer_source_key"))
+    replace_fake("dashboard_transfer_source_key", entry.get("source_key") or pool_row.get("dashboard_transfer_source_key"))
+    fill(
+        "dashboard_transfer_source_signature_hash",
+        entry.get("source_signature_hash") or pool_row.get("dashboard_transfer_source_signature_hash"),
+    )
+    fill(
+        "dashboard_transfer_source_latest_mtime_ns",
+        entry.get("latest_mtime_ns") or pool_row.get("dashboard_transfer_source_latest_mtime_ns"),
+    )
+    signature = pool_row.get("dashboard_transfer_source_signature")
+    if isinstance(signature, dict) and not isinstance(out.get("dashboard_transfer_source_signature"), dict):
+        out["dashboard_transfer_source_signature"] = signature
+        changed = True
+    return out, changed
+
+
+def hydrate_success_pool_indexes_from_transfer_cache(run_dir: Union[str, os.PathLike]) -> Dict[str, object]:
+    run_dir = os.path.abspath(str(run_dir))
+    if not is_dashboard_success_pool_dir(run_dir):
+        return {"ok": True, "is_success_pool": False, "changed": False}
+    by_dest = _success_transfer_cache_by_dest(run_dir)
+    if not by_dest:
+        return {"ok": True, "is_success_pool": True, "changed": False, "hydrated_rows": 0}
+    changed_total = 0
+    split_counts: Dict[str, int] = {}
+    for split in ["trainable", "success", "all"]:
+        rows = load_index(run_dir, split)
+        if not rows:
+            continue
+        fixed_rows = []
+        split_changed = 0
+        for row in rows:
+            fixed, changed = _hydrate_success_pool_row_from_cache(row, by_dest, run_dir)
+            fixed_rows.append(fixed)
+            if changed:
+                split_changed += 1
+        if split_changed:
+            write_jsonl(index_path(run_dir, split), fixed_rows)
+            changed_total += split_changed
+            split_counts[split] = split_changed
+    return {
+        "ok": True,
+        "is_success_pool": True,
+        "changed": bool(changed_total),
+        "hydrated_rows": changed_total,
+        "split_counts": split_counts,
+    }
+
+
 def relpath_posix(path: Union[str, os.PathLike], base: Union[str, os.PathLike]) -> str:
     return os.path.relpath(str(path), str(base)).replace("\\", "/")
 
@@ -1135,20 +1274,11 @@ def normalize_export_time_policy(policy: object) -> Dict[str, object]:
         speed_scale = 1.0
     if not math.isfinite(speed_scale) or speed_scale <= 0:
         speed_scale = 1.0
-    time_mode = str(data.get("time_mode") or "uniform_fps").strip() or "uniform_fps"
-    if time_mode not in {"uniform_fps", "scaled_raw"}:
-        time_mode = "uniform_fps"
-    try:
-        base_fps = float(data.get("base_fps")) if data.get("base_fps") not in (None, "") else None
-    except Exception:
-        base_fps = None
-    if base_fps is not None and (not math.isfinite(base_fps) or base_fps <= 0):
-        base_fps = None
     return {
         "version": 1,
         "speed_scale": float(speed_scale),
-        "time_mode": time_mode,
-        "base_fps": base_fps,
+        "time_mode": "uniform_fps",
+        "base_fps": None,
     }
 
 
@@ -1189,6 +1319,41 @@ def effective_export_fps(base_fps: float, policy: object) -> float:
     if not math.isfinite(base) or base <= 0:
         base = 10.0
     return max(0.001, base * float(normalized.get("speed_scale") or 1.0))
+
+
+def lerobot_export_config_for_run(
+    run_dir: Union[str, os.PathLike],
+    split: str = "trainable",
+    time_policy: object = None,
+) -> Dict[str, object]:
+    base_export_fps = infer_export_fps(run_dir, None)
+    time_policy_info = load_export_time_policy(run_dir, explicit_policy=time_policy)
+    normalized_time_policy = dict(time_policy_info.get("policy") or default_export_time_policy())
+    export_fps = effective_export_fps(base_export_fps, normalized_time_policy)
+    export_config = {
+        "video_layout": "per_episode",
+        "fps": float(export_fps),
+        "video_keyframe_interval": int(LEROBOT_VIDEO_KEYFRAME_INTERVAL),
+        "base_fps": float(base_export_fps),
+        "time_policy": normalized_time_policy,
+        "time_policy_hash": str(time_policy_info.get("hash") or export_time_policy_hash(normalized_time_policy)),
+        "image_features": list(LEROBOT_IMAGE_KEYS),
+        "image_shape": list(LEROBOT_IMAGE_SHAPE),
+        "source_split": split,
+        "schema": LEROBOT_EXPORT_SCHEMA,
+    }
+    export_config_hash = hashlib.sha1(
+        json.dumps(export_config, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    return {
+        "base_export_fps": float(base_export_fps),
+        "export_fps": float(export_fps),
+        "time_policy_info": time_policy_info,
+        "time_policy": normalized_time_policy,
+        "time_policy_hash": str(time_policy_info.get("hash") or export_time_policy_hash(normalized_time_policy)),
+        "export_config": export_config,
+        "export_config_hash": export_config_hash,
+    }
 
 
 def _unwrap_angle_series(values: Sequence[Optional[Sequence[float]]], dim: int) -> List[List[Optional[float]]]:
@@ -1335,10 +1500,7 @@ def apply_export_time_policy_to_trajectory(
     for index, sample in enumerate(samples):
         raw_t = safe_float_value(sample.get("t"), raw_first_t) or raw_first_t
         raw_times.append(float(raw_t) - raw_first_t)
-        if normalized.get("time_mode") == "scaled_raw":
-            new_times.append(float(raw_t - raw_first_t) / speed_scale)
-        else:
-            new_times.append(float(index) / float(effective_fps_value))
+        new_times.append(float(index) / float(effective_fps_value))
     dim = 4
     q_raw = [_vector_with_fallback(sample.get("obs.q"), sample.get("goal.q"), dim) for sample in samples]
     q_cmd_raw = [_vector_with_fallback(sample.get("obs.q_cmd"), sample.get("goal.q"), dim) for sample in samples]
@@ -2008,9 +2170,12 @@ def lerobot_manifest_reuse_entries(reuse_from_dir: Union[str, os.PathLike, None]
         if episode.get("export_ready") is not True:
             continue
         source_hash = str(episode.get("source_signature_hash") or "")
-        if not source_hash:
+        if source_hash:
+            out[source_hash] = episode
             continue
-        out[source_hash] = episode
+        raw_episode_id = str(episode.get("raw_episode_id") or "")
+        if raw_episode_id:
+            out[f"raw_episode_id:{raw_episode_id}"] = episode
     return out
 
 
@@ -2022,9 +2187,18 @@ def reusable_episode_video(
     expected_frames: int,
 ) -> Optional[str]:
     source_hash = str(episode.get("source_signature_hash") or "")
-    if not source_hash:
-        return None
-    reused_episode = reusable_episodes.get(source_hash)
+    reuse_keys = [source_hash] if source_hash else []
+    raw_episode_id = str(episode.get("raw_episode_id") or "")
+    if raw_episode_id:
+        reuse_keys.append(f"raw_episode_id:{raw_episode_id}")
+    reused_episode = None
+    for reuse_key in reuse_keys:
+        if not reuse_key:
+            continue
+        candidate = reusable_episodes.get(reuse_key)
+        if isinstance(candidate, dict):
+            reused_episode = candidate
+            break
     if not isinstance(reused_episode, dict):
         return None
     if int(reused_episode.get("length", -1) or -1) != int(episode.get("length", -2) or -2):
@@ -2052,6 +2226,7 @@ def collect_lerobot_rows(
     base_fps: float = 10.0,
 ) -> Dict[str, object]:
     run_dir = str(run_dir)
+    hydrate_success_pool_indexes_from_transfer_cache(run_dir)
     episode_rows = load_index(run_dir, split)
     if limit_episodes is not None:
         episode_rows = episode_rows[: max(0, int(limit_episodes))]
@@ -2288,13 +2463,14 @@ def export_lerobot_dataset(
     except Exception as exc:
         raise RuntimeError(f"pandas is required for strict LeRobot v3 export: {type(exc).__name__}:{exc}") from exc
 
-    base_export_fps = infer_export_fps(run_dir, fps)
-    time_policy_info = load_export_time_policy(run_dir, explicit_policy=time_policy)
-    normalized_time_policy = dict(time_policy_info.get("policy") or default_export_time_policy())
-    export_fps = effective_export_fps(base_export_fps, normalized_time_policy)
+    export_config_info = lerobot_export_config_for_run(run_dir, split=split, time_policy=time_policy)
+    base_export_fps = float(export_config_info.get("base_export_fps") or 10.0)
+    time_policy_info = dict(export_config_info.get("time_policy_info") or {})
+    normalized_time_policy = dict(export_config_info.get("time_policy") or default_export_time_policy())
+    export_fps = float(export_config_info.get("export_fps") or 10.0)
     progress(
         5.0,
-        f"collecting trainable rows and validating camera files; speed_scale={normalized_time_policy.get('speed_scale', 1.0)} effective_fps={export_fps:.3f}",
+        f"collecting trainable rows and validating camera files; speed_scale={normalized_time_policy.get('speed_scale', 1.0)} uniform_timeline=exporter",
     )
     collected = collect_lerobot_rows(
         run_dir,
@@ -2316,21 +2492,8 @@ def export_lerobot_dataset(
         export_fps = 10.0
     video_results = {}
     image_features = list(LEROBOT_IMAGE_KEYS)
-    export_config = {
-        "video_layout": "per_episode",
-        "fps": float(export_fps),
-        "video_keyframe_interval": int(LEROBOT_VIDEO_KEYFRAME_INTERVAL),
-        "base_fps": float(base_export_fps),
-        "time_policy": normalized_time_policy,
-        "time_policy_hash": str(time_policy_info.get("hash") or export_time_policy_hash(normalized_time_policy)),
-        "image_features": list(image_features),
-        "image_shape": list(LEROBOT_IMAGE_SHAPE),
-        "source_split": split,
-        "schema": LEROBOT_EXPORT_SCHEMA,
-    }
-    export_config_hash = hashlib.sha1(
-        json.dumps(export_config, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8")
-    ).hexdigest()
+    export_config = dict(export_config_info.get("export_config") or {})
+    export_config_hash = str(export_config_info.get("export_config_hash") or "")
     reusable_episodes = lerobot_manifest_reuse_entries(reuse_dir, export_config_hash)
     if reuse_dir:
         progress(10.0, f"reuse manifest entries={len(reusable_episodes)} from {reuse_dir}")
@@ -2683,7 +2846,7 @@ def export_lerobot_dataset(
         f"Split: `{split}`",
         f"Frames: `{len(data_rows)}`",
         f"Episodes: `{len(episodes)}`",
-        f"FPS: `{export_fps}`",
+        f"Uniform timeline/video rate: `{export_fps}`",
         f"LeRobot v3 / VLA ready: `{vla_training_ready}`",
         "",
         "This subfolder is generated from the raw auto-collection run and keeps trainable data separate from debug logs.",
@@ -2714,7 +2877,6 @@ def print_lerobot_export(
     run_dir: Union[str, os.PathLike],
     output_dir: Optional[Union[str, os.PathLike]] = None,
     split: str = "trainable",
-    fps: Optional[float] = None,
     limit_episodes: Optional[int] = None,
     overwrite: bool = False,
     require_standard: bool = False,
@@ -2725,7 +2887,6 @@ def print_lerobot_export(
         run_dir,
         output_dir=output_dir,
         split=split,
-        fps=fps,
         limit_episodes=limit_episodes,
         overwrite=overwrite,
         require_standard=require_standard,
@@ -3566,10 +3727,7 @@ if __name__ == "__main__":
     parser.add_argument("--export-lerobot-v3", action="store_true", help="Alias for --export-lerobot.")
     parser.add_argument("--export-dir", default=None, help="Output directory for --export-lerobot. Defaults to run_dir/lerobot_v3.")
     parser.add_argument("--export-split", default="trainable", help="Episode index split to export, default: trainable.")
-    parser.add_argument("--export-fps", type=float, default=None, help="Video fps for exported camera streams; defaults to camera_config frequency.")
     parser.add_argument("--export-speed-scale", type=float, default=None, help="Speed multiplier for export timestamps and recomputed dq/ddq/action.")
-    parser.add_argument("--export-time-mode", default="uniform_fps", choices=["uniform_fps", "scaled_raw"], help="Time policy for export rows.")
-    parser.add_argument("--export-base-fps", type=float, default=None, help="Base fps before speed scaling; defaults to camera_config frequency.")
     parser.add_argument("--export-limit", type=int, default=None, help="Limit exported episodes for smoke tests.")
     parser.add_argument("--export-overwrite", action="store_true", help="Delete and rebuild the export directory if it already exists.")
     parser.add_argument("--export-require-standard", action="store_true", help="Fail if parquet/mp4 standard export cannot be produced.")
@@ -3596,17 +3754,16 @@ if __name__ == "__main__":
         did_action = True
     if args.export_lerobot or args.export_lerobot_v3:
         export_time_policy = None
-        if args.export_speed_scale is not None or args.export_base_fps is not None or args.export_time_mode != "uniform_fps":
+        if args.export_speed_scale is not None:
             export_time_policy = {
                 "speed_scale": args.export_speed_scale if args.export_speed_scale is not None else 1.0,
-                "time_mode": args.export_time_mode,
-                "base_fps": args.export_base_fps,
+                "time_mode": "uniform_fps",
+                "base_fps": None,
             }
         print_lerobot_export(
             run_dir,
             output_dir=args.export_dir,
             split=args.export_split,
-            fps=args.export_fps,
             limit_episodes=args.export_limit,
             overwrite=args.export_overwrite,
             require_standard=args.export_require_standard,

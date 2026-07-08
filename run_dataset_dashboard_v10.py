@@ -3510,6 +3510,116 @@ def write_success_pool_indexes(pool_dir: str, rows: Sequence[dict]) -> None:
     write_jsonl(os.path.join(pool_dir, "episodes.jsonl"), ordered)
 
 
+def invalidate_success_pool_export_manifest(pool_dir: Union[str, os.PathLike], reason: str) -> Dict[str, object]:
+    manifest_path = dashboard_success_pool_export_manifest_path(pool_dir)
+    if not os.path.isfile(manifest_path):
+        return {"invalidated": False, "reason": "manifest_missing", "manifest_path": manifest_path}
+    manifest = read_json(manifest_path, default={}) or {}
+    if not isinstance(manifest, dict):
+        return {"invalidated": False, "reason": "manifest_unreadable", "manifest_path": manifest_path}
+    manifest["vla_training_ready"] = False
+    manifest["standard_lerobot_ready"] = False
+    manifest["pool_invalidated_at"] = time.time()
+    manifest["pool_invalidated_reason"] = str(reason or "success_pool_changed")
+    write_json(manifest_path, manifest)
+    return {"invalidated": True, "reason": reason, "manifest_path": manifest_path}
+
+
+def trash_success_pool_episodes(pool_dir: Union[str, os.PathLike], episode_indices: Sequence[object]) -> Dict[str, object]:
+    pool_dir = os.path.abspath(str(pool_dir))
+    if not is_dashboard_success_pool_dir(pool_dir):
+        return {"ok": False, "reason": "not_dashboard_success_pool", "status": 400}
+    reconcile_success_pool_indexes(pool_dir, recover_orphan_folders=True)
+    wanted_order = []
+    wanted_set = set()
+    for value in episode_indices or []:
+        text = str(value).strip()
+        if text and text not in wanted_set:
+            wanted_order.append(text)
+            wanted_set.add(text)
+    if not wanted_order:
+        return {"ok": False, "reason": "no_episode_indices", "status": 400}
+    rows = load_index(pool_dir, "trainable")
+    matching = [row for row in rows if str(row.get("episode_index")) in wanted_set]
+    if not matching:
+        return {"ok": False, "reason": f"episode_not_found:{','.join(wanted_order)}", "status": 404}
+    found_set = {str(row.get("episode_index")) for row in matching}
+    missing = [value for value in wanted_order if value not in found_set]
+    dataset_root = os.path.dirname(pool_dir)
+    runtime_id = time.strftime("%Y%m%d_%H%M%S") + f"_{int((time.time() % 1) * 1000):03d}"
+    trash_root = ensure_dir(os.path.join(dataset_root, ".dashboard_trash", f"manual_ep_delete_{runtime_id}"))
+    episodes_root = os.path.abspath(os.path.join(pool_dir, "episodes"))
+    trashed = []
+    errors = []
+    cache = load_success_transfer_cache(pool_dir)
+    cache_changed = False
+    for selected in matching:
+        episode_index = str(selected.get("episode_index"))
+        episode_dir = episode_dir_from_row(selected)
+        item = {
+            "episode_index": episode_index,
+            "episode_dir": episode_dir,
+            "moved_to": "",
+            "move_reason": "episode_dir_missing",
+        }
+        if episode_dir and os.path.isdir(episode_dir):
+            try:
+                episode_abs = os.path.abspath(episode_dir)
+                if os.path.commonpath([episodes_root, episode_abs]) != episodes_root:
+                    errors.append({"episode_index": episode_index, "reason": "episode_dir_not_under_success_pool", "episode_dir": episode_abs})
+                    continue
+                moved_to = unique_path(os.path.join(trash_root, os.path.basename(episode_abs)))
+                shutil.move(episode_abs, moved_to)
+                item["moved_to"] = moved_to
+                item["move_reason"] = "moved_to_trash"
+            except Exception as exc:
+                errors.append({"episode_index": episode_index, "reason": f"move_to_trash_failed:{type(exc).__name__}:{exc}", "episode_dir": episode_dir})
+                continue
+        source_key = aggregate_row_source_key(selected)
+        if source_key and source_key in cache:
+            cache.pop(source_key, None)
+            cache_changed = True
+        trashed.append(item)
+    trashed_ids = {str(item.get("episode_index")) for item in trashed}
+    remaining = [row for row in rows if str(row.get("episode_index")) not in trashed_ids]
+    if errors and not trashed:
+        return {"ok": False, "reason": "trash_episode_failed", "status": 500, "errors": errors, "trashed": trashed, "trash_dir": trash_root}
+    write_success_pool_indexes(pool_dir, remaining)
+    if cache_changed:
+        write_success_transfer_cache(pool_dir, cache)
+    invalidated = invalidate_success_pool_export_manifest(pool_dir, f"manual_trash_episodes:{','.join(wanted_order)}")
+    with RUN_PAYLOAD_CACHE_LOCK:
+        RUN_PAYLOAD_MEMORY_CACHE.pop(os.path.normcase(pool_dir), None)
+    with FRAME_CONTEXT_CACHE_LOCK:
+        frame_keys = [key for key in FRAME_CONTEXT_CACHE if os.path.normcase(key[0]) == os.path.normcase(pool_dir)]
+        for key in frame_keys:
+            FRAME_CONTEXT_CACHE.pop(key, None)
+    return {
+        "ok": True,
+        "reason": "partial_trash_episode_failed" if errors else "ok",
+        "episode_indices": wanted_order,
+        "trashed": trashed,
+        "errors": errors,
+        "missing": missing,
+        "removed_rows": len(trashed),
+        "remaining_rows": len(remaining),
+        "trash_dir": trash_root,
+        "export_invalidated": invalidated,
+    }
+
+
+def trash_success_pool_episode(pool_dir: Union[str, os.PathLike], episode_index: Union[int, str]) -> Dict[str, object]:
+    result = trash_success_pool_episodes(pool_dir, [episode_index])
+    if result.get("ok"):
+        trashed = result.get("trashed") if isinstance(result.get("trashed"), list) else []
+        first = trashed[0] if trashed else {}
+        result.update({
+            "episode_index": str(episode_index),
+            "episode_dir": first.get("episode_dir", ""),
+            "moved_to": first.get("moved_to", ""),
+            "move_reason": first.get("move_reason", ""),
+        })
+    return result
 
 
 def is_dashboard_success_pool_dir(run_dir: Union[str, os.PathLike]) -> bool:
@@ -3749,7 +3859,10 @@ def dashboard_success_pool_export_lookup(run_dir: Union[str, os.PathLike]) -> Di
         or (not manifest_policy_hash and not current_policy_is_default)
     )
     manifest_config_hash = str(manifest.get("export_config_hash") or "")
+    manifest_invalidated = bool(manifest.get("pool_invalidated_at"))
     export_config_mismatch = bool(
+        manifest_invalidated
+        or
         (manifest_config_hash and current_export_config_hash and manifest_config_hash != current_export_config_hash)
         or (not manifest_config_hash and bool(current_export_config_hash))
     )
@@ -3807,6 +3920,8 @@ def dashboard_success_pool_export_lookup(run_dir: Union[str, os.PathLike]) -> Di
             "manifest_export_config_hash": manifest_config_hash,
             "time_policy_mismatch": time_policy_mismatch,
             "export_config_mismatch": export_config_mismatch,
+            "pool_invalidated_at": manifest.get("pool_invalidated_at"),
+            "pool_invalidated_reason": manifest.get("pool_invalidated_reason", ""),
         },
     }
 
@@ -3870,11 +3985,18 @@ def dashboard_row_export_status(row: dict, export_lookup: Dict[str, object]) -> 
         manifest_hash = entry_policy_hash or str(export_lookup.get("manifest_time_policy_hash") or "")
         manifest_config_hash = entry_config_hash or str(export_lookup.get("manifest_export_config_hash") or "")
         reason_kind = "time_policy_mismatch" if time_policy_mismatch else "export_config_mismatch"
+        summary = export_lookup.get("summary") if isinstance(export_lookup.get("summary"), dict) else {}
+        invalidated_reason = str(summary.get("pool_invalidated_reason") or "").strip()
+        detail = (
+            f"pool_invalidated:{invalidated_reason} "
+            if invalidated_reason and reason_kind == "export_config_mismatch"
+            else ""
+        )
         return {
             "export_ready": False,
             "export_status": reason_kind,
             "export_reason": (
-                f"{reason_kind} current_time={current_hash[:8] or 'default'} "
+                f"{reason_kind} {detail}current_time={current_hash[:8] or 'default'} "
                 f"manifest_time={manifest_hash[:8] or 'none'} "
                 f"current_config={current_config_hash[:8] or 'none'} "
                 f"manifest_config={manifest_config_hash[:8] or 'none'}"
@@ -3893,6 +4015,7 @@ def dashboard_row_export_status(row: dict, export_lookup: Dict[str, object]) -> 
         "export_episode_index": entry.get("episode_index"),
         "export_video_layout": entry.get("video_layout", ""),
         "export_video_count": available_videos,
+        "export_videos": videos if ready else {},
         "export_config_hash": entry.get("export_config_hash", ""),
     }
 
@@ -5071,6 +5194,7 @@ def dashboard_run_payload_uncached(run_dir: Union[str, os.PathLike]) -> Dict[str
     compact["counts"] = compact_counts
     return {
         "run_dir": run_dir,
+        "is_success_pool": success_pool_mode,
         "compact": compact,
         "diagnosis": diagnosis,
         "dataset_metrics": dataset_metrics,
@@ -5681,6 +5805,47 @@ def dashboard_episode_frame_image(
     }
 
 
+def dashboard_episode_export_video(
+    run_dir: Union[str, os.PathLike],
+    episode_index: Union[int, str],
+    camera: object,
+) -> Dict[str, object]:
+    run_dir = os.path.abspath(str(run_dir))
+    key = dashboard_camera_key(camera)
+    if not key:
+        return {"ok": False, "status": 400, "error": f"camera_not_found:{camera}"}
+    selected, _rows = dashboard_find_episode_row(run_dir, episode_index)
+    if selected is None:
+        return {"ok": False, "status": 404, "error": f"episode_not_found:{episode_index}"}
+    lookup = dashboard_success_pool_export_lookup(run_dir)
+    status = dashboard_row_export_status(selected, lookup)
+    if status.get("export_ready") is not True:
+        return {"ok": False, "status": 404, "error": f"episode_export_not_ready:{status.get('export_status') or 'missing'}"}
+    videos = status.get("export_videos") if isinstance(status.get("export_videos"), dict) else {}
+    entry = videos.get(key) if isinstance(videos.get(key), dict) else {}
+    if entry.get("available") is not True:
+        return {"ok": False, "status": 404, "error": f"video_not_available:{key}"}
+    rel_path = str(entry.get("path") or "").replace("\\", "/").lstrip("/")
+    if not rel_path or ".." in rel_path.split("/"):
+        return {"ok": False, "status": 400, "error": "invalid_video_path"}
+    export_root = os.path.abspath(os.path.join(run_dir, LEROBOT_DEFAULT_EXPORT_DIRNAME))
+    video_path = os.path.abspath(os.path.join(export_root, *[part for part in rel_path.split("/") if part]))
+    try:
+        if os.path.commonpath([export_root, video_path]) != export_root:
+            return {"ok": False, "status": 400, "error": "video_path_outside_export"}
+    except Exception:
+        return {"ok": False, "status": 400, "error": "video_path_invalid"}
+    if not os.path.isfile(video_path):
+        return {"ok": False, "status": 404, "error": f"video_file_missing:{rel_path}"}
+    return {
+        "ok": True,
+        "path": video_path,
+        "content_type": "video/mp4",
+        "entry": entry,
+        "camera": key,
+    }
+
+
 def dashboard_episode_payload(
     run_dir: Union[str, os.PathLike],
     episode_index: Union[int, str],
@@ -5720,6 +5885,23 @@ def dashboard_episode_payload(
     except Exception:
         episode_meta = {}
     episode_summary = dashboard_episode_summary(selected, runtime_s=trajectory_runtime_s(trajectory))
+    if is_dashboard_success_pool_dir(run_dir):
+        try:
+            export_status = dashboard_row_export_status(selected, dashboard_success_pool_export_lookup(run_dir))
+            for key in [
+                "export_ready",
+                "export_status",
+                "export_reason",
+                "export_episode_index",
+                "export_video_layout",
+                "export_video_count",
+                "export_videos",
+            ]:
+                if key in export_status:
+                    episode_summary[key] = export_status[key]
+        except Exception as exc:
+            episode_summary["export_ready"] = False
+            episode_summary["export_status"] = f"export_status_error:{type(exc).__name__}"
     episode_summary["task_prompt"] = dashboard_episode_task_prompt(selected, trajectory=trajectory, episode_meta=episode_meta)
     episode_summary["export_time_policy"] = {
         "policy": time_transform.get("time_policy", default_export_time_policy()),
@@ -5852,6 +6034,8 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
 @media(max-width:1280px){.episodeInspector{grid-template-columns:1fr;min-height:0}.episodeSide{height:min(560px,var(--episodeAsideHeight,560px));max-height:min(560px,var(--episodeAsideHeight,560px))}.timelinePaneHeader{position:static}.miniChartGrid{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:760px){.miniChartGrid{grid-template-columns:1fr}.statusFilterBar{align-items:flex-start}.episodeTabMetrics{grid-template-columns:repeat(2,1fr)}}
 
+.episodeHeaderTop{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.episodeHeaderActions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .taskPrompt{margin-top:8px;border-left:3px solid #175cd3;padding:7px 9px;background:#f8fafc;border-radius:8px;color:#344054;font-size:12px;line-height:1.4}
 .taskPromptLabel{font-weight:800;color:#175cd3;margin-right:6px}
 .cameraPreview{border:1px solid #eaecf0;border-radius:12px;background:#f8fafc;padding:10px;margin-bottom:14px}
@@ -5867,11 +6051,11 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
 .cameraPlayerBtn.primary.playing{background:#b42318;border-color:#b42318}
 .cameraGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
 .cameraCard{border:1px solid #dbe3ee;border-radius:10px;background:#fff;overflow:hidden;min-width:0}
-.cameraCard.loading img{opacity:.74}
+.cameraCard.loading img,.cameraCard.loading video{opacity:.74}
 .cameraCardHeader{display:flex;justify-content:space-between;gap:8px;padding:7px 8px;border-bottom:1px solid #eef2f6;font-size:11px;color:#475467}
 .cameraCardTitle{font-weight:850;color:#101828}
-.cameraCard img{display:block;width:min(100%,256px);max-width:256px;aspect-ratio:1/1;object-fit:contain;background:#0f172a;margin:0 auto}
-.cameraCard.missing img{display:none}
+.cameraCard img,.cameraCard video{display:block;width:min(100%,256px);max-width:256px;aspect-ratio:1/1;object-fit:contain;background:#0f172a;margin:0 auto}
+.cameraCard.missing img,.cameraCard.missing video{display:none}
 .cameraMissing{display:none;min-height:160px;align-items:center;justify-content:center;padding:16px;color:#98a2b3;font-size:12px;text-align:center}
 .cameraCard.missing .cameraMissing{display:flex}
 .cameraOpenLink{font-size:11px;color:#175cd3;text-decoration:none}
@@ -6006,7 +6190,12 @@ body main details>summary:after,.managerPanel>summary:after,.detailsPanel>summar
       </aside>
       <section class="timelinePane">
         <div class="timelinePaneHeader">
-          <h2 id="episodeTitle">Attempt timeline</h2>
+          <div class="episodeHeaderTop">
+            <h2 id="episodeTitle">Attempt timeline</h2>
+            <div class="episodeHeaderActions">
+              <button type="button" class="danger" id="trashEpisodeBtn" disabled title="Only available after loading .dashboard_success">Trash EP</button>
+            </div>
+          </div>
           <div id="episodeMeta" class="muted" style="margin-top:6px"></div>
           <div id="episodeTaskPrompt" class="taskPrompt" style="display:none"></div>
         </div>
@@ -6060,6 +6249,7 @@ const lineColors = ["#175cd3","#067647","#b54708","#d92d20","#6941c6","#0086c9"]
 const stagePalette = ["#dbeafe","#dcfce7","#fef3c7","#fee2e2","#ede9fe","#cffafe","#fce7f3","#e2e8f0"];
 let currentRun = null;
 let currentEpisodeIndex = null;
+let selectedEpisodeTrash = new Set();
 let episodeSort = {key:"episode_index", dir:1};
 let selectedStatuses = new Set();
 let runMonitorTimer = null;
@@ -6227,6 +6417,11 @@ function joinOne(base, child){
 function successPoolPath(){
   const root=String($('rootInput').value||'excavator_auto_dataset').replace(/[\\/]+$/,'');
   return joinOne(root, '.dashboard_success');
+}
+function isCurrentSuccessPool(){
+  if(currentRun && currentRun.is_success_pool===true) return true;
+  const run=String((currentRun&&currentRun.run_dir)||$('runInput')?.value||'').replace(/[\\/]+$/,'');
+  return /(^|[\\/])\.dashboard_success$/i.test(run);
 }
 function syncSuccessPoolPath(){const input=$('successDestInput'); if(input) input.value=successPoolPath();}
 function setTransferProgress(text, percent=0, busy=false){
@@ -6410,6 +6605,46 @@ async function loadSuccessPool(){
   setStatus('Loading .dashboard_success...');
   await loadRun();
 }
+function updateTrashEpisodeButton(ep){
+  const btn=$("trashEpisodeBtn");
+  if(!btn) return;
+  const selectedCount=selectedEpisodeTrash.size;
+  const enabled=!!(isCurrentSuccessPool() && ((ep && ep.episode_index!==undefined && ep.episode_index!==null) || selectedCount>0));
+  btn.disabled=!enabled;
+  btn.textContent=selectedCount>0?`Trash selected EP (${selectedCount})`:"Trash EP";
+  btn.title=enabled?"Move checked/current success-pool episode(s) to .dashboard_trash and mark export stale":"Only available after loading .dashboard_success";
+}
+async function trashSelectedEpisode(){
+  if(!currentRun || (currentEpisodeIndex===null || currentEpisodeIndex===undefined) && selectedEpisodeTrash.size===0){
+    setStatus("Select an EP first", "error");
+    return;
+  }
+  if(!isCurrentSuccessPool()){
+    setStatus("Trash EP is only available for .dashboard_success", "error");
+    return;
+  }
+  const trashList=[...selectedEpisodeTrash];
+  if(!trashList.length) trashList.push(currentEpisodeIndex);
+  const label=trashList.length===1?`EP ${trashList[0]}`:`${trashList.length} EPs (${trashList.slice(0,8).join(", ")}${trashList.length>8?", ...":""})`;
+  if(!confirm(`Move ${label} from .dashboard_success to .dashboard_trash? The VLA export will be marked stale until re-exported.`)) return;
+  setStatus(`Trashing ${label}...`);
+  const result=await postJSON("/api/manage/trash_episode", {run_dir:currentRun.run_dir, episode_indices:trashList});
+  if(!result.ok) throw new Error(result.reason || result.error || "trash_episode failed");
+  selectedEpisodeTrash.clear();
+  const errCount=(result.errors||[]).length;
+  setStatus(`Trashed ${result.removed_rows||trashList.length} EP(s); remaining=${result.remaining_rows}; errors=${errCount}; trash=${result.trash_dir||""}`, errCount?"error":"ok");
+  await loadRun(true);
+  const eps=filteredEpisodes();
+  if(eps.length){
+    const maxRemoved=Math.max(...(result.episode_indices||[]).map(Number).filter(Number.isFinite), Number(currentEpisodeIndex)||0);
+    const next=eps.find(item=>Number(item.episode_index)>maxRemoved) || eps[0];
+    await loadEpisode(next.episode_index);
+  }else{
+    currentEpisodeIndex=null;
+    updateTrashEpisodeButton(null);
+    $("cameraPreview").innerHTML='<div class="empty">No episodes remain in .dashboard_success.</div>';
+  }
+}
 async function exportSuccessPool(){
   showExportTimeModal();
 }
@@ -6476,7 +6711,7 @@ async function loadRun(force=false){
     clearTimeout(rebuildTimer);
   }
   const wallMs=performance.now()-started;
-  currentRun=data; currentEpisodeIndex=null;
+  currentRun=data; currentEpisodeIndex=null; selectedEpisodeTrash.clear(); updateTrashEpisodeButton(null);
   renderRun(data);
   const cache=data.analysis_cache || {};
   const timing=cache.timing_ms||{};
@@ -6719,18 +6954,31 @@ function renderEpisodes(episodes){
 }
 function episodeSortLabel(key){return ({episode_index:"Ep",time_s:"Time",score:"Score",max_bucket:"Bucket",lift_bucket:"Lift",final_bin:"Bin",final_spill:"Spill",robot_yaw:"Robot yaw",truck_yaw:"Truck yaw",samples:"Samples",freeze_count:"Freeze"})[key]||key}
 function sortHeader(key,label,cls=""){const arrow=episodeSort.key===key?(episodeSort.dir>0?" ▲":" ▼"):""; return `<th class="sortable ${esc(cls)}" data-action="sort-episodes" data-sort-key="${esc(key)}" title="Click to sort by ${esc(label)}">${esc(label)}${arrow}</th>`}
-function episodeTableHtml(rows){const head=`<thead><tr>${sortHeader("episode_index","Ep","epCol")}<th>Status</th>${sortHeader("time_s","Time","num")}${sortHeader("score","Score","num")}${sortHeader("max_bucket","Bucket","num")}${sortHeader("lift_bucket","Lift","num")}${sortHeader("final_bin","Bin","num")}${sortHeader("final_spill","Spill","num")}${sortHeader("robot_yaw","Robot yaw","num")}${sortHeader("truck_yaw","Truck yaw","num")}<th>Reason</th></tr></thead>`; const body=rows.map(ep=>episodeRowHtml(ep)).join(""); return `<table id="episodeTable" class="episodeDataSheet">${head}<tbody>${body}</tbody></table>`}
+function episodeTableHtml(rows){const selectHead=isCurrentSuccessPool()?`<th title="Select EPs to trash"><input type="checkbox" data-action="toggle-all-episode-trash"></th>`:""; const head=`<thead><tr>${selectHead}${sortHeader("episode_index","Ep","epCol")}<th>Status</th>${sortHeader("time_s","Time","num")}${sortHeader("score","Score","num")}${sortHeader("max_bucket","Bucket","num")}${sortHeader("lift_bucket","Lift","num")}${sortHeader("final_bin","Bin","num")}${sortHeader("final_spill","Spill","num")}${sortHeader("robot_yaw","Robot yaw","num")}${sortHeader("truck_yaw","Truck yaw","num")}<th>Reason</th></tr></thead>`; const body=rows.map(ep=>episodeRowHtml(ep)).join(""); return `<table id="episodeTable" class="episodeDataSheet">${head}<tbody>${body}</tbody></table>`}
 function exportReadyState(ep){
-  if(ep.export_status==="time_policy_mismatch"||ep.export_status==="export_config_mismatch") return {cls:"stale", title:`VLA export stale: settings mismatch - ${ep.export_reason||"re-export required"}`};
+  if(ep.export_status==="time_policy_mismatch"||ep.export_status==="export_config_mismatch") return {cls:"stale", title:`VLA export stale - ${ep.export_reason||"re-export required"}`};
   if(ep.export_ready===true) return {cls:"ready", title:`VLA export ready${ep.export_video_count!=null?` - videos=${ep.export_video_count}`:""}`};
   if(ep.export_ready===false) return {cls:"notReady", title:`VLA export missing/not ready - ${ep.export_reason||"not exported or missing"}`};
   return {cls:"unknown", title:`VLA export unknown - ${ep.export_reason||"load .dashboard_success or export first"}`};
 }
-function episodeRowHtml(ep){const s=ep.scene||{}; const status=statusKey(ep.status); const reason=ep.reason||ep.warning_reason||""; const time=Number(ep.time_s); const timeText=Number.isFinite(time)?`${fmt(time,2)}s`:""; const exportState=exportReadyState(ep); const epCell=`<span class="epCellInner"><span>${esc(ep.episode_index)}</span><span class="exportReadyDot ${esc(exportState.cls)}" title="${esc(exportState.title)}"></span></span>`; return `<tr data-ep="${esc(ep.episode_index)}"><td class="epCol">${epCell}</td><td><span class="pill ${esc(status)}">${esc(status)}</span></td><td class="num">${esc(timeText)}</td><td class="num">${fmt(ep.score,1)}</td><td class="num">${esc(ep.max_bucket??"")}</td><td class="num">${esc(ep.lift_bucket??"")}</td><td class="num">${esc(ep.final_bin??"")}</td><td class="num">${esc(ep.final_spill??"")}</td><td class="num">${fmt(s.robot_body_yaw_deg,1)}</td><td class="num">${fmt(s.truck_yaw_deg,1)}</td><td class="reasonCell" title="${esc(reason)}">${esc(shortText(reason||"no reason",150))}</td></tr>`}
+function episodeRowHtml(ep){const s=ep.scene||{}; const status=statusKey(ep.status); const reason=ep.reason||ep.warning_reason||""; const time=Number(ep.time_s); const timeText=Number.isFinite(time)?`${fmt(time,2)}s`:""; const exportState=exportReadyState(ep); const epId=String(ep.episode_index); const selectCell=isCurrentSuccessPool()?`<td><input type="checkbox" data-action="toggle-episode-trash" data-ep="${esc(epId)}" ${selectedEpisodeTrash.has(epId)?"checked":""}></td>`:""; const epCell=`<span class="epCellInner"><span>${esc(ep.episode_index)}</span><span class="exportReadyDot ${esc(exportState.cls)}" title="${esc(exportState.title)}"></span></span>`; return `<tr data-ep="${esc(ep.episode_index)}">${selectCell}<td class="epCol">${epCell}</td><td><span class="pill ${esc(status)}">${esc(status)}</span></td><td class="num">${esc(timeText)}</td><td class="num">${fmt(ep.score,1)}</td><td class="num">${esc(ep.max_bucket??"")}</td><td class="num">${esc(ep.lift_bucket??"")}</td><td class="num">${esc(ep.final_bin??"")}</td><td class="num">${esc(ep.final_spill??"")}</td><td class="num">${fmt(s.robot_body_yaw_deg,1)}</td><td class="num">${fmt(s.truck_yaw_deg,1)}</td><td class="reasonCell" title="${esc(reason)}">${esc(shortText(reason||"no reason",150))}</td></tr>`}
 function sortEpisodes(key){if(episodeSort.key===key){episodeSort.dir*=-1}else{episodeSort={key,dir:key==="episode_index"?1:-1}} renderEpisodes(filteredEpisodes())}
 function sortValue(ep,key){if(key==="robot_yaw") return numericOrNull((ep.scene||{}).robot_body_yaw_deg); if(key==="truck_yaw") return numericOrNull((ep.scene||{}).truck_yaw_deg); return numericOrNull(ep[key])}
 function numericOrNull(v){const n=Number(v); return Number.isFinite(n)?n:null}
 function markSelectedTab(index){document.querySelectorAll("#episodeTabs tr[data-ep]").forEach(row=>row.classList.toggle("selected",row.dataset.ep==String(index)))}
+function toggleEpisodeTrashSelection(ep, checked){
+  const key=String(ep);
+  if(checked) selectedEpisodeTrash.add(key); else selectedEpisodeTrash.delete(key);
+  updateTrashEpisodeButton(currentEpisodeIndex!==null?{episode_index:currentEpisodeIndex}:null);
+}
+function toggleAllEpisodeTrashSelection(checked){
+  selectedEpisodeTrash.clear();
+  if(checked){
+    for(const ep of filteredEpisodes()) selectedEpisodeTrash.add(String(ep.episode_index));
+  }
+  renderEpisodes(filteredEpisodes());
+  updateTrashEpisodeButton(currentEpisodeIndex!==null?{episode_index:currentEpisodeIndex}:null);
+}
 
 function renderEpisode(data){
   const ep=data.episode||{}; $("episodeTitle").textContent=`Attempt ${ep.episode_index} timeline`; $("episodeMeta").textContent=`${statusKey(ep.status)} · score=${fmt(ep.score,1)} · samples=${data.sample_count} · shown=${data.returned_points} · ${shortText(ep.dataset_skip_reason || ep.reason||ep.warning_reason||"",260)}`; $("rawBox").textContent=JSON.stringify({episode:ep,stage_spans:data.stage_spans,camera_preview:data.camera_preview},null,2);
@@ -6740,6 +6988,7 @@ function renderEpisode(data){
   $("episodeMeta").textContent=`${statusKey(ep.status)} | score=${fmt(ep.score,1)} | samples=${data.sample_count} | shown=${data.returned_points} | ${tpInfo} | ${shortText(ep.dataset_skip_reason || ep.reason||ep.warning_reason||"",260)}`;
   $("rawBox").textContent=JSON.stringify({episode:ep,time_policy:data.time_policy,stage_spans:data.stage_spans,camera_preview:data.camera_preview},null,2);
   const promptEl=$("episodeTaskPrompt"); const promptText=String(ep.task_prompt||"").trim(); if(promptEl){promptEl.style.display=promptText?"block":"none"; promptEl.innerHTML=promptText?`<span class="taskPromptLabel">Task prompt</span>${esc(promptText)}`:"";}
+  updateTrashEpisodeButton(ep);
   renderCameraPreview(data);
   const s=data.series||{}; drawLineChart("bucketChart","Bucket sand holding",s.t,[{name:"bucket_from_pile",values:s.bucket_from_pile},{name:"bucket_total",values:s.bucket_total}],data.stage_spans,"particles"); drawVectorChart("qChart","Joint angles",s.t,s.q_deg,data.stage_spans,"deg"); drawVectorChart("dqChart","Joint velocity",s.t,s.dq_deg_s,data.stage_spans,"deg/s"); drawVectorChart("ddqChart","Joint acceleration",s.t,s.ddq_deg_s2,data.stage_spans,"deg/s²"); drawVectorChart("effortChart","Measured joint effort",s.t,s.effort,data.stage_spans,"effort");
   updateTimelineCursors();
@@ -6784,12 +7033,40 @@ function cameraImageUrl(cameraKey, frameIndex){
   });
   return `/api/frame?${qs.toString()}`;
 }
+function cameraExportVideoUrl(cameraKey){
+  const qs=new URLSearchParams({
+    run_dir:(currentRun&&currentRun.run_dir)||$("runInput").value||"",
+    episode_index:String(currentEpisodeIndex ?? ""),
+    camera:String(cameraKey),
+    v:frameCacheToken()
+  });
+  return `/api/export_video?${qs.toString()}`;
+}
+function cameraPreviewUsesExportVideo(){
+  const preview=(currentRun&&currentRun._lastEpisodePreview)||{};
+  return !!preview.use_export_video;
+}
+function cameraPreviewVideoElements(){
+  return Array.from(document.querySelectorAll("#cameraPreview video.cameraVideo"));
+}
+function syncCameraPreviewVideos(timeValue, force=false){
+  const t=Number(timeValue);
+  if(!Number.isFinite(t)) return;
+  cameraPreviewVideoElements().forEach(video=>{
+    try{
+      if(force || Math.abs(Number(video.currentTime||0)-t)>0.08) video.currentTime=Math.max(0,t);
+    }catch(_err){}
+  });
+}
 function stopCameraPlayer(){
   cameraPlayerPlaying=false;
   if(cameraPlayerTimer){
     clearTimeout(cameraPlayerTimer);
     cameraPlayerTimer=null;
   }
+  cameraPreviewVideoElements().forEach(video=>{
+    try{video.pause();}catch(_err){}
+  });
   const btn=$("cameraPlayBtn");
   if(btn){
     btn.textContent="Play";
@@ -6814,6 +7091,18 @@ function cameraPlayerTick(){
     stopCameraPlayer();
     return;
   }
+  if(cameraPreviewUsesExportVideo()){
+    const videos=cameraPreviewVideoElements();
+    const master=videos.find(v=>!v.paused && !v.ended) || videos[0];
+    if(!master || master.ended){
+      stopCameraPlayer();
+      return;
+    }
+    const idx=nearestCameraFrameByTime(Number(master.currentTime||0));
+    setCameraFrameDisplay(idx);
+    cameraPlayerTimer=setTimeout(cameraPlayerTick,100);
+    return;
+  }
   updateCameraPreviewFrame((cameraFrameIndex+1)%frameCount,{immediate:true});
   cameraPlayerTimer=setTimeout(cameraPlayerTick,cameraPlayerDelayMs());
 }
@@ -6823,9 +7112,22 @@ function toggleCameraPlayer(){
   cameraPlayerPlaying=!cameraPlayerPlaying;
   updateCameraPlayButton();
   if(cameraPlayerPlaying){
+    if(cameraPreviewUsesExportVideo()){
+      syncCameraPreviewVideos(currentCameraTime(),true);
+      cameraPreviewVideoElements().forEach(video=>{
+        try{
+          video.muted=true;
+          const promise=video.play();
+          if(promise&&typeof promise.catch==="function") promise.catch(()=>{});
+        }catch(_err){}
+      });
+    }
     if(cameraPlayerTimer) clearTimeout(cameraPlayerTimer);
     cameraPlayerTimer=setTimeout(cameraPlayerTick,cameraPlayerDelayMs());
   }else if(cameraPlayerTimer){
+    cameraPreviewVideoElements().forEach(video=>{
+      try{video.pause();}catch(_err){}
+    });
     clearTimeout(cameraPlayerTimer);
     cameraPlayerTimer=null;
   }
@@ -7017,7 +7319,7 @@ function bindCameraPreviewControls(container){
     next.dataset.boundCameraPreview="1";
     next.addEventListener("click",()=>stepCameraPreview(1));
   }
-  root.querySelectorAll(".cameraCard img").forEach(img=>{
+  root.querySelectorAll(".cameraCard img,.cameraCard video").forEach(img=>{
     if(img.dataset.boundCameraPreview==="1") return;
     img.dataset.boundCameraPreview="1";
     img.addEventListener("error",()=>{
@@ -7032,6 +7334,7 @@ function renderCameraPreview(data){
   stopCameraPlayer();
   const preview=data.camera_preview||{};
   preview.time_policy=data.time_policy||{};
+  preview.export_videos=(data.episode&&data.episode.export_videos)||{};
   if(currentRun) currentRun._lastEpisodePreview=preview;
   const frameCount=Number(preview.frame_count||data.sample_count||0);
   const cameras=preview.cameras||[];
@@ -7039,15 +7342,25 @@ function renderCameraPreview(data){
     box.innerHTML='<div class="empty">No camera frames for this attempt.</div>';
     return;
   }
+  const exportVideos=preview.export_videos||{};
+  const useExportVideo=!!(data.episode&&data.episode.export_ready===true&&cameras.length&&cameras.every(cam=>{
+    const entry=exportVideos[cam.key]||{};
+    return entry&&entry.available===true&&entry.path;
+  }));
+  preview.use_export_video=useExportVideo;
   const preferred=Number(preview.initial_frame_index||0);
   cameraFrameIndex=Math.max(0, Math.min(frameCount-1, Number.isFinite(preferred)?preferred:0));
   const header=`<div class="cameraPreviewHeader"><div class="cameraFrameControls"><span class="muted nowrap">frame</span><input id="cameraFrameSlider" type="range" min="0" max="${Math.max(0,frameCount-1)}" value="${cameraFrameIndex}"><span id="cameraFrameText" class="mono small nowrap">${cameraFrameIndex}/${Math.max(0,frameCount-1)}</span></div></div>`;
   const cards=cameras.map((cam,idx)=>{
     const key=cam.key; const available=!!cam.available; const existing=Number(cam.existing_frames||0); const present=Number(cam.present_frames||0);
     const cls=available?"cameraCard":"cameraCard missing";
-    const src=available?cameraImageUrl(key,cameraFrameIndex):"";
+    const src=useExportVideo?cameraExportVideoUrl(key):(available?cameraImageUrl(key,cameraFrameIndex):"");
     const blackWarn=cam.looks_all_black?`<span class="pill failed" title="sampled frames are black">black</span>`:"";
-    return `<div class="${cls}" data-camera-key="${esc(key)}"><div class="cameraCardHeader"><span class="cameraCardTitle">${esc(cam.label||cameraDisplayName(key))} ${blackWarn}</span><span title="existing/present frames">${existing}/${present}</span></div><img id="cameraImg${idx}" src="${esc(src)}" alt="${esc(cam.label||cameraDisplayName(key))}"><div class="cameraMissing">missing image for this camera/frame</div><div style="padding:6px 8px"><a id="cameraOpen${idx}" class="cameraOpenLink" href="${esc(src)}" target="_blank">open image</a></div></div>`;
+    const media=useExportVideo
+      ? `<video id="cameraVideo${idx}" class="cameraVideo" src="${esc(src)}" preload="auto" muted playsinline></video>`
+      : `<img id="cameraImg${idx}" src="${esc(src)}" alt="${esc(cam.label||cameraDisplayName(key))}">`;
+    const sourceLabel=useExportVideo?`<span class="pill ok" title="using exported per-episode mp4">mp4</span>`:"";
+    return `<div class="${cls}" data-camera-key="${esc(key)}"><div class="cameraCardHeader"><span class="cameraCardTitle">${esc(cam.label||cameraDisplayName(key))} ${blackWarn} ${sourceLabel}</span><span title="existing/present frames">${existing}/${present}</span></div>${media}<div class="cameraMissing">missing image for this camera/frame</div><div style="padding:6px 8px"><a id="cameraOpen${idx}" class="cameraOpenLink" href="${esc(src)}" target="_blank">open ${useExportVideo?"video":"image"}</a></div></div>`;
   }).join("");
   const timeline=cameraTimelineMarkup(preview, data.stage_spans||[]);
   box.innerHTML=header+timeline+`<div class="cameraGrid">${cards}</div>`;
@@ -7060,9 +7373,10 @@ function renderCameraPreview(data){
     headerEl.insertBefore(player,frameControls);
   }
   bindCameraPreviewControls(box);
-  prefetchCameraFrames(cameraFrameIndex, 8);
+  if(useExportVideo) syncCameraPreviewVideos(currentCameraTime(),true);
+  else prefetchCameraFrames(cameraFrameIndex, 8);
 }
-function updateCameraPreviewFrame(value,opts){
+function setCameraFrameDisplay(value){
   const frameCount=Number(((currentRun&&currentRun._lastEpisodePreview)||{}).frame_count||0);
   const preview=(currentRun&&currentRun._lastEpisodePreview)||{};
   if(!frameCount) return;
@@ -7072,6 +7386,15 @@ function updateCameraPreviewFrame(value,opts){
   const meta=$("cameraFrameMeta"); if(meta) meta.textContent=cameraFrameMeta(preview,cameraFrameIndex);
   const timelineMeta=$("cameraTimelineFrameMeta"); if(timelineMeta) timelineMeta.textContent=cameraFrameMeta(preview,cameraFrameIndex);
   updateTimelineCursors();
+}
+function updateCameraPreviewFrame(value,opts){
+  const frameCount=Number(((currentRun&&currentRun._lastEpisodePreview)||{}).frame_count||0);
+  if(!frameCount) return;
+  setCameraFrameDisplay(value);
+  if(cameraPreviewUsesExportVideo()){
+    syncCameraPreviewVideos(currentCameraTime(),true);
+    return;
+  }
   prefetchCameraFrames(cameraFrameIndex, cameraPlayerPlaying?10:4);
   if(cameraPreviewTimer) clearTimeout(cameraPreviewTimer);
   if(opts&&opts.immediate){
@@ -7234,6 +7557,9 @@ document.addEventListener("click", evt=>{
     sortEpisodes(sortBtn.dataset.sortKey||"episode_index");
     return;
   }
+  if(target.closest('[data-action="toggle-episode-trash"],[data-action="toggle-all-episode-trash"]')){
+    return;
+  }
   const episodeRow=target.closest("#episodeTabs tr[data-ep]");
   if(episodeRow){
     evt.preventDefault();
@@ -7249,6 +7575,14 @@ document.addEventListener("change", evt=>{
   }
   if(target.matches('[data-action="toggle-run-selection"]')){
     toggleRunSelection(target.dataset.runPath||"", !!target.checked);
+    return;
+  }
+  if(target.matches('[data-action="toggle-episode-trash"]')){
+    toggleEpisodeTrashSelection(target.dataset.ep||"", !!target.checked);
+    return;
+  }
+  if(target.matches('[data-action="toggle-all-episode-trash"]')){
+    toggleAllEpisodeTrashSelection(!!target.checked);
   }
 });
 
@@ -7277,6 +7611,7 @@ bindStaticControl("refreshSelectedSizesBtn","click",()=>refreshSelectedSizes().c
 bindStaticControl("deleteSelectedRunsBtn","click",()=>deleteSelectedZeroSuccessRuns().catch(e=>setStatus(e.message,"error")));
 bindStaticControl("copySuccessBtn","click",()=>transferSuccessRecords("copy", false).catch(e=>setStatus(e.message,"error")));
 bindStaticControl("moveSuccessBtn","click",()=>transferSuccessRecords("move", false).catch(e=>setStatus(e.message,"error")));
+bindStaticControl("trashEpisodeBtn","click",()=>trashSelectedEpisode().catch(e=>setStatus(e.message,"error")));
 bindStaticControl("cancelExportTimeBtn","click",()=>hideExportTimeModal());
 bindStaticControl("resetTimePolicyBtn","click",()=>saveExportTimePolicyForPreview(true, true).catch(e=>setStatus(e.message,"error")));
 bindStaticControl("applyTimePreviewBtn","click",()=>applyTimePreviewAndClose().catch(e=>setStatus(e.message,"error")));
@@ -7327,6 +7662,47 @@ def serve_dashboard(
             self.end_headers()
             self.wfile.write(data)
 
+        def send_file_range(self, path: str, content_type: str = "application/octet-stream", cache_control: str = "public, max-age=3600, immutable"):
+            size = os.path.getsize(path)
+            range_header = self.headers.get("Range") or ""
+            start = 0
+            end = size - 1
+            status = 200
+            if range_header.startswith("bytes="):
+                try:
+                    spec = range_header.split("=", 1)[1].split(",", 1)[0].strip()
+                    left, _, right = spec.partition("-")
+                    if left:
+                        start = max(0, int(left))
+                    if right:
+                        end = min(size - 1, int(right))
+                    if start > end or start >= size:
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{size}")
+                        self.end_headers()
+                        return
+                    status = 206
+                except Exception:
+                    start, end, status = 0, size - 1, 200
+            length = max(0, end - start + 1)
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", cache_control)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(length))
+            if status == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.end_headers()
+            with open(path, "rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+
         def send_json(self, data: object, status: int = 200):
             self.send_bytes(json.dumps(data, ensure_ascii=True).encode("utf-8"), "application/json; charset=utf-8", status)
 
@@ -7375,6 +7751,20 @@ def serve_dashboard(
                         cache_control="public, max-age=3600, immutable",
                     )
                     return
+                if parsed.path == "/api/export_video":
+                    run_dir = normalize_dashboard_client_path(params.get("run_dir") or latest_run(default_root))
+                    episode = params.get("episode_index") or "1"
+                    camera = params.get("camera") or "0"
+                    result = dashboard_episode_export_video(run_dir, episode, camera)
+                    if not result.get("ok"):
+                        self.send_json({"error": result.get("error", "video_not_found")}, status=int(result.get("status", 404) or 404))
+                        return
+                    self.send_file_range(
+                        str(result.get("path") or ""),
+                        str(result.get("content_type") or "video/mp4"),
+                        cache_control="public, max-age=3600, immutable",
+                    )
+                    return
                 self.send_json({"error": "not_found"}, status=404)
             except Exception as exc:
                 self.send_json({"error": f"{type(exc).__name__}: {exc}"}, status=500)
@@ -7419,6 +7809,15 @@ def serve_dashboard(
                         mode=str(body.get("mode") or "copy"),
                     )
                     self.send_json(result)
+                    return
+                if parsed.path == "/api/manage/trash_episode":
+                    run_dir = normalize_dashboard_client_path(body.get("run_dir") or "")
+                    episode_indices = body.get("episode_indices")
+                    if not isinstance(episode_indices, list):
+                        episode_indices = [body.get("episode_index")]
+                    result = trash_success_pool_episodes(run_dir, episode_indices)
+                    status = int(result.get("status", 200) or 200)
+                    self.send_json(result, status=status)
                     return
                 if parsed.path == "/api/manage/export_success_vla":
                     root = normalize_dashboard_client_path(body.get("root") or default_root)

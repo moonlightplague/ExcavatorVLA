@@ -47,6 +47,7 @@ def run_excavator_with_sand():
         "excavator_app.ik_movement",
         "excavator_app.trace_showing",
         "excavator_app.joint_space_planner",
+        "excavator_app.excavator_dataset_camera",
     ]:
         reload_runtime(module_name)
     reload_runtime("excavator_app.sand_site_runtime")

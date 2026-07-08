@@ -975,6 +975,65 @@ def row_path_value(row: dict, key: str) -> str:
     return str(value or "")
 
 
+def _path_parts_any_platform(path: object) -> List[str]:
+    text = str(path or "").strip()
+    if not text:
+        return []
+    return [part for part in text.replace("\\", "/").split("/") if part]
+
+
+def _basename_any_platform(path: object) -> str:
+    parts = _path_parts_any_platform(path)
+    return parts[-1] if parts else ""
+
+
+def _dirname_any_platform(path: object) -> str:
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    if "\\" not in text:
+        return os.path.dirname(text)
+    parts = _path_parts_any_platform(text)
+    if len(parts) <= 1:
+        return ""
+    return "/".join(parts[:-1])
+
+
+def _is_windows_absolute_path(path: object) -> bool:
+    text = str(path or "").strip()
+    return bool(re.match(r"^[A-Za-z]:[\\/]", text) or text.startswith("\\\\"))
+
+
+def _normalize_client_path_for_server(path: object) -> str:
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    try:
+        text = unquote(text)
+    except Exception:
+        pass
+    if os.sep == "/" and "\\" in text:
+        text = text.replace("\\", "/")
+    return os.path.abspath(os.path.expanduser(text))
+
+
+def _success_pool_episode_dir_from_row(run_dir: str, row: dict) -> str:
+    episodes_root = os.path.join(str(run_dir), "episodes")
+    for key in ["transferred_episode_dir", "dest_episode_dir"]:
+        folder = _basename_any_platform(row.get(key))
+        if folder:
+            candidate = os.path.join(episodes_root, folder)
+            if os.path.isdir(candidate):
+                return candidate
+    for key in ["trajectory", "meta", "score_path", "events"]:
+        parent = _basename_any_platform(_dirname_any_platform(row_path_value(row, key)))
+        if parent:
+            candidate = os.path.join(episodes_root, parent)
+            if os.path.isdir(candidate):
+                return candidate
+    return ""
+
+
 def sample_image_value(sample: dict, canonical_key: str) -> object:
     for key in LEROBOT_IMAGE_KEY_ALIASES.get(canonical_key, [canonical_key]):
         value = sample.get(key)
@@ -983,11 +1042,28 @@ def sample_image_value(sample: dict, canonical_key: str) -> object:
     return None
 
 
-def episode_dir_from_row(row: dict) -> str:
+def episode_dir_from_row(row: dict, run_dir: Optional[Union[str, os.PathLike]] = None) -> str:
+    if run_dir:
+        pool_episode_dir = _success_pool_episode_dir_from_row(str(run_dir), row)
+        if pool_episode_dir:
+            return pool_episode_dir
     for key in ["trajectory", "meta", "score_path", "events"]:
         path = row_path_value(row, key)
         if path:
-            return os.path.dirname(path)
+            if os.path.isabs(path) and os.path.isdir(os.path.dirname(path)):
+                return os.path.dirname(path)
+            dirname = _dirname_any_platform(path)
+            if dirname:
+                if run_dir:
+                    parent_name = _basename_any_platform(dirname)
+                    if parent_name:
+                        run_relative = os.path.join(str(run_dir), parent_name)
+                        if os.path.isdir(run_relative):
+                            return run_relative
+                normalized = _normalize_client_path_for_server(dirname)
+                if os.path.isdir(normalized):
+                    return normalized
+                return dirname
     return ""
 
 
@@ -995,9 +1071,32 @@ def resolve_episode_file(episode_dir: str, value: object) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
-    if os.path.isabs(text):
+    if os.path.isabs(text) and os.path.exists(text):
         return text
-    return os.path.normpath(os.path.join(episode_dir, text))
+    normalized = _normalize_client_path_for_server(text)
+    if os.path.isabs(text) and os.path.exists(normalized):
+        return normalized
+    # A success pool copied between Windows and Linux can contain stale absolute
+    # paths such as D:\...\episode_x\trajectory.jsonl.  In that case the current
+    # pool's episode directory is authoritative; the stored path is only a
+    # filename hint.
+    basename = _basename_any_platform(text)
+    if _is_windows_absolute_path(text) and episode_dir and basename:
+        candidate = os.path.join(episode_dir, basename)
+        if os.path.exists(candidate):
+            return candidate
+        return os.path.normpath(candidate)
+    if episode_dir:
+        rel_text = text.replace("\\", os.sep) if os.sep == "/" else text.replace("/", os.sep)
+        candidate = os.path.normpath(os.path.join(episode_dir, rel_text))
+        if os.path.exists(candidate):
+            return candidate
+        if basename:
+            basename_candidate = os.path.join(episode_dir, basename)
+            if os.path.exists(basename_candidate):
+                return basename_candidate
+        return candidate
+    return normalized
 
 
 def relpath_posix(path: Union[str, os.PathLike], base: Union[str, os.PathLike]) -> str:
@@ -1025,16 +1124,176 @@ def infer_export_fps(run_dir: Union[str, os.PathLike], explicit_fps: Optional[fl
     return 10.0
 
 
-def lerobot_task_text(sample: dict, episode_meta: dict) -> str:
-    for value in [
-        sample.get("task"),
-        episode_meta.get("task"),
-        episode_meta.get("dataset_task_text"),
-    ]:
+GENERIC_LEROBOT_TASK_TEXT = "Dig soil from the marked area and dump it into the target container."
+
+
+def is_generic_lerobot_task_text(text: object) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    if not normalized:
+        return True
+    generic = re.sub(r"\s+", " ", GENERIC_LEROBOT_TASK_TEXT.lower())
+    return normalized == generic or ("marked area" in normalized and "target container" in normalized)
+
+
+def _nested_value(data: object, path: Sequence[str], default=None):
+    cur = data
+    for key in path:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(key)
+    return default if cur is None else cur
+
+
+def _first_vector_xy(*values: object) -> Optional[List[float]]:
+    for value in values:
+        vec = vector_or_none(value)
+        if vec is not None and len(vec) >= 2:
+            return [float(vec[0]), float(vec[1])]
+    return None
+
+
+def _first_float(*values: object) -> Optional[float]:
+    for value in values:
+        out = safe_float_value(value, None)
+        if out is not None:
+            return float(out)
+    return None
+
+
+def _episode_scene_dict(episode_row: Optional[dict], episode_meta: Optional[dict]) -> Dict[str, object]:
+    for source in [episode_row, episode_meta]:
+        if isinstance(source, dict) and isinstance(source.get("scene_randomization"), dict):
+            return source.get("scene_randomization")  # type: ignore[return-value]
+    return {}
+
+
+def _state_xy_yaw(sample: Optional[dict], state_names: Optional[Sequence[str]] = None) -> Tuple[Optional[List[float]], Optional[float]]:
+    if not isinstance(sample, dict):
+        return None, None
+    state = vector_or_none(sample.get("observation.state")) or vector_or_none(sample.get("obs.state"))
+    if state is None:
+        return None, None
+    names = list(state_names or [])
+    x_index = names.index("base_x") if "base_x" in names else 0
+    y_index = names.index("base_y") if "base_y" in names else 1
+    yaw_index = names.index("base_yaw") if "base_yaw" in names else 2
+    xy = None
+    yaw = None
+    if len(state) > max(x_index, y_index):
+        xy = [float(state[x_index]), float(state[y_index])]
+    if len(state) > yaw_index:
+        yaw = float(state[yaw_index])
+    return xy, yaw
+
+
+def _direction_label_from_xy(
+    point_xy: Optional[Sequence[float]],
+    origin_xy: Optional[Sequence[float]],
+    robot_yaw_rad: Optional[float],
+) -> str:
+    if point_xy is None or origin_xy is None or len(point_xy) < 2 or len(origin_xy) < 2:
+        return "nearby"
+    dx = float(point_xy[0]) - float(origin_xy[0])
+    dy = float(point_xy[1]) - float(origin_xy[1])
+    if abs(dx) + abs(dy) < 1.0e-6:
+        return "nearby"
+    # In this scene, yaw=0 points roughly toward +Y, so local-front angle is
+    # world yaw + 90 degrees.  Positive local angle is left of the excavator.
+    forward_angle = (float(robot_yaw_rad or 0.0) + math.pi * 0.5)
+    angle = math.atan2(dy, dx) - forward_angle
+    while angle <= -math.pi:
+        angle += 2.0 * math.pi
+    while angle > math.pi:
+        angle -= 2.0 * math.pi
+    labels = [
+        "front",
+        "front-left",
+        "left",
+        "rear-left",
+        "rear",
+        "rear-right",
+        "right",
+        "front-right",
+    ]
+    index = int(math.floor(((math.degrees(angle) + 22.5) % 360.0) / 45.0))
+    return labels[index % len(labels)]
+
+
+def _format_xy_for_task(xy: Optional[Sequence[float]]) -> str:
+    if xy is None or len(xy) < 2:
+        return "the selected area"
+    return f"({float(xy[0]):.2f}, {float(xy[1]):.2f})"
+
+
+def build_episode_task_text(
+    sample: Optional[dict],
+    episode_meta: Optional[dict],
+    episode_row: Optional[dict] = None,
+    state_names: Optional[Sequence[str]] = None,
+) -> str:
+    explicit_values = []
+    for source in [sample, episode_meta, episode_row]:
+        if isinstance(source, dict):
+            explicit_values.extend([source.get("task"), source.get("dataset_task_text")])
+    for value in explicit_values:
+        text = str(value or "").strip()
+        if text and not is_generic_lerobot_task_text(text):
+            return text
+
+    scene = _episode_scene_dict(episode_row, episode_meta)
+    candidate = scene.get("candidate") if isinstance(scene.get("candidate"), dict) else {}
+    applied = scene.get("applied") if isinstance(scene.get("applied"), dict) else {}
+    scene_context = applied.get("scene_context") if isinstance(applied.get("scene_context"), dict) else {}
+
+    state_xy, state_yaw = _state_xy_yaw(sample, state_names=state_names)
+    robot_xy = _first_vector_xy(
+        _nested_value(applied, ["robot_translation_xyz"]),
+        state_xy,
+        [0.0, 0.0],
+    )
+    robot_yaw_deg = _first_float(
+        applied.get("robot_body_yaw_deg") if isinstance(applied, dict) else None,
+        candidate.get("robot_body_yaw_deg") if isinstance(candidate, dict) else None,
+    )
+    robot_yaw_rad = math.radians(robot_yaw_deg) if robot_yaw_deg is not None else state_yaw
+
+    sand_xy = _first_vector_xy(
+        _nested_value(applied, ["sand_center"]),
+        _nested_value(candidate, ["sand_xy"]),
+        _nested_value(scene_context, ["pile_center"]),
+        episode_row.get("target_xyz") if isinstance(episode_row, dict) else None,
+        sample.get("target") if isinstance(sample, dict) else None,
+    )
+    unload_xy = _first_vector_xy(
+        _nested_value(applied, ["unload_point_xyz"]),
+        _nested_value(scene_context, ["unload_point"]),
+        _nested_value(candidate, ["unload_xy"]),
+        episode_row.get("unload_point_xyz") if isinstance(episode_row, dict) else None,
+        episode_row.get("unload_release_xyz") if isinstance(episode_row, dict) else None,
+        episode_row.get("unload_landing_xyz") if isinstance(episode_row, dict) else None,
+    )
+    sand_dir = _direction_label_from_xy(sand_xy, robot_xy, robot_yaw_rad)
+    unload_dir = _direction_label_from_xy(unload_xy, robot_xy, robot_yaw_rad)
+    if sand_xy is not None or unload_xy is not None:
+        return (
+            f"Dig soil from the sand pile near {_format_xy_for_task(sand_xy)}, {sand_dir} of the excavator, "
+            f"and dump it into the truck bed near {_format_xy_for_task(unload_xy)}, {unload_dir} of the excavator."
+        )
+
+    for value in explicit_values:
         text = str(value or "").strip()
         if text:
             return text
-    return "Dig soil from the marked area and dump it into the target container."
+    return GENERIC_LEROBOT_TASK_TEXT
+
+
+def lerobot_task_text(
+    sample: dict,
+    episode_meta: dict,
+    episode_row: Optional[dict] = None,
+    state_names: Optional[Sequence[str]] = None,
+) -> str:
+    return build_episode_task_text(sample, episode_meta, episode_row=episode_row, state_names=state_names)
 
 
 def try_write_parquet(rows: Sequence[dict], path: str) -> Tuple[bool, str]:
@@ -1087,22 +1346,47 @@ def resize_rgb_frame(frame, target_size: Optional[Tuple[int, int]] = None):
     return np.asarray(image)
 
 
+def _call_frame_progress(progress_callback, done: int, total: int, message: str) -> None:
+    if not progress_callback:
+        return
+    try:
+        progress_callback(int(done), int(max(1, total)), str(message or ""))
+    except Exception:
+        pass
+
+
+def _frame_progress_interval(total: int) -> int:
+    # Keep dashboard job polling useful without flooding it for long camera streams.
+    return max(1, int(max(1, total) // 120))
+
+
 def try_encode_mp4_imageio(
     image_paths: Sequence[str],
     output_path: str,
     fps: float,
     target_size: Optional[Tuple[int, int]] = None,
+    progress_callback=None,
+    progress_label: str = "",
 ) -> Tuple[bool, str]:
     try:
         import imageio.v2 as imageio  # type: ignore
     except Exception as exc:
         return False, f"imageio_unavailable:{type(exc).__name__}:{exc}"
+    total = len(image_paths)
+    interval = _frame_progress_interval(total)
     try:
         ensure_dir(os.path.dirname(output_path) or ".")
         writer = imageio.get_writer(output_path, fps=float(fps), codec="libx264", quality=8, macro_block_size=1)
         try:
-            for image_path in image_paths:
+            for frame_i, image_path in enumerate(image_paths, 1):
                 writer.append_data(resize_rgb_frame(imageio.imread(image_path), target_size=target_size))
+                if frame_i == 1 or frame_i == total or frame_i % interval == 0:
+                    _call_frame_progress(
+                        progress_callback,
+                        frame_i,
+                        total,
+                        f"encoding {progress_label or os.path.basename(os.path.dirname(output_path))} with imageio: {frame_i}/{total}",
+                    )
         finally:
             writer.close()
         return True, "ok"
@@ -1115,11 +1399,15 @@ def try_encode_mp4_cv2(
     output_path: str,
     fps: float,
     target_size: Optional[Tuple[int, int]] = None,
+    progress_callback=None,
+    progress_label: str = "",
 ) -> Tuple[bool, str]:
     try:
         import cv2  # type: ignore
     except Exception as exc:
         return False, f"cv2_unavailable:{type(exc).__name__}:{exc}"
+    total = len(image_paths)
+    interval = _frame_progress_interval(total)
     try:
         first = cv2.imread(str(image_paths[0]), cv2.IMREAD_COLOR)
         if first is None:
@@ -1133,13 +1421,20 @@ def try_encode_mp4_cv2(
         if not writer.isOpened():
             return False, "cv2_writer_not_opened"
         try:
-            for image_path in image_paths:
+            for frame_i, image_path in enumerate(image_paths, 1):
                 frame = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
                 if frame is None:
                     return False, f"cv2_frame_unreadable:{image_path}"
                 if int(frame.shape[1]) != width or int(frame.shape[0]) != height:
                     frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
                 writer.write(frame)
+                if frame_i == 1 or frame_i == total or frame_i % interval == 0:
+                    _call_frame_progress(
+                        progress_callback,
+                        frame_i,
+                        total,
+                        f"encoding {progress_label or os.path.basename(os.path.dirname(output_path))} with cv2: {frame_i}/{total}",
+                    )
         finally:
             writer.release()
         return True, "ok"
@@ -1152,17 +1447,33 @@ def encode_mp4(
     output_path: str,
     fps: float,
     target_size: Optional[Tuple[int, int]] = None,
+    progress_callback=None,
+    progress_label: str = "",
 ) -> Tuple[bool, str, str]:
     if not image_paths:
         return False, "none", "no_images"
     missing = [path for path in image_paths if not path or not os.path.isfile(path)]
     if missing:
         return False, "none", f"missing_images:{len(missing)}"
-    ok, reason = try_encode_mp4_imageio(image_paths, output_path, fps, target_size=target_size)
+    ok, reason = try_encode_mp4_imageio(
+        image_paths,
+        output_path,
+        fps,
+        target_size=target_size,
+        progress_callback=progress_callback,
+        progress_label=progress_label,
+    )
     if ok:
         return True, "imageio", reason
     first_reason = reason
-    ok, reason = try_encode_mp4_cv2(image_paths, output_path, fps, target_size=target_size)
+    ok, reason = try_encode_mp4_cv2(
+        image_paths,
+        output_path,
+        fps,
+        target_size=target_size,
+        progress_callback=progress_callback,
+        progress_label=progress_label,
+    )
     if ok:
         return True, "cv2", reason
     return False, "none", f"{first_reason}; {reason}"
@@ -1423,9 +1734,10 @@ def collect_lerobot_rows(
     missing_camera_examples: List[dict] = []
     global_frame = 0
     for source_episode_index, episode in enumerate(episode_rows):
-        trajectory = load_trajectory(episode)
-        episode_dir = episode_dir_from_row(episode)
-        meta = read_json(row_path_value(episode, "meta"), default={}) or {}
+        episode_dir = episode_dir_from_row(episode, run_dir=run_dir)
+        trajectory_path = resolve_episode_file(episode_dir, row_path_value(episode, "trajectory"))
+        trajectory = read_jsonl(trajectory_path)
+        meta = read_json(resolve_episode_file(episode_dir, row_path_value(episode, "meta")), default={}) or {}
         if not trajectory:
             continue
         export_episode_index = len(episodes)
@@ -1470,7 +1782,7 @@ def collect_lerobot_rows(
                     )
                 continue
             effort = vector_or_none(sample.get("observation.effort"), len(effort_names))
-            task_text = lerobot_task_text(sample, meta)
+            task_text = lerobot_task_text(sample, meta, episode_row=episode, state_names=state_names)
             if task_text not in tasks_by_text:
                 tasks_by_text[task_text] = len(tasks_by_text)
             task_index = tasks_by_text[task_text]
@@ -1554,11 +1866,22 @@ def export_lerobot_dataset(
     overwrite: bool = False,
     require_standard: bool = False,
     require_vla: bool = False,
+    progress_callback=None,
 ) -> Dict[str, object]:
+    def progress(percent: float, message: str, current: Optional[int] = None, total: Optional[int] = None) -> None:
+        if not progress_callback:
+            return
+        try:
+            progress_callback(float(max(0.0, min(100.0, percent))), str(message or ""), current, total)
+        except Exception:
+            pass
+
     run_dir = os.path.abspath(str(run_dir))
+    progress(1.0, "checking source run folder")
     if not os.path.isdir(run_dir):
         raise FileNotFoundError(run_dir)
     export_dir = os.path.abspath(str(output_dir or os.path.join(run_dir, LEROBOT_DEFAULT_EXPORT_DIRNAME)))
+    progress(2.0, "preparing export directory")
     if os.path.exists(export_dir):
         if not overwrite:
             raise FileExistsError(f"{export_dir} already exists; pass --export-overwrite to rebuild it")
@@ -1572,6 +1895,7 @@ def export_lerobot_dataset(
     except Exception as exc:
         raise RuntimeError(f"pandas is required for strict LeRobot v3 export: {type(exc).__name__}:{exc}") from exc
 
+    progress(5.0, "collecting trainable rows and validating camera files")
     collected = collect_lerobot_rows(run_dir, split=split, limit_episodes=limit_episodes)
     rows: List[dict] = list(collected["rows"])  # type: ignore[arg-type]
     if not rows:
@@ -1588,17 +1912,34 @@ def export_lerobot_dataset(
     video_results = {}
     image_features = list(LEROBOT_IMAGE_KEYS)
     image_paths: Dict[str, List[str]] = collected["image_paths"]  # type: ignore[assignment]
-    for key in LEROBOT_IMAGE_KEYS:
+    image_frame_counts = {key: len(image_paths.get(key, []) or []) for key in image_features}
+    image_missing_file_counts = {
+        key: len([path for path in (image_paths.get(key, []) or []) if not path or not os.path.isfile(path)])
+        for key in image_features
+    }
+    progress(12.0, "camera preflight: " + ", ".join(f"{key}={image_frame_counts.get(key, 0)}" for key in image_features))
+    for camera_i, key in enumerate(image_features):
         paths = image_paths.get(key, [])
+        start_percent = 15.0 + camera_i * 20.0
+        end_percent = 15.0 + (camera_i + 1) * 20.0
         if not paths or not any(paths):
-            video_results[key] = {"available": False, "reason": "no_images"}
+            video_results[key] = {"available": False, "reason": "no_images", "frames": 0}
+            progress(end_percent, f"{key}: no images")
             continue
         video_path = os.path.join(export_dir, "videos", key, "chunk-000", "file-000.mp4")
+
+        def camera_progress(done: int, total: int, message: str, _start=start_percent, _end=end_percent):
+            ratio = float(done) / float(max(1, total))
+            progress(_start + (_end - _start) * ratio, message, int(done), int(max(1, total)))
+
+        progress(start_percent, f"encoding {key}: 0/{len(paths)}", 0, len(paths))
         ok, encoder, reason = encode_mp4(
             paths,
             video_path,
             export_fps,
             target_size=(LEROBOT_IMAGE_SHAPE[1], LEROBOT_IMAGE_SHAPE[0]),
+            progress_callback=camera_progress,
+            progress_label=key,
         )
         if ok:
             video_results[key] = {
@@ -1608,12 +1949,16 @@ def export_lerobot_dataset(
                 "frames": len(paths),
                 "shape": LEROBOT_IMAGE_SHAPE,
             }
+            progress(end_percent, f"encoded {key}: {len(paths)} frames", len(paths), len(paths))
             continue
         video_results[key] = {
             "available": False,
             "reason": reason,
+            "frames": len(paths),
         }
+        progress(end_percent, f"{key}: video encode failed: {reason}", len(paths), len(paths))
 
+    progress(78.0, "building parquet tables and metadata")
     tasks = collected["tasks"]
     episodes = collected["episodes"]
     state_names = list(collected["state_names"])  # type: ignore[arg-type]
@@ -1645,6 +1990,7 @@ def export_lerobot_dataset(
     parquet_path = os.path.join(data_dir, "file-000.parquet")
     data_df = pd.DataFrame(data_rows)
     parquet_ok, parquet_reason = try_write_dataframe_parquet(data_df, parquet_path, index=False)
+    progress(82.0, "wrote data parquet" if parquet_ok else f"data parquet failed: {parquet_reason}")
 
     tasks_path = os.path.join(meta_dir, "tasks.parquet")
     tasks_df = pd.DataFrame(
@@ -1652,6 +1998,7 @@ def export_lerobot_dataset(
         index=pd.Index([str(task["task"]) for task in tasks]),  # type: ignore[index]
     )
     tasks_ok, tasks_reason = try_write_dataframe_parquet(tasks_df, tasks_path, index=True)
+    progress(84.0, "wrote tasks parquet" if tasks_ok else f"tasks parquet failed: {tasks_reason}")
 
     episode_meta_rows = []
     for episode in episodes:  # type: ignore[assignment]
@@ -1679,6 +2026,7 @@ def export_lerobot_dataset(
     episodes_path = os.path.join(episodes_dir, "file-000.parquet")
     episodes_df = pd.DataFrame(episode_meta_rows)
     episodes_ok, episodes_reason = try_write_dataframe_parquet(episodes_df, episodes_path, index=False)
+    progress(86.0, "wrote episode metadata" if episodes_ok else f"episode metadata failed: {episodes_reason}")
 
     features = {
         "observation.state": {
@@ -1726,6 +2074,7 @@ def export_lerobot_dataset(
         "features": features,
     }
     write_json(os.path.join(meta_dir, "info.json"), info)
+    progress(90.0, "wrote info.json")
 
     stats = build_lerobot_v3_stats(
         data_rows,
@@ -1735,9 +2084,11 @@ def export_lerobot_dataset(
         image_features,
     )
     write_json(os.path.join(meta_dir, "stats.json"), stats)
+    progress(93.0, "wrote stats.json")
 
     video_ready = all(video_results.get(key, {}).get("available") is True for key in image_features)
     parquet_ready = bool(parquet_ok and tasks_ok and episodes_ok)
+    progress(95.0, "validating LeRobot/VLA export")
     validation = validate_lerobot_v3_export(export_dir, image_features)
     vla_training_ready = bool(parquet_ready and video_ready and validation["ok"])
     manifest = {
@@ -1761,6 +2112,8 @@ def export_lerobot_dataset(
             "episodes_reason": episodes_reason,
         },
         "videos": video_results,
+        "image_frame_counts": image_frame_counts,
+        "image_missing_file_counts": image_missing_file_counts,
         "validation": validation,
         "fps": export_fps,
         "total_frames": len(data_rows),
@@ -1805,6 +2158,7 @@ def export_lerobot_dataset(
         "",
     ]
     write_text(os.path.join(export_dir, "README.md"), "\n".join(readme))
+    progress(98.0, "VLA export ready" if vla_training_ready else "VLA export incomplete; see manifest.validation")
     if require_standard and not vla_training_ready:
         raise RuntimeError(f"LeRobot export incomplete: {json.dumps(manifest, ensure_ascii=True)}")
     if require_vla and not vla_training_ready:

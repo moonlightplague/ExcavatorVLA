@@ -10,10 +10,17 @@ Headless auto collect:
 """
 
 import argparse
+import importlib
 import os
+import platform
 import runpy
 import sys
 import time
+
+try:
+    importlib.import_module("nest_asyncio").apply()
+except Exception:
+    pass
 
 from excavator_common import paths
 
@@ -45,7 +52,16 @@ def parse_args():
     parser.add_argument("--with-ui", action="store_true", help="Show Excavator/Sand control windows. Off by default for this launcher.")
     parser.add_argument("--width", type=int, default=1920)
     parser.add_argument("--height", type=int, default=1080)
-    parser.add_argument("--renderer", default="RayTracedLighting")
+    parser.add_argument("--renderer", default="RaytracedLighting")
+    parser.add_argument(
+        "--graphics-api",
+        choices=("auto", "vulkan", "d3d12"),
+        default="auto",
+        help="Renderer graphics API. auto uses D3D12 for Windows headless auto-collect and Isaac defaults elsewhere.",
+    )
+    parser.add_argument("--active-gpu", type=int, default=0, help="Renderer GPU index for Isaac SimulationApp.")
+    parser.add_argument("--physics-gpu", type=int, default=0, help="Physics CUDA device index for Isaac SimulationApp.")
+    parser.add_argument("--multi-gpu", action="store_true", help="Enable Isaac multi-GPU rendering.")
 
     bridge_group = parser.add_mutually_exclusive_group()
     bridge_group.add_argument("--bridge", dest="bridge", action="store_true", help="Start TCP bridge for SmolVLA clients.")
@@ -65,6 +81,12 @@ def parse_args():
     parser.add_argument("--dataset-root", default="", help="Override EXCAVATOR_DATASET_ROOT.")
     parser.add_argument("--disable-export", action="store_true", help="Disable automatic LeRobot v3 export after auto collect.")
     parser.add_argument("--export-python", default="", help="Python executable used for LeRobot export subprocess.")
+    parser.add_argument(
+        "--log-mode",
+        choices=("data", "debug", "profile"),
+        default="",
+        help="Runtime log mode: data is fastest, debug enables diagnostics/Calc Viz, profile also records timing telemetry.",
+    )
     parser.add_argument("--wait-runtime-seconds", type=float, default=180.0)
     export_group = parser.add_mutually_exclusive_group()
     export_group.add_argument("--wait-export", dest="wait_export", action="store_true", help="Wait for LeRobot export task before closing in auto-collect mode.")
@@ -100,6 +122,7 @@ def wait_runtime_ready(simulation_app, rt, timeout_s):
     while simulation_app.is_running():
         simulation_app.update()
         if runtime_is_ready(rt):
+            suppress_headless_log_noise()
             print("[INFO] Runtime ready: robot articulation and joint indices are initialized.", flush=True)
             return
 
@@ -126,7 +149,7 @@ def wait_task_done(simulation_app, task, label):
     if task is None or not hasattr(task, "done"):
         return
     while simulation_app.is_running() and not task.done():
-        simulation_app.update()
+        profiled_simulation_update(simulation_app, None, f"wait_task:{label}")
     if task.done():
         try:
             exc = task.exception()
@@ -136,7 +159,312 @@ def wait_task_done(simulation_app, task, label):
             raise RuntimeError(f"{label} failed: {type(exc).__name__}: {exc}")
 
 
+def launcher_update_profile_threshold_ms():
+    raw = os.environ.get("EXCAVATOR_LAUNCHER_UPDATE_PROFILE_THRESHOLD_MS", "")
+    if raw != "":
+        try:
+            return max(0.0, float(raw))
+        except Exception:
+            return 0.0
+    mode = str(os.environ.get("EXCAVATOR_LOG_MODE", "data") or "data").strip().lower()
+    if mode == "profile":
+        return 400.0
+    if mode == "debug":
+        return 1500.0
+    return 0.0
+
+
+def apply_stable_dataset_render_settings(reason="startup"):
+    """Reduce temporal render variance in captured training frames."""
+    try:
+        import carb
+    except Exception as exc:
+        print(f"[WARN] Stable render settings skipped: {type(exc).__name__}: {exc}", flush=True)
+        return {}
+    settings = carb.settings.get_settings()
+    applied = {}
+
+    def set_value(key, value):
+        try:
+            settings.set(key, value)
+            applied[str(key)] = value
+        except Exception as exc:
+            applied[str(key)] = f"{type(exc).__name__}: {exc}"
+
+    def set_bool(key, value):
+        try:
+            settings.set_bool(key, bool(value))
+            applied[str(key)] = bool(value)
+        except Exception:
+            set_value(key, bool(value))
+
+    def set_int(key, value):
+        try:
+            settings.set_int(key, int(value))
+            applied[str(key)] = int(value)
+        except Exception:
+            set_value(key, int(value))
+
+    def set_float(key, value):
+        try:
+            settings.set_float(key, float(value))
+            applied[str(key)] = float(value)
+        except Exception:
+            set_value(key, float(value))
+
+    # Keep the camera pipeline on a deterministic Kit clock and avoid temporal
+    # post effects that can make static background pixels shimmer frame-to-frame.
+    set_bool("/omni/replicator/captureOnPlay", False)
+    set_bool("/app/asyncRendering", False)
+    set_bool("/exts/isaacsim.core.throttling/enable_async", False)
+    set_bool("/app/player/useFixedTimeStepping", True)
+
+    # DLSS mode 2 is the stable/off-style mode used by the camera diagnostics.
+    set_int("/rtx/post/dlss/execMode", 2)
+    set_int("/rtx/post/aa/op", 0)
+    set_bool("/rtx/post/motionblur/enabled", False)
+    set_bool("/rtx/post/motionBlur/enabled", False)
+    set_bool("/rtx/post/tonemap/autoExposure/enabled", False)
+    set_bool("/rtx/post/histogram/enabled", False)
+    set_float("/rtx/post/tonemap/exposure", 0.0)
+    set_float("/rtx/post/tonemap/whitepoint", 1.0)
+
+    # Disable adaptive render resolution variants where available.
+    set_bool("/rtx-transient/resourcemanager/enableTextureStreaming", False)
+    set_bool("/rtx/post/dlss/autoExposure", False)
+    set_bool("/rtx/post/dlss/autoScale", False)
+
+    print(
+        "[INFO] Stable dataset render settings applied:",
+        f"reason={reason}",
+        f"count={len(applied)}",
+        flush=True,
+    )
+    return applied
+
+
+def runtime_update_snapshot(rt):
+    if rt is None:
+        return {}
+    try:
+        state = getattr(rt, "STATE", {}) or {}
+        progress = dict(state.get("auto_collect_progress", {}) or {})
+        step_recent = list(state.get("step_updates_recent", []) or [])
+        debug_last = dict(state.get("debug_profile_last", {}) or {})
+        sample_spans = dict(state.get("dataset_record_sample_spans", {}) or {})
+        return {
+            "active_task": str(state.get("active_task_name", "") or ""),
+            "stage": str(progress.get("stage", "") or ""),
+            "result": str(progress.get("result", "") or ""),
+            "progress_age_s": round(max(0.0, time.time() - float(progress.get("updated_at", time.time()) or time.time())), 3)
+            if progress else 0.0,
+            "attempt": int(progress.get("attempt", state.get("auto_collect_attempts", 0)) or 0),
+            "run_dir": str(state.get("auto_collect_run_dir", "") or ""),
+            "auto_collect_active": bool(state.get("auto_collect_active", False)),
+            "dataset_recording": bool(state.get("dataset_recording", False)),
+            "dataset_samples": int(state.get("dataset_samples", 0) or 0),
+            "dataset_episode": str(state.get("dataset_episode_uid", "") or ""),
+            "camera_backend": str(state.get("dataset_camera_backend", "") or ""),
+            "camera_available": bool(state.get("dataset_camera_available", False)),
+            "debug_visuals": bool(state.get("debug_visuals_visible", False)),
+            "trace_mode": int(state.get("trace_mode", 0) or 0),
+            "last_step_caller": str(step_recent[-1].get("caller", "") if step_recent else ""),
+            "last_step_frame_ms": float(step_recent[-1].get("per_frame_ms", 0.0) if step_recent else 0.0),
+            "last_profile_label": str(debug_last.get("label", "") or ""),
+            "last_profile_ms": float(debug_last.get("elapsed_ms", 0.0) or 0.0),
+            "sample_spans": sample_spans,
+        }
+    except Exception as exc:
+        return {"snapshot_error": f"{type(exc).__name__}: {exc}"}
+
+
+def record_launcher_update_profile(rt, label, elapsed_ms, threshold_ms, before, after):
+    if rt is None:
+        return
+    try:
+        state = getattr(rt, "STATE", {}) or {}
+        profile = state.get("launcher_update_profile")
+        if not isinstance(profile, dict):
+            profile = {
+                "count": 0,
+                "total_ms": 0.0,
+                "max_ms": 0.0,
+                "slow_count": 0,
+                "threshold_ms": float(threshold_ms),
+                "by_context": {},
+            }
+        profile["count"] = int(profile.get("count", 0) or 0) + 1
+        profile["total_ms"] = float(profile.get("total_ms", 0.0) or 0.0) + float(elapsed_ms)
+        profile["avg_ms"] = profile["total_ms"] / max(1, int(profile.get("count", 0) or 0))
+        profile["max_ms"] = max(float(profile.get("max_ms", 0.0) or 0.0), float(elapsed_ms))
+        if elapsed_ms >= threshold_ms:
+            profile["slow_count"] = int(profile.get("slow_count", 0) or 0) + 1
+
+        after = after if isinstance(after, dict) else {}
+        context_key = "|".join(
+            [
+                str(label or "launcher"),
+                str(after.get("stage", "")),
+                str(after.get("result", "")),
+                str(after.get("active_task", "")),
+                f"recording={bool(after.get('dataset_recording', False))}",
+                f"viz={bool(after.get('debug_visuals', False))}",
+                str(after.get("camera_backend", "")),
+            ]
+        )
+        by_context = profile.get("by_context")
+        if not isinstance(by_context, dict):
+            by_context = {}
+        row = by_context.get(context_key)
+        if not isinstance(row, dict):
+            row = {
+                "count": 0,
+                "total_ms": 0.0,
+                "max_ms": 0.0,
+                "slow_count": 0,
+                "label": str(label or ""),
+                "stage": str(after.get("stage", "")),
+                "result": str(after.get("result", "")),
+                "active_task": str(after.get("active_task", "")),
+                "dataset_recording": bool(after.get("dataset_recording", False)),
+                "debug_visuals": bool(after.get("debug_visuals", False)),
+                "camera_backend": str(after.get("camera_backend", "")),
+            }
+        row["count"] = int(row.get("count", 0) or 0) + 1
+        row["total_ms"] = float(row.get("total_ms", 0.0) or 0.0) + float(elapsed_ms)
+        row["avg_ms"] = row["total_ms"] / max(1, int(row.get("count", 0) or 0))
+        row["max_ms"] = max(float(row.get("max_ms", 0.0) or 0.0), float(elapsed_ms))
+        if elapsed_ms >= threshold_ms:
+            row["slow_count"] = int(row.get("slow_count", 0) or 0) + 1
+        by_context[context_key] = row
+        profile["by_context"] = by_context
+        state["launcher_update_profile"] = profile
+
+        if elapsed_ms >= threshold_ms:
+            entry = {
+                "t": time.time(),
+                "label": str(label or ""),
+                "elapsed_ms": round(float(elapsed_ms), 3),
+                "threshold_ms": round(float(threshold_ms), 3),
+                "before": before,
+                "after": after,
+            }
+            recent = state.get("launcher_update_recent")
+            if not isinstance(recent, list):
+                recent = []
+            recent.append(entry)
+            state["launcher_update_recent"] = recent[-64:]
+
+            now = time.time()
+            last_print = float(state.get("launcher_update_last_print_time", 0.0) or 0.0)
+            slow_count = int(profile.get("slow_count", 0) or 0)
+            if slow_count <= 5 or elapsed_ms >= threshold_ms * 4.0 or now - last_print >= 5.0:
+                state["launcher_update_last_print_time"] = now
+                print(
+                    "[LAUNCHER UPDATE SLOW]",
+                    f"label={label}",
+                    f"elapsed_ms={elapsed_ms:.1f}",
+                    f"stage={after.get('stage', '')}",
+                    f"result={after.get('result', '')}",
+                    f"active_task={after.get('active_task', '')}",
+                    f"recording={after.get('dataset_recording', False)}",
+                    f"samples={after.get('dataset_samples', 0)}",
+                    f"viz={after.get('debug_visuals', False)}",
+                    f"last_step={after.get('last_step_caller', '')}:{after.get('last_step_frame_ms', 0.0):.1f}ms",
+                    f"last_profile={after.get('last_profile_label', '')}:{after.get('last_profile_ms', 0.0):.1f}ms",
+                    flush=True,
+                )
+    except Exception:
+        pass
+
+
+def profiled_simulation_update(simulation_app, rt=None, label="launcher"):
+    threshold_ms = launcher_update_profile_threshold_ms()
+    started = time.perf_counter() if threshold_ms > 0.0 else 0.0
+    before = runtime_update_snapshot(rt) if threshold_ms > 0.0 else {}
+    simulation_app.update()
+    if threshold_ms <= 0.0:
+        return
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    after = runtime_update_snapshot(rt)
+    record_launcher_update_profile(rt, label, elapsed_ms, threshold_ms, before, after)
+    if elapsed_ms <= threshold_ms:
+        return
+
+
+def suppress_headless_log_noise():
+    try:
+        import carb
+        import carb.logging
+
+        logging = carb.logging.acquire_logging()
+        logging.set_level_threshold(carb.logging.LEVEL_ERROR)
+        for source in [
+            "isaacsim.core.simulation_manager",
+            "isaacsim.core.simulation_manager.plugin",
+            "isaacsim.core.simulation_manager.impl.simulation_manager",
+        ]:
+            logging.set_log_enabled_for_source(source, False)
+            logging.set_level_threshold_for_source(source, carb.logging.LEVEL_ERROR)
+    except Exception:
+        pass
+
+
+def request_runtime_shutdown(simulation_app, rt, timeout_s=10.0):
+    if rt is None:
+        return
+    try:
+        rt.STATE["running"] = False
+        rt.STATE["auto_collect_stop_requested"] = True
+    except Exception:
+        pass
+
+    started = time.time()
+    timeout_s = min(float(timeout_s), 3.0)
+    while simulation_app.is_running():
+        tasks = getattr(rt, "STATE", {}).get("async_tasks", {}) or {}
+        main_task = tasks.get("main_loop")
+        if main_task is None or not hasattr(main_task, "done") or main_task.done():
+            break
+        simulation_app.update()
+        if time.time() - started > float(timeout_s):
+            try:
+                main_task.cancel()
+            except Exception:
+                pass
+            break
+
+    try:
+        world = getattr(rt, "World", None)
+        world_instance = world.instance() if world is not None else None
+        if world_instance is not None:
+            stop = getattr(world_instance, "stop", None)
+            if callable(stop):
+                stop()
+    except Exception:
+        pass
+    try:
+        import omni.timeline
+
+        omni.timeline.get_timeline_interface().stop()
+    except Exception:
+        pass
+    try:
+        cancel_tasks = getattr(rt, "cancel_registered_tasks", None)
+        if callable(cancel_tasks):
+            cancel_tasks(reason="launcher_shutdown", keep={"main_loop"})
+    except Exception:
+        pass
+
+    for _ in range(2):
+        try:
+            simulation_app.update()
+        except Exception:
+            break
+
+
 def run_auto_collect(simulation_app, rt, success_count, max_attempts, wait_export):
+    suppress_headless_log_noise()
     success_count = max(1, int(success_count))
     max_attempts_arg = None if int(max_attempts or 0) <= 0 else int(max_attempts)
     print(
@@ -148,24 +476,39 @@ def run_auto_collect(simulation_app, rt, success_count, max_attempts, wait_expor
     rt.request_auto_collect(success_count, max_attempts=max_attempts_arg)
 
     started = False
-    last_print = 0.0
+    last_status_key = None
+    heartbeat_interval = float(os.environ.get("EXCAVATOR_AUTO_COLLECT_HEARTBEAT_SECONDS", "0") or 0)
+    last_heartbeat = time.time()
     while simulation_app.is_running():
-        simulation_app.update()
+        profiled_simulation_update(simulation_app, rt, "auto_collect")
         active = bool(rt.STATE.get("auto_collect_active", False))
         task = rt.STATE.get("auto_collect_task")
         if active or task is not None:
             started = True
 
         now = time.time()
-        if now - last_print > 5.0:
-            last_print = now
+        status_key = (
+            bool(active),
+            int(rt.STATE.get("auto_collect_successes", 0) or 0),
+            int(rt.STATE.get("auto_collect_rejections", 0) or 0),
+            int(rt.STATE.get("auto_collect_failures", 0) or 0),
+            str(rt.STATE.get("auto_collect_last_result", "") or ""),
+        )
+        heartbeat_due = heartbeat_interval > 0.0 and now - last_heartbeat > heartbeat_interval
+        if status_key != last_status_key or heartbeat_due:
+            if heartbeat_due:
+                last_heartbeat = now
+            last_status_key = status_key
             print(
                 "[AUTO COLLECT]",
                 f"active={active}",
                 f"attempts={rt.STATE.get('auto_collect_attempts', 0)}",
                 f"success={rt.STATE.get('auto_collect_successes', 0)}",
+                f"rejected={rt.STATE.get('auto_collect_rejections', 0)}",
+                f"fail={rt.STATE.get('auto_collect_failures', 0)}",
                 f"target={rt.STATE.get('auto_collect_requested', success_count)}",
                 f"max_attempts={rt.STATE.get('auto_collect_max_attempts_requested', 0)}",
+                f"last={rt.STATE.get('auto_collect_last_result', '')}",
                 f"run_dir={rt.STATE.get('auto_collect_run_dir', '')}",
                 flush=True,
             )
@@ -190,6 +533,7 @@ def run_auto_collect(simulation_app, rt, success_count, max_attempts, wait_expor
 def main():
     args = parse_args()
     add_import_roots(PROJECT_ROOT)
+    rt = None
 
     bridge_enabled = args.bridge if args.bridge is not None else (not args.auto_collect and not args.headless)
     if args.headless and bridge_enabled:
@@ -208,25 +552,72 @@ def main():
         os.environ["EXCAVATOR_AUTO_EXPORT_LEROBOT_V3"] = "0"
     if args.export_python:
         os.environ["EXCAVATOR_LEROBOT_V3_EXPORT_PYTHON"] = args.export_python
+    # Do not inherit a stale EXCAVATOR_LOG_MODE=profile/debug from the shell.
+    # Auto collection should default to the fastest data mode unless the launch
+    # command explicitly requests diagnostics.
+    os.environ["EXCAVATOR_LOG_MODE"] = str(args.log_mode or "data")
     os.environ["EXCAVATOR_BRIDGE_HOST"] = str(args.bridge_host)
     os.environ["EXCAVATOR_BRIDGE_PORT"] = str(args.bridge_port)
 
     from isaacsim import SimulationApp
+
+    graphics_api = str(args.graphics_api or "auto").lower()
+    extra_args = ["--/renderer/multiGpu/autoEnable=0"]
+    if graphics_api == "auto" and platform.system().lower().startswith("win") and args.headless and args.auto_collect:
+        graphics_api = "d3d12"
+    if graphics_api == "d3d12":
+        extra_args.append("--/app/vulkan=false")
+    elif graphics_api == "vulkan":
+        extra_args.append("--/app/vulkan=true")
+
+    os.environ["EXCAVATOR_GRAPHICS_API"] = str(graphics_api)
+    os.environ["EXCAVATOR_RENDERER"] = str(args.renderer)
+    os.environ["EXCAVATOR_ACTIVE_GPU"] = str(int(args.active_gpu))
+    os.environ["EXCAVATOR_PHYSICS_GPU"] = str(int(args.physics_gpu))
+    os.environ["EXCAVATOR_MULTI_GPU"] = "1" if bool(args.multi_gpu) else "0"
+
+    print(
+        "[INFO] Isaac renderer config:",
+        f"renderer={args.renderer}",
+        f"graphics_api={graphics_api}",
+        f"multi_gpu={bool(args.multi_gpu)}",
+        f"active_gpu={int(args.active_gpu)}",
+        f"physics_gpu={int(args.physics_gpu)}",
+        f"extra_args={extra_args}",
+        flush=True,
+    )
 
     simulation_app = SimulationApp({
         "headless": bool(args.headless),
         "width": int(args.width),
         "height": int(args.height),
         "renderer": str(args.renderer),
+        "multi_gpu": bool(args.multi_gpu),
+        "active_gpu": int(args.active_gpu),
+        "physics_gpu": int(args.physics_gpu),
+        "extra_args": extra_args,
     })
+    apply_stable_dataset_render_settings(reason="post_simulation_app")
+    if args.headless and args.auto_collect:
+        suppress_headless_log_noise()
 
     try:
         open_stage(simulation_app, args.scene)
+        apply_stable_dataset_render_settings(reason="post_open_stage")
 
         from excavator_app.bootstrap import run_excavator_with_sand
 
         rt = run_excavator_with_sand()
+        try:
+            rt.set_log_mode(str(args.log_mode or "data"), announce=bool(args.log_mode))
+        except Exception:
+            pass
         wait_runtime_ready(simulation_app, rt, args.wait_runtime_seconds)
+        stable_settings = apply_stable_dataset_render_settings(reason="runtime_ready")
+        try:
+            rt.STATE["dataset_stable_render_settings"] = stable_settings
+        except Exception:
+            pass
         if args.sand_amount is not None and not args.random_sand_amount:
             rt.STATE["auto_scene_random_sand_amount_enabled"] = False
             print("[INFO] Auto collect sand amount randomization disabled because --sand-amount was provided.", flush=True)
@@ -243,9 +634,7 @@ def main():
                 wait_export=args.wait_export,
             )
             if not args.keep_running_after_auto_collect:
-                rt.STATE["running"] = False
-                for _ in range(5):
-                    simulation_app.update()
+                request_runtime_shutdown(simulation_app, rt)
                 return
 
         print("[INFO] Runtime is running. Press Ctrl+C to exit.", flush=True)
@@ -255,8 +644,12 @@ def main():
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted.", flush=True)
     finally:
+        request_runtime_shutdown(simulation_app, rt)
         try:
-            simulation_app.close()
+            simulation_app.close(
+                wait_for_replicator=False,
+                skip_cleanup=bool(args.headless and args.auto_collect),
+            )
         except Exception:
             pass
 

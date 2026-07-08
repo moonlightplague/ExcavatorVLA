@@ -131,6 +131,22 @@ Important options:
 - `--export-python`: Python executable used for LeRobot export.
 - `--no-wait-export`: close Isaac Sim immediately after auto collect finishes instead of waiting for LeRobot export.
 
+### Dataset Camera Clock Rules
+
+Dataset image collection uses a single Isaac camera clock:
+
+1. Physics: `world.step(render=True)`
+2. Camera graph: `camera_global_tick()`
+3. Vision read: `cam.get_rgb()`
+4. Dataset writer
+
+Rules:
+
+- Camera capture must be driven by `camera_global_tick()`.
+- Dataset collection must not depend on viewport capture.
+- `world.step()` alone is not sufficient for dataset camera frames.
+- Isaac camera RGB reads require an explicit Replicator orchestrator step.
+
 ## Isaac Sim Script Editor Workflow
 
 If Isaac Sim is already open and you want the interactive GUI workflow, run this in Script Editor:

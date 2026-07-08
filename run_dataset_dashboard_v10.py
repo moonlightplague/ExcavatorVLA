@@ -563,6 +563,7 @@ def compact_analysis(report: Dict[str, object]) -> Dict[str, object]:
         "max_attempts_requested": run_summary.get("max_attempts_requested"),
         "counts": summary.get("counts", {}),
         "segments": summary.get("segments", {}),
+        "wall_clock_breakdown": run_summary.get("wall_clock_breakdown", {}),
         "success_rate": summary.get("success_rate"),
         "rejection_rate": summary.get("rejection_rate"),
         "segment_rates_vs_attempts": report.get("segment_rates_vs_attempts", {}),
@@ -2800,17 +2801,7 @@ def export_lerobot_dataset(
 ) -> Dict[str, object]:
     shared_exporter = getattr(shared_dataset_tools, "export_lerobot_dataset", None) if shared_dataset_tools is not None else None
     if shared_exporter is None:
-        return _legacy_export_lerobot_dataset(
-            run_dir,
-            output_dir=output_dir,
-            split=split,
-            fps=fps,
-            limit_episodes=limit_episodes,
-            overwrite=overwrite,
-            require_standard=require_standard,
-            require_vla=require_vla,
-            progress_callback=progress_callback,
-        )
+        raise RuntimeError("shared VLA exporter unavailable: excavator_dataset_tools.export_lerobot_dataset")
     return shared_exporter(
         run_dir,
         output_dir=output_dir,
@@ -4317,6 +4308,138 @@ def is_dashboard_success_pool_dir(run_dir: Union[str, os.PathLike]) -> bool:
         return False
 
 
+def dashboard_success_pool_export_manifest_path(run_dir: Union[str, os.PathLike]) -> str:
+    return os.path.join(os.path.abspath(str(run_dir)), LEROBOT_DEFAULT_EXPORT_DIRNAME, "manifest.json")
+
+
+def dashboard_success_pool_export_lookup(run_dir: Union[str, os.PathLike]) -> Dict[str, object]:
+    """Return manifest lookup tables used to mark .dashboard_success rows as export-ready."""
+    manifest_path = dashboard_success_pool_export_manifest_path(run_dir)
+    manifest = read_json(manifest_path, default={}) or {}
+    if not isinstance(manifest, dict) or not os.path.isfile(manifest_path):
+        return {
+            "has_manifest": False,
+            "manifest_path": manifest_path,
+            "summary": {
+                "has_manifest": False,
+                "ready": 0,
+                "not_ready": 0,
+                "reason": "lerobot_v3_manifest_missing",
+            },
+            "by_source_signature": {},
+            "by_source_key": {},
+            "by_raw_episode": {},
+        }
+    episodes = manifest.get("episodes")
+    if not isinstance(episodes, list):
+        episodes = []
+    by_source_signature: Dict[str, dict] = {}
+    by_source_key: Dict[str, dict] = {}
+    by_raw_episode: Dict[str, dict] = {}
+    ready = 0
+    not_ready = 0
+    for entry in episodes:
+        if not isinstance(entry, dict):
+            continue
+        clean = dict(entry)
+        if clean.get("export_ready") is True:
+            ready += 1
+        else:
+            not_ready += 1
+        for key in [
+            clean.get("source_signature_hash"),
+            clean.get("dashboard_transfer_source_signature_hash"),
+        ]:
+            text = str(key or "").strip()
+            if text:
+                by_source_signature[text] = clean
+        source_key = str(clean.get("source_key") or clean.get("dashboard_transfer_source_key") or "").strip()
+        if source_key:
+            by_source_key[source_key] = clean
+        for key in [clean.get("raw_episode_index"), clean.get("source_episode_index")]:
+            text = str(key).strip() if key is not None else ""
+            if text:
+                by_raw_episode[text] = clean
+    return {
+        "has_manifest": True,
+        "manifest_path": manifest_path,
+        "manifest": manifest,
+        "by_source_signature": by_source_signature,
+        "by_source_key": by_source_key,
+        "by_raw_episode": by_raw_episode,
+        "summary": {
+            "has_manifest": True,
+            "manifest_path": manifest_path,
+            "video_layout": manifest.get("video_layout", ""),
+            "export_config_hash": manifest.get("export_config_hash", ""),
+            "ready": ready,
+            "not_ready": not_ready,
+            "total": len(episodes),
+            "vla_training_ready": bool(manifest.get("vla_training_ready")),
+            "reused_video_jobs": int(manifest.get("reused_video_jobs") or 0),
+            "encoded_video_jobs": int(manifest.get("encoded_video_jobs") or 0),
+            "total_video_jobs": int(manifest.get("total_video_jobs") or 0),
+        },
+    }
+
+
+def dashboard_row_export_status(row: dict, export_lookup: Dict[str, object]) -> Dict[str, object]:
+    if not export_lookup.get("has_manifest"):
+        return {
+            "export_ready": None,
+            "export_status": "unknown",
+            "export_reason": str((export_lookup.get("summary") or {}).get("reason") or "not_exported"),
+            "export_manifest_path": export_lookup.get("manifest_path", ""),
+        }
+    entry = None
+    by_signature = export_lookup.get("by_source_signature") if isinstance(export_lookup.get("by_source_signature"), dict) else {}
+    for key in [
+        row.get("dashboard_transfer_source_signature_hash"),
+        row.get("source_signature_hash"),
+    ]:
+        text = str(key or "").strip()
+        if text and text in by_signature:
+            entry = by_signature[text]
+            break
+    if entry is None:
+        by_source_key = export_lookup.get("by_source_key") if isinstance(export_lookup.get("by_source_key"), dict) else {}
+        source_key = str(row.get("dashboard_transfer_source_key") or row.get("source_key") or "").strip()
+        if source_key and source_key in by_source_key:
+            entry = by_source_key[source_key]
+    if entry is None:
+        by_raw_episode = export_lookup.get("by_raw_episode") if isinstance(export_lookup.get("by_raw_episode"), dict) else {}
+        for key in [row.get("episode_index"), row.get("source_episode_index")]:
+            text = str(key).strip() if key is not None else ""
+            if text and text in by_raw_episode:
+                entry = by_raw_episode[text]
+                break
+    if not isinstance(entry, dict):
+        return {
+            "export_ready": False,
+            "export_status": "not_ready",
+            "export_reason": "not_exported_or_stale",
+            "export_manifest_path": export_lookup.get("manifest_path", ""),
+        }
+    ready = entry.get("export_ready") is True
+    reasons = entry.get("not_ready_reasons")
+    if isinstance(reasons, list):
+        reason_text = "; ".join(str(item) for item in reasons if str(item))
+    else:
+        reason_text = str(reasons or "")
+    videos = entry.get("videos") if isinstance(entry.get("videos"), dict) else {}
+    available_videos = sum(1 for value in videos.values() if isinstance(value, dict) and value.get("available") is True)
+    return {
+        "export_ready": bool(ready),
+        "export_status": "ready" if ready else "not_ready",
+        "export_reason": reason_text or ("ready" if ready else str(entry.get("export_status") or "not_ready")),
+        "export_manifest_path": export_lookup.get("manifest_path", ""),
+        "export_episode_index": entry.get("episode_index"),
+        "export_video_layout": entry.get("video_layout", ""),
+        "export_video_count": available_videos,
+        "export_config_hash": entry.get("export_config_hash", ""),
+    }
+
+
 def episode_dir_key_from_row(row: dict) -> str:
     for value in [row.get("transferred_episode_dir"), row.get("dest_episode_dir")]:
         if value:
@@ -4953,6 +5076,7 @@ def dashboard_export_success_pool(
         shared_exporter = getattr(shared_dataset_tools, "export_lerobot_dataset", None) if shared_dataset_tools is not None else None
         if shared_exporter is None:
             raise RuntimeError("shared VLA exporter unavailable: excavator_dataset_tools.export_lerobot_dataset")
+        progress(5.0, "using shared segmented VLA exporter")
         result = shared_exporter(
             pool_dir,
             output_dir=staging_export_dir,
@@ -4961,6 +5085,7 @@ def dashboard_export_success_pool(
             overwrite=True,
             require_standard=False,
             require_vla=require_vla,
+            reuse_from_dir=final_export_dir if os.path.isdir(final_export_dir) else None,
             progress_callback=progress,
         )
         progress(99.0, "publishing final lerobot_v3 folder")
@@ -5138,6 +5263,7 @@ def dashboard_run_payload_signature(run_dir: Union[str, os.PathLike]) -> Dict[st
         "transfer_source_cache.json",
     ]:
         files[f"root/{filename}"] = stat_signature(os.path.join(run_abs, filename))
+    files["export/manifest"] = stat_signature(dashboard_success_pool_export_manifest_path(run_abs))
     signature: Dict[str, object] = {
         "cache_version": RUN_PAYLOAD_CACHE_VERSION,
         "run_dir": run_abs,
@@ -5226,6 +5352,15 @@ def dashboard_run_payload_uncached(run_dir: Union[str, os.PathLike]) -> Dict[str
     compact = compact_analysis(report)
     rows, success_catchup = load_dashboard_all_rows(run_dir)
     dataset_metrics = compute_dataset_generation_metrics(rows)
+    success_export_lookup = (
+        dashboard_success_pool_export_lookup(run_dir)
+        if is_dashboard_success_pool_dir(run_dir)
+        else {
+            "has_manifest": False,
+            "manifest_path": "",
+            "summary": {"has_manifest": False, "reason": "not_success_pool"},
+        }
+    )
     tag_by_episode = {}
     skip_reason_by_episode = {}
     runtime_by_episode = {}
@@ -5236,15 +5371,18 @@ def dashboard_run_payload_uncached(run_dir: Union[str, os.PathLike]) -> Dict[str
         tag_by_episode[key] = tag
         skip_reason_by_episode[key] = reason if tag == "skip" else ""
         runtime_by_episode[key] = estimate_row_runtime_s(row, trajectory)
-    episodes = [
-        dashboard_episode_summary(
+    episodes = []
+    for row in rows:
+        key = str(row.get("episode_index"))
+        episode = dashboard_episode_summary(
             row,
-            dataset_tag=tag_by_episode.get(str(row.get("episode_index"))),
-            dataset_skip_reason=skip_reason_by_episode.get(str(row.get("episode_index")), ""),
-            runtime_s=runtime_by_episode.get(str(row.get("episode_index"))),
+            dataset_tag=tag_by_episode.get(key),
+            dataset_skip_reason=skip_reason_by_episode.get(key, ""),
+            runtime_s=runtime_by_episode.get(key),
         )
-        for row in rows
-    ]
+        if is_dashboard_success_pool_dir(run_dir):
+            episode.update(dashboard_row_export_status(row, success_export_lookup))
+        episodes.append(episode)
     scene_points = [episode["scene"] for episode in episodes]
     status_counts = Counter(str(episode.get("status", "unknown")) for episode in episodes)
     diagnosis = build_report_context(compact, report=report, all_rows=rows)
@@ -5256,6 +5394,7 @@ def dashboard_run_payload_uncached(run_dir: Union[str, os.PathLike]) -> Dict[str
     diagnosis["data_efficiency_score"] = dataset_metrics.get("data_efficiency_score", 0)
     diagnosis["success_catchup"] = success_catchup
     diagnosis["success_pool_reconcile"] = success_pool_reconcile
+    diagnosis["success_export"] = success_export_lookup.get("summary", {})
     compact = dict(compact)
     compact_counts = dict(compact.get("counts", {}) if isinstance(compact.get("counts"), dict) else {})
     compact_counts["skip"] = int(status_counts.get("skip", 0))
@@ -6047,6 +6186,10 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
 @media(max-width:720px){.triageGrid{grid-template-columns:1fr}.diagStats{grid-template-columns:1fr}}
 .transferProgress{margin:8px 0 10px;border:1px solid #dbe3ee;border-radius:10px;background:#f8fafc;padding:8px 10px}.transferProgressMeta{display:flex;justify-content:space-between;gap:10px;font-size:12px;color:#475467;margin-bottom:6px}.transferProgressTrack{height:8px;border-radius:999px;background:#e5e7eb;overflow:hidden}.transferProgressFill{height:100%;border-radius:999px;background:#12b76a;transition:width .22s ease}.transferProgressFill.busy{background:linear-gradient(90deg,#12b76a,#60a5fa,#12b76a);background-size:180% 100%;animation:progressSlide 1.1s linear infinite}@keyframes progressSlide{from{background-position:0 0}to{background-position:180% 0}}
 
+.terminalPanel{margin-bottom:14px}.terminalPanel .panelHeader,.rawAttemptPanel .panelHeader{margin-bottom:8px}.terminalActions,.rawAttemptActions{display:flex;align-items:center;gap:8px}.terminalBox{max-height:180px;min-height:72px}.rawAttemptActions:after{content:"debug only";font-size:12px;color:#667085}
+.epCellInner{display:inline-flex;align-items:center;gap:6px}.exportReadyDot{width:8px;height:8px;border-radius:999px;display:inline-block;box-shadow:0 0 0 2px #fff,0 0 0 3px #d0d5dd;flex:0 0 auto}.exportReadyDot.ready{background:#12b76a;box-shadow:0 0 0 2px #fff,0 0 0 3px rgba(18,183,106,.35)}.exportReadyDot.notReady{background:#f04438;box-shadow:0 0 0 2px #fff,0 0 0 3px rgba(240,68,56,.32)}.exportReadyDot.unknown{background:#98a2b3}
+body main details>summary:after,.managerPanel>summary:after,.detailsPanel>summary:after{content:""!important;width:10px!important;height:10px!important;border:0!important;border-right:2px solid #667085!important;border-bottom:2px solid #667085!important;border-radius:0!important;padding:0!important;background:transparent!important;transform:rotate(-45deg);transition:transform .2s ease;flex:0 0 auto;margin-top:4px}body main details[open]>summary:after,.managerPanel[open]>summary:after,.detailsPanel[open]>summary:after{content:""!important;transform:rotate(45deg);margin-top:7px}
+
 </style>
 </head>
 <body>
@@ -6077,6 +6220,15 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
   </div>
 </header>
 <main class="shell">
+  <section class="panel terminalPanel">
+    <div class="panelHeader">
+      <h2>Terminal output</h2>
+      <div class="terminalActions">
+        <button type="button" class="secondary" id="clearTerminalBtn">Clear</button>
+      </div>
+    </div>
+    <pre id="terminalBox" class="codeBox terminalBox">Dashboard ready.</pre>
+  </section>
   <details class="panel managerPanel" open>
     <summary>
       <div><h2>Run folder manager</h2></div>
@@ -6172,9 +6324,8 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
   <section class="panel rawAttemptPanel" style="margin-top:14px">
     <div class="panelHeader">
       <h2>Raw selected attempt</h2>
-      <div style="display:flex;align-items:center;gap:8px">
+      <div class="rawAttemptActions">
         <button type="button" class="secondary" id="copyRawAttemptBtn">Copy raw</button>
-        <span class="panelHint">debug only</span>
       </div>
     </div>
     <pre id="rawBox" class="codeBox">{}</pre>
@@ -6208,7 +6359,17 @@ let timelineDragState = {active:false, svg:null, moved:false, suppressClick:fals
 
 function $(id){return document.getElementById(id)}
 function esc(s){return String(s ?? "").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]))}
-function setStatus(text, cls="muted"){const el=$("status"); if(el){el.className=cls; el.textContent=text}}
+function terminalTimestamp(){const d=new Date(); return d.toLocaleTimeString("en-GB",{hour12:false})}
+function terminalWrite(text, cls="muted"){
+  const box=$("terminalBox"); if(!box) return;
+  const line=`[${terminalTimestamp()}] ${String(text||"")}`;
+  const current=box.textContent&&box.textContent!=="Dashboard ready."?box.textContent:"";
+  const lines=(current?current+"\n":"")+line;
+  box.textContent=lines.split("\n").slice(-240).join("\n");
+  box.scrollTop=box.scrollHeight;
+  box.dataset.level=cls||"muted";
+}
+function setStatus(text, cls="muted"){const el=$("status"); if(el){el.className=cls; el.textContent=text} terminalWrite(text,cls)}
 async function api(path, params){const qs=new URLSearchParams(params||{}); const r=await fetch(path+"?"+qs.toString()); if(!r.ok) throw new Error(await r.text()); return await r.json()}
 async function postJSON(path, payload){let r; try{r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload||{})});}catch(err){throw new Error(`Failed to fetch ${path}: ${err.message||err}`);} if(!r.ok) throw new Error(await r.text()); return await r.json()}
 function finite(v){return typeof v==="number" && Number.isFinite(v)}
@@ -6275,18 +6436,23 @@ async function pollDashboardJob(jobId, onDone){
   let last = null;
   for(;;){
     const job = await api('/api/manage/job', {job_id:jobId, _:Date.now()});
-    last = job;
     const percent = Number(job.percent || 0);
     const msg = job.message || job.title || 'working';
     setTransferProgress(`${msg} (${job.current||0}/${job.total||1})`, percent, job.status==='running' || job.status==='queued');
+    if(msg !== last?.message || Math.round(percent) !== Math.round(Number(last?.percent || -1))){
+      terminalWrite(`${job.type||"job"}: ${msg} (${Math.round(percent)}%)`, job.status==='error'?'error':'muted');
+    }
+    last = job;
     if(job.status === 'done'){
       setTransferProgress('complete', 100, false);
+      terminalWrite(`${job.type||"job"}: complete`, "ok");
       if(onDone) await onDone(job.result || job);
       hideTransferProgressSoon();
       return job;
     }
     if(job.status === 'error'){
       setTransferProgress(job.error || 'job failed', 100, false);
+      terminalWrite(`${job.type||"job"}: ${job.error || 'job failed'}`, "error");
       throw new Error(job.error || 'job failed');
     }
     await new Promise(resolve=>setTimeout(resolve, 500));
@@ -6447,9 +6613,14 @@ async function exportSuccessPool(){
   if(!job.job_id){throw new Error(job.error || 'export_success_vla job did not start');}
   await pollDashboardJob(job.job_id, async (result)=>{
     const videoSummary=Object.entries(result.videos||{}).map(([k,v])=>`${k}:${v&&v.available?'ok':'fail'}`).join(', ');
-    setTransferProgress(`Export complete: ${result.total_episodes||0} episodes, ${result.total_frames||0} frames`, 100, false);
-    setStatus(`Export complete: ready=${!!result.vla_training_ready}; videos=${videoSummary}; dir=${result.export_dir||''}`, result.vla_training_ready?'ok':'error');
+    const encoded=Number(result.encoded_video_jobs||0);
+    const reused=Number(result.reused_video_jobs||0);
+    const totalJobs=Number(result.total_video_jobs||0);
+    const jobSummary=totalJobs?`encoded=${encoded}, reused=${reused}/${totalJobs}`:`encoded=${encoded}, reused=${reused}`;
+    setTransferProgress(`Export complete: ${result.total_episodes||0} episodes, ${result.total_frames||0} frames, ${jobSummary}`, 100, false);
+    setStatus(`Export complete: ready=${!!result.vla_training_ready}; ${jobSummary}; videos=${videoSummary}; dir=${result.export_dir||''}`, result.vla_training_ready?'ok':'error');
     $('runInput').value=pool;
+    await loadRun(true);
   });
 }
 
@@ -6511,7 +6682,7 @@ function renderRun(data){
   // KPI strip removed: counts/readiness/efficiency are consolidated into Runtime distribution.
   renderTopBlocker(diagnosis, blockerRows);
   renderQualitySignal(diagnosis, qualityRows);
-  renderRuntimePie("runtimePieCard", data.tag_runtime_seconds || datasetMetrics.tag_runtime_seconds || {}, datasetMetrics, diagnosis, {attempts, trainable, rejected, failed, diagnostic, skip});
+  renderRuntimePie("runtimePieCard", data.tag_runtime_seconds || datasetMetrics.tag_runtime_seconds || {}, datasetMetrics, diagnosis, {attempts, trainable, rejected, failed, diagnostic, skip}, compact.wall_clock_breakdown || diagnosis.wall_clock_breakdown || {});
   renderGates(diagnosis.readiness_gates||[]);
   renderMaterialTable(diagnosis.material_table||[]);
   renderSchemaTables(diagnosis.field_coverage||{}, diagnosis.camera_coverage||{});
@@ -6535,11 +6706,17 @@ function renderRun(data){
   refreshFilteredViews();
 }
 
-function renderRuntimePie(id, data, metrics, diagnosis={}, counts={}){
+function renderRuntimePie(id, data, metrics, diagnosis={}, counts={}, wallClock={}){
   const el=$(id); if(!el) return;
   el.className="diagCard runtimePieCard info";
   const entries=Object.entries(data||{}).map(([key,value])=>({key:statusKey(key), value:Number(value)||0})).filter(r=>r.value>0);
   const total=entries.reduce((a,r)=>a+r.value,0);
+  const wall=wallClock&&wallClock.available?wallClock:null;
+  const wallTotal=wall?Number(wall.total_wall_s||0):0;
+  const overhead=wall?Math.max(0,wallTotal-total):0;
+  const overheadPct=wallTotal>0?pct(overhead/wallTotal):"";
+  const topStages=(wall&&Array.isArray(wall.top_stages)?wall.top_stages:[]).slice(0,4).map(s=>`${esc(s.stage)} ${fmt(Number(s.total_s||0),1)}s`).join(" · ");
+  const wallHtml=wall?`<div class="datasetScore">wall-clock: ${fmt(wallTotal,1)}s · recorded: ${fmt(total,1)}s · overhead: ${fmt(overhead,1)}s ${overheadPct}${topStages?`<br>top wall stages: ${topStages}`:""}</div>`:"";
   const attempts=Number(counts.attempts||0);
   const trainable=Number(counts.trainable||0);
   const rejected=Number(counts.rejected||0);
@@ -6564,13 +6741,13 @@ function renderRuntimePie(id, data, metrics, diagnosis={}, counts={}){
     const fallbackCounts=(metrics&&metrics.tag_counts)||{};
     const countEntries=Object.entries(fallbackCounts).map(([key,value])=>({key:statusKey(key), value:Number(value)||0})).filter(r=>r.value>0);
     if(!countEntries.length){
-      el.innerHTML=`<div class="diagCardTitle">Runtime distribution</div><div class="diagCardValue">no runtime data</div><div class="diagCardDetail">Counts, readiness and data efficiency are consolidated here; no duplicate KPI strip is shown.</div>${statHtml}${framesHtml}`;
+      el.innerHTML=`<div class="diagCardTitle">Runtime distribution</div><div class="diagCardValue">no runtime data</div><div class="diagCardDetail">Counts, readiness and data efficiency are consolidated here; no duplicate KPI strip is shown.</div>${statHtml}${framesHtml}${wallHtml}`;
       return;
     }
-    el.innerHTML=`<div class="diagCardTitle">Runtime distribution</div><div class="diagCardValue">count fallback</div><div class="diagCardDetail">No runtime seconds were available. Counts/readiness/efficiency are consolidated here instead of repeated in KPI cards.</div>${pieMarkup(countEntries,"episodes")}${statHtml}${framesHtml}`;
+    el.innerHTML=`<div class="diagCardTitle">Runtime distribution</div><div class="diagCardValue">count fallback</div><div class="diagCardDetail">No runtime seconds were available. Counts/readiness/efficiency are consolidated here instead of repeated in KPI cards.</div>${pieMarkup(countEntries,"episodes")}${statHtml}${framesHtml}${wallHtml}`;
     return;
   }
-  el.innerHTML=`<div class="diagCardTitle">Runtime distribution</div><div class="diagCardValue">${fmt(total,1)}s total</div><div class="diagCardDetail">Tag runtime share plus dataset balance. Skip is surfaced instead of silently dropped; duplicate KPI cards are removed.</div>${pieMarkup(entries,"s")}${statHtml}${framesHtml}`;
+  el.innerHTML=`<div class="diagCardTitle">Runtime distribution</div><div class="diagCardValue">${fmt(total,1)}s recorded</div><div class="diagCardDetail">Tag runtime share plus dataset balance. Wall-clock overhead is included when the run summary has phase timing.</div>${pieMarkup(entries,"s")}${statHtml}${framesHtml}${wallHtml}`;
 }
 function pieMarkup(entries, unit){
   const total=entries.reduce((a,r)=>a+r.value,0)||1;
@@ -6700,7 +6877,9 @@ function renderScenePlots(pts, eps){
 function renderEpisodes(episodes){
   const sorted=[...(episodes||[])].sort((a,b)=>{const av=sortValue(a,episodeSort.key), bv=sortValue(b,episodeSort.key); if(av===bv) return Number(a.episode_index||0)-Number(b.episode_index||0); if(av===null)return 1; if(bv===null)return -1; return (av<bv?-1:1)*episodeSort.dir});
   const label=episodeSortLabel(episodeSort.key); const arrow=episodeSort.dir>0?"↑":"↓";
-  $("episodeSideMeta").textContent=`${sorted.length} shown · sorted by ${label} ${arrow}`;
+  const hasExportFields=sorted.some(ep=>Object.prototype.hasOwnProperty.call(ep,"export_ready"));
+  const exportMeta=hasExportFields?` · export ready ${sorted.filter(ep=>ep.export_ready===true).length}, pending ${sorted.filter(ep=>ep.export_ready===false).length}, unknown ${sorted.filter(ep=>ep.export_ready!==true&&ep.export_ready!==false).length}`:"";
+  $("episodeSideMeta").textContent=`${sorted.length} shown · sorted by ${label} ${arrow}${exportMeta}`;
   if(!sorted.length){$("episodeTabs").innerHTML='<div class="empty">No attempts match the current status filter.</div>'; syncEpisodeInspectorHeight(); return}
   $("episodeTabs").innerHTML=episodeTableHtml(sorted);
   markSelectedTab(currentEpisodeIndex);
@@ -6709,7 +6888,12 @@ function renderEpisodes(episodes){
 function episodeSortLabel(key){return ({episode_index:"Ep",time_s:"Time",score:"Score",max_bucket:"Bucket",lift_bucket:"Lift",final_bin:"Bin",final_spill:"Spill",robot_yaw:"Robot yaw",truck_yaw:"Truck yaw",samples:"Samples",freeze_count:"Freeze"})[key]||key}
 function sortHeader(key,label,cls=""){const arrow=episodeSort.key===key?(episodeSort.dir>0?" ▲":" ▼"):""; return `<th class="sortable ${esc(cls)}" onclick="sortEpisodes('${esc(key)}')" title="Click to sort by ${esc(label)}">${esc(label)}${arrow}</th>`}
 function episodeTableHtml(rows){const head=`<thead><tr>${sortHeader("episode_index","Ep","epCol")}<th>Status</th>${sortHeader("time_s","Time","num")}${sortHeader("score","Score","num")}${sortHeader("max_bucket","Bucket","num")}${sortHeader("lift_bucket","Lift","num")}${sortHeader("final_bin","Bin","num")}${sortHeader("final_spill","Spill","num")}${sortHeader("robot_yaw","Robot yaw","num")}${sortHeader("truck_yaw","Truck yaw","num")}<th>Reason</th></tr></thead>`; const body=rows.map(ep=>episodeRowHtml(ep)).join(""); return `<table id="episodeTable" class="episodeDataSheet">${head}<tbody>${body}</tbody></table>`}
-function episodeRowHtml(ep){const s=ep.scene||{}; const status=statusKey(ep.status); const reason=ep.reason||ep.warning_reason||""; const time=Number(ep.time_s); const timeText=Number.isFinite(time)?`${fmt(time,2)}s`:""; return `<tr data-ep="${esc(ep.episode_index)}" onclick="loadEpisode('${esc(ep.episode_index)}')"><td class="epCol">${esc(ep.episode_index)}</td><td><span class="pill ${esc(status)}">${esc(status)}</span></td><td class="num">${esc(timeText)}</td><td class="num">${fmt(ep.score,1)}</td><td class="num">${esc(ep.max_bucket??"")}</td><td class="num">${esc(ep.lift_bucket??"")}</td><td class="num">${esc(ep.final_bin??"")}</td><td class="num">${esc(ep.final_spill??"")}</td><td class="num">${fmt(s.robot_body_yaw_deg,1)}</td><td class="num">${fmt(s.truck_yaw_deg,1)}</td><td class="reasonCell" title="${esc(reason)}">${esc(shortText(reason||"no reason",150))}</td></tr>`}
+function exportReadyState(ep){
+  if(ep.export_ready===true) return {cls:"ready", title:`VLA export ready${ep.export_video_count!=null?` · videos=${ep.export_video_count}`:""}`};
+  if(ep.export_ready===false) return {cls:"notReady", title:`VLA export not ready · ${ep.export_reason||"not exported or stale"}`};
+  return {cls:"unknown", title:`VLA export unknown · ${ep.export_reason||"load .dashboard_success or export first"}`};
+}
+function episodeRowHtml(ep){const s=ep.scene||{}; const status=statusKey(ep.status); const reason=ep.reason||ep.warning_reason||""; const time=Number(ep.time_s); const timeText=Number.isFinite(time)?`${fmt(time,2)}s`:""; const exportState=exportReadyState(ep); const epCell=`<span class="epCellInner"><span>${esc(ep.episode_index)}</span><span class="exportReadyDot ${esc(exportState.cls)}" title="${esc(exportState.title)}"></span></span>`; return `<tr data-ep="${esc(ep.episode_index)}" onclick="loadEpisode('${esc(ep.episode_index)}')"><td class="epCol">${epCell}</td><td><span class="pill ${esc(status)}">${esc(status)}</span></td><td class="num">${esc(timeText)}</td><td class="num">${fmt(ep.score,1)}</td><td class="num">${esc(ep.max_bucket??"")}</td><td class="num">${esc(ep.lift_bucket??"")}</td><td class="num">${esc(ep.final_bin??"")}</td><td class="num">${esc(ep.final_spill??"")}</td><td class="num">${fmt(s.robot_body_yaw_deg,1)}</td><td class="num">${fmt(s.truck_yaw_deg,1)}</td><td class="reasonCell" title="${esc(reason)}">${esc(shortText(reason||"no reason",150))}</td></tr>`}
 function sortEpisodes(key){if(episodeSort.key===key){episodeSort.dir*=-1}else{episodeSort={key,dir:key==="episode_index"?1:-1}} renderEpisodes(filteredEpisodes())}
 function sortValue(ep,key){if(key==="robot_yaw") return numericOrNull((ep.scene||{}).robot_body_yaw_deg); if(key==="truck_yaw") return numericOrNull((ep.scene||{}).truck_yaw_deg); return numericOrNull(ep[key])}
 function numericOrNull(v){const n=Number(v); return Number.isFinite(n)?n:null}
@@ -7123,6 +7307,7 @@ $("exportSuccessPoolBtn").onclick=()=>exportSuccessPool().catch(e=>setStatus(e.m
 $("loadRunBtn").onclick=()=>loadRun(false).catch(e=>setStatus(e.message,"error"));
 $("reloadBtn").onclick=()=>loadRun(true).catch(e=>setStatus(e.message,"error"));
 $("copyPathBtn").onclick=()=>navigator.clipboard&&navigator.clipboard.writeText($("runInput").value).then(()=>setStatus("Run path copied","ok")).catch(()=>setStatus("Copy failed","error"));
+$("clearTerminalBtn").onclick=()=>{const box=$("terminalBox"); if(box) box.textContent=""; terminalWrite("terminal cleared","muted");};
 $("copyRawAttemptBtn").onclick=()=>{
   const text=$("rawBox")?.textContent||"";
   if(!navigator.clipboard){setStatus("Clipboard unavailable","error");return;}

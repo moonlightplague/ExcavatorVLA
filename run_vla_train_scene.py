@@ -87,6 +87,22 @@ def parse_args():
         default="",
         help="Runtime log mode: data is fastest, debug enables diagnostics/Calc Viz, profile also records timing telemetry.",
     )
+    parser.add_argument(
+        "--stable-camera-render",
+        action="store_true",
+        help=(
+            "Opt in to deterministic/stable render settings for camera-quality diagnostics. "
+            "Off by default because these global Kit settings can slow auto-collect execution."
+        ),
+    )
+    parser.add_argument(
+        "--camera-capture-resolution",
+        default="",
+        help=(
+            "Optional viewport capture resolution before downsampling, e.g. 256 or 1024. "
+            "Unset keeps runtime default."
+        ),
+    )
     parser.add_argument("--wait-runtime-seconds", type=float, default=180.0)
     export_group = parser.add_mutually_exclusive_group()
     export_group.add_argument("--wait-export", dest="wait_export", action="store_true", help="Wait for LeRobot export task before closing in auto-collect mode.")
@@ -174,8 +190,24 @@ def launcher_update_profile_threshold_ms():
     return 0.0
 
 
-def apply_stable_dataset_render_settings(reason="startup"):
+def stable_camera_render_requested(args=None):
+    raw = os.environ.get("EXCAVATOR_STABLE_CAMERA_RENDER", "")
+    if raw != "":
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return bool(getattr(args, "stable_camera_render", False))
+
+
+def apply_stable_dataset_render_settings(reason="startup", enabled=False):
     """Reduce temporal render variance in captured training frames."""
+    if not bool(enabled):
+        print(
+            "[INFO] Stable dataset render settings skipped:",
+            f"reason={reason}",
+            "enabled=False",
+            "note=use --stable-camera-render or EXCAVATOR_STABLE_CAMERA_RENDER=1 to enable",
+            flush=True,
+        )
+        return {}
     try:
         import carb
     except Exception as exc:
@@ -223,7 +255,6 @@ def apply_stable_dataset_render_settings(reason="startup"):
     set_int("/rtx/post/dlss/execMode", 2)
     set_int("/rtx/post/aa/op", 0)
     set_bool("/rtx/post/motionblur/enabled", False)
-    set_bool("/rtx/post/motionBlur/enabled", False)
     set_bool("/rtx/post/tonemap/autoExposure/enabled", False)
     set_bool("/rtx/post/histogram/enabled", False)
     set_float("/rtx/post/tonemap/exposure", 0.0)
@@ -534,6 +565,7 @@ def main():
     args = parse_args()
     add_import_roots(PROJECT_ROOT)
     rt = None
+    stable_render_enabled = stable_camera_render_requested(args)
 
     bridge_enabled = args.bridge if args.bridge is not None else (not args.auto_collect and not args.headless)
     if args.headless and bridge_enabled:
@@ -558,6 +590,7 @@ def main():
     os.environ["EXCAVATOR_LOG_MODE"] = str(args.log_mode or "data")
     os.environ["EXCAVATOR_BRIDGE_HOST"] = str(args.bridge_host)
     os.environ["EXCAVATOR_BRIDGE_PORT"] = str(args.bridge_port)
+    env_set_if_value("EXCAVATOR_DATASET_CAMERA_CAPTURE_RESOLUTION", args.camera_capture_resolution)
 
     from isaacsim import SimulationApp
 
@@ -597,13 +630,13 @@ def main():
         "physics_gpu": int(args.physics_gpu),
         "extra_args": extra_args,
     })
-    apply_stable_dataset_render_settings(reason="post_simulation_app")
+    apply_stable_dataset_render_settings(reason="post_simulation_app", enabled=stable_render_enabled)
     if args.headless and args.auto_collect:
         suppress_headless_log_noise()
 
     try:
         open_stage(simulation_app, args.scene)
-        apply_stable_dataset_render_settings(reason="post_open_stage")
+        apply_stable_dataset_render_settings(reason="post_open_stage", enabled=stable_render_enabled)
 
         from excavator_app.bootstrap import run_excavator_with_sand
 
@@ -613,9 +646,10 @@ def main():
         except Exception:
             pass
         wait_runtime_ready(simulation_app, rt, args.wait_runtime_seconds)
-        stable_settings = apply_stable_dataset_render_settings(reason="runtime_ready")
+        stable_settings = apply_stable_dataset_render_settings(reason="runtime_ready", enabled=stable_render_enabled)
         try:
             rt.STATE["dataset_stable_render_settings"] = stable_settings
+            rt.STATE["dataset_stable_render_settings_enabled"] = bool(stable_render_enabled)
         except Exception:
             pass
         if args.sand_amount is not None and not args.random_sand_amount:

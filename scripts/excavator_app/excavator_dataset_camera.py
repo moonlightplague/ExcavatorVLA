@@ -2849,6 +2849,7 @@ def config_snapshot(rt):
         "available": bool(current_backend == "viewport_capture" or rep is not None),
         "backend": current_backend,
         "renderer_launch": renderer_launch,
+        "stable_render_settings_enabled": bool(rt.STATE.get("dataset_stable_render_settings_enabled", False)),
         "stable_render_settings": dict(rt.STATE.get("dataset_stable_render_settings", {}) or {}),
         "captureOnPlay": (rt.STATE.get("dataset_camera_capture_on_play_status") or {}).get("captureOnPlay"),
         "captureOnPlay_status": rt.STATE.get("dataset_camera_capture_on_play_status"),

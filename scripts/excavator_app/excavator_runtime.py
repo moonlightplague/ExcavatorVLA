@@ -11124,8 +11124,25 @@ def ensure_auto_collect_run_dir():
             STATE["debug_timeline_path"] = os.path.join(run_dir, DATASET_DEBUG_TIMELINE_FILE)
         return run_dir
 
+    def clean_run_id_suffix(raw):
+        text = str(raw or "").strip()
+        if not text:
+            return ""
+        cleaned = "".join(ch if (ch.isalnum() or ch in ["_", "-"]) else "_" for ch in text)
+        return cleaned.strip("_-")[:40]
+
+    os.makedirs(AUTO_COLLECT_DATASET_ROOT, exist_ok=True)
+    run_suffix = clean_run_id_suffix(os.environ.get("EXCAVATOR_AUTO_RUN_ID_SUFFIX", ""))
     run_id = "run_" + time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    if run_suffix:
+        run_id = f"{run_id}_{run_suffix}"
+    base_run_id = run_id
     run_dir = os.path.join(AUTO_COLLECT_DATASET_ROOT, run_id)
+    duplicate_index = 2
+    while os.path.exists(run_dir):
+        run_id = f"{base_run_id}_{duplicate_index:02d}"
+        run_dir = os.path.join(AUTO_COLLECT_DATASET_ROOT, run_id)
+        duplicate_index += 1
     os.makedirs(run_dir, exist_ok=True)
     STATE["auto_collect_run_id"] = run_id
     STATE["auto_collect_run_dir"] = run_dir
@@ -11147,6 +11164,7 @@ def ensure_auto_collect_run_dir():
             "quality_gate_version": QUALITY_GATE_VERSION,
             "config_hash": config_hash,
             "dataset_root": AUTO_COLLECT_DATASET_ROOT,
+            "run_id_suffix": run_suffix,
             "camera_backend": config_snapshot["camera"].get("backend", ""),
             "camera_module_version": config_snapshot["camera"].get("module_version", ""),
             "camera_renderer_launch": config_snapshot["camera"].get("renderer_launch", {}),
@@ -11411,6 +11429,7 @@ def auto_collect_write_run_summary():
             "debug_profile_recent": list(STATE.get("debug_profile_recent", []) or [])[-64:],
             "launcher_update_profile": dict(STATE.get("launcher_update_profile", {}) or {}),
             "launcher_update_recent": list(STATE.get("launcher_update_recent", []) or [])[-64:],
+            "wall_clock_breakdown": auto_collect_wall_time_summary(),
             "plan_build_summary": dict(STATE.get("plan_build_summary", {}) or {}),
             "dataset_record_sample_spans": dict(STATE.get("dataset_record_sample_spans", {}) or {}),
             "step_updates_profile": dict(STATE.get("step_updates_profile", {}) or {}),
@@ -15863,6 +15882,132 @@ async def auto_collect_find_plan(attempt_index):
     return await auto_dataset_collect.find_plan(runtime_module(), attempt_index)
 
 
+def auto_collect_wall_stage_name(row):
+    if not isinstance(row, dict):
+        return "unknown"
+    stage = str(row.get("stage", "") or "unknown")
+    if stage.startswith("move:"):
+        return stage
+    return stage
+
+
+def auto_collect_wall_record_stage(stage, seconds, attempt=None, result="", reason=""):
+    try:
+        seconds = float(seconds)
+    except Exception:
+        return
+    if seconds <= 0.0 or not np.isfinite(seconds):
+        return
+    stage = str(stage or "unknown")
+    summary = STATE.get("auto_collect_wall_time_by_stage")
+    if not isinstance(summary, dict):
+        summary = {}
+    row = summary.get(stage)
+    if not isinstance(row, dict):
+        row = {
+            "total_s": 0.0,
+            "count": 0,
+            "max_s": 0.0,
+            "max_attempt": None,
+            "last_s": 0.0,
+            "last_attempt": None,
+            "last_result": "",
+            "last_reason": "",
+        }
+    row["total_s"] = round(float(row.get("total_s", 0.0) or 0.0) + seconds, 6)
+    row["count"] = int(row.get("count", 0) or 0) + 1
+    row["last_s"] = round(seconds, 6)
+    row["last_attempt"] = None if attempt is None else int(attempt)
+    row["last_result"] = str(result or "")
+    row["last_reason"] = str(reason or "")
+    if seconds >= float(row.get("max_s", 0.0) or 0.0):
+        row["max_s"] = round(seconds, 6)
+        row["max_attempt"] = None if attempt is None else int(attempt)
+    summary[stage] = row
+    STATE["auto_collect_wall_time_by_stage"] = summary
+
+    recent = STATE.get("auto_collect_wall_time_recent")
+    if not isinstance(recent, list):
+        recent = []
+    recent.append({
+        "stage": stage,
+        "seconds": round(seconds, 6),
+        "attempt": None if attempt is None else int(attempt),
+        "result": str(result or ""),
+        "reason": str(reason or ""),
+        "t": time.time(),
+    })
+    STATE["auto_collect_wall_time_recent"] = recent[-128:]
+
+
+def auto_collect_wall_advance(next_row=None, final=False):
+    now = time.time()
+    previous = STATE.get("auto_collect_wall_time_last_row")
+    previous_at = float(STATE.get("auto_collect_wall_time_last_at", 0.0) or 0.0)
+    if isinstance(previous, dict) and previous_at > 0.0:
+        auto_collect_wall_record_stage(
+            auto_collect_wall_stage_name(previous),
+            max(0.0, now - previous_at),
+            attempt=previous.get("attempt"),
+            result=previous.get("result", ""),
+            reason=previous.get("reason", ""),
+        )
+    if final:
+        STATE["auto_collect_wall_time_last_row"] = None
+        STATE["auto_collect_wall_time_last_at"] = 0.0
+        return
+    if isinstance(next_row, dict):
+        STATE["auto_collect_wall_time_last_row"] = dict(next_row)
+        STATE["auto_collect_wall_time_last_at"] = now
+
+
+def auto_collect_wall_time_summary():
+    started_at = float(STATE.get("auto_collect_wall_time_started_at", 0.0) or 0.0)
+    ended_at = float(STATE.get("auto_collect_wall_time_ended_at", 0.0) or 0.0)
+    now = time.time()
+    if started_at <= 0.0:
+        return {
+            "available": False,
+            "reason": "not_started",
+            "by_stage": {},
+            "recent": [],
+        }
+    effective_end = ended_at if ended_at > 0.0 else now
+    by_stage = dict(STATE.get("auto_collect_wall_time_by_stage", {}) or {})
+    accounted = 0.0
+    sorted_items = []
+    for stage, row in by_stage.items():
+        if not isinstance(row, dict):
+            continue
+        total = float(row.get("total_s", 0.0) or 0.0)
+        accounted += total
+        sorted_items.append((stage, total, row))
+    sorted_items.sort(key=lambda item: item[1], reverse=True)
+    top = [
+        {
+            "stage": stage,
+            "total_s": round(total, 3),
+            "count": int(row.get("count", 0) or 0),
+            "max_s": round(float(row.get("max_s", 0.0) or 0.0), 3),
+            "max_attempt": row.get("max_attempt"),
+        }
+        for stage, total, row in sorted_items[:24]
+    ]
+    total_wall = max(0.0, effective_end - started_at)
+    return {
+        "available": True,
+        "started_at": started_at,
+        "ended_at": ended_at if ended_at > 0.0 else None,
+        "updated_at": now,
+        "total_wall_s": round(total_wall, 3),
+        "accounted_stage_s": round(accounted, 3),
+        "unattributed_wall_s": round(max(0.0, total_wall - accounted), 3),
+        "by_stage": by_stage,
+        "top_stages": top,
+        "recent": list(STATE.get("auto_collect_wall_time_recent", []) or [])[-32:],
+    }
+
+
 def auto_collect_attempt_progress(attempt_index, stage, result="start", started=None, **data):
     """Forced, low-cost breadcrumbs for locating silent auto-collect stalls."""
     elapsed_ms = None
@@ -15886,6 +16031,7 @@ def auto_collect_attempt_progress(attempt_index, stage, result="start", started=
         else:
             row[str(key)] = str(value)
     row["updated_at"] = time.time()
+    auto_collect_wall_advance(row)
     STATE["auto_collect_progress"] = dict(row)
     if not debug_diagnostics_enabled():
         return
@@ -16330,12 +16476,19 @@ async def auto_collect_loop(count, max_attempts=None):
     }
     STATE["auto_collect_active"] = True
     STATE["auto_collect_clock_owner_announced"] = False
+    STATE["auto_collect_wall_time_started_at"] = time.time()
+    STATE["auto_collect_wall_time_ended_at"] = 0.0
+    STATE["auto_collect_wall_time_by_stage"] = {}
+    STATE["auto_collect_wall_time_recent"] = []
+    STATE["auto_collect_wall_time_last_row"] = None
+    STATE["auto_collect_wall_time_last_at"] = 0.0
     STATE["auto_collect_progress"] = {
         "attempt": 0,
         "stage": "loop_start",
         "result": "start",
         "updated_at": time.time(),
     }
+    auto_collect_wall_advance(STATE["auto_collect_progress"])
     STATE["auto_collect_stop_requested"] = False
     STATE["auto_collect_requested"] = int(count)
     attempts_source = "ui" if max_attempts is not None else "default"
@@ -16516,6 +16669,8 @@ async def auto_collect_loop(count, max_attempts=None):
             "result": str(STATE.get("auto_collect_last_result", "") or "finished"),
             "updated_at": time.time(),
         }
+        auto_collect_wall_advance(STATE["auto_collect_progress"], final=True)
+        STATE["auto_collect_wall_time_ended_at"] = time.time()
         STATE["auto_collect_stop_requested"] = False
         STATE["dataset_recording"] = previous_dataset["dataset_recording"]
         STATE["dataset_path"] = previous_dataset["dataset_path"]

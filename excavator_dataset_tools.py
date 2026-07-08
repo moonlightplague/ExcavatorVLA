@@ -1,4 +1,5 @@
 import json
+import hashlib
 import math
 import os
 import re
@@ -1605,15 +1606,12 @@ def build_lerobot_v3_stats(
 
 
 def lerobot_v3_required_paths(export_dir: str, image_keys: Sequence[str]) -> List[str]:
-    required = [
+    return [
         os.path.join(export_dir, "meta", "info.json"),
         os.path.join(export_dir, "meta", "tasks.parquet"),
         os.path.join(export_dir, "meta", "episodes", "chunk-000", "file-000.parquet"),
         os.path.join(export_dir, "data", "chunk-000", "file-000.parquet"),
     ]
-    for key in image_keys:
-        required.append(os.path.join(export_dir, "videos", key, "chunk-000", "file-000.mp4"))
-    return required
 
 
 def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Dict[str, object]:
@@ -1670,11 +1668,26 @@ def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Di
             import pandas as pd  # type: ignore
 
             episodes_df = pd.read_parquet(episodes_path)
+            if len(episodes_df) <= 0:
+                reasons.append("episodes/no_rows")
             for key in image_keys:
                 for suffix in ["chunk_index", "file_index", "from_timestamp", "to_timestamp"]:
                     column = f"videos/{key}/{suffix}"
                     if column not in episodes_df.columns:
                         reasons.append(f"episodes/missing_{column}")
+                chunk_column = f"videos/{key}/chunk_index"
+                file_column = f"videos/{key}/file_index"
+                if chunk_column in episodes_df.columns and file_column in episodes_df.columns:
+                    for row_i, row in episodes_df.iterrows():
+                        try:
+                            chunk_index = int(row[chunk_column])
+                            file_index = int(row[file_column])
+                        except Exception:
+                            reasons.append(f"episodes/{key}_bad_video_index_row_{row_i}")
+                            continue
+                        video_path = os.path.join(export_dir, "videos", key, f"chunk-{chunk_index:03d}", f"file-{file_index:03d}.mp4")
+                        if not os.path.exists(video_path):
+                            reasons.append(f"videos/missing_{key}_file_{file_index:03d}")
         except Exception as exc:
             reasons.append(f"episodes/read_failed:{type(exc).__name__}:{exc}")
     return {
@@ -1682,6 +1695,60 @@ def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Di
         "reasons": reasons,
         "missing": missing,
     }
+
+
+def lerobot_manifest_reuse_entries(reuse_from_dir: Union[str, os.PathLike, None], export_config_hash: str) -> Dict[str, dict]:
+    reuse_dir = os.path.abspath(str(reuse_from_dir or ""))
+    if not reuse_dir or not os.path.isdir(reuse_dir):
+        return {}
+    manifest = read_json(os.path.join(reuse_dir, "manifest.json"), default={}) or {}
+    if not isinstance(manifest, dict):
+        return {}
+    if manifest.get("video_layout") != "per_episode":
+        return {}
+    if str(manifest.get("export_config_hash") or "") != str(export_config_hash or ""):
+        return {}
+    out: Dict[str, dict] = {}
+    for episode in manifest.get("episodes", []) or []:
+        if not isinstance(episode, dict):
+            continue
+        if episode.get("export_ready") is not True:
+            continue
+        source_hash = str(episode.get("source_signature_hash") or "")
+        if not source_hash:
+            continue
+        out[source_hash] = episode
+    return out
+
+
+def reusable_episode_video(
+    reuse_from_dir: Union[str, os.PathLike, None],
+    reusable_episodes: Dict[str, dict],
+    episode: dict,
+    image_key: str,
+    expected_frames: int,
+) -> Optional[str]:
+    source_hash = str(episode.get("source_signature_hash") or "")
+    if not source_hash:
+        return None
+    reused_episode = reusable_episodes.get(source_hash)
+    if not isinstance(reused_episode, dict):
+        return None
+    if int(reused_episode.get("length", -1) or -1) != int(episode.get("length", -2) or -2):
+        return None
+    videos = reused_episode.get("videos", {}) if isinstance(reused_episode.get("videos", {}), dict) else {}
+    entry = videos.get(image_key, {}) if isinstance(videos.get(image_key, {}), dict) else {}
+    if entry.get("available") is not True:
+        return None
+    if int(entry.get("frames", -1) or -1) != int(expected_frames):
+        return None
+    rel_path = str(entry.get("path") or "")
+    if not rel_path:
+        return None
+    src_path = os.path.normpath(os.path.join(os.path.abspath(str(reuse_from_dir or "")), rel_path.replace("/", os.sep)))
+    if not os.path.isfile(src_path):
+        return None
+    return src_path
 
 
 def collect_lerobot_rows(
@@ -1727,6 +1794,7 @@ def collect_lerobot_rows(
     episode_stats = []
     tasks_by_text: Dict[str, int] = {}
     image_paths = {key: [] for key in LEROBOT_IMAGE_KEYS}
+    episode_image_paths: List[Dict[str, List[str]]] = []
     skipped_frames = 0
     skipped_state_action_frames = 0
     skipped_missing_camera_frames = 0
@@ -1747,6 +1815,7 @@ def collect_lerobot_rows(
         task_index = 0
         task_text = ""
         score = safe_float_value(episode.get("score"), None)
+        current_episode_image_paths = {key: [] for key in LEROBOT_IMAGE_KEYS}
         for sample in trajectory:
             state = vector_or_none(sample.get("observation.state"), len(state_names))
             if state is None:
@@ -1805,6 +1874,7 @@ def collect_lerobot_rows(
             for key in LEROBOT_IMAGE_KEYS:
                 image_value, abs_image = resolved_images[key]
                 image_paths[key].append(abs_image)
+                current_episode_image_paths[key].append(abs_image)
                 row[key] = image_value
                 row[f"{key}.available"] = True
             rows.append(row)
@@ -1823,8 +1893,18 @@ def collect_lerobot_rows(
                 "score": score,
                 "from_frame": int(episode_start_frame),
                 "to_frame": int(episode_start_frame + episode_length),
+                "source_episode_index": int(source_episode_index),
+                "source_episode_dir": episode_dir,
+                "raw_episode_dir": episode_dir,
+                "source_signature_hash": episode.get("dashboard_transfer_source_signature_hash")
+                or episode.get("source_signature_hash")
+                or "",
+                "source_key": episode.get("dashboard_transfer_source_key")
+                or episode.get("source_key")
+                or "",
             }
         )
+        episode_image_paths.append(current_episode_image_paths)
         episode_stats.append(
             {
                 "episode_index": export_episode_index,
@@ -1844,6 +1924,7 @@ def collect_lerobot_rows(
         "episode_stats": episode_stats,
         "tasks": tasks,
         "image_paths": image_paths,
+        "episode_image_paths": episode_image_paths,
         "state_names": state_names,
         "action_names": action_names,
         "effort_names": effort_names,
@@ -1866,6 +1947,7 @@ def export_lerobot_dataset(
     overwrite: bool = False,
     require_standard: bool = False,
     require_vla: bool = False,
+    reuse_from_dir: Optional[Union[str, os.PathLike]] = None,
     progress_callback=None,
 ) -> Dict[str, object]:
     def progress(percent: float, message: str, current: Optional[int] = None, total: Optional[int] = None) -> None:
@@ -1881,6 +1963,11 @@ def export_lerobot_dataset(
     if not os.path.isdir(run_dir):
         raise FileNotFoundError(run_dir)
     export_dir = os.path.abspath(str(output_dir or os.path.join(run_dir, LEROBOT_DEFAULT_EXPORT_DIRNAME)))
+    reuse_dir = os.path.abspath(str(reuse_from_dir or ""))
+    if not reuse_dir or not os.path.isdir(reuse_dir):
+        reuse_dir = ""
+    if reuse_dir and os.path.normcase(reuse_dir) == os.path.normcase(export_dir):
+        reuse_dir = ""
     progress(2.0, "preparing export directory")
     if os.path.exists(export_dir):
         if not overwrite:
@@ -1911,56 +1998,134 @@ def export_lerobot_dataset(
         export_fps = 10
     video_results = {}
     image_features = list(LEROBOT_IMAGE_KEYS)
+    export_config = {
+        "video_layout": "per_episode",
+        "fps": int(export_fps),
+        "image_features": list(image_features),
+        "image_shape": list(LEROBOT_IMAGE_SHAPE),
+        "source_split": split,
+        "schema": LEROBOT_EXPORT_SCHEMA,
+    }
+    export_config_hash = hashlib.sha1(
+        json.dumps(export_config, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    reusable_episodes = lerobot_manifest_reuse_entries(reuse_dir, export_config_hash)
+    if reuse_dir:
+        progress(10.0, f"reuse manifest entries={len(reusable_episodes)} from {reuse_dir}")
     image_paths: Dict[str, List[str]] = collected["image_paths"]  # type: ignore[assignment]
+    episode_image_paths: List[Dict[str, List[str]]] = list(collected.get("episode_image_paths", []))  # type: ignore[arg-type]
     image_frame_counts = {key: len(image_paths.get(key, []) or []) for key in image_features}
     image_missing_file_counts = {
         key: len([path for path in (image_paths.get(key, []) or []) if not path or not os.path.isfile(path)])
         for key in image_features
     }
     progress(12.0, "camera preflight: " + ", ".join(f"{key}={image_frame_counts.get(key, 0)}" for key in image_features))
-    for camera_i, key in enumerate(image_features):
-        paths = image_paths.get(key, [])
-        start_percent = 15.0 + camera_i * 20.0
-        end_percent = 15.0 + (camera_i + 1) * 20.0
-        if not paths or not any(paths):
-            video_results[key] = {"available": False, "reason": "no_images", "frames": 0}
-            progress(end_percent, f"{key}: no images")
-            continue
-        video_path = os.path.join(export_dir, "videos", key, "chunk-000", "file-000.mp4")
-
-        def camera_progress(done: int, total: int, message: str, _start=start_percent, _end=end_percent):
-            ratio = float(done) / float(max(1, total))
-            progress(_start + (_end - _start) * ratio, message, int(done), int(max(1, total)))
-
-        progress(start_percent, f"encoding {key}: 0/{len(paths)}", 0, len(paths))
-        ok, encoder, reason = encode_mp4(
-            paths,
-            video_path,
-            export_fps,
-            target_size=(LEROBOT_IMAGE_SHAPE[1], LEROBOT_IMAGE_SHAPE[0]),
-            progress_callback=camera_progress,
-            progress_label=key,
-        )
-        if ok:
-            video_results[key] = {
-                "available": True,
-                "encoder": encoder,
-                "path": relpath_posix(video_path, export_dir),
-                "frames": len(paths),
-                "shape": LEROBOT_IMAGE_SHAPE,
-            }
-            progress(end_percent, f"encoded {key}: {len(paths)} frames", len(paths), len(paths))
-            continue
+    episodes = collected["episodes"]
+    tasks = collected["tasks"]
+    for key in image_features:
         video_results[key] = {
-            "available": False,
-            "reason": reason,
-            "frames": len(paths),
+            "available": True,
+            "layout": "per_episode",
+            "frames": 0,
+            "shape": LEROBOT_IMAGE_SHAPE,
+            "episode_files": [],
         }
-        progress(end_percent, f"{key}: video encode failed: {reason}", len(paths), len(paths))
+    episode_video_manifest: List[dict] = []
+    total_video_jobs = max(1, len(episode_image_paths) * len(image_features))
+    completed_video_jobs = 0
+    reused_video_jobs = 0
+    encoded_video_jobs = 0
+    video_start_percent = 15.0
+    video_end_percent = 75.0
+    for episode_i, episode_paths_by_key in enumerate(episode_image_paths):
+        current_episode = episodes[episode_i] if 0 <= episode_i < len(episodes) else {"episode_index": episode_i, "length": 0}
+        episode_video = {
+            "episode_index": int(episode_i),
+            "videos": {},
+        }
+        for key in image_features:
+            paths = list(episode_paths_by_key.get(key, []) or [])
+            job_start = video_start_percent + (video_end_percent - video_start_percent) * (completed_video_jobs / total_video_jobs)
+            job_end = video_start_percent + (video_end_percent - video_start_percent) * ((completed_video_jobs + 1) / total_video_jobs)
+            if not paths or not any(paths):
+                entry = {"available": False, "reason": "no_images", "frames": 0, "chunk_index": 0, "file_index": int(episode_i)}
+                episode_video["videos"][key] = entry
+                video_results[key]["available"] = False
+                video_results[key].setdefault("failed_episodes", []).append(entry)
+                completed_video_jobs += 1
+                progress(job_end, f"{key} episode {episode_i}: no images", completed_video_jobs, total_video_jobs)
+                continue
+            video_path = os.path.join(export_dir, "videos", key, "chunk-000", f"file-{episode_i:03d}.mp4")
+            rel_video_path = relpath_posix(video_path, export_dir)
+            reused_src = reusable_episode_video(reuse_dir, reusable_episodes, current_episode, key, len(paths))
+            if reused_src and safe_copy_file(reused_src, video_path):
+                entry = {
+                    "available": True,
+                    "encoder": "reused",
+                    "path": rel_video_path,
+                    "frames": len(paths),
+                    "chunk_index": 0,
+                    "file_index": int(episode_i),
+                    "from_timestamp": 0.0,
+                    "to_timestamp": float(len(paths)) / float(export_fps),
+                    "reused_from": relpath_posix(reused_src, reuse_dir),
+                }
+                video_results[key]["frames"] = int(video_results[key].get("frames", 0) or 0) + len(paths)
+                video_results[key]["episode_files"].append(entry)
+                episode_video["videos"][key] = entry
+                completed_video_jobs += 1
+                reused_video_jobs += 1
+                progress(job_end, f"reused {key} episode {episode_i}: {len(paths)} frames", completed_video_jobs, total_video_jobs)
+                continue
+
+            def camera_progress(done: int, total: int, message: str, _start=job_start, _end=job_end):
+                ratio = float(done) / float(max(1, total))
+                progress(_start + (_end - _start) * ratio, message, completed_video_jobs, total_video_jobs)
+
+            progress(job_start, f"encoding {key} episode {episode_i}: 0/{len(paths)}", completed_video_jobs, total_video_jobs)
+            ok, encoder, reason = encode_mp4(
+                paths,
+                video_path,
+                export_fps,
+                target_size=(LEROBOT_IMAGE_SHAPE[1], LEROBOT_IMAGE_SHAPE[0]),
+                progress_callback=camera_progress,
+                progress_label=f"{key} ep{episode_i}",
+            )
+            if ok:
+                entry = {
+                    "available": True,
+                    "encoder": encoder,
+                    "path": rel_video_path,
+                    "frames": len(paths),
+                    "chunk_index": 0,
+                    "file_index": int(episode_i),
+                    "from_timestamp": 0.0,
+                    "to_timestamp": float(len(paths)) / float(export_fps),
+                }
+                video_results[key]["frames"] = int(video_results[key].get("frames", 0) or 0) + len(paths)
+                video_results[key]["episode_files"].append(entry)
+                episode_video["videos"][key] = entry
+                completed_video_jobs += 1
+                encoded_video_jobs += 1
+                progress(job_end, f"encoded {key} episode {episode_i}: {len(paths)} frames", completed_video_jobs, total_video_jobs)
+                continue
+            entry = {
+                "available": False,
+                "reason": reason,
+                "path": rel_video_path,
+                "frames": len(paths),
+                "chunk_index": 0,
+                "file_index": int(episode_i),
+            }
+            episode_video["videos"][key] = entry
+            video_results[key]["available"] = False
+            video_results[key].setdefault("failed_episodes", []).append(entry)
+            completed_video_jobs += 1
+            encoded_video_jobs += 1
+            progress(job_end, f"{key} episode {episode_i}: video encode failed: {reason}", completed_video_jobs, total_video_jobs)
+        episode_video_manifest.append(episode_video)
 
     progress(78.0, "building parquet tables and metadata")
-    tasks = collected["tasks"]
-    episodes = collected["episodes"]
     state_names = list(collected["state_names"])  # type: ignore[arg-type]
     action_names = list(collected["action_names"])  # type: ignore[arg-type]
     effort_names = list(collected.get("effort_names", []))  # type: ignore[arg-type]
@@ -2019,9 +2184,9 @@ def export_lerobot_dataset(
         }
         for key in LEROBOT_IMAGE_KEYS:
             meta_row[f"videos/{key}/chunk_index"] = 0
-            meta_row[f"videos/{key}/file_index"] = 0
-            meta_row[f"videos/{key}/from_timestamp"] = float(start) / float(export_fps)
-            meta_row[f"videos/{key}/to_timestamp"] = float(end) / float(export_fps)
+            meta_row[f"videos/{key}/file_index"] = int(episode.get("episode_index", 0))
+            meta_row[f"videos/{key}/from_timestamp"] = 0.0
+            meta_row[f"videos/{key}/to_timestamp"] = float(int(episode.get("length", 0))) / float(export_fps)
         episode_meta_rows.append(meta_row)
     episodes_path = os.path.join(episodes_dir, "file-000.parquet")
     episodes_df = pd.DataFrame(episode_meta_rows)
@@ -2086,6 +2251,39 @@ def export_lerobot_dataset(
     write_json(os.path.join(meta_dir, "stats.json"), stats)
     progress(93.0, "wrote stats.json")
 
+    episode_export_manifest = []
+    for episode in episodes:  # type: ignore[assignment]
+        episode_index = int(episode.get("episode_index", 0))
+        task_indices = [int(value) for value in episode.get("tasks", [])]
+        episode_task_texts = [task_text_by_index.get(index, "") for index in task_indices]
+        video_entry = episode_video_manifest[episode_index] if 0 <= episode_index < len(episode_video_manifest) else {"videos": {}}
+        missing_or_failed = []
+        for key in image_features:
+            key_video = video_entry.get("videos", {}).get(key, {}) if isinstance(video_entry.get("videos", {}), dict) else {}
+            if key_video.get("available") is not True:
+                missing_or_failed.append(f"{key}:{key_video.get('reason', 'not_available')}")
+        episode_export_manifest.append(
+            {
+                "episode_index": episode_index,
+                "raw_episode_index": episode.get("raw_episode_index"),
+                "raw_episode_id": episode.get("raw_episode_id", ""),
+                "source_episode_index": episode.get("source_episode_index"),
+                "source_episode_dir": episode.get("source_episode_dir", ""),
+                "source_signature_hash": episode.get("source_signature_hash", ""),
+                "source_key": episode.get("source_key", ""),
+                "task_texts": episode_task_texts,
+                "length": int(episode.get("length", 0)),
+                "from_frame": int(episode.get("from_frame", 0)),
+                "to_frame": int(episode.get("to_frame", 0)),
+                "video_layout": "per_episode",
+                "videos": video_entry.get("videos", {}),
+                "export_ready": not missing_or_failed,
+                "export_status": "ready" if not missing_or_failed else "not_ready",
+                "not_ready_reasons": missing_or_failed,
+                "export_config_hash": export_config_hash,
+            }
+        )
+
     video_ready = all(video_results.get(key, {}).get("available") is True for key in image_features)
     parquet_ready = bool(parquet_ok and tasks_ok and episodes_ok)
     progress(95.0, "validating LeRobot/VLA export")
@@ -2098,6 +2296,12 @@ def export_lerobot_dataset(
         "source_run_dir": run_dir,
         "source_split": split,
         "created_at": time.time(),
+        "export_config": export_config,
+        "export_config_hash": export_config_hash,
+        "reuse_from_dir": reuse_dir,
+        "reused_video_jobs": int(reused_video_jobs),
+        "encoded_video_jobs": int(encoded_video_jobs),
+        "total_video_jobs": int(total_video_jobs),
         "standard_lerobot_ready": vla_training_ready,
         "state_action_ready": bool(parquet_ok),
         "effort_available": bool(effort_available),
@@ -2111,7 +2315,9 @@ def export_lerobot_dataset(
             "tasks_reason": tasks_reason,
             "episodes_reason": episodes_reason,
         },
+        "video_layout": "per_episode",
         "videos": video_results,
+        "episodes": episode_export_manifest,
         "image_frame_counts": image_frame_counts,
         "image_missing_file_counts": image_missing_file_counts,
         "validation": validation,
@@ -2128,6 +2334,7 @@ def export_lerobot_dataset(
             "Original auto-collection debug data remains outside this subfolder.",
             "This folder follows the LeRobot v3.0 offline layout for VLA/SmolVLA training.",
             "Camera streams are observation.images.0, observation.images.1, observation.images.2.",
+            "Camera media is segmented per episode so training can open the relevant episode video directly.",
             "Rows missing any camera frame are skipped during export so state/action/video stay aligned.",
             "If vla_training_ready is false, install pandas/pyarrow plus a video encoder, then rerun the exporter.",
         ],
@@ -2152,9 +2359,10 @@ def export_lerobot_dataset(
         "- `meta/stats.json`: state/action/effort/scalar statistics plus video normalization entries",
         "- `data/chunk-000/file-000.parquet`: frame table",
         "- `observation.effort` is included in the frame table only when Isaac measured joint efforts were available for every exported frame.",
-        "- `videos/observation.images.0/chunk-000/file-000.mp4`: camera 0 stream",
-        "- `videos/observation.images.1/chunk-000/file-000.mp4`: camera 1 stream",
-        "- `videos/observation.images.2/chunk-000/file-000.mp4`: camera 2 stream",
+        "- `videos/observation.images.0/chunk-000/file-XYZ.mp4`: camera 0 stream for episode file_index XYZ",
+        "- `videos/observation.images.1/chunk-000/file-XYZ.mp4`: camera 1 stream for episode file_index XYZ",
+        "- `videos/observation.images.2/chunk-000/file-XYZ.mp4`: camera 2 stream for episode file_index XYZ",
+        "- `manifest.json`: export status per episode, including source signature and segmented video paths",
         "",
     ]
     write_text(os.path.join(export_dir, "README.md"), "\n".join(readme))

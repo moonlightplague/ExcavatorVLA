@@ -1,3 +1,5 @@
+import hashlib
+import json
 import math
 import time
 
@@ -41,6 +43,29 @@ def _path(tree, idx):
         idx = node["parent"]
     out.reverse()
     return out
+
+
+def _stable_rrt_seed(rt, label, q_start, q_goal, mode):
+    episode_seed = 0
+    try:
+        episode_seed = int(getattr(rt, "STATE", {}).get("episode_seed", 0) or 0)
+    except Exception:
+        episode_seed = 0
+    try:
+        world_version = int(getattr(rt, "STATE", {}).get("rigid_obstacle_cache_version", 0) or 0)
+    except Exception:
+        world_version = 0
+    key = {
+        "planner": "joint_rrt_connect_v1",
+        "episode_seed": int(episode_seed),
+        "world_version": int(world_version),
+        "label": str(label),
+        "mode": str(mode),
+        "q_start": [round(float(x), 5) for x in _as_q(q_start)],
+        "q_goal": [round(float(x), 5) for x in _as_q(q_goal)],
+    }
+    payload = json.dumps(key, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return int(hashlib.sha256(payload).hexdigest()[:8], 16)
 
 
 def _clip_near(rt, q, reference):
@@ -355,8 +380,7 @@ def plan_joint_space_route(
     max_step = math.radians(float(getattr(rt, "PATH_RRT_STEP_DEG", 13.0)))
     goal_bias = float(getattr(rt, "PATH_RRT_GOAL_BIAS", 0.18))
     weights = np.array(getattr(rt, "PATH_RRT_JOINT_WEIGHTS", [1.15, 1.0, 0.9, 0.7]), dtype=np.float32)
-    seed_base = int(abs(hash(str(label))) % 1000003)
-    rng = np.random.default_rng(seed_base + int(time.time() * 10.0) % 1000003)
+    rng = np.random.default_rng(_stable_rrt_seed(rt, label, q_start, q_goal, mode))
     stats = {
         "direct_reason": "",
         "trapped": 0,

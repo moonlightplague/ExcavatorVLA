@@ -764,7 +764,8 @@ AUTO_COLLECT_LEROBOT_V3_EXPORT_PYTHON = str(
 AUTO_COLLECT_LEROBOT_V3_EXPORT_TIMEOUT_S = float(
     os.environ.get("EXCAVATOR_LEROBOT_V3_EXPORT_TIMEOUT_S", "1200") or 1200.0
 )
-PLANNER_VERSION = "dig_plan_v4_joint_space_world_debug"
+EXPERT_PLANNER_V1_ENABLED = env_bool("EXCAVATOR_EXPERT_PLANNER_V1", True)
+PLANNER_VERSION = "dig_plan_v4_joint_space_world_debug_expert_v1" if EXPERT_PLANNER_V1_ENABLED else "dig_plan_v4_joint_space_world_debug"
 QUALITY_GATE_VERSION = "quality_gate_v3_low_bin_warning_scatter_accept"
 RUNTIME_PATCH_TAG = "20260703_reject_trainable_lowbin_scatter_recovery"
 AUTO_PREFLIGHT_MIN_PARTICLES = 1000
@@ -778,7 +779,10 @@ AUTO_DIG_RING_RADII = [0.0, 0.18, 0.36, 0.55]
 AUTO_DIG_RING_POINTS = [1, 6, 8, 10]
 AUTO_DIG_DEPTH_PRIORITY = [0.22, 0.18, 0.14, 0.10]
 AUTO_DIG_SWEEP_RADIUS = 0.30
-AUTO_DIG_FULL_PLAN_TOPK_PER_RING = 4
+AUTO_DIG_FULL_PLAN_TOPK_PER_RING = env_int(
+    "EXCAVATOR_AUTO_DIG_FULL_PLAN_TOPK_PER_RING",
+    8 if EXPERT_PLANNER_V1_ENABLED else 4,
+)
 AUTO_DIG_SCORE_WEIGHTS = {
     "reach": 32.0,
     "fill": 26.0,
@@ -7105,11 +7109,17 @@ def stable_json_hash(data):
 def planner_config_snapshot():
     return {
         "planner_version": PLANNER_VERSION,
+        "expert_planner_v1_enabled": bool(EXPERT_PLANNER_V1_ENABLED),
         "dig_stage_profile": "load_volume_continuous",
         "dig_plan_max_build_seconds": DIG_PLAN_MAX_BUILD_SECONDS,
+        "dig_plan_early_accept_enabled": bool(DIG_PLAN_EARLY_ACCEPT_ENABLED),
+        "dig_plan_staged_prefix_early_accept_enabled": bool(DIG_PLAN_STAGED_PREFIX_EARLY_ACCEPT_ENABLED),
         "auto_collect_candidate_plan_seconds": AUTO_COLLECT_CANDIDATE_PLAN_SECONDS,
         "auto_collect_candidate_hard_budget_grace_seconds": AUTO_COLLECT_CANDIDATE_HARD_BUDGET_GRACE_SECONDS,
         "auto_collect_find_plan_max_seconds": AUTO_COLLECT_FIND_PLAN_MAX_SECONDS,
+        "auto_collect_max_full_plan_attempts": int(AUTO_COLLECT_MAX_FULL_PLAN_ATTEMPTS),
+        "auto_collect_min_success_per_ring": int(AUTO_COLLECT_MIN_SUCCESS_PER_RING),
+        "auto_collect_continue_after_first_success_seconds": float(AUTO_COLLECT_CONTINUE_AFTER_FIRST_SUCCESS_SECONDS),
         "auto_collect_require_pre_sample_secure": bool(AUTO_COLLECT_REQUIRE_PRE_SAMPLE_SECURE),
         "auto_collect_owns_step_clock": bool(AUTO_COLLECT_OWNS_STEP_CLOCK),
         "auto_collect_passive_main_sleep_s": float(AUTO_COLLECT_PASSIVE_MAIN_SLEEP_S),
@@ -20329,7 +20339,10 @@ DIG_PLAN_TOPK_IK = 2
 DIG_PLAN_MAX_CANDIDATES = 10
 DIG_PLAN_PATH_CHECK_SAMPLES = 6
 DIG_PLAN_MAX_BUILD_SECONDS = 10.0
-DIG_PLAN_EARLY_ACCEPT_ENABLED = str(os.environ.get("EXCAVATOR_DIG_PLAN_EARLY_ACCEPT", "1") or "1").strip().lower() not in (
+DIG_PLAN_EARLY_ACCEPT_DEFAULT = "0" if EXPERT_PLANNER_V1_ENABLED else "1"
+DIG_PLAN_EARLY_ACCEPT_ENABLED = str(
+    os.environ.get("EXCAVATOR_DIG_PLAN_EARLY_ACCEPT", DIG_PLAN_EARLY_ACCEPT_DEFAULT) or DIG_PLAN_EARLY_ACCEPT_DEFAULT
+).strip().lower() not in (
     "0",
     "false",
     "no",
@@ -20337,8 +20350,13 @@ DIG_PLAN_EARLY_ACCEPT_ENABLED = str(os.environ.get("EXCAVATOR_DIG_PLAN_EARLY_ACC
 )
 DIG_PLAN_EARLY_ACCEPT_MAX_COST = float(os.environ.get("EXCAVATOR_DIG_PLAN_EARLY_ACCEPT_MAX_COST", "950.0") or 950.0)
 DIG_PLAN_EARLY_ACCEPT_AFTER_CANDIDATES = int(os.environ.get("EXCAVATOR_DIG_PLAN_EARLY_ACCEPT_AFTER", "1") or 1)
+DIG_PLAN_STAGED_PREFIX_EARLY_ACCEPT_DEFAULT = "0" if EXPERT_PLANNER_V1_ENABLED else "1"
 DIG_PLAN_STAGED_PREFIX_EARLY_ACCEPT_ENABLED = str(
-    os.environ.get("EXCAVATOR_DIG_PLAN_STAGED_PREFIX_EARLY_ACCEPT", "1") or "1"
+    os.environ.get(
+        "EXCAVATOR_DIG_PLAN_STAGED_PREFIX_EARLY_ACCEPT",
+        DIG_PLAN_STAGED_PREFIX_EARLY_ACCEPT_DEFAULT,
+    )
+    or DIG_PLAN_STAGED_PREFIX_EARLY_ACCEPT_DEFAULT
 ).strip().lower() not in (
     "0",
     "false",
@@ -20357,10 +20375,27 @@ AUTO_COLLECT_REQUIRE_PRE_SAMPLE_SECURE = str(
     "off",
 )
 PLANNER_SYNC_BLOCK_WARN_MS = 250.0
-AUTO_COLLECT_FIND_PLAN_MAX_SECONDS = 30.0
-AUTO_COLLECT_CANDIDATE_PLAN_SECONDS = 10.0
+AUTO_COLLECT_FIND_PLAN_MAX_SECONDS = env_float(
+    "EXCAVATOR_AUTO_COLLECT_FIND_PLAN_MAX_SECONDS",
+    60.0 if EXPERT_PLANNER_V1_ENABLED else 30.0,
+)
+AUTO_COLLECT_CANDIDATE_PLAN_SECONDS = env_float(
+    "EXCAVATOR_AUTO_COLLECT_CANDIDATE_PLAN_SECONDS",
+    12.0 if EXPERT_PLANNER_V1_ENABLED else 10.0,
+)
 AUTO_COLLECT_CANDIDATE_HARD_BUDGET_GRACE_SECONDS = 0.50
-AUTO_COLLECT_MAX_FULL_PLAN_ATTEMPTS = 2
+AUTO_COLLECT_MAX_FULL_PLAN_ATTEMPTS = env_int(
+    "EXCAVATOR_AUTO_COLLECT_MAX_FULL_PLAN_ATTEMPTS",
+    12 if EXPERT_PLANNER_V1_ENABLED else 2,
+)
+AUTO_COLLECT_MIN_SUCCESS_PER_RING = env_int(
+    "EXCAVATOR_AUTO_COLLECT_MIN_SUCCESS_PER_RING",
+    3 if EXPERT_PLANNER_V1_ENABLED else 1,
+)
+AUTO_COLLECT_CONTINUE_AFTER_FIRST_SUCCESS_SECONDS = env_float(
+    "EXCAVATOR_AUTO_COLLECT_CONTINUE_AFTER_FIRST_SUCCESS_SECONDS",
+    4.0 if EXPERT_PLANNER_V1_ENABLED else 0.0,
+)
 AUTO_COLLECT_PLANNING_SNAPSHOT_MAX_AGE = 6.0
 PLANNING_PATH_PENALTY_CACHE_MAX = 2048
 PLANNING_SWING_CORRIDOR_CACHE_MAX = 128
@@ -29870,6 +29905,109 @@ def should_append_staged_post_secure_load_after_stage(stage_name):
     return False
 
 
+def dig_plan_expert_rank_cost(row, candidate, legacy_score=0.0, reports=None):
+    planner_cost = float((row or {}).get("planner_cost", 1.0e9) or 1.0e9)
+    if not bool(EXPERT_PLANNER_V1_ENABLED):
+        return planner_cost, {
+            "enabled": False,
+            "planner_cost": planner_cost,
+            "expert_cost": planner_cost,
+        }
+    reports = [r for r in (reports or []) if isinstance(r, dict)]
+    path_warning_count = 0
+    for report in reports:
+        if not bool(report.get("phase_ok", True)):
+            path_warning_count += 1
+        if not bool(report.get("obstacle_ok", True)):
+            path_warning_count += 1
+    stages = [s for s in ((row or {}).get("stages", []) or []) if isinstance(s, dict)]
+    stage_warning_count = 0
+    unload_warning_count = 0
+    carry_warning_count = 0
+
+    def has_warning_value(value):
+        if value is None or value is False:
+            return False
+        if isinstance(value, str):
+            text = value.lower()
+            return "warning" in text or "best_effort" in text or "fallback" in text
+        if isinstance(value, (list, tuple, set)):
+            return any(has_warning_value(item) for item in value)
+        if isinstance(value, dict):
+            return any(has_warning_value(item) for item in value.values())
+        return False
+
+    for stage in stages:
+        stage_has_warning = (
+            has_warning_value(stage.get("warning"))
+            or has_warning_value(stage.get("warnings"))
+            or has_warning_value(stage.get("reason"))
+            or has_warning_value(stage.get("failure_reason"))
+            or has_warning_value(stage.get("material_hold"))
+            or has_warning_value(stage.get("secure_load"))
+        )
+        if stage_has_warning:
+            stage_warning_count += 1
+        phase = str(stage.get("phase", "")).lower()
+        drop = stage.get("drop") if isinstance(stage.get("drop"), dict) else {}
+        drop_not_ready = "drop_alignment_ready" in stage and not bool(stage.get("drop_alignment_ready", True))
+        if isinstance(drop, dict):
+            drop_not_ready = drop_not_ready or (
+                bool(drop)
+                and not (
+                    bool(drop.get("execution_ok", False))
+                    or bool(drop.get("inside_xy", False))
+                    or bool(drop.get("scatter_xy_ok", False))
+                )
+            )
+        if "unload" in phase and (stage_has_warning or drop_not_ready):
+            unload_warning_count += 1
+        material_hold = stage.get("material_hold") if isinstance(stage.get("material_hold"), dict) else {}
+        carry_not_ok = isinstance(material_hold, dict) and material_hold.get("ok") is False
+        if ("carry" in phase or "secure" in phase or "lift" in phase) and (stage_has_warning or carry_not_ok):
+            carry_warning_count += 1
+
+    try:
+        legacy = float(legacy_score)
+    except Exception:
+        legacy = 0.0
+    legacy_bonus = max(-80.0, min(80.0, 0.20 * legacy))
+
+    candidate = candidate if isinstance(candidate, dict) else {}
+    fill_terms = []
+    for key in ("insert_depth", "mid_depth", "mid_pull", "exit_pull", "lift_height"):
+        try:
+            fill_terms.append(max(0.0, float(candidate.get(key, 0.0) or 0.0)))
+        except Exception:
+            pass
+    fill_potential = min(2.0, float(sum(fill_terms)))
+    fill_bonus = 4.0 * fill_potential
+
+    expert_cost = (
+        planner_cost
+        - legacy_bonus
+        - fill_bonus
+        + 8.0 * float(path_warning_count)
+        + 6.0 * float(stage_warning_count)
+        + 10.0 * float(unload_warning_count)
+        + 8.0 * float(carry_warning_count)
+    )
+    detail = {
+        "enabled": True,
+        "planner_cost": planner_cost,
+        "legacy_score": legacy,
+        "legacy_bonus": legacy_bonus,
+        "fill_potential": fill_potential,
+        "fill_bonus": fill_bonus,
+        "path_warning_count": int(path_warning_count),
+        "stage_warning_count": int(stage_warning_count),
+        "unload_warning_count": int(unload_warning_count),
+        "carry_warning_count": int(carry_warning_count),
+        "expert_cost": float(expert_cost),
+    }
+    return float(expert_cost), detail
+
+
 def dig_plan_candidate_early_accept_ok(row, evaluated_count):
     if not bool(DIG_PLAN_EARLY_ACCEPT_ENABLED):
         return False, "disabled"
@@ -29880,10 +30018,10 @@ def dig_plan_candidate_early_accept_ok(row, evaluated_count):
     contract = row.get("fsm_contract")
     if isinstance(contract, dict) and contract.get("ok") is False:
         return False, "contract_failed"
-    planner_cost = float(row.get("planner_cost", row.get("rank_cost", 1.0e9)) or 1.0e9)
-    if planner_cost > float(DIG_PLAN_EARLY_ACCEPT_MAX_COST):
-        return False, f"cost>{float(DIG_PLAN_EARLY_ACCEPT_MAX_COST):.1f}"
-    return True, f"cost<={float(DIG_PLAN_EARLY_ACCEPT_MAX_COST):.1f}"
+    rank_cost = float(row.get("rank_cost", row.get("planner_cost", 1.0e9)) or 1.0e9)
+    if rank_cost > float(DIG_PLAN_EARLY_ACCEPT_MAX_COST):
+        return False, f"rank_cost>{float(DIG_PLAN_EARLY_ACCEPT_MAX_COST):.1f}"
+    return True, f"rank_cost<={float(DIG_PLAN_EARLY_ACCEPT_MAX_COST):.1f}"
 
 
 def dig_plan_staged_prefix_early_accept_ok(row, evaluated_count):
@@ -29976,20 +30114,30 @@ def plan_dig_sequence_from_target(target_xyz, max_seconds=None):
                 else:
                     legacy_score, score_reason, reports = evaluate_dig_plan_candidate(seq, points, candidate, stages=row.get("stages"))
                 planner_cost = float(row.get("planner_cost", 1.0e9))
-                row["rank_cost"] = planner_cost
-                row["score"] = float(1000.0 - planner_cost)
                 row["legacy_score"] = float(legacy_score)
+                expert_cost, expert_detail = dig_plan_expert_rank_cost(
+                    row,
+                    candidate,
+                    legacy_score=legacy_score,
+                    reports=reports,
+                )
+                row["expert_cost"] = float(expert_cost)
+                row["expert_cost_detail"] = expert_detail
+                row["rank_cost"] = float(expert_cost)
+                row["score"] = float(1000.0 - float(expert_cost))
                 row["score_reason"] = (
                     f"planner_cost={planner_cost:.2f}; "
+                    f"expert_cost={float(expert_cost):.2f}; "
                     f"weighted_angle={float(row.get('weighted_angle', 0.0)):.2f}; "
                     f"estimated_time={float(row.get('estimated_time', 0.0)):.2f}; "
                     + score_reason
                 )
                 row["path_reports"] = reports
-                if best is None or planner_cost < best["rank_cost"]:
+                if best is None or float(row["rank_cost"]) < float(best["rank_cost"]):
                     best = {
                         "score": float(row["score"]),
-                        "rank_cost": planner_cost,
+                        "rank_cost": float(row["rank_cost"]),
+                        "planner_cost": planner_cost,
                         "sequence": seq,
                         "points": points,
                         "candidate": dict(candidate),

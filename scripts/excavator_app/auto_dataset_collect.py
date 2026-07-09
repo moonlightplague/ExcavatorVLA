@@ -149,11 +149,19 @@ async def find_plan(rt, attempt_index):
     for ring_index, ring_rows_all in _group_targets_by_ring(ranked_targets):
         ring_rows = ring_rows_all[:per_ring_limit]
         ring_successes = []
+        first_success_time = None
+        min_successes_per_ring = max(1, int(getattr(rt, "AUTO_COLLECT_MIN_SUCCESS_PER_RING", 1)))
+        continue_after_first_s = max(
+            0.0,
+            float(getattr(rt, "AUTO_COLLECT_CONTINUE_AFTER_FIRST_SUCCESS_SECONDS", 0.0)),
+        )
         rt.info_print(
             "[AUTO DIG TARGET RING]",
             f"ring_index={ring_index}",
             f"candidates={len(ring_rows_all)}",
             f"planning_top={len(ring_rows)}",
+            f"min_successes={min_successes_per_ring}",
+            f"continue_after_first={continue_after_first_s:.1f}s",
         )
         repeated_failure_signature = None
         repeated_failure_count = 0
@@ -269,9 +277,13 @@ async def find_plan(rt, attempt_index):
                     "detail": pre_sample_detail,
                 }
                 plan_cost = (
-                    shared_plan.get("total_plan_cost")
-                    if isinstance(shared_plan, dict) and shared_plan.get("total_plan_cost") is not None
-                    else (chosen_plan or {}).get("rank_cost", (chosen_plan or {}).get("planner_cost", 1.0e9))
+                    (chosen_plan or {}).get("rank_cost")
+                    if isinstance(chosen_plan, dict) and (chosen_plan or {}).get("rank_cost") is not None
+                    else (
+                        shared_plan.get("total_plan_cost")
+                        if isinstance(shared_plan, dict) and shared_plan.get("total_plan_cost") is not None
+                        else (chosen_plan or {}).get("planner_cost", 1.0e9)
+                    )
                 )
                 row["full_plan_cost"] = float(plan_cost)
             else:
@@ -341,6 +353,9 @@ async def find_plan(rt, attempt_index):
                 f"reason={row.get('failure_reason', row.get('reason', ''))}",
             )
             if seq:
+                now_success = rt.time.time()
+                if first_success_time is None:
+                    first_success_time = now_success
                 repeated_failure_signature = None
                 repeated_failure_count = 0
                 ring_successes.append(
@@ -357,10 +372,42 @@ async def find_plan(rt, attempt_index):
                     "[AUTO DIG TARGET ACCEPT]",
                     f"retry={retry}",
                     f"ring_index={row.get('ring_index')}",
-                    "reason=first_valid_plan_central_priority",
+                    "reason=candidate_success_best_of_k_pending",
+                    f"successes={len(ring_successes)}/{min_successes_per_ring}",
+                    f"elapsed_after_first={0.0 if first_success_time is None else now_success - first_success_time:.2f}s",
                     f"wall_ms={plan_elapsed_ms:.1f}",
                 )
-                return _return_best_ring_success("first_valid_plan_central_priority")
+                enough_successes = len(ring_successes) >= min_successes_per_ring
+                enough_after_first = (
+                    len(ring_successes) > 0
+                    and continue_after_first_s <= 0.0
+                ) or (
+                    first_success_time is not None
+                    and now_success - first_success_time >= continue_after_first_s
+                )
+                retry += 1
+                if (
+                    enough_successes
+                    or enough_after_first
+                    or retry >= max_full_plan_attempts
+                    or rt.time.time() > find_plan_deadline
+                ):
+                    reason = (
+                        "best_of_k_min_successes"
+                        if enough_successes
+                        else (
+                            "best_of_k_time_window"
+                            if enough_after_first
+                            else (
+                                "best_of_k_attempt_limit"
+                                if retry >= max_full_plan_attempts
+                                else "best_of_k_find_plan_budget"
+                            )
+                        )
+                    )
+                    return _return_best_ring_success(reason)
+                await rt.step_updates(2)
+                continue
             retry += 1
             budget_s = float(getattr(rt, "AUTO_COLLECT_CANDIDATE_PLAN_SECONDS", 4.0))
             hard_grace_s = float(getattr(rt, "AUTO_COLLECT_CANDIDATE_HARD_BUDGET_GRACE_SECONDS", 0.75))

@@ -103,6 +103,20 @@ def parse_args():
             "Unset keeps runtime default."
         ),
     )
+    parser.add_argument(
+        "--fast-sampled-replay",
+        action="store_true",
+        help=(
+            "Enable planned-time sampled replay for the free-space pre_dig stage only. "
+            "Loaded transit, lift, contact, dump, and settle remain full PhysX."
+        ),
+    )
+    parser.add_argument(
+        "--fast-replay-sample-hz",
+        type=float,
+        default=5.0,
+        help="Planned-time sample rate for --fast-sampled-replay (default: 5 Hz).",
+    )
     parser.add_argument("--wait-runtime-seconds", type=float, default=180.0)
     export_group = parser.add_mutually_exclusive_group()
     export_group.add_argument("--wait-export", dest="wait_export", action="store_true", help="Wait for LeRobot export task before closing in auto-collect mode.")
@@ -590,6 +604,9 @@ def main():
     os.environ["EXCAVATOR_LOG_MODE"] = str(args.log_mode or "data")
     os.environ["EXCAVATOR_BRIDGE_HOST"] = str(args.bridge_host)
     os.environ["EXCAVATOR_BRIDGE_PORT"] = str(args.bridge_port)
+    os.environ["EXCAVATOR_FAST_SAMPLED_REPLAY"] = "1" if bool(args.fast_sampled_replay) else "0"
+    os.environ["EXCAVATOR_FAST_REPLAY_PRE_DIG"] = "1"
+    os.environ["EXCAVATOR_FAST_REPLAY_SAMPLE_HZ"] = str(max(1.0, float(args.fast_replay_sample_hz)))
     env_set_if_value("EXCAVATOR_DATASET_CAMERA_CAPTURE_RESOLUTION", args.camera_capture_resolution)
 
     from isaacsim import SimulationApp

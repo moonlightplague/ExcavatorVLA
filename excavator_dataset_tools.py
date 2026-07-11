@@ -30,6 +30,52 @@ SEGMENT_FILES = {
 
 LEROBOT_EXPORT_SCHEMA = "excavator_lerobot_export_v3"
 LEROBOT_CODEBASE_VERSION = "v3.0"
+LEROBOT_TASK_PROMPT_VERSION = "excavator_relative_task_v2"
+LEROBOT_STATE_SCHEMA_VERSION = "excavator_state_v3_28d_plus_4effort_phase_index10"
+LEROBOT_CANONICAL_PHASE_NAMES = [
+    "pre_dig",
+    "approach_contact",
+    "insert_cut",
+    "pull_mid_cut",
+    "curl_to_hold_material",
+    "pull_exit_cut",
+    "secure_load",
+    "lift_carry",
+    "loaded_transit",
+    "unload_to_bin",
+]
+LEROBOT_BASE_STATE_NAMES_14D = [
+    "base_x",
+    "base_y",
+    "base_yaw",
+    "swing",
+    "boom",
+    "arm",
+    "bucket",
+    "bucket_load_estimate",
+    "bucket_tip_x",
+    "bucket_tip_y",
+    "bucket_tip_z",
+    "bucket_load_x",
+    "bucket_load_y",
+    "bucket_load_z",
+]
+LEROBOT_STATE_NAMES_28D = LEROBOT_BASE_STATE_NAMES_14D + [
+    "swing_velocity",
+    "boom_velocity",
+    "arm_velocity",
+    "bucket_velocity",
+    "phase_index",
+    "dig_target_local_x",
+    "dig_target_local_y",
+    "dig_target_local_z",
+    "unload_landing_local_x",
+    "unload_landing_local_y",
+    "unload_landing_local_z",
+    "truck_heading_relative_sin",
+    "truck_heading_relative_cos",
+    "bucket_load_rate",
+]
 LEROBOT_DEFAULT_EXPORT_DIRNAME = "lerobot_v3"
 EXPORT_TIME_POLICY_FILENAME = "export_time_policy.json"
 LEROBOT_IMAGE_SHAPE = [256, 256, 3]
@@ -1334,6 +1380,11 @@ def lerobot_export_config_for_run(
         "video_layout": "per_episode",
         "fps": float(export_fps),
         "video_keyframe_interval": int(LEROBOT_VIDEO_KEYFRAME_INTERVAL),
+        "task_prompt_version": LEROBOT_TASK_PROMPT_VERSION,
+        "state_schema_version": LEROBOT_STATE_SCHEMA_VERSION,
+        "state_dim": len(LEROBOT_STATE_NAMES_28D),
+        "effort_dim": 4,
+        "effective_robot_observation_dim": len(LEROBOT_STATE_NAMES_28D) + 4,
         "base_fps": float(base_export_fps),
         "time_policy": normalized_time_policy,
         "time_policy_hash": str(time_policy_info.get("hash") or export_time_policy_hash(normalized_time_policy)),
@@ -1342,6 +1393,17 @@ def lerobot_export_config_for_run(
         "source_split": split,
         "schema": LEROBOT_EXPORT_SCHEMA,
     }
+    metadata_only_keys = {
+        "task_prompt_version",
+        "state_schema_version",
+        "state_dim",
+        "effort_dim",
+        "effective_robot_observation_dim",
+    }
+    media_config = {key: value for key, value in export_config.items() if key not in metadata_only_keys}
+    media_config_hash = hashlib.sha1(
+        json.dumps(media_config, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
     export_config_hash = hashlib.sha1(
         json.dumps(export_config, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
@@ -1353,6 +1415,8 @@ def lerobot_export_config_for_run(
         "time_policy_hash": str(time_policy_info.get("hash") or export_time_policy_hash(normalized_time_policy)),
         "export_config": export_config,
         "export_config_hash": export_config_hash,
+        "media_config": media_config,
+        "media_config_hash": media_config_hash,
     }
 
 
@@ -1573,7 +1637,8 @@ def is_generic_lerobot_task_text(text: object) -> bool:
     if not normalized:
         return True
     generic = re.sub(r"\s+", " ", GENERIC_LEROBOT_TASK_TEXT.lower())
-    return normalized == generic or ("marked area" in normalized and "target container" in normalized)
+    legacy_generated = normalized.startswith("dig soil from the sand pile near (") and "dump it into the truck bed near (" in normalized
+    return normalized == generic or ("marked area" in normalized and "target container" in normalized) or legacy_generated
 
 
 def _nested_value(data: object, path: Sequence[str], default=None):
@@ -1660,10 +1725,18 @@ def _direction_label_from_xy(
     return labels[index % len(labels)]
 
 
-def _format_xy_for_task(xy: Optional[Sequence[float]]) -> str:
-    if xy is None or len(xy) < 2:
-        return "the selected area"
-    return f"({float(xy[0]):.2f}, {float(xy[1]):.2f})"
+def _task_relative_phrase(object_name: str, direction: str) -> str:
+    relation = {
+        "front": "in front of",
+        "front-left": "at the front-left of",
+        "left": "to the left of",
+        "rear-left": "at the rear-left of",
+        "rear": "behind",
+        "rear-right": "at the rear-right of",
+        "right": "to the right of",
+        "front-right": "at the front-right of",
+    }.get(str(direction), "near")
+    return f"the {object_name} {relation} the excavator's initial base pose"
 
 
 def build_episode_task_text(
@@ -1698,27 +1771,42 @@ def build_episode_task_text(
     )
     robot_yaw_rad = math.radians(robot_yaw_deg) if robot_yaw_deg is not None else state_yaw
 
+    # The language goal must describe the points actually used by this episode,
+    # while exact world transforms remain in state/meta rather than becoming a
+    # unique language task for every randomized scene.
     sand_xy = _first_vector_xy(
+        episode_row.get("target_xyz") if isinstance(episode_row, dict) else None,
+        episode_meta.get("target_xyz") if isinstance(episode_meta, dict) else None,
+        sample.get("target") if isinstance(sample, dict) else None,
         _nested_value(applied, ["sand_center"]),
         _nested_value(candidate, ["sand_xy"]),
         _nested_value(scene_context, ["pile_center"]),
-        episode_row.get("target_xyz") if isinstance(episode_row, dict) else None,
-        sample.get("target") if isinstance(sample, dict) else None,
     )
     unload_xy = _first_vector_xy(
+        episode_row.get("unload_landing_xyz") if isinstance(episode_row, dict) else None,
+        episode_meta.get("unload_landing_xyz") if isinstance(episode_meta, dict) else None,
+        episode_row.get("unload_point_xyz") if isinstance(episode_row, dict) else None,
+        episode_meta.get("unload_point_xyz") if isinstance(episode_meta, dict) else None,
         _nested_value(applied, ["unload_point_xyz"]),
         _nested_value(scene_context, ["unload_point"]),
         _nested_value(candidate, ["unload_xy"]),
-        episode_row.get("unload_point_xyz") if isinstance(episode_row, dict) else None,
         episode_row.get("unload_release_xyz") if isinstance(episode_row, dict) else None,
-        episode_row.get("unload_landing_xyz") if isinstance(episode_row, dict) else None,
     )
     sand_dir = _direction_label_from_xy(sand_xy, robot_xy, robot_yaw_rad)
     unload_dir = _direction_label_from_xy(unload_xy, robot_xy, robot_yaw_rad)
     if sand_xy is not None or unload_xy is not None:
+        source = (
+            _task_relative_phrase("sand pile", sand_dir)
+            if sand_xy is not None
+            else "the visible sand pile"
+        )
+        destination = (
+            _task_relative_phrase("truck bed", unload_dir)
+            if unload_xy is not None
+            else "the visible truck bed"
+        )
         return (
-            f"Dig soil from the sand pile near {_format_xy_for_task(sand_xy)}, {sand_dir} of the excavator, "
-            f"and dump it into the truck bed near {_format_xy_for_task(unload_xy)}, {unload_dir} of the excavator."
+            f"Excavate one scoop of sand from {source}, then carry and dump the collected material into {destination}."
         )
 
     for value in explicit_values:
@@ -1735,6 +1823,156 @@ def lerobot_task_text(
     state_names: Optional[Sequence[str]] = None,
 ) -> str:
     return build_episode_task_text(sample, episode_meta, episode_row=episode_row, state_names=state_names)
+
+
+def canonical_lerobot_phase_index(phase: object) -> Optional[int]:
+    text = str(phase or "").strip().lower()
+    if "clearance_route_post" in text or "staged_unload" in text or "high_carry" in text:
+        return 8
+    if "unload_to_bin" in text or "unload_pre_dump_align" in text or "unload" in text or "dump" in text:
+        return 9
+    if "pre_dig" in text or "clearance_route" in text or "travel" in text or "align" in text:
+        return 0
+    if "approach_contact" in text or ("approach" in text and "contact" in text):
+        return 1
+    if "insert" in text:
+        return 2
+    if "pull_mid" in text:
+        return 3
+    if "curl" in text:
+        return 4
+    if "pull_exit" in text:
+        return 5
+    if "secure" in text:
+        return 6
+    if "lift" in text or "carry" in text:
+        return 7
+    return None
+
+
+def _first_vector_xyz(*values: object) -> Optional[List[float]]:
+    for value in values:
+        vec = vector_or_none(value)
+        if vec is not None and len(vec) >= 3:
+            return [float(vec[0]), float(vec[1]), float(vec[2])]
+    return None
+
+
+def _state_values_by_name(
+    state: Sequence[float],
+    state_names: Sequence[str],
+    required_names: Sequence[str],
+) -> Optional[List[float]]:
+    lookup = {str(name): index for index, name in enumerate(state_names)}
+    values: List[float] = []
+    for name in required_names:
+        index = lookup.get(str(name))
+        if index is None or index >= len(state):
+            return None
+        values.append(float(state[index]))
+    return values
+
+
+def _point_in_initial_heading_frame(
+    point_xyz: Sequence[float],
+    origin_xy: Sequence[float],
+    heading_rad: float,
+) -> List[float]:
+    dx = float(point_xyz[0]) - float(origin_xy[0])
+    dy = float(point_xyz[1]) - float(origin_xy[1])
+    c = math.cos(float(heading_rad))
+    s = math.sin(float(heading_rad))
+    return [
+        c * dx + s * dy,
+        -s * dx + c * dy,
+        float(point_xyz[2]),
+    ]
+
+
+def build_lerobot_state_28d(
+    sample: dict,
+    episode_meta: dict,
+    episode_row: dict,
+    raw_state_names: Sequence[str],
+    bucket_load_rate: float,
+) -> Tuple[Optional[List[float]], str]:
+    raw_state = vector_or_none(sample.get("observation.state")) or vector_or_none(sample.get("obs.state"))
+    if raw_state is None:
+        return None, "missing_raw_state"
+    base_state = _state_values_by_name(raw_state, raw_state_names, LEROBOT_BASE_STATE_NAMES_14D)
+    if base_state is None:
+        return None, "raw_state_missing_named_14d_components"
+
+    joint_velocity = vector_or_none(sample.get("obs.dq"), 4)
+    if joint_velocity is None:
+        return None, "missing_joint_velocity"
+    effort = vector_or_none(sample.get("observation.effort"), 4)
+    if effort is None:
+        return None, "missing_measured_effort"
+
+    phase_index = canonical_lerobot_phase_index(sample.get("phase") or sample.get("label"))
+    if phase_index is None:
+        return None, f"unknown_phase:{sample.get('phase') or sample.get('label')}"
+
+    scene = _episode_scene_dict(episode_row, episode_meta)
+    candidate = scene.get("candidate") if isinstance(scene.get("candidate"), dict) else {}
+    applied = scene.get("applied") if isinstance(scene.get("applied"), dict) else {}
+    scene_context = applied.get("scene_context") if isinstance(applied.get("scene_context"), dict) else {}
+
+    dig_target = _first_vector_xyz(
+        sample.get("target"),
+        episode_row.get("target_xyz"),
+        episode_meta.get("target_xyz"),
+        scene_context.get("pile_center"),
+    )
+    if dig_target is None:
+        return None, "missing_dig_target_xyz"
+    unload_landing = _first_vector_xyz(
+        episode_row.get("unload_landing_xyz"),
+        episode_meta.get("unload_landing_xyz"),
+        applied.get("unload_landing_xyz"),
+        scene_context.get("unload_point"),
+        episode_row.get("unload_point_xyz"),
+        episode_meta.get("unload_point_xyz"),
+    )
+    if unload_landing is None:
+        return None, "missing_unload_landing_xyz"
+
+    base_x = float(base_state[0])
+    base_y = float(base_state[1])
+    robot_heading_deg = _first_float(
+        applied.get("robot_body_yaw_deg"),
+        candidate.get("robot_body_yaw_deg"),
+    )
+    if robot_heading_deg is None:
+        robot_heading_rad = float(base_state[2]) + float(base_state[3])
+    else:
+        robot_heading_rad = math.radians(float(robot_heading_deg))
+    dig_local = _point_in_initial_heading_frame(dig_target, [base_x, base_y], robot_heading_rad)
+    unload_local = _point_in_initial_heading_frame(unload_landing, [base_x, base_y], robot_heading_rad)
+
+    truck_yaw_deg = _first_float(
+        applied.get("truck_yaw_deg"),
+        candidate.get("truck_yaw_deg"),
+    )
+    if truck_yaw_deg is None:
+        return None, "missing_truck_yaw_deg"
+    truck_relative_yaw = math.radians(float(truck_yaw_deg)) - float(robot_heading_rad)
+
+    state = (
+        [float(value) for value in base_state]
+        + [float(value) for value in joint_velocity]
+        + [float(phase_index)]
+        + [float(value) for value in dig_local]
+        + [float(value) for value in unload_local]
+        + [math.sin(truck_relative_yaw), math.cos(truck_relative_yaw)]
+        + [float(bucket_load_rate)]
+    )
+    if len(state) != len(LEROBOT_STATE_NAMES_28D):
+        return None, f"state_dimension_mismatch:{len(state)}"
+    if not all(math.isfinite(float(value)) for value in state):
+        return None, "state_contains_non_finite_value"
+    return state, "ok"
 
 
 def try_write_parquet(rows: Sequence[dict], path: str) -> Tuple[bool, str]:
@@ -2152,7 +2390,7 @@ def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Di
     }
 
 
-def lerobot_manifest_reuse_entries(reuse_from_dir: Union[str, os.PathLike, None], export_config_hash: str) -> Dict[str, dict]:
+def lerobot_manifest_reuse_entries(reuse_from_dir: Union[str, os.PathLike, None], media_config_hash: str) -> Dict[str, dict]:
     reuse_dir = os.path.abspath(str(reuse_from_dir or ""))
     if not reuse_dir or not os.path.isdir(reuse_dir):
         return {}
@@ -2161,7 +2399,18 @@ def lerobot_manifest_reuse_entries(reuse_from_dir: Union[str, os.PathLike, None]
         return {}
     if manifest.get("video_layout") != "per_episode":
         return {}
-    if str(manifest.get("export_config_hash") or "") != str(export_config_hash or ""):
+    manifest_media_hash = str(manifest.get("media_config_hash") or "")
+    if not manifest_media_hash:
+        legacy_media_config = dict(manifest.get("export_config") or {})
+        legacy_media_config.pop("task_prompt_version", None)
+        legacy_media_config.pop("state_schema_version", None)
+        legacy_media_config.pop("state_dim", None)
+        legacy_media_config.pop("effort_dim", None)
+        legacy_media_config.pop("effective_robot_observation_dim", None)
+        manifest_media_hash = hashlib.sha1(
+            json.dumps(legacy_media_config, ensure_ascii=True, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+    if manifest_media_hash != str(media_config_hash or ""):
         return {}
     out: Dict[str, dict] = {}
     for episode in manifest.get("episodes", []) or []:
@@ -2231,7 +2480,7 @@ def collect_lerobot_rows(
     if limit_episodes is not None:
         episode_rows = episode_rows[: max(0, int(limit_episodes))]
     run_meta = read_json(os.path.join(run_dir, "run_meta.json"), default={}) or {}
-    state_names = run_meta.get("state_names") or [
+    raw_state_names = run_meta.get("state_names") or [
         "base_x",
         "base_y",
         "base_yaw",
@@ -2247,6 +2496,8 @@ def collect_lerobot_rows(
         "bucket_load_y",
         "bucket_load_z",
     ]
+    raw_state_names = list(raw_state_names)
+    state_names = list(LEROBOT_STATE_NAMES_28D)
     action_names = run_meta.get("action_names") or [
         "swing_cmd_velocity",
         "boom_cmd_velocity",
@@ -2270,6 +2521,8 @@ def collect_lerobot_rows(
     skipped_missing_camera_frames = 0
     missing_camera_by_key: Counter = Counter()
     missing_camera_examples: List[dict] = []
+    missing_vla_state_by_reason: Counter = Counter()
+    missing_vla_state_examples: List[dict] = []
     global_frame = 0
     for source_episode_index, episode in enumerate(episode_rows):
         episode_dir = episode_dir_from_row(episode, run_dir=run_dir)
@@ -2282,7 +2535,7 @@ def collect_lerobot_rows(
             trajectory,
             policy=time_policy,
             base_fps=base_fps,
-            state_names=state_names,
+            state_names=raw_state_names,
             action_names=action_names,
         )
         trajectory = list(transformed.get("samples") or [])
@@ -2294,12 +2547,14 @@ def collect_lerobot_rows(
         task_text = ""
         score = safe_float_value(episode.get("score"), None)
         current_episode_image_paths = {key: [] for key in LEROBOT_IMAGE_KEYS}
+        previous_bucket_load: Optional[float] = None
+        previous_sample_t: Optional[float] = None
         for sample in trajectory:
-            state = vector_or_none(sample.get("observation.state"), len(state_names))
-            if state is None:
-                state = vector_or_none(sample.get("obs.state"), len(state_names))
+            raw_state = vector_or_none(sample.get("observation.state"), len(raw_state_names))
+            if raw_state is None:
+                raw_state = vector_or_none(sample.get("obs.state"), len(raw_state_names))
             action = vector_or_none(sample.get("action"), len(action_names))
-            if state is None or action is None:
+            if raw_state is None or action is None:
                 skipped_frames += 1
                 skipped_state_action_frames += 1
                 continue
@@ -2329,11 +2584,44 @@ def collect_lerobot_rows(
                     )
                 continue
             effort = vector_or_none(sample.get("observation.effort"), len(effort_names))
-            task_text = lerobot_task_text(sample, meta, episode_row=episode, state_names=state_names)
+            sample_t = safe_float_value(sample.get("t"), first_t) or first_t
+            raw_base_state = _state_values_by_name(raw_state, raw_state_names, LEROBOT_BASE_STATE_NAMES_14D)
+            if raw_base_state is None:
+                state = None
+                state_reason = "raw_state_missing_named_14d_components"
+            else:
+                current_bucket_load = float(raw_base_state[7])
+                if previous_bucket_load is None or previous_sample_t is None:
+                    bucket_load_rate = 0.0
+                else:
+                    dt_sample = max(1.0e-6, float(sample_t) - float(previous_sample_t))
+                    bucket_load_rate = (current_bucket_load - float(previous_bucket_load)) / dt_sample
+                state, state_reason = build_lerobot_state_28d(
+                    sample,
+                    meta,
+                    episode,
+                    raw_state_names,
+                    bucket_load_rate,
+                )
+            if state is None:
+                skipped_frames += 1
+                missing_vla_state_by_reason[str(state_reason)] += 1
+                if len(missing_vla_state_examples) < 20:
+                    missing_vla_state_examples.append(
+                        {
+                            "source_episode_index": int(source_episode_index),
+                            "raw_episode_index": episode.get("episode_index"),
+                            "raw_episode_id": episode.get("episode_id", ""),
+                            "raw_sample_index": sample.get("i"),
+                            "phase": str(sample.get("phase", "")),
+                            "reason": str(state_reason),
+                        }
+                    )
+                continue
+            task_text = lerobot_task_text(sample, meta, episode_row=episode, state_names=raw_state_names)
             if task_text not in tasks_by_text:
                 tasks_by_text[task_text] = len(tasks_by_text)
             task_index = tasks_by_text[task_text]
-            sample_t = safe_float_value(sample.get("t"), first_t) or first_t
             row = {
                 "index": global_frame,
                 "episode_index": export_episode_index,
@@ -2356,6 +2644,8 @@ def collect_lerobot_rows(
                 row[key] = image_value
                 row[f"{key}.available"] = True
             rows.append(row)
+            previous_bucket_load = float(state[7])
+            previous_sample_t = float(sample_t)
             episode_length += 1
             global_frame += 1
         if episode_length <= 0:
@@ -2397,6 +2687,11 @@ def collect_lerobot_rows(
                 "freeze_count": episode.get("freeze_count"),
             }
         )
+    if missing_vla_state_by_reason:
+        raise ValueError(
+            "cannot build complete 28D VLA state plus 4D effort: "
+            f"missing={dict(missing_vla_state_by_reason)} examples={missing_vla_state_examples[:5]}"
+        )
     tasks = [{"task_index": index, "task": text} for text, index in sorted(tasks_by_text.items(), key=lambda item: item[1])]
     return {
         "rows": rows,
@@ -2406,6 +2701,9 @@ def collect_lerobot_rows(
         "image_paths": image_paths,
         "episode_image_paths": episode_image_paths,
         "state_names": state_names,
+        "raw_state_names": raw_state_names,
+        "state_schema_version": LEROBOT_STATE_SCHEMA_VERSION,
+        "canonical_phase_names": list(LEROBOT_CANONICAL_PHASE_NAMES),
         "action_names": action_names,
         "effort_names": effort_names,
         "run_meta": run_meta,
@@ -2494,7 +2792,9 @@ def export_lerobot_dataset(
     image_features = list(LEROBOT_IMAGE_KEYS)
     export_config = dict(export_config_info.get("export_config") or {})
     export_config_hash = str(export_config_info.get("export_config_hash") or "")
-    reusable_episodes = lerobot_manifest_reuse_entries(reuse_dir, export_config_hash)
+    media_config = dict(export_config_info.get("media_config") or {})
+    media_config_hash = str(export_config_info.get("media_config_hash") or "")
+    reusable_episodes = lerobot_manifest_reuse_entries(reuse_dir, media_config_hash)
     if reuse_dir:
         progress(10.0, f"reuse manifest entries={len(reusable_episodes)} from {reuse_dir}")
     image_paths: Dict[str, List[str]] = collected["image_paths"]  # type: ignore[assignment]
@@ -2718,6 +3018,11 @@ def export_lerobot_dataset(
     info = {
         "codebase_version": LEROBOT_CODEBASE_VERSION,
         "robot_type": "excavator",
+        "state_schema_version": LEROBOT_STATE_SCHEMA_VERSION,
+        "state_dim": len(state_names),
+        "effort_dim": effort_dim if effort_available else 0,
+        "effective_robot_observation_dim": len(state_names) + (effort_dim if effort_available else 0),
+        "canonical_phase_names": list(LEROBOT_CANONICAL_PHASE_NAMES),
         "total_episodes": len(episodes),
         "total_frames": len(data_rows),
         "total_tasks": len(tasks),
@@ -2773,6 +3078,7 @@ def export_lerobot_dataset(
                 "export_status": "ready" if not missing_or_failed else "not_ready",
                 "not_ready_reasons": missing_or_failed,
                 "export_config_hash": export_config_hash,
+                "media_config_hash": media_config_hash,
                 "time_policy": normalized_time_policy,
                 "time_policy_hash": str(time_policy_info.get("hash") or export_time_policy_hash(normalized_time_policy)),
             }
@@ -2792,6 +3098,19 @@ def export_lerobot_dataset(
         "created_at": time.time(),
         "export_config": export_config,
         "export_config_hash": export_config_hash,
+        "media_config": media_config,
+        "media_config_hash": media_config_hash,
+        "task_prompt_version": LEROBOT_TASK_PROMPT_VERSION,
+        "state_schema_version": LEROBOT_STATE_SCHEMA_VERSION,
+        "state_names": list(LEROBOT_STATE_NAMES_28D),
+        "effort_names": [
+            "swing_measured_effort",
+            "boom_measured_effort",
+            "arm_measured_effort",
+            "bucket_measured_effort",
+        ],
+        "effective_robot_observation_dim": len(LEROBOT_STATE_NAMES_28D) + 4,
+        "canonical_phase_names": list(LEROBOT_CANONICAL_PHASE_NAMES),
         "time_policy": normalized_time_policy,
         "time_policy_hash": str(time_policy_info.get("hash") or export_time_policy_hash(normalized_time_policy)),
         "base_fps": float(base_export_fps),

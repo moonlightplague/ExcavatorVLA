@@ -5846,6 +5846,100 @@ def dashboard_episode_export_video(
     }
 
 
+def dashboard_vla_observation_preview(
+    run_dir: Union[str, os.PathLike],
+    trajectory: Sequence[dict],
+    episode_row: dict,
+    episode_meta: dict,
+) -> Dict[str, object]:
+    state_builder = getattr(shared_dataset_tools, "build_lerobot_state_28d", None) if shared_dataset_tools is not None else None
+    state_names = list(getattr(shared_dataset_tools, "LEROBOT_STATE_NAMES_28D", []) or []) if shared_dataset_tools is not None else []
+    effort_names = [
+        "swing_measured_effort",
+        "boom_measured_effort",
+        "arm_measured_effort",
+        "bucket_measured_effort",
+    ]
+    if not callable(state_builder) or len(state_names) != 28:
+        return {
+            "available": False,
+            "reason": "shared_32d_state_builder_unavailable",
+            "state_names": state_names,
+            "effort_names": effort_names,
+            "names": state_names + effort_names,
+            "rows": [],
+        }
+
+    run_meta = read_json(os.path.join(str(run_dir), "run_meta.json"), default={}) or {}
+    raw_state_names = list(run_meta.get("state_names") or [
+        "base_x", "base_y", "base_yaw", "swing", "boom", "arm", "bucket",
+        "bucket_load_estimate", "bucket_tip_x", "bucket_tip_y", "bucket_tip_z",
+        "bucket_load_x", "bucket_load_y", "bucket_load_z",
+    ])
+    raw_name_lookup = {str(name): index for index, name in enumerate(raw_state_names)}
+    bucket_load_index = raw_name_lookup.get("bucket_load_estimate")
+    first_t = safe_float_value(trajectory[0].get("t"), 0.0) if trajectory else 0.0
+    first_t = float(first_t or 0.0)
+    previous_bucket_load: Optional[float] = None
+    previous_t: Optional[float] = None
+    rows: List[dict] = []
+    valid_rows = 0
+
+    for frame_index, sample in enumerate(trajectory or []):
+        sample_t = float(safe_float_value(sample.get("t"), first_t) or first_t)
+        raw_state = vector_or_none(sample.get("observation.state")) or vector_or_none(sample.get("obs.state"))
+        current_bucket_load: Optional[float] = None
+        if raw_state is not None and bucket_load_index is not None and bucket_load_index < len(raw_state):
+            current_bucket_load = safe_float_value(raw_state[bucket_load_index], None)
+        if current_bucket_load is None or previous_bucket_load is None or previous_t is None:
+            bucket_load_rate = 0.0
+        else:
+            bucket_load_rate = (float(current_bucket_load) - float(previous_bucket_load)) / max(1.0e-6, sample_t - float(previous_t))
+        try:
+            state, reason = state_builder(
+                sample,
+                episode_meta,
+                episode_row,
+                raw_state_names,
+                bucket_load_rate,
+            )
+        except Exception as exc:
+            state = None
+            reason = f"{type(exc).__name__}:{exc}"
+        effort = vector_or_none(sample.get("observation.effort"), 4)
+        valid = state is not None and len(state) == 28 and effort is not None and len(effort) == 4
+        if valid:
+            values = [float(value) for value in state] + [float(value) for value in effort]
+            valid_rows += 1
+        else:
+            values = []
+            if state is not None and effort is None:
+                reason = "missing_measured_effort"
+        rows.append({
+            "index": int(frame_index),
+            "t": float(sample_t - first_t),
+            "phase": str(sample.get("phase") or sample.get("label") or "unknown"),
+            "valid": bool(valid),
+            "reason": str(reason or "unavailable"),
+            "values": values,
+        })
+        if current_bucket_load is not None:
+            previous_bucket_load = float(current_bucket_load)
+            previous_t = float(sample_t)
+
+    return {
+        "available": bool(rows and valid_rows == len(rows)),
+        "reason": "ok" if rows and valid_rows == len(rows) else f"valid_rows={valid_rows}/{len(rows)}",
+        "schema": "28D observation.state + 4D observation.effort",
+        "state_names": state_names,
+        "effort_names": effort_names,
+        "names": state_names + effort_names,
+        "rows": rows,
+        "valid_rows": int(valid_rows),
+        "frame_count": int(len(rows)),
+    }
+
+
 def dashboard_episode_payload(
     run_dir: Union[str, os.PathLike],
     episode_index: Union[int, str],
@@ -5876,6 +5970,7 @@ def dashboard_episode_payload(
             "joint_names": ["swing", "boom", "arm", "bucket"],
             "series": empty_series,
             "camera_preview": {"frame_count": 0, "initial_frame_index": 0, "cameras": [], "frames": []},
+            "vla_observation_preview": {"available": False, "reason": "trajectory_empty", "names": [], "rows": []},
             "time_policy": time_transform,
         }
     episode_meta = {}
@@ -5964,6 +6059,12 @@ def dashboard_episode_payload(
             first_t,
             image_paths=frame_context.get("image_paths") if isinstance(frame_context.get("image_paths"), dict) else None,
         ),
+        "vla_observation_preview": dashboard_vla_observation_preview(
+            run_dir,
+            trajectory,
+            selected,
+            episode_meta,
+        ),
     }
 
 
@@ -5988,11 +6089,12 @@ body{margin:0;background:linear-gradient(180deg,#eef3fb 0,#f6f8fb 220px,#f6f8fb 
 body.dark{background:linear-gradient(180deg,#0b1220 0,#111827 240px,#111827 100%);color:#e5e7eb;--panel:#111827;--border:#334155;--muted:#94a3b8;--ink:#f8fafc}
 body.dark .topbar{background:rgba(15,23,42,.96);border-bottom-color:#334155;box-shadow:0 6px 18px rgba(0,0,0,.30)}
 body.dark h1,body.dark h2,body.dark h3,body.dark .cameraPreviewTitle,body.dark .cameraCardTitle,body.dark .diagCardValue,body.dark .runMonitorTitle,body.dark .managerTable .nameCell{color:#f8fafc}
-body.dark .panel,body.dark .kpi,body.dark .diagCard,body.dark .subPanel,body.dark .managerPanel,body.dark .episodeSide,body.dark .timelinePaneHeader,body.dark .cameraPreview,body.dark .cameraCard,body.dark .miniChart,body.dark .finding,body.dark .action{background:#0f172a;border-color:#334155;color:#e5e7eb}
+body.dark .panel,body.dark .kpi,body.dark .diagCard,body.dark .subPanel,body.dark .managerPanel,body.dark .episodeSide,body.dark .vlaStatePanel,body.dark .timelinePaneHeader,body.dark .cameraPreview,body.dark .cameraCard,body.dark .miniChart,body.dark .finding,body.dark .action{background:#0f172a;border-color:#334155;color:#e5e7eb}
 body.dark input,body.dark select,body.dark button.secondary,body.dark .cameraPlayerBtn,body.dark .filterBtn,body.dark .runBadge,body.dark .unitLegend,body.dark .meshFrameBadge,body.dark .darkModeToggle{background:#111827;color:#e5e7eb;border-color:#475569}
 body.dark button{border-color:#334155}
 body.dark .muted,body.dark .panelHint,body.dark .filterCount,body.dark .diagCardDetail,body.dark .diagCardTitle,body.dark .sideFooter,body.dark .sideSortHint,body.dark .chartLegend,body.dark .plotNote{color:#94a3b8}
-body.dark .tableWrap,body.dark .managerTableWrap,body.dark .episodeTabsList{background:#0b1220;border-color:#334155}
+body.dark .tableWrap,body.dark .managerTableWrap,body.dark .episodeTabsList,body.dark .vlaStateGrid{background:#0b1220;border-color:#334155}
+body.dark .vlaStateItem{background:#0f172a}body.dark .vlaStateItem.effort{background:#0d211c}body.dark .vlaStateTitle,body.dark .vlaStateValue{color:#f8fafc}body.dark .vlaStateName{color:#cbd5e1}
 body.dark th,body.dark .episodeDataSheet th,body.dark .managerTable th{background:#111827;color:#cbd5e1;border-bottom-color:#334155}
 body.dark td,body.dark .episodeDataSheet td,body.dark .managerTable td{color:#e5e7eb;border-bottom-color:#1e293b}
 body.dark tbody tr:hover,body.dark .episodeDataSheet tbody tr:hover td{background:#172033}
@@ -6030,8 +6132,8 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
 
 /* v4 layout fixes */
 .statusFilterBar{margin-top:10px;border-top:1px solid #eaecf0;padding-top:10px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
-.statusFilterTitle{font-size:12px;color:#475467;font-weight:700;margin-right:4px}.statusFilter{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.filterBtn{min-height:28px;border:1px solid #d0d5dd;border-radius:999px;background:#fff;color:#344054;padding:0 10px;font-size:12px;font-weight:700;cursor:pointer}.filterBtn.active{color:#fff;border-color:transparent}.filterBtn.all.active{background:#344054}.filterBtn.trainable.active,.filterBtn.success.active{background:#067647}.filterBtn.rejected.active{background:#d92d20}.filterBtn.failed.active,.filterBtn.fail.active{background:#f79009;color:#111827}.filterBtn.diagnostic.active{background:#6941c6}.filterBtn.planning.active{background:#175cd3}.filterBtn.skip.active{background:#475467}.filterBtn.unknown.active{background:#667085}.filterCount{font-size:12px;color:#667085;white-space:nowrap}.chartMeta{font-size:11px;color:#667085;line-height:1.35;margin-top:6px}.miniChartGrid{display:grid;grid-template-columns:1fr;gap:10px}.miniChart{border:1px solid #eaecf0;border-radius:12px;background:#fcfcfd;padding:10px;min-width:0}.miniChart h3{margin:0 0 6px;font-size:12px;color:#344054;text-transform:none;letter-spacing:0}.miniChart .chart{max-height:165px}.smallChartBox{min-height:0}.pill.failed,.pill.fail{background:#fff7ed;color:#c2410c}.pill.rejected{background:#fef3f2;color:#b42318}.pill.diagnostic{background:#f4f3ff;color:#5925dc}.pill.skip{background:#f2f4f7;color:#344054}.episodeInspector{display:grid;grid-template-columns:minmax(560px,42%) minmax(0,1fr);gap:14px;align-items:start;min-height:0}.episodeSide{background:#f8fafc;border:1px solid #eaecf0;border-radius:12px;padding:10px;display:flex;flex-direction:column;min-height:0;height:var(--episodeAsideHeight,640px);max-height:var(--episodeAsideHeight,640px);overflow:hidden;align-self:start}.sideTabsToolbar{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:8px}.sideSortHint{font-size:11px;color:#667085;line-height:1.35;text-align:right;max-width:190px}.episodeTabsList{flex:1;min-height:0;overflow:auto;scrollbar-width:none;-ms-overflow-style:none;border:1px solid #eaecf0;border-radius:10px;background:#fff}.episodeTabsList::-webkit-scrollbar{display:none;width:0;height:0}.episodeDataSheet{min-width:1080px;width:100%;border-collapse:separate;border-spacing:0;font-size:11.5px;line-height:1.25}.episodeDataSheet th,.episodeDataSheet td{padding:7px 8px;border-bottom:1px solid #eef2f6;white-space:nowrap;vertical-align:middle}.episodeDataSheet th{position:sticky;top:0;z-index:4;background:#f8fafc;color:#475467;text-transform:uppercase;letter-spacing:.04em;font-size:10.5px}.episodeDataSheet th.sortable{cursor:pointer;color:#175cd3;user-select:none}.episodeDataSheet th.sortable:hover{background:#eff8ff}.episodeDataSheet tbody tr{cursor:pointer}.episodeDataSheet tbody tr:hover td{background:#f8fafc}.episodeDataSheet tbody tr.selected td{background:#e0f2fe}.episodeDataSheet .epCol{position:sticky;left:0;z-index:3;background:#fff;font-weight:800;color:#101828}.episodeDataSheet th.epCol{z-index:5;background:#f8fafc}.episodeDataSheet tbody tr:hover .epCol{background:#f8fafc}.episodeDataSheet tbody tr.selected .epCol{background:#e0f2fe}.episodeDataSheet .num{text-align:right;font-variant-numeric:tabular-nums}.episodeDataSheet .reasonCell{max-width:360px;overflow:hidden;text-overflow:ellipsis}.sideFooter{font-size:11px;color:#98a2b3;margin-top:7px;line-height:1.35}.timelinePane{min-width:0;display:flex;flex-direction:column;height:auto;align-self:start}.timelinePaneHeader{position:relative;top:auto;z-index:2;background:#fff;border:1px solid #eaecf0;border-radius:12px;padding:10px 12px;margin-bottom:16px}.timelinePaneHeader + .timelineGrid{margin-top:0}#bucketChart{margin-top:0}.timelineChart svg{display:block}.timelineSvgClickable{cursor:crosshair}.timelineCursor,.cameraTimelineCursor{pointer-events:none}.timelineGrid{gap:12px;min-width:0}.timelineChart .chart{min-height:230px}.unitLegend{border:1px solid #d0d5dd;border-radius:999px;padding:2px 7px;background:#fff;color:#475467;font-weight:700}.plotNote{font-size:11px;color:#667085;margin-top:6px;line-height:1.35}.densityBadge{display:inline-block;margin-left:6px;border:1px solid #d0d5dd;border-radius:999px;padding:1px 6px;font-size:10px;color:#475467;background:#fff}.meshFrameBadge{display:inline-block;border:1px solid #d0d5dd;border-radius:999px;padding:2px 7px;background:#fff;color:#475467;font-size:11px;margin-top:6px}
-@media(max-width:1280px){.episodeInspector{grid-template-columns:1fr;min-height:0}.episodeSide{height:min(560px,var(--episodeAsideHeight,560px));max-height:min(560px,var(--episodeAsideHeight,560px))}.timelinePaneHeader{position:static}.miniChartGrid{grid-template-columns:repeat(3,minmax(0,1fr))}}
+.statusFilterTitle{font-size:12px;color:#475467;font-weight:700;margin-right:4px}.statusFilter{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.filterBtn{min-height:28px;border:1px solid #d0d5dd;border-radius:999px;background:#fff;color:#344054;padding:0 10px;font-size:12px;font-weight:700;cursor:pointer}.filterBtn.active{color:#fff;border-color:transparent}.filterBtn.all.active{background:#344054}.filterBtn.trainable.active,.filterBtn.success.active{background:#067647}.filterBtn.rejected.active{background:#d92d20}.filterBtn.failed.active,.filterBtn.fail.active{background:#f79009;color:#111827}.filterBtn.diagnostic.active{background:#6941c6}.filterBtn.planning.active{background:#175cd3}.filterBtn.skip.active{background:#475467}.filterBtn.unknown.active{background:#667085}.filterCount{font-size:12px;color:#667085;white-space:nowrap}.chartMeta{font-size:11px;color:#667085;line-height:1.35;margin-top:6px}.miniChartGrid{display:grid;grid-template-columns:1fr;gap:10px}.miniChart{border:1px solid #eaecf0;border-radius:12px;background:#fcfcfd;padding:10px;min-width:0}.miniChart h3{margin:0 0 6px;font-size:12px;color:#344054;text-transform:none;letter-spacing:0}.miniChart .chart{max-height:165px}.smallChartBox{min-height:0}.pill.failed,.pill.fail{background:#fff7ed;color:#c2410c}.pill.rejected{background:#fef3f2;color:#b42318}.pill.diagnostic{background:#f4f3ff;color:#5925dc}.pill.skip{background:#f2f4f7;color:#344054}.episodeInspector{display:grid;grid-template-columns:minmax(560px,42%) minmax(0,1fr);gap:14px;align-items:start;min-height:0}.episodeLeftRail{height:var(--episodeAsideHeight,640px);max-height:var(--episodeAsideHeight,640px);display:grid;grid-template-rows:minmax(270px,340px) minmax(0,1fr);gap:12px;min-height:0;align-self:start}.vlaStatePanel{background:#f8fafc;border:1px solid #eaecf0;border-radius:12px;padding:10px;display:flex;flex-direction:column;min-height:0;overflow:hidden}.vlaStateHeader{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:8px}.vlaStateTitle{font-size:13px;font-weight:850;color:#101828}.vlaStateMeta{font-size:11px;color:#667085;text-align:right;line-height:1.35}.vlaStateGrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;min-height:0;overflow:auto;scrollbar-width:none;-ms-overflow-style:none;background:#e4e7ec;border:1px solid #e4e7ec;border-radius:9px}.vlaStateGrid::-webkit-scrollbar{display:none;width:0;height:0}.vlaStateGrid>.empty{grid-column:1/-1}.vlaStateItem{display:grid;grid-template-columns:26px minmax(0,1fr) auto;gap:6px;align-items:center;background:#fff;padding:5px 7px;min-width:0}.vlaStateItem.effort{background:#f0fdf4}.vlaStateIndex{font-size:10px;color:#98a2b3;font-variant-numeric:tabular-nums}.vlaStateName{font-size:10.5px;color:#475467;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.vlaStateValue{font-size:11px;color:#101828;font-weight:750;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}.episodeSide{background:#f8fafc;border:1px solid #eaecf0;border-radius:12px;padding:10px;display:flex;flex-direction:column;min-height:0;height:var(--episodeAsideHeight,640px);max-height:var(--episodeAsideHeight,640px);overflow:hidden;align-self:start}.episodeLeftRail>.episodeSide{height:auto;max-height:none;align-self:stretch}.sideTabsToolbar{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:8px}.sideSortHint{font-size:11px;color:#667085;line-height:1.35;text-align:right;max-width:190px}.episodeTabsList{flex:1;min-height:0;overflow:auto;scrollbar-width:none;-ms-overflow-style:none;border:1px solid #eaecf0;border-radius:10px;background:#fff}.episodeTabsList::-webkit-scrollbar{display:none;width:0;height:0}.episodeDataSheet{min-width:1080px;width:100%;border-collapse:separate;border-spacing:0;font-size:11.5px;line-height:1.25}.episodeDataSheet th,.episodeDataSheet td{padding:7px 8px;border-bottom:1px solid #eef2f6;white-space:nowrap;vertical-align:middle}.episodeDataSheet th{position:sticky;top:0;z-index:4;background:#f8fafc;color:#475467;text-transform:uppercase;letter-spacing:.04em;font-size:10.5px}.episodeDataSheet th.sortable{cursor:pointer;color:#175cd3;user-select:none}.episodeDataSheet th.sortable:hover{background:#eff8ff}.episodeDataSheet tbody tr{cursor:pointer}.episodeDataSheet tbody tr:hover td{background:#f8fafc}.episodeDataSheet tbody tr.selected td{background:#e0f2fe}.episodeDataSheet .epCol{position:sticky;left:0;z-index:3;background:#fff;font-weight:800;color:#101828}.episodeDataSheet th.epCol{z-index:5;background:#f8fafc}.episodeDataSheet tbody tr:hover .epCol{background:#f8fafc}.episodeDataSheet tbody tr.selected .epCol{background:#e0f2fe}.episodeDataSheet .num{text-align:right;font-variant-numeric:tabular-nums}.episodeDataSheet .reasonCell{max-width:360px;overflow:hidden;text-overflow:ellipsis}.sideFooter{font-size:11px;color:#98a2b3;margin-top:7px;line-height:1.35}.timelinePane{min-width:0;display:flex;flex-direction:column;height:auto;align-self:start}.timelinePaneHeader{position:relative;top:auto;z-index:2;background:#fff;border:1px solid #eaecf0;border-radius:12px;padding:10px 12px;margin-bottom:16px}.timelinePaneHeader + .timelineGrid{margin-top:0}#bucketChart{margin-top:0}.timelineChart svg{display:block}.timelineSvgClickable{cursor:crosshair}.timelineCursor,.cameraTimelineCursor{pointer-events:none}.timelineGrid{gap:12px;min-width:0}.timelineChart .chart{min-height:230px}.unitLegend{border:1px solid #d0d5dd;border-radius:999px;padding:2px 7px;background:#fff;color:#475467;font-weight:700}.plotNote{font-size:11px;color:#667085;margin-top:6px;line-height:1.35}.densityBadge{display:inline-block;margin-left:6px;border:1px solid #d0d5dd;border-radius:999px;padding:1px 6px;font-size:10px;color:#475467;background:#fff}.meshFrameBadge{display:inline-block;border:1px solid #d0d5dd;border-radius:999px;padding:2px 7px;background:#fff;color:#475467;font-size:11px;margin-top:6px}
+@media(max-width:1280px){.episodeInspector{grid-template-columns:1fr;min-height:0}.episodeLeftRail{height:min(560px,var(--episodeAsideHeight,560px));max-height:min(560px,var(--episodeAsideHeight,560px));grid-template-rows:minmax(250px,300px) minmax(0,1fr)}.timelinePaneHeader{position:static}.miniChartGrid{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:760px){.miniChartGrid{grid-template-columns:1fr}.statusFilterBar{align-items:flex-start}.episodeTabMetrics{grid-template-columns:repeat(2,1fr)}}
 
 .episodeHeaderTop{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
@@ -6180,14 +6282,23 @@ body main details>summary:after,.managerPanel>summary:after,.detailsPanel>summar
   <section class="panel" style="margin-top:14px">
     <div class="panelHeader"><div><h2>Episode inspection</h2></div></div>
     <div class="episodeInspector">
-      <aside class="episodeSide">
-        <div class="sideTabsToolbar">
-          <div><h3>Attempts datasheet</h3><div id="episodeSideMeta" class="muted"></div></div>
-          <div class="sideSortHint">Click a column header to sort. Wheel/trackpad scroll is enabled; scrollbars are hidden.</div>
-        </div>
-        <div id="episodeTabs" class="episodeTabsList" role="region" aria-label="Attempt datasheet"></div>
-        <div class="sideFooter">Database-style view: sticky header, sortable columns, hidden side-panel scrollbars.</div>
-      </aside>
+      <div class="episodeLeftRail">
+        <section class="vlaStatePanel" aria-label="VLA 32D observation">
+          <div class="vlaStateHeader">
+            <div><div class="vlaStateTitle">VLA observation · 32D</div><div class="muted">28D state + 4D measured effort</div></div>
+            <div id="vlaStateMeta" class="vlaStateMeta">Select an attempt</div>
+          </div>
+          <div id="vlaStateGrid" class="vlaStateGrid"><div class="empty">Select an attempt and frame.</div></div>
+        </section>
+        <aside class="episodeSide">
+          <div class="sideTabsToolbar">
+            <div><h3>Attempts datasheet</h3><div id="episodeSideMeta" class="muted"></div></div>
+            <div class="sideSortHint">Click a column header to sort. Wheel/trackpad scroll is enabled; scrollbars are hidden.</div>
+          </div>
+          <div id="episodeTabs" class="episodeTabsList" role="region" aria-label="Attempt datasheet"></div>
+          <div class="sideFooter">Database-style view: sticky header, sortable columns, hidden side-panel scrollbars.</div>
+        </aside>
+      </div>
       <section class="timelinePane">
         <div class="timelinePaneHeader">
           <div class="episodeHeaderTop">
@@ -6990,6 +7101,7 @@ function renderEpisode(data){
   const promptEl=$("episodeTaskPrompt"); const promptText=String(ep.task_prompt||"").trim(); if(promptEl){promptEl.style.display=promptText?"block":"none"; promptEl.innerHTML=promptText?`<span class="taskPromptLabel">Task prompt</span>${esc(promptText)}`:"";}
   updateTrashEpisodeButton(ep);
   renderCameraPreview(data);
+  renderVlaObservationPreview(data);
   const s=data.series||{}; drawLineChart("bucketChart","Bucket sand holding",s.t,[{name:"bucket_from_pile",values:s.bucket_from_pile},{name:"bucket_total",values:s.bucket_total}],data.stage_spans,"particles"); drawVectorChart("qChart","Joint angles",s.t,s.q_deg,data.stage_spans,"deg"); drawVectorChart("dqChart","Joint velocity",s.t,s.dq_deg_s,data.stage_spans,"deg/s"); drawVectorChart("ddqChart","Joint acceleration",s.t,s.ddq_deg_s2,data.stage_spans,"deg/s²"); drawVectorChart("effortChart","Measured joint effort",s.t,s.effort,data.stage_spans,"effort");
   updateTimelineCursors();
   markSelectedTab(ep.episode_index);
@@ -7376,6 +7488,47 @@ function renderCameraPreview(data){
   if(useExportVideo) syncCameraPreviewVideos(currentCameraTime(),true);
   else prefetchCameraFrames(cameraFrameIndex, 8);
 }
+function formatVlaStateValue(value,name){
+  const number=Number(value);
+  if(!Number.isFinite(number)) return "-";
+  if(String(name||"")==="phase_index") return String(Math.round(number));
+  const magnitude=Math.abs(number);
+  if(magnitude>=100000 || (magnitude>0 && magnitude<0.0001)) return number.toExponential(3);
+  return number.toFixed(magnitude>=1000?1:(magnitude>=10?3:5));
+}
+function renderVlaObservationPreview(data){
+  const preview=(data&&data.vla_observation_preview)||{};
+  if(currentRun) currentRun._lastVlaStatePreview=preview;
+  const grid=$("vlaStateGrid");
+  const meta=$("vlaStateMeta");
+  if(!grid || !meta) return;
+  const names=Array.isArray(preview.names)?preview.names:[];
+  const rows=Array.isArray(preview.rows)?preview.rows:[];
+  if(names.length!==32 || !rows.length){
+    grid.innerHTML=`<div class="empty">32D unavailable: ${esc(preview.reason||"no state rows")}</div>`;
+    meta.textContent="Unavailable";
+    return;
+  }
+  grid.innerHTML=names.map((name,index)=>`<div class="vlaStateItem ${index>=28?"effort":"state"}" title="${esc(index>=28?"observation.effort":"observation.state")}"><span class="vlaStateIndex">${index}</span><span class="vlaStateName" title="${esc(name)}">${esc(name)}</span><span class="vlaStateValue" data-vla-value-index="${index}">-</span></div>`).join("");
+  updateVlaObservationFrame(cameraFrameIndex);
+}
+function updateVlaObservationFrame(frameIndex){
+  const preview=(currentRun&&currentRun._lastVlaStatePreview)||{};
+  const rows=Array.isArray(preview.rows)?preview.rows:[];
+  const meta=$("vlaStateMeta");
+  if(!rows.length || !meta) return;
+  const index=Math.max(0,Math.min(rows.length-1,Number(frameIndex)||0));
+  const row=rows[index]||{};
+  const values=Array.isArray(row.values)?row.values:[];
+  document.querySelectorAll("#vlaStateGrid [data-vla-value-index]").forEach(node=>{
+    const valueIndex=Number(node.dataset.vlaValueIndex);
+    node.textContent=row.valid===true?formatVlaStateValue(values[valueIndex],preview.names[valueIndex]):"-";
+  });
+  const time=Number(row.t);
+  meta.textContent=row.valid===true
+    ? `frame ${index} · ${Number.isFinite(time)?time.toFixed(2)+"s":"no time"} · ${row.phase||"unknown"}`
+    : `frame ${index} · ${row.reason||"unavailable"}`;
+}
 function setCameraFrameDisplay(value){
   const frameCount=Number(((currentRun&&currentRun._lastEpisodePreview)||{}).frame_count||0);
   const preview=(currentRun&&currentRun._lastEpisodePreview)||{};
@@ -7385,6 +7538,7 @@ function setCameraFrameDisplay(value){
   const text=$("cameraFrameText"); if(text) text.textContent=`${cameraFrameIndex}/${Math.max(0,frameCount-1)}`;
   const meta=$("cameraFrameMeta"); if(meta) meta.textContent=cameraFrameMeta(preview,cameraFrameIndex);
   const timelineMeta=$("cameraTimelineFrameMeta"); if(timelineMeta) timelineMeta.textContent=cameraFrameMeta(preview,cameraFrameIndex);
+  updateVlaObservationFrame(cameraFrameIndex);
   updateTimelineCursors();
 }
 function updateCameraPreviewFrame(value,opts){

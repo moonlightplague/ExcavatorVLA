@@ -91,6 +91,15 @@ DATASET_CAMERA_FREQUENCY_DEFAULT = max(
 )
 CONTROL_STEP_FRAMES_LEGACY = 2
 CONTROL_STEP_FRAMES_ENV_RAW = os.environ.get("EXCAVATOR_CONTROL_STEP_FRAMES", "")
+EXEC_PROFILE_FORCE_ENABLED = env_bool("EXCAVATOR_EXEC_PROFILE", False)
+EXEC_PROFILE_RECENT_MAX = max(16, env_int("EXCAVATOR_EXEC_PROFILE_RECENT_MAX", 96))
+EXEC_AB_DISABLE_CAMERA = env_bool("EXCAVATOR_EXEC_AB_DISABLE_CAMERA", False)
+EXEC_AB_DISABLE_DATASET_SAMPLE = env_bool("EXCAVATOR_EXEC_AB_DISABLE_DATASET_SAMPLE", False)
+EXEC_AB_DISABLE_SAND_GATE = env_bool("EXCAVATOR_EXEC_AB_DISABLE_SAND_GATE", False)
+FAST_SAMPLED_REPLAY = env_bool("EXCAVATOR_FAST_SAMPLED_REPLAY", False)
+FAST_REPLAY_SAMPLE_HZ = max(1.0, env_float("EXCAVATOR_FAST_REPLAY_SAMPLE_HZ", 5.0))
+FAST_REPLAY_PRE_DIG = env_bool("EXCAVATOR_FAST_REPLAY_PRE_DIG", True)
+FAST_REPLAY_FALLBACK_SLOW = env_bool("EXCAVATOR_FAST_REPLAY_FALLBACK_SLOW", True)
 
 
 def _load_optional_joint_space_planner():
@@ -320,6 +329,12 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "step_updates_total_lock_wait_ms": 0.0,
     "step_updates_total_update_ms": 0.0,
     "step_updates_total_frames": 0,
+    "execution_profile_summary": {},
+    "execution_profile_recent": [],
+    "execution_profile_last_by_stage": {},
+    "execution_profile_count": 0,
+    "fast_sampled_replay_last_validation": {},
+    "fast_sampled_replay_validation_recent": [],
     "stage_timing_active": {},
     "stage_timing_summary": {},
     "stage_timing_recent": [],
@@ -329,6 +344,10 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_episode_start_time": 0.0,
     "dataset_episode_freezes": 0,
     "dataset_last_sample_time": 0.0,
+    "dataset_last_wall_sample_time": 0.0,
+    "dataset_last_train_sample_time": 0.0,
+    "dataset_last_derivative_time": 0.0,
+    "dataset_train_time_cursor": 0.0,
     "dataset_sample_interval": float(DATASET_SAMPLE_INTERVAL_DEFAULT),
     "dataset_last_q_cmd": None,
     "dataset_last_q_real": None,
@@ -336,7 +355,7 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_last_dq_real": None,
     "dataset_last_ddq_real": None,
     "dataset_current_q_goal": None,
-    "dataset_camera_enabled": True,
+    "dataset_camera_enabled": env_bool("EXCAVATOR_DATASET_CAMERA_ENABLED", True) and not bool(EXEC_AB_DISABLE_CAMERA),
     "dataset_camera_backend": "viewport_capture",
     "dataset_camera_objects": {},
     "dataset_camera_initialized": False,
@@ -1202,7 +1221,47 @@ def get_prim(path):
     return stage.GetPrimAtPath(sdf_path(path))
 
 
-async def step_updates(n=1):
+def emit_step_updates_edge_trace(label, edge, caller="", frame_index=0, frames=1):
+    label = str(label or "").strip()
+    if not label:
+        return
+    row = {
+        "label": label,
+        "edge": str(edge or ""),
+        "caller": str(caller or ""),
+        "frame_index": int(frame_index),
+        "frames": int(frames),
+        "active_task": str(STATE.get("active_task_name", "") or ""),
+        "episode": str(STATE.get("dataset_episode_uid", "") or ""),
+    }
+    try:
+        printer = globals().get("info_print")
+        if callable(printer):
+            printer(
+                "[STEP UPDATE EDGE]",
+                f"label={label}",
+                f"edge={row['edge']}",
+                f"frame={int(frame_index) + 1}/{max(1, int(frames))}",
+                f"caller={row['caller']}",
+                force_log=True,
+            )
+    except Exception:
+        pass
+    try:
+        recorder = globals().get("debug_timeline_record")
+        if callable(recorder):
+            recorder(
+                "STEP_UPDATE_EDGE",
+                stage=label,
+                result=row["edge"],
+                data=row,
+                include_sand=False,
+            )
+    except Exception:
+        pass
+
+
+async def step_updates(n=1, trace_label=""):
     global _STEP_UPDATES_LOCK
     if _STEP_UPDATES_LOCK is None:
         _STEP_UPDATES_LOCK = asyncio.Lock()
@@ -1225,14 +1284,29 @@ async def step_updates(n=1):
                 caller = f"{os.path.basename(str(caller_frame.f_code.co_filename))}:{int(caller_frame.f_lineno)}:{caller_frame.f_code.co_name}"
             except Exception:
                 caller = ""
+    trace_label = str(trace_label or "").strip()
+    if trace_label and not caller:
+        try:
+            caller_frame = sys._getframe(1)
+            caller = f"{os.path.basename(str(caller_frame.f_code.co_filename))}:{int(caller_frame.f_lineno)}:{caller_frame.f_code.co_name}"
+        except Exception:
+            caller = ""
     try:
-        for _ in range(frames):
+        for frame_index in range(frames):
             lock_t = time.perf_counter() if profile else 0.0
+            if trace_label and frame_index == 0:
+                emit_step_updates_edge_trace(trace_label, "wait_lock", caller, frame_index, frames)
             async with _STEP_UPDATES_LOCK:
+                if trace_label and frame_index == 0:
+                    emit_step_updates_edge_trace(trace_label, "lock_acquired", caller, frame_index, frames)
                 if profile:
                     lock_wait_ms += (time.perf_counter() - lock_t) * 1000.0
                     update_t = time.perf_counter()
+                if trace_label and frame_index == 0:
+                    emit_step_updates_edge_trace(trace_label, "update_start", caller, frame_index, frames)
                 await app.next_update_async()
+                if trace_label and frame_index == 0:
+                    emit_step_updates_edge_trace(trace_label, "update_ok", caller, frame_index, frames)
                 if profile:
                     update_ms += (time.perf_counter() - update_t) * 1000.0
     finally:
@@ -1417,6 +1491,236 @@ def non_quiet_diagnostics_enabled():
     return current_log_mode() != "data"
 
 
+def execution_profile_enabled():
+    try:
+        return bool(EXEC_PROFILE_FORCE_ENABLED or debug_profile_enabled())
+    except Exception:
+        return bool(EXEC_PROFILE_FORCE_ENABLED)
+
+
+def execution_ab_config_snapshot():
+    return {
+        "exec_profile_force_enabled": bool(EXEC_PROFILE_FORCE_ENABLED),
+        "disable_camera": bool(EXEC_AB_DISABLE_CAMERA),
+        "disable_dataset_sample": bool(EXEC_AB_DISABLE_DATASET_SAMPLE),
+        "disable_sand_gate": bool(EXEC_AB_DISABLE_SAND_GATE),
+    }
+
+
+def fast_sampled_replay_config_snapshot():
+    return {
+        "enabled": bool(FAST_SAMPLED_REPLAY),
+        "sample_hz": float(FAST_REPLAY_SAMPLE_HZ),
+        "pre_dig": bool(FAST_REPLAY_PRE_DIG),
+        "loaded_transit": False,
+        "lift_carry": False,
+        "loaded_disable_reason": "live_particle_payload_guard_not_implemented",
+        "metrics_policy": "stage_start_live_snapshot; intermediate_reuse; final_live_snapshot",
+        "fallback_slow": bool(FAST_REPLAY_FALLBACK_SLOW),
+    }
+
+
+def _exec_profile_percentile(values, pct):
+    if not values:
+        return 0.0
+    arr = sorted(float(v) for v in values)
+    if len(arr) == 1:
+        return float(arr[0])
+    rank = max(0.0, min(1.0, float(pct) / 100.0)) * (len(arr) - 1)
+    lo = int(math.floor(rank))
+    hi = int(math.ceil(rank))
+    if lo == hi:
+        return float(arr[lo])
+    frac = rank - lo
+    return float(arr[lo] * (1.0 - frac) + arr[hi] * frac)
+
+
+def execution_stage_profile_start(stage, mode, planned_s=None, steps=0, step_frames=0, source="move_to_profile"):
+    if not execution_profile_enabled():
+        return None
+    return {
+        "stage": str(stage or mode or ""),
+        "mode": str(mode or ""),
+        "source": str(source or ""),
+        "started_perf": time.perf_counter(),
+        "started_wall": time.time(),
+        "planned_s": None if planned_s is None else float(planned_s),
+        "steps_planned": int(steps or 0),
+        "step_frames": int(step_frames or 0),
+        "cmd_steps": 0,
+        "update_calls": 0,
+        "update_frames": 0,
+        "update_ms_values": [],
+        "apply_target_ms": 0.0,
+        "dataset_sample_ms": 0.0,
+        "dataset_sample_count": 0,
+        "dataset_sample_skipped": 0,
+        "camera_ms": 0.0,
+        "camera_count": 0,
+        "particle_bucket_ms": 0.0,
+        "sand_metric_ms": 0.0,
+        "gate_ms": 0.0,
+        "gate_count": 0,
+        "recovery_ms": 0.0,
+        "recovery_count": 0,
+        "freeze_check_ms": 0.0,
+        "freeze_check_count": 0,
+        "errors": [],
+    }
+
+
+def execution_stage_profile_add_ms(profile, key, elapsed_ms, count_key=None, count=1):
+    if not isinstance(profile, dict):
+        return
+    try:
+        profile[key] = float(profile.get(key, 0.0) or 0.0) + float(elapsed_ms or 0.0)
+        if count_key:
+            profile[count_key] = int(profile.get(count_key, 0) or 0) + int(count)
+    except Exception:
+        pass
+
+
+def execution_stage_profile_now(profile):
+    if isinstance(profile, dict):
+        return time.perf_counter()
+    return None
+
+
+def execution_stage_profile_add_elapsed(profile, key, started, count_key=None, count=1):
+    if not isinstance(profile, dict) or started is None:
+        return
+    execution_stage_profile_add_ms(profile, key, (time.perf_counter() - float(started)) * 1000.0, count_key, count)
+
+
+def execution_stage_profile_add_dataset_spans(profile):
+    if not isinstance(profile, dict):
+        return
+    spans = STATE.get("dataset_record_sample_spans")
+    if not isinstance(spans, dict):
+        spans = {}
+    for key, value in spans.items():
+        try:
+            value_ms = float(value or 0.0)
+        except Exception:
+            continue
+        key_l = str(key).lower()
+        if "camera" in key_l:
+            execution_stage_profile_add_ms(profile, "camera_ms", value_ms, "camera_count", 1)
+        elif "particle" in key_l or "bucket" in key_l:
+            execution_stage_profile_add_ms(profile, "particle_bucket_ms", value_ms)
+        elif "sand" in key_l or "metrics" in key_l:
+            execution_stage_profile_add_ms(profile, "sand_metric_ms", value_ms)
+
+
+def execution_stage_profile_finish(profile, result="done", reason=""):
+    if not isinstance(profile, dict):
+        return None
+    try:
+        elapsed_ms = (time.perf_counter() - float(profile.get("started_perf", time.perf_counter()))) * 1000.0
+        updates = [float(v) for v in profile.get("update_ms_values", []) if v is not None]
+        update_frames = int(profile.get("update_frames", 0) or 0)
+        update_calls = int(profile.get("update_calls", 0) or 0)
+        row = {
+            "stage": str(profile.get("stage", "")),
+            "mode": str(profile.get("mode", "")),
+            "source": str(profile.get("source", "")),
+            "result": str(result or ""),
+            "reason": debug_short_string(reason, 240) if reason else "",
+            "planned_s": profile.get("planned_s"),
+            "wall_ms": round(elapsed_ms, 2),
+            "steps_planned": int(profile.get("steps_planned", 0) or 0),
+            "cmd_steps": int(profile.get("cmd_steps", 0) or 0),
+            "step_frames": int(profile.get("step_frames", 0) or 0),
+            "update_calls": update_calls,
+            "update_frames": update_frames,
+            "update_ms_total": round(sum(updates), 2),
+            "update_ms_avg_call": round(sum(updates) / max(1, len(updates)), 2),
+            "update_ms_avg_frame": round(sum(updates) / max(1, update_frames), 2),
+            "update_ms_p50_call": round(_exec_profile_percentile(updates, 50), 2),
+            "update_ms_p95_call": round(_exec_profile_percentile(updates, 95), 2),
+            "update_ms_max_call": round(max(updates) if updates else 0.0, 2),
+            "apply_target_ms": round(float(profile.get("apply_target_ms", 0.0) or 0.0), 2),
+            "dataset_sample_ms": round(float(profile.get("dataset_sample_ms", 0.0) or 0.0), 2),
+            "dataset_sample_count": int(profile.get("dataset_sample_count", 0) or 0),
+            "dataset_sample_skipped": int(profile.get("dataset_sample_skipped", 0) or 0),
+            "camera_ms": round(float(profile.get("camera_ms", 0.0) or 0.0), 2),
+            "camera_count": int(profile.get("camera_count", 0) or 0),
+            "particle_bucket_ms": round(float(profile.get("particle_bucket_ms", 0.0) or 0.0), 2),
+            "sand_metric_ms": round(float(profile.get("sand_metric_ms", 0.0) or 0.0), 2),
+            "gate_ms": round(float(profile.get("gate_ms", 0.0) or 0.0), 2),
+            "gate_count": int(profile.get("gate_count", 0) or 0),
+            "recovery_ms": round(float(profile.get("recovery_ms", 0.0) or 0.0), 2),
+            "recovery_count": int(profile.get("recovery_count", 0) or 0),
+            "freeze_check_ms": round(float(profile.get("freeze_check_ms", 0.0) or 0.0), 2),
+            "freeze_check_count": int(profile.get("freeze_check_count", 0) or 0),
+            "ab": execution_ab_config_snapshot(),
+        }
+        errors = profile.get("errors")
+        if errors:
+            row["errors"] = list(errors)[-6:]
+
+        summary = STATE.get("execution_profile_summary")
+        if not isinstance(summary, dict):
+            summary = {}
+        stage_key = str(row.get("stage", "") or "unknown")
+        stage_sum = summary.get(stage_key)
+        if not isinstance(stage_sum, dict):
+            stage_sum = {
+                "count": 0,
+                "wall_ms": 0.0,
+                "update_ms": 0.0,
+                "update_frames": 0,
+                "dataset_sample_ms": 0.0,
+                "camera_ms": 0.0,
+                "particle_bucket_ms": 0.0,
+                "sand_metric_ms": 0.0,
+                "gate_ms": 0.0,
+                "max_wall_ms": 0.0,
+            }
+        stage_sum["count"] = int(stage_sum.get("count", 0) or 0) + 1
+        for key in ("wall_ms", "dataset_sample_ms", "camera_ms", "particle_bucket_ms", "sand_metric_ms", "gate_ms"):
+            stage_sum[key] = round(float(stage_sum.get(key, 0.0) or 0.0) + float(row.get(key, 0.0) or 0.0), 2)
+        stage_sum["update_ms"] = round(float(stage_sum.get("update_ms", 0.0) or 0.0) + float(row.get("update_ms_total", 0.0) or 0.0), 2)
+        stage_sum["update_frames"] = int(stage_sum.get("update_frames", 0) or 0) + int(row.get("update_frames", 0) or 0)
+        stage_sum["max_wall_ms"] = max(float(stage_sum.get("max_wall_ms", 0.0) or 0.0), float(row.get("wall_ms", 0.0) or 0.0))
+        count = max(1, int(stage_sum.get("count", 1) or 1))
+        stage_sum["avg_wall_ms"] = round(float(stage_sum.get("wall_ms", 0.0) or 0.0) / count, 2)
+        stage_sum["avg_update_ms_per_frame"] = round(
+            float(stage_sum.get("update_ms", 0.0) or 0.0) / max(1, int(stage_sum.get("update_frames", 0) or 0)),
+            2,
+        )
+        summary[stage_key] = stage_sum
+        STATE["execution_profile_summary"] = summary
+
+        recent = STATE.get("execution_profile_recent")
+        if not isinstance(recent, list):
+            recent = []
+        recent.append(row)
+        STATE["execution_profile_recent"] = recent[-int(EXEC_PROFILE_RECENT_MAX):]
+        last_by_stage = STATE.get("execution_profile_last_by_stage")
+        if not isinstance(last_by_stage, dict):
+            last_by_stage = {}
+        last_by_stage[stage_key] = row
+        STATE["execution_profile_last_by_stage"] = last_by_stage
+        STATE["execution_profile_count"] = int(STATE.get("execution_profile_count", 0) or 0) + 1
+        return row
+    except Exception as exc:
+        try:
+            info_print("[WARN] execution profile finish failed:", type(exc).__name__, exc)
+        except Exception:
+            pass
+        return None
+
+
+def consume_execution_stage_profile(stage_name):
+    last_by_stage = STATE.get("execution_profile_last_by_stage")
+    if not isinstance(last_by_stage, dict):
+        return None
+    row = last_by_stage.pop(str(stage_name or ""), None)
+    STATE["execution_profile_last_by_stage"] = last_by_stage
+    return row if isinstance(row, dict) else None
+
+
 def log_text_from_args(args, kwargs=None):
     sep = " "
     if isinstance(kwargs, dict):
@@ -1572,7 +1876,16 @@ def timeline_allows_background_work():
     return bool(STATE.get("running", False)) and bool(simulation_timeline_is_playing())
 
 
+def internal_timeline_pause_active():
+    try:
+        return int(getattr(builtins, "_EXCAVATOR_INTERNAL_TIMELINE_PAUSE_DEPTH", 0) or 0) > 0
+    except Exception:
+        return False
+
+
 def handle_timeline_stop_if_needed(label=""):
+    if internal_timeline_pause_active():
+        return False
     if simulation_timeline_is_playing():
         STATE["timeline_stop_handled"] = False
         return False
@@ -2662,6 +2975,15 @@ def toggle_excavator_render_mode():
 
 def debug_visuals_enabled():
     return bool(STATE.get("debug_visuals_visible", True)) and debug_diagnostics_enabled()
+
+
+def debug_visual_authoring_allowed():
+    # Defer nonessential marker/curve USD edits while auto collect is between
+    # episodes and its render products remain alive.
+    return not (
+        bool(STATE.get("auto_collect_active", False))
+        and not bool(STATE.get("dataset_recording", False))
+    )
 
 
 def debug_visual_root_paths():
@@ -6490,12 +6812,12 @@ DATASET_PHASE_NAMES = [
     "approach_contact",
     "insert_cut",
     "pull_mid_cut",
-    "pull_exit_cut",
     "curl_to_hold_material",
+    "pull_exit_cut",
     "secure_load",
     "lift_carry",
+    "loaded_transit",
     "unload_to_bin",
-    "unload_dump",
 ]
 
 
@@ -6830,7 +7152,7 @@ def dataset_record_sample_due(force=False):
     if force:
         return True
     interval = float(STATE.get("dataset_sample_interval", 0.10))
-    return time.time() - float(STATE.get("dataset_last_sample_time", 0.0)) >= interval
+    return time.time() - float(STATE.get("dataset_last_wall_sample_time", STATE.get("dataset_last_sample_time", 0.0)) or 0.0) >= interval
 
 
 async def dataset_camera_warmup_for_episode(label="episode"):
@@ -6943,11 +7265,32 @@ def dataset_camera_start_background(label="auto_collect"):
 
 
 def dataset_camera_stop_background(reason=""):
+    pending = STATE.get("dataset_camera_pending_capture")
+    debug_timeline_record(
+        "DATASET_CAMERA_STOP",
+        stage="background_capture",
+        result="start",
+        reason=str(reason or ""),
+        data={
+            "pending": bool(isinstance(pending, dict) and not bool(pending.get("done", False))),
+            "helpers": len(pending.get("helpers", []) or []) if isinstance(pending, dict) else 0,
+        },
+    )
     try:
         excavator_dataset_camera.stop_background_capture(runtime_module(), reason=reason)
     except Exception:
         pass
     cancel_registered_task("dataset_camera_capture", reason=reason or "dataset_camera_stop")
+    debug_timeline_record(
+        "DATASET_CAMERA_STOP",
+        stage="background_capture",
+        result="ok",
+        reason=str(reason or ""),
+        data={
+            "pending": bool(STATE.get("dataset_camera_pending_capture")),
+            "cancelled_helpers_total": int(STATE.get("dataset_camera_cancelled_helpers", 0) or 0),
+        },
+    )
 
 
 def jsonl_line_count(path):
@@ -10355,11 +10698,12 @@ def update_episode_quality_trackers(metrics, phase, q_cmd=None, q_real=None, act
             pass
 
 
-def dataset_motion_derivatives(q_cmd, q_real, now):
+def dataset_motion_derivatives(q_cmd, q_real, sample_time):
     q_cmd = np.array(q_cmd, dtype=np.float32).reshape(-1)[:4]
     q_real = np.array(q_real, dtype=np.float32).reshape(-1)[:4]
-    t_prev = float(STATE.get("dataset_last_sample_time", 0.0) or 0.0)
-    dt = max(1.0e-4, float(now) - t_prev) if t_prev > 0.0 else 0.0
+    sample_time = float(sample_time)
+    t_prev = float(STATE.get("dataset_last_derivative_time", 0.0) or 0.0)
+    dt = max(1.0e-4, sample_time - t_prev) if t_prev > 0.0 else 0.0
 
     last_q_cmd = STATE.get("dataset_last_q_cmd")
     last_q_real = STATE.get("dataset_last_q_real")
@@ -10397,6 +10741,7 @@ def dataset_motion_derivatives(q_cmd, q_real, now):
     STATE["dataset_last_action"] = action.copy()
     STATE["dataset_last_dq_real"] = dq_real.copy()
     STATE["dataset_last_ddq_real"] = ddq_real.copy()
+    STATE["dataset_last_derivative_time"] = float(sample_time)
 
     return {
         "dt": float(dt),
@@ -10512,7 +10857,11 @@ def dataset_joint_force_torque_observation():
 
 def dataset_phase_index(phase):
     text = str(phase).lower()
-    if "pre_dig" in text or "travel" in text or "align" in text:
+    if "clearance_route_post" in text or "staged_unload" in text or "high_carry" in text:
+        return 8
+    if "unload_to_bin" in text or "unload_pre_dump_align" in text or "unload" in text or "dump" in text:
+        return 9
+    if "pre_dig" in text or "clearance_route" in text or "travel" in text or "align" in text:
         return 0
     if "approach_contact" in text or ("approach" in text and "contact" in text):
         return 1
@@ -10520,18 +10869,14 @@ def dataset_phase_index(phase):
         return 2
     if "pull_mid" in text:
         return 3
-    if "pull_exit" in text:
-        return 4
     if "curl" in text:
+        return 4
+    if "pull_exit" in text:
         return 5
     if "secure_load" in text or text == "secure" or "secure" in text:
         return 6
     if "lift_carry" in text or "lift" in text or "carry" in text:
         return 7
-    if "unload_dump" in text or ("dump" in text and "unload" in text):
-        return 9
-    if "unload_to_bin" in text or "unload" in text or "dump" in text:
-        return 8
     return -1
 
 
@@ -10787,20 +11132,50 @@ def dataset_observation_state(q_real=None, bucket_load_metrics=None):
 
 
 @debug_profiled("dataset_record_sample", threshold_ms=2.0)
-def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False, camera_payload=None):
+def dataset_record_sample(
+    phase,
+    q_cmd=None,
+    q_real=None,
+    label="",
+    force=False,
+    camera_payload=None,
+    timestamp_override=None,
+    timestamp_source="wall",
+    metrics_mode="auto",
+    bucket_metrics_override=None,
+):
     if not bool(STATE.get("dataset_recording", False)):
-        return
+        return False
     if not str(STATE.get("dataset_episode_uid", "") or ""):
-        return
+        return False
     if not str(STATE.get("dataset_episode_dir", "") or ""):
-        return
+        return False
 
-    now = time.time()
+    wall_now = time.time()
     interval = float(STATE.get("dataset_sample_interval", 0.10))
-    if (not force) and now - float(STATE.get("dataset_last_sample_time", 0.0)) < interval:
-        return
+    if (not force) and wall_now - float(STATE.get("dataset_last_wall_sample_time", STATE.get("dataset_last_sample_time", 0.0)) or 0.0) < interval:
+        return False
 
     try:
+        episode_start = float(STATE.get("dataset_episode_start_time", wall_now) or wall_now)
+        last_train_t = float(STATE.get("dataset_last_train_sample_time", 0.0) or 0.0)
+        last_wall_sample = float(
+            STATE.get("dataset_last_wall_sample_time", STATE.get("dataset_last_sample_time", 0.0)) or 0.0
+        )
+        has_episode_rows = int(STATE.get("dataset_samples", 0) or 0) > int(STATE.get("dataset_episode_sample_start", 0) or 0)
+        if timestamp_override is None:
+            if has_episode_rows and last_wall_sample > 0.0:
+                train_t = last_train_t + max(1.0e-4, float(wall_now) - last_wall_sample)
+            else:
+                train_t = max(0.0, float(wall_now) - episode_start)
+            train_abs = episode_start + train_t
+            timestamp_source_text = str(timestamp_source or "wall")
+        else:
+            train_t = max(0.0, float(timestamp_override))
+            if has_episode_rows:
+                train_t = max(train_t, last_train_t + 1.0e-4)
+            train_abs = episode_start + train_t
+            timestamp_source_text = str(timestamp_source or "planned")
         sample_spans = {}
 
         def mark_span(span_label, started, threshold_ms=5.0, data=None):
@@ -10812,13 +11187,6 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False,
             q_cmd = CTRL.q_cmd.copy()
         if q_real is None:
             q_real = get_real_joint_positions()
-
-        span_t = time.perf_counter()
-        dynamics = dataset_motion_derivatives(q_cmd, q_real, now)
-        action = dynamics["action"]
-        joint_velocity = dynamics["dq_real"]
-        joint_acceleration = dynamics["ddq_real"]
-        mark_span("dataset_record_sample.motion", span_t, threshold_ms=1.0)
 
         sample_index = int(STATE.get("dataset_samples", 0)) - int(STATE.get("dataset_episode_sample_start", 0))
         if dataset_camera_sample_requires_complete_images(sample_index):
@@ -10839,14 +11207,35 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False,
                         f"dropped={dropped}",
                         f"reason={camera_reason}",
                     )
-                return
+                return False
 
         span_t = time.perf_counter()
-        metrics_bundle = dataset_metrics_frame_bundle(label=f"sample:{sample_index}", q_real=q_real, need_full=False)
-        particle_snapshot = metrics_bundle.get("snapshot") if isinstance(metrics_bundle, dict) else None
-        bucket_metrics = metrics_bundle.get("bucket_metrics") if isinstance(metrics_bundle, dict) else None
-        if not isinstance(bucket_metrics, dict):
-            bucket_metrics = bucket_load_fast_current(force=True, points=particle_snapshot if isinstance(particle_snapshot, dict) else None)
+        dynamics = dataset_motion_derivatives(q_cmd, q_real, train_abs)
+        action = dynamics["action"]
+        joint_velocity = dynamics["dq_real"]
+        joint_acceleration = dynamics["ddq_real"]
+        mark_span("dataset_record_sample.motion", span_t, threshold_ms=1.0)
+
+        metrics_mode_text = str(metrics_mode or "auto")
+        span_t = time.perf_counter()
+        if isinstance(bucket_metrics_override, dict):
+            particle_snapshot = None
+            bucket_metrics = dict(bucket_metrics_override)
+            bucket_metrics["sample_metrics_mode"] = metrics_mode_text
+            bucket_metrics["sample_metrics_source"] = "stage_snapshot_override"
+        else:
+            metrics_bundle = dataset_metrics_frame_bundle(label=f"sample:{sample_index}", q_real=q_real, need_full=False)
+            particle_snapshot = metrics_bundle.get("snapshot") if isinstance(metrics_bundle, dict) else None
+            bucket_metrics = metrics_bundle.get("bucket_metrics") if isinstance(metrics_bundle, dict) else None
+            if not isinstance(bucket_metrics, dict):
+                bucket_metrics = bucket_load_fast_current(
+                    force=True,
+                    points=particle_snapshot if isinstance(particle_snapshot, dict) else None,
+                )
+            if isinstance(bucket_metrics, dict):
+                bucket_metrics = dict(bucket_metrics)
+                bucket_metrics["sample_metrics_mode"] = metrics_mode_text
+                bucket_metrics["sample_metrics_source"] = "live_particle_snapshot"
         mark_span(
             "dataset_record_sample.particle_bucket",
             span_t,
@@ -10924,10 +11313,14 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False,
             "ep": int(STATE.get("dataset_episode_id", 0)),
             "id": str(STATE.get("dataset_episode_uid", "")),
             "i": int(sample_index),
-            "timestamp": float(now),
-            "observation.timestamp": float(now),
-            "action.timestamp": float(now),
-            "t": float(now) - float(STATE.get("dataset_episode_start_time", now)),
+            "timestamp": float(train_abs),
+            "observation.timestamp": float(train_abs),
+            "action.timestamp": float(train_abs),
+            "t": float(train_t),
+            "timestamp.source": timestamp_source_text,
+            "timestamp.wall": float(wall_now),
+            "t.wall": float(wall_now) - episode_start,
+            "metrics.mode": metrics_mode_text,
             "task": str(STATE.get("dataset_task_text", "Dig soil from the marked area and dump it into the target container.")),
             "phase": str(phase),
             "phase.index": phase_features["index"],
@@ -10979,8 +11372,10 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False,
                 sand_path,
                 {
                     "episode_id": str(STATE.get("dataset_episode_uid", "")),
-                    "timestamp": float(now),
-                    "t_episode": float(now) - float(STATE.get("dataset_episode_start_time", now)),
+                    "timestamp": float(train_abs),
+                    "timestamp.wall": float(wall_now),
+                    "t_episode": float(train_t),
+                    "t_wall": float(wall_now) - episode_start,
                     "phase": str(phase),
                     "label": str(label),
                     "sand": compact_bucket_load_metrics(bucket_metrics),
@@ -10988,33 +11383,117 @@ def dataset_record_sample(phase, q_cmd=None, q_real=None, label="", force=False,
             )
             mark_span("dataset_record_sample.sand_write", span_t, threshold_ms=2.0)
 
-        STATE["dataset_last_sample_time"] = now
+        STATE["dataset_last_sample_time"] = wall_now
+        STATE["dataset_last_wall_sample_time"] = wall_now
+        STATE["dataset_last_train_sample_time"] = float(train_t)
+        STATE["dataset_train_time_cursor"] = float(train_t)
         STATE["dataset_samples"] = int(STATE.get("dataset_samples", 0)) + 1
         if sample_spans:
             STATE["dataset_record_sample_spans"] = sample_spans
+        return True
     except Exception as e:
-        if now - float(STATE.get("dataset_last_error_time", 0.0)) > 2.0:
-            STATE["dataset_last_error_time"] = now
+        if wall_now - float(STATE.get("dataset_last_error_time", 0.0)) > 2.0:
+            STATE["dataset_last_error_time"] = wall_now
             info_print("[WARN] dataset record failed:", type(e).__name__, e)
+        return False
 
 
-async def dataset_record_sample_async(phase, q_cmd=None, q_real=None, label="", force=False):
+async def dataset_record_sample_async(
+    phase,
+    q_cmd=None,
+    q_real=None,
+    label="",
+    force=False,
+    timestamp_override=None,
+    timestamp_source="wall",
+    metrics_mode="auto",
+    bucket_metrics_override=None,
+):
     if not dataset_record_sample_due(force=force):
-        return
+        return False
     sample_index = int(STATE.get("dataset_samples", 0)) - int(STATE.get("dataset_episode_sample_start", 0))
     camera_payload = None
     if dataset_camera_sample_requires_complete_images(sample_index):
         span_t = time.perf_counter()
         camera_payload = dataset_capture_camera_observations(sample_index)
+        camera_ms = (time.perf_counter() - span_t) * 1000.0
+        STATE["dataset_last_camera_capture_ms"] = float(camera_ms)
         debug_profile_span("dataset_record_sample.camera_latest_cache", span_t, threshold_ms=4.0)
-    dataset_record_sample(
+    return dataset_record_sample(
         phase,
         q_cmd=q_cmd,
         q_real=q_real,
         label=label,
         force=force,
         camera_payload=camera_payload,
+        timestamp_override=timestamp_override,
+        timestamp_source=timestamp_source,
+        metrics_mode=metrics_mode,
+        bucket_metrics_override=bucket_metrics_override,
     )
+
+
+async def dataset_camera_wait_for_fresh_pose_capture(sample_index, pose_set_wall, task_id=None):
+    """Advance Kit until a complete camera triplet captured after this pose is ready."""
+    if (
+        not bool(STATE.get("dataset_camera_enabled", True))
+        or not dataset_camera_sample_requires_complete_images(sample_index)
+        or str(STATE.get("dataset_camera_backend", "")) != "viewport_capture"
+    ):
+        started = time.perf_counter()
+        await step_updates(1)
+        return True, "camera_not_required", 1, (time.perf_counter() - started) * 1000.0
+
+    last_used_seq = int(STATE.get("dataset_camera_last_payload_capture_seq", 0) or 0)
+    timeout_s = max(0.5, float(STATE.get("dataset_camera_viewport_timeout_s", 2.0) or 2.0))
+    pending_at_start = STATE.get("dataset_camera_pending_capture")
+    stale_pending_at_start = (
+        isinstance(pending_at_start, dict)
+        and not bool(pending_at_start.get("done", False))
+        and float(pending_at_start.get("started_at", 0.0) or 0.0) < float(pose_set_wall)
+    )
+    # A capture submitted before this pose must finish before the pose-specific
+    # triplet can be submitted, so reserve one timeout window for each.
+    deadline = time.time() + timeout_s * (2.0 if stale_pending_at_start else 1.0)
+    updates = 0
+    started = time.perf_counter()
+    last_reason = "fresh_pose_capture_not_submitted"
+
+    while time.time() <= deadline:
+        if motion_cancel_requested(task_id):
+            return False, "motion_cancel_requested", updates, (time.perf_counter() - started) * 1000.0
+
+        latest = STATE.get("dataset_camera_latest_capture")
+        if isinstance(latest, dict):
+            latest_seq = int(latest.get("seq", 0) or 0)
+            latest_started = float(latest.get("capture_started_at", 0.0) or 0.0)
+            if latest_seq > last_used_seq and latest_started >= float(pose_set_wall):
+                return True, "fresh_pose_capture_ready", updates, (time.perf_counter() - started) * 1000.0
+
+        pending = STATE.get("dataset_camera_pending_capture")
+        pending_active = isinstance(pending, dict) and not bool(pending.get("done", False))
+        if not pending_active:
+            submitted, submit_reason = excavator_dataset_camera.submit_viewport_capture_triplet(
+                runtime_module(),
+                sample_index=int(sample_index),
+            )
+            last_reason = str(submit_reason or "capture_submit_failed")
+            if submitted:
+                last_reason = "capture_submitted"
+
+        await step_updates(1)
+        updates += 1
+
+    latest = STATE.get("dataset_camera_latest_capture")
+    latest_seq = int(latest.get("seq", 0) or 0) if isinstance(latest, dict) else 0
+    latest_started = float(latest.get("capture_started_at", 0.0) or 0.0) if isinstance(latest, dict) else 0.0
+    reason = (
+        "fresh_pose_capture_timeout:"
+        f"sample={int(sample_index)};last_used_seq={last_used_seq};latest_seq={latest_seq};"
+        f"latest_started={latest_started:.6f};pose_set_wall={float(pose_set_wall):.6f};"
+        f"last_reason={last_reason}"
+    )
+    return False, reason, updates, (time.perf_counter() - started) * 1000.0
 
 
 async def dataset_record_wait_sample_async(phase, label="", q_cmd=None):
@@ -11437,6 +11916,16 @@ def auto_collect_write_run_summary():
             "control_step_frames_env": str(CONTROL_STEP_FRAMES_ENV_RAW or ""),
             "debug_profile_summary": dict(STATE.get("debug_profile_summary", {}) or {}),
             "debug_profile_recent": list(STATE.get("debug_profile_recent", []) or [])[-64:],
+            "execution_ab_config": execution_ab_config_snapshot(),
+            "fast_sampled_replay": fast_sampled_replay_config_snapshot(),
+            "fast_sampled_replay_last_validation": dict(
+                STATE.get("fast_sampled_replay_last_validation", {}) or {}
+            ),
+            "fast_sampled_replay_validation_recent": list(
+                STATE.get("fast_sampled_replay_validation_recent", []) or []
+            )[-32:],
+            "execution_profile_summary": dict(STATE.get("execution_profile_summary", {}) or {}),
+            "execution_profile_recent": list(STATE.get("execution_profile_recent", []) or [])[-64:],
             "launcher_update_profile": dict(STATE.get("launcher_update_profile", {}) or {}),
             "launcher_update_recent": list(STATE.get("launcher_update_recent", []) or [])[-64:],
             "wall_clock_breakdown": auto_collect_wall_time_summary(),
@@ -12144,6 +12633,10 @@ def record_stage_audit(stage_name, stage_index, result, reason="", q_goal=None, 
                 pass
         if include_sand:
             row["sand"] = debug_compact_sand_counts()
+        if str(result) in {"done", "failed", "cancelled", "stopped"}:
+            exec_profile = consume_execution_stage_profile(stage_name)
+            if isinstance(exec_profile, dict):
+                row["execution_profile"] = exec_profile
         if isinstance(data, dict):
             row.update(data)
         if bool(STATE.get("dataset_recording", False)):
@@ -13039,6 +13532,10 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
     STATE["dataset_episode_start_time"] = time.time()
     STATE["dataset_episode_freezes"] = 0
     STATE["dataset_last_sample_time"] = 0.0
+    STATE["dataset_last_wall_sample_time"] = 0.0
+    STATE["dataset_last_train_sample_time"] = 0.0
+    STATE["dataset_last_derivative_time"] = 0.0
+    STATE["dataset_train_time_cursor"] = 0.0
     STATE["dataset_last_q_cmd"] = None
     STATE["dataset_last_q_real"] = None
     STATE["dataset_last_action"] = None
@@ -15209,6 +15706,12 @@ def auto_scene_apply_candidate(candidate):
     truck_moved = False
 
     if cfg["random_truck"] or cfg["random_truck_yaw"]:
+        debug_timeline_record(
+            "AUTO_SCENE_APPLY_STEP",
+            stage="truck_transform",
+            result="start",
+            data={"attempt": int(candidate.get("attempt", 0) or 0)},
+        )
         truck_base = auto_scene_truck_baseline()
         if not (isinstance(truck_base, dict) and truck_base.get("valid")):
             return False, str(truck_base.get("reason", "truck_baseline_invalid"))
@@ -15252,10 +15755,22 @@ def auto_scene_apply_candidate(candidate):
             candidate["applied_truck_delta_xy"] = delta.copy()
         clear_rigid_obstacle_cache("auto_scene_random_truck")
         scene_changed = True
+        debug_timeline_record(
+            "AUTO_SCENE_APPLY_STEP",
+            stage="truck_transform",
+            result="ok",
+            data={"attempt": int(candidate.get("attempt", 0) or 0)},
+        )
 
     api = get_sand_site_api()
     apply_scene = api.get("apply_auto_scene_parameters") if isinstance(api, dict) else None
     if callable(apply_scene):
+        debug_timeline_record(
+            "AUTO_SCENE_APPLY_STEP",
+            stage="sand_parameters",
+            result="start",
+            data={"attempt": int(candidate.get("attempt", 0) or 0)},
+        )
         sand_xy = candidate.get("sand_xy") if cfg["random_sand_xy"] else None
         amount = candidate.get("sand_amount_multiplier") if cfg["random_sand_amount"] else None
         unload_xy = None
@@ -15272,36 +15787,58 @@ def auto_scene_apply_candidate(candidate):
         if isinstance(result, dict) and result.get("changed"):
             scene_changed = True
             if cfg["random_sand_xy"] or cfg["random_sand_amount"]:
-                clear_sand_fn = api.get("clear_real_particle_sand") if isinstance(api, dict) else None
-                if callable(clear_sand_fn):
-                    try:
-                        clear_sand_fn()
-                        candidate["cleared_old_sand_particles"] = True
-                        info_print(
-                            "[AUTO SCENE RANDOMIZE]",
-                            "cleared_old_sand_particles=True",
-                            "reason=sand_source_changed_waiting_for_prepare_reset",
-                        )
-                    except Exception as exc:
-                        candidate["cleared_old_sand_particles"] = False
-                        candidate["clear_old_sand_error"] = f"{type(exc).__name__}: {exc}"
+                info_print(
+                    "[AUTO SCENE RANDOMIZE]",
+                    f"cleared_old_sand_particles={bool(candidate.get('cleared_old_sand_particles', False))}",
+                    "reason=cleared_before_sand_parameter_apply",
+                )
+        debug_timeline_record(
+            "AUTO_SCENE_APPLY_STEP",
+            stage="sand_parameters",
+            result="ok",
+            data={"attempt": int(candidate.get("attempt", 0) or 0)},
+        )
     elif cfg["random_sand_xy"] or cfg["random_sand_amount"]:
         return False, "sand_site_apply_api_missing"
 
     if truck_moved:
+        debug_timeline_record(
+            "AUTO_SCENE_APPLY_STEP",
+            stage="unload_mesh_refresh",
+            result="start",
+            data={"attempt": int(candidate.get("attempt", 0) or 0)},
+        )
         if not apply_default_unload_source_mesh():
             return False, "unload_source_mesh_refresh_failed_after_truck_move"
         ctx_after_unload_mesh = task_scene_context()
         candidate["applied_unload_point_xyz"] = np.array(ctx_after_unload_mesh.get("unload_point"), dtype=np.float32).reshape(-1)[:3].copy()
         candidate["applied_unload_selected_path"] = str(ctx_after_unload_mesh.get("manual_unload_selected_path", ""))
         scene_changed = True
+        debug_timeline_record(
+            "AUTO_SCENE_APPLY_STEP",
+            stage="unload_mesh_refresh",
+            result="ok",
+            data={"attempt": int(candidate.get("attempt", 0) or 0)},
+        )
 
     if scene_changed:
+        debug_timeline_record(
+            "AUTO_SCENE_APPLY_STEP",
+            stage="geometry_gate",
+            result="start",
+            data={"attempt": int(candidate.get("attempt", 0) or 0)},
+        )
         ctx_after = task_scene_context()
         geom_ok, geom_reason, geom_detail = auto_scene_geometry_legal(candidate, ctx=ctx_after, applied=True)
         candidate["applied_geometry_legal_detail"] = geom_detail
         if not geom_ok:
             return False, f"applied_scene_geometry:{geom_reason}"
+        debug_timeline_record(
+            "AUTO_SCENE_APPLY_STEP",
+            stage="geometry_gate",
+            result="ok",
+            data={"attempt": int(candidate.get("attempt", 0) or 0)},
+        )
 
     if scene_changed:
         STATE["auto_collect_sand_reset_done"] = False
@@ -15338,7 +15875,20 @@ async def auto_collect_apply_scene_randomization(attempt_index):
             f"candidate={STATE['auto_scene_last_randomization'].get('candidate', {})}",
         )
         return True
+    debug_timeline_record(
+        "AUTO_SCENE_RANDOMIZE_STEP",
+        stage="candidate_sample",
+        result="start",
+        data={"attempt": int(attempt_index)},
+    )
     candidate = auto_scene_sample_candidate(attempt_index)
+    debug_timeline_record(
+        "AUTO_SCENE_RANDOMIZE_STEP",
+        stage="candidate_sample",
+        result="ok" if "error" not in candidate else "failed",
+        reason=str(candidate.get("error", "")),
+        data={"attempt": int(attempt_index)},
+    )
     if "error" in candidate:
         record = auto_scene_attempt_record(candidate, ok=False, reason=candidate.get("error"), cfg=cfg)
         STATE["auto_scene_last_randomization"] = record
@@ -15352,7 +15902,76 @@ async def auto_collect_apply_scene_randomization(attempt_index):
         )
         update_status(f"[AUTO SCENE RANDOMIZE] skipped invalid sample: {candidate.get('error')}", force=True)
         return False
-    ok, reason = auto_scene_apply_candidate(candidate)
+    debug_timeline_record(
+        "AUTO_SCENE_RANDOMIZE_STEP",
+        stage="apply_candidate",
+        result="start",
+        data={"attempt": int(attempt_index)},
+    )
+    timeline = None
+    resume_timeline = False
+    try:
+        if HAS_OMNI_TIMELINE:
+            timeline = omni.timeline.get_timeline_interface()
+            resume_timeline = bool(timeline is not None and timeline.is_playing())
+        if resume_timeline:
+            builtins._EXCAVATOR_INTERNAL_TIMELINE_PAUSE_DEPTH = int(
+                getattr(builtins, "_EXCAVATOR_INTERNAL_TIMELINE_PAUSE_DEPTH", 0) or 0
+            ) + 1
+            info_print(
+                "[AUTO SCENE PHYSX]",
+                f"attempt={int(attempt_index)}",
+                "timeline=pause_for_scene_transaction",
+            )
+            timeline.pause()
+            await step_updates(
+                2,
+                trace_label=f"scene_pause:attempt_{int(attempt_index)}",
+            )
+
+        if cfg["random_sand_xy"] or cfg["random_sand_amount"]:
+            api = get_sand_site_api()
+            clear_sand_fn = api.get("clear_real_particle_sand") if isinstance(api, dict) else None
+            if not callable(clear_sand_fn):
+                raise RuntimeError("sand_clear_api_missing_before_scene_apply")
+            clear_sand_fn()
+            candidate["cleared_old_sand_particles"] = True
+            await step_updates(
+                3,
+                trace_label=f"scene_particle_clear:attempt_{int(attempt_index)}",
+            )
+
+        ok, reason = auto_scene_apply_candidate(candidate)
+        if ok:
+            await step_updates(
+                2,
+                trace_label=f"scene_commit:attempt_{int(attempt_index)}",
+            )
+    finally:
+        if resume_timeline and timeline is not None:
+            try:
+                timeline.play()
+                await step_updates(
+                    2,
+                    trace_label=f"scene_resume:attempt_{int(attempt_index)}",
+                )
+                info_print(
+                    "[AUTO SCENE PHYSX]",
+                    f"attempt={int(attempt_index)}",
+                    "timeline=play_after_scene_transaction",
+                )
+            finally:
+                builtins._EXCAVATOR_INTERNAL_TIMELINE_PAUSE_DEPTH = max(
+                    0,
+                    int(getattr(builtins, "_EXCAVATOR_INTERNAL_TIMELINE_PAUSE_DEPTH", 1) or 1) - 1,
+                )
+    debug_timeline_record(
+        "AUTO_SCENE_RANDOMIZE_STEP",
+        stage="apply_candidate",
+        result="ok" if ok else "failed",
+        reason=str(reason or ""),
+        data={"attempt": int(attempt_index)},
+    )
     record = auto_scene_attempt_record(candidate, ok=ok, reason=reason, cfg=cfg)
     STATE["auto_scene_last_randomization"] = record
     append_jsonl(os.path.join(ensure_auto_collect_run_dir(), "scene_randomization.jsonl"), record)
@@ -15368,9 +15987,7 @@ async def auto_collect_apply_scene_randomization(attempt_index):
         f"sand_amount={cfg['random_sand_amount']}",
         f"candidate={record['candidate']}",
     )
-    if ok:
-        await step_updates(2)
-    else:
+    if not ok:
         update_status(f"[AUTO SCENE RANDOMIZE] apply failed: {reason}", force=True)
     return bool(ok)
 
@@ -15643,7 +16260,7 @@ async def auto_collect_prepare_environment(initial_info=None, attempt_index=None
                 f"task_alive={task_alive(task_id)}; "
                 f"home_needed_reason={home_need_reason}; "
                 f"q_home_deg={q_deg_values(q_home, wrap_swing_for_display=True)}"
-            f"{home_detail_text}"
+                f"{home_detail_text}"
             )
             record_prepare_step("home_pose", "failed", step_t, reason=reason)
             return fail_prepare(reason, gate="home_pose", detail=home_detail, q_cmd=q_home)
@@ -15669,7 +16286,19 @@ async def auto_collect_prepare_environment(initial_info=None, attempt_index=None
             detail={"home_needed_reason": home_need_reason},
         )
         record_prepare_step("home_pose", "skipped", reason=home_need_reason)
+    step_t = time.perf_counter()
+    record_prepare_step(
+        "pre_reset_settle",
+        "start",
+        detail={"frames": int(AUTO_COLLECT_PRE_RESET_SETTLE_FRAMES)},
+    )
     await step_updates(AUTO_COLLECT_PRE_RESET_SETTLE_FRAMES)
+    record_prepare_step(
+        "pre_reset_settle",
+        "ok",
+        step_t,
+        detail={"frames": int(AUTO_COLLECT_PRE_RESET_SETTLE_FRAMES)},
+    )
     if handle_timeline_stop_if_needed("auto_collect_prepare_after_home"):
         return fail_prepare("prepare_failed/timeline_stopped_after_home", gate="timeline")
 
@@ -16526,6 +17155,12 @@ async def auto_collect_loop(count, max_attempts=None):
     STATE["stage_timing_active"] = {}
     STATE["stage_timing_summary"] = {}
     STATE["stage_timing_recent"] = []
+    STATE["execution_profile_summary"] = {}
+    STATE["execution_profile_recent"] = []
+    STATE["execution_profile_last_by_stage"] = {}
+    STATE["execution_profile_count"] = 0
+    STATE["fast_sampled_replay_last_validation"] = {}
+    STATE["fast_sampled_replay_validation_recent"] = []
     STATE["debug_profile_summary"] = {}
     STATE["debug_profile_recent"] = []
     STATE["debug_profile_count"] = 0
@@ -18545,7 +19180,8 @@ def set_manual_unload_point_xyz(x, y, z, source="ui", inner_size=None, z_range=N
             STATE["manual_unload_z_range"] = np.array([min(float(arr[0]), float(arr[1])), max(float(arr[0]), float(arr[1]))], dtype=np.float32)
     else:
         STATE["manual_unload_z_range"] = np.array([min(float(GROUND_TOP_Z), float(z)), max(float(GROUND_TOP_Z), float(z))], dtype=np.float32)
-    ensure_unload_marker(p, label=f"manual_{source}")
+    if debug_visual_authoring_allowed():
+        ensure_unload_marker(p, label=f"manual_{source}")
     reset_dig_plan()
     return p
 
@@ -19245,7 +19881,10 @@ def draw_trace(force=False):
             ensure_trace_prims()
             show_trace_prims(mode)
             set_trace_visibility([TRACE_REAL_CURVE_PATH, TRACE_PLAN_END_PATH], False)
-            if not bool(STATE.get("trace_no_plan_notice_shown", False)):
+            if (
+                not bool(STATE.get("auto_collect_active", False))
+                and not bool(STATE.get("trace_no_plan_notice_shown", False))
+            ):
                 STATE["trace_no_plan_notice_shown"] = True
                 STATE["trace_no_plan_notice_time"] = now
                 update_status("[TRACE PLAN] no cached dig plan; press Build Dig Plan first", force=False)
@@ -19493,6 +20132,292 @@ def verify_motion_reached(q_goal, label="", mode="auto", record_failure=True):
         if q_real is not None:
             hold_real_state_after_verify_failure(q_real, mode)
     return False
+
+
+def fast_sampled_replay_enabled(label="", mode=""):
+    if not bool(FAST_SAMPLED_REPLAY):
+        return False
+    text = f"{label} {mode}".lower()
+    if is_sand_contact_phase(text):
+        return False
+    if is_unload_dump_motion(mode=mode, label=label):
+        return False
+    if mode_requires_loaded_carry_bucket(mode, label):
+        return False
+    if "lift_carry" in text or "unload_to_bin" in text or "loaded" in text or "dump" in text:
+        return False
+    return bool(FAST_REPLAY_PRE_DIG and "pre_dig" in text)
+
+
+def fast_sampled_replay_dataset_phase(label="", mode=""):
+    text = f"{label} {mode}".lower()
+    if "pre_dig" in text:
+        return "pre_dig"
+    return str(mode or label or "fast_replay")
+
+
+async def move_to_profile_sampled_replay(
+    q0,
+    q1,
+    seconds_eff,
+    label="",
+    mode="auto",
+    task_id=None,
+    exec_profile=None,
+):
+    sample_hz = max(1.0, float(FAST_REPLAY_SAMPLE_HZ))
+    duration = max(0.0, float(seconds_eff))
+    n_samples = 1 if duration <= 1.0e-6 else max(2, int(math.ceil(duration * sample_hz)) + 1)
+    sample_times = [min(duration, float(k) / sample_hz) for k in range(n_samples)]
+    sample_times[-1] = duration
+    motion_hz = max(sample_hz, float(CONTROL_HZ))
+    n_motion_points = max(2, int(math.ceil(duration * motion_hz)) + 1)
+    motion_times = [min(duration, float(k) / motion_hz) for k in range(n_motion_points)]
+    motion_times[-1] = duration
+    sample_time_lookup = {round(float(value), 9): int(k) for k, value in enumerate(sample_times)}
+    timeline_times = sorted({round(float(value), 9) for value in motion_times + sample_times})
+    precheck_samples = max(2, min(32, n_samples))
+
+    phase_ok, phase_reason, phase_i, phase_report = path_phase_check(q0, q1, mode, samples=precheck_samples)
+    obstacle_ok, obstacle_reason, obstacle_i, obstacle_report = path_obstacle_check(q0, q1, mode, samples=precheck_samples)
+    if not phase_ok or not obstacle_ok:
+        reason = (
+            "fast_replay_path_precheck_failed:"
+            f"phase_ok={phase_ok};phase_i={phase_i};phase_reason={phase_reason};"
+            f"obstacle_ok={obstacle_ok};obstacle_i={obstacle_i};obstacle_reason={obstacle_reason}"
+        )
+        dataset_record_event(
+            "fast_sampled_replay_precheck_failed",
+            f"{label}:{mode}:{reason}",
+            data={
+                "phase_report": phase_report,
+                "obstacle_report": obstacle_report,
+                "precheck_samples": int(precheck_samples),
+            },
+        )
+        return False, 0, reason, True
+
+    q0 = np.array(q0, dtype=np.float32).reshape(-1)[:4].copy()
+    q1 = np.array(q1, dtype=np.float32).reshape(-1)[:4].copy()
+    last_train_t = float(STATE.get("dataset_train_time_cursor", STATE.get("dataset_last_train_sample_time", 0.0)) or 0.0)
+    episode_rows = int(STATE.get("dataset_samples", 0) or 0) - int(STATE.get("dataset_episode_sample_start", 0) or 0)
+    stage_t0 = 0.0 if episode_rows <= 0 else max(0.0, last_train_t)
+    dataset_phase = fast_sampled_replay_dataset_phase(label=label, mode=mode)
+    camera_drops_before = int(STATE.get("dataset_camera_dropped_incomplete_samples", 0) or 0)
+    recorded_train_times = []
+    attempted_samples = 0
+    stage_bucket_metrics = None
+    try:
+        metrics_bundle = dataset_metrics_frame_bundle(
+            label=f"fast_replay_start:{label or mode}",
+            q_real=q0,
+            need_full=False,
+        )
+        candidate_metrics = metrics_bundle.get("bucket_metrics") if isinstance(metrics_bundle, dict) else None
+        if isinstance(candidate_metrics, dict):
+            stage_bucket_metrics = dict(candidate_metrics)
+    except Exception:
+        stage_bucket_metrics = None
+
+    dataset_record_event(
+        "fast_sampled_replay_start",
+        (
+            f"{label}:{mode}:duration={duration:.3f}:sample_hz={sample_hz:.2f}:samples={n_samples}:"
+            f"motion_hz={motion_hz:.2f}:motion_points={len(timeline_times)}"
+        ),
+    )
+    debug_timeline_record(
+        "FAST_SAMPLED_REPLAY_START",
+        stage=str(label or mode),
+        result="start",
+        reason="pre_dig_fast_replay",
+        q_cmd=q0,
+        data={
+            "duration": float(duration),
+            "sample_hz": float(sample_hz),
+            "samples": int(n_samples),
+            "motion_hz": float(motion_hz),
+            "motion_points": int(len(timeline_times)),
+            "timestamp_source": "planned_fast_replay",
+        },
+    )
+
+    emitted = 0
+    for motion_k, t_stage in enumerate(timeline_times):
+        if motion_cancel_requested(task_id):
+            return False, emitted, "motion_cancel_requested", False
+        if duration <= 1.0e-6:
+            u = 1.0
+        else:
+            u = max(0.0, min(1.0, t_stage / duration))
+        s = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u)
+        q = interpolate_q_motion(q0, q1, s, mode=mode, label=label)
+
+        apply_t = execution_stage_profile_now(exec_profile)
+        ok_state = set_robot_joint_state(q, label=f"{label}_fast_replay")
+        execution_stage_profile_add_elapsed(exec_profile, "apply_target_ms", apply_t, "cmd_steps", 1)
+        if not ok_state:
+            set_execution_failure_reason(f"execution_failed/fast_replay_set_joint_state_failed:{label}:{mode}")
+            return False, emitted, "set_joint_state_failed", bool(motion_k == 0)
+        CTRL.q_cmd = q.copy()
+        CTRL.q_safe = q.copy()
+        STATE["dataset_current_q_goal"] = q1.copy()
+
+        sample_k = sample_time_lookup.get(round(float(t_stage), 9))
+        if sample_k is None:
+            update_t = execution_stage_profile_now(exec_profile)
+            await step_updates(1)
+            if isinstance(exec_profile, dict):
+                update_ms = (time.perf_counter() - float(update_t)) * 1000.0
+                exec_profile["update_calls"] = int(exec_profile.get("update_calls", 0) or 0) + 1
+                exec_profile["update_frames"] = int(exec_profile.get("update_frames", 0) or 0) + 1
+                exec_profile.setdefault("update_ms_values", []).append(float(update_ms))
+            continue
+
+        sample_index = int(STATE.get("dataset_samples", 0)) - int(STATE.get("dataset_episode_sample_start", 0))
+        pose_set_wall = time.time()
+        camera_ready, camera_reason, update_frames, update_ms = await dataset_camera_wait_for_fresh_pose_capture(
+            sample_index,
+            pose_set_wall,
+            task_id=task_id,
+        )
+        if isinstance(exec_profile, dict):
+            exec_profile["update_calls"] = int(exec_profile.get("update_calls", 0) or 0) + 1
+            exec_profile["update_frames"] = int(exec_profile.get("update_frames", 0) or 0) + int(update_frames)
+            exec_profile.setdefault("update_ms_values", []).append(float(update_ms))
+            execution_stage_profile_add_ms(exec_profile, "camera_pose_sync_ms", float(update_ms), "camera_pose_sync_count", 1)
+        if not camera_ready:
+            reason = f"fast_replay_camera_pose_sync_failed:{camera_reason}"
+            set_execution_failure_reason(f"execution_failed/{reason}:{label}:{mode}")
+            dataset_record_event(
+                "fast_sampled_replay_camera_failed",
+                f"{label}:{mode}:{reason}",
+                data={
+                    "sample_index": int(sample_index),
+                    "planned_sample": int(sample_k),
+                    "planned_samples": int(n_samples),
+                    "update_frames": int(update_frames),
+                },
+            )
+            return False, emitted, reason, False
+        if motion_cancel_requested(task_id):
+            return False, emitted, "motion_cancel_requested", False
+
+        try:
+            q_real = q_real_near_command(get_real_joint_positions(), q)
+        except Exception:
+            q_real = q.copy()
+
+        if bool(EXEC_AB_DISABLE_DATASET_SAMPLE):
+            if isinstance(exec_profile, dict):
+                exec_profile["dataset_sample_skipped"] = int(exec_profile.get("dataset_sample_skipped", 0) or 0) + 1
+        else:
+            sample_t = execution_stage_profile_now(exec_profile)
+            use_live_metrics = bool(sample_k == n_samples - 1 or not isinstance(stage_bucket_metrics, dict))
+            wrote_sample = await dataset_record_sample_async(
+                dataset_phase,
+                q_cmd=q.copy(),
+                q_real=q_real,
+                label=f"{label}_fast_replay",
+                force=True,
+                timestamp_override=stage_t0 + t_stage,
+                timestamp_source="planned_fast_replay",
+                metrics_mode="live_final" if use_live_metrics else "light_pre_dig_stage_snapshot",
+                bucket_metrics_override=None if use_live_metrics else stage_bucket_metrics,
+            )
+            attempted_samples += 1
+            if bool(wrote_sample):
+                emitted += 1
+                recorded_train_times.append(float(STATE.get("dataset_last_train_sample_time", stage_t0 + t_stage) or 0.0))
+            else:
+                reason = f"fast_replay_sample_not_recorded:sample={sample_k}/{n_samples - 1};camera={camera_reason}"
+                set_execution_failure_reason(f"execution_failed/{reason}:{label}:{mode}")
+                dataset_record_event(
+                    "fast_sampled_replay_sample_failed",
+                    f"{label}:{mode}:{reason}",
+                    data={
+                        "sample_index": int(sample_index),
+                        "planned_sample": int(sample_k),
+                        "planned_samples": int(n_samples),
+                    },
+                )
+                return False, emitted, reason, False
+            execution_stage_profile_add_elapsed(exec_profile, "dataset_sample_ms", sample_t, "dataset_sample_count", 1)
+            if isinstance(exec_profile, dict):
+                camera_ms = STATE.pop("dataset_last_camera_capture_ms", None)
+                if camera_ms is not None:
+                    execution_stage_profile_add_ms(exec_profile, "camera_ms", float(camera_ms), "camera_count", 1)
+            execution_stage_profile_add_dataset_spans(exec_profile)
+        notify_sand_site_tool_sample(mode)
+
+    STATE["dataset_train_time_cursor"] = max(
+        float(STATE.get("dataset_train_time_cursor", 0.0) or 0.0),
+        stage_t0 + duration,
+    )
+    if not verify_motion_reached(q1, label=label, mode=mode, record_failure=True):
+        return False, emitted, str(STATE.get("last_execution_failure_reason", "") or "fast_replay_not_reached"), False
+    time_deltas = [
+        float(recorded_train_times[i] - recorded_train_times[i - 1])
+        for i in range(1, len(recorded_train_times))
+    ]
+    timestamp_monotonic = all(dt > 0.0 for dt in time_deltas)
+    expected_dt = 1.0 / sample_hz
+    interior_dt_errors = [abs(dt - expected_dt) for dt in time_deltas[:-1]] if len(time_deltas) > 1 else []
+    camera_drops = max(
+        0,
+        int(STATE.get("dataset_camera_dropped_incomplete_samples", 0) or 0) - camera_drops_before,
+    )
+    validation = {
+        "stage": str(label or mode),
+        "mode": str(mode),
+        "duration": float(duration),
+        "sample_hz": float(sample_hz),
+        "motion_hz": float(motion_hz),
+        "motion_points": int(len(timeline_times)),
+        "planned_samples": int(n_samples),
+        "attempted_samples": int(attempted_samples),
+        "recorded_samples": int(emitted),
+        "dropped_samples": int(max(0, attempted_samples - emitted)),
+        "camera_drops": int(camera_drops),
+        "camera_pose_synchronized": True,
+        "complete_sample_sequence": bool(emitted == attempted_samples == n_samples),
+        "timestamp_source": "planned_fast_replay",
+        "timestamp_monotonic": bool(timestamp_monotonic),
+        "recorded_t_first": None if not recorded_train_times else float(recorded_train_times[0]),
+        "recorded_t_last": None if not recorded_train_times else float(recorded_train_times[-1]),
+        "expected_dt": float(expected_dt),
+        "max_interior_dt_error": float(max(interior_dt_errors) if interior_dt_errors else 0.0),
+        "metrics_policy": "stage_start_live_snapshot; intermediate_reuse; final_live_snapshot",
+    }
+    STATE["fast_sampled_replay_last_validation"] = validation
+    recent_validations = STATE.get("fast_sampled_replay_validation_recent")
+    if not isinstance(recent_validations, list):
+        recent_validations = []
+    recent_validations.append(validation)
+    STATE["fast_sampled_replay_validation_recent"] = recent_validations[-32:]
+    dataset_record_event(
+        "fast_sampled_replay_done",
+        f"{label}:{mode}:samples={emitted}/{attempted_samples}:duration={duration:.3f}:hz={sample_hz:.2f}",
+        data=validation,
+    )
+    debug_timeline_record(
+        "FAST_SAMPLED_REPLAY_DONE",
+        stage=str(label or mode),
+        result="done",
+        reason=f"samples={emitted}",
+        q_cmd=q1,
+        data={
+            "duration": float(duration),
+            "sample_hz": float(sample_hz),
+            "samples": int(emitted),
+            "attempted_samples": int(attempted_samples),
+            "camera_drops": int(camera_drops),
+            "timestamp_monotonic": bool(timestamp_monotonic),
+            "max_interior_dt_error": float(validation["max_interior_dt_error"]),
+            "timestamp_source": "planned_fast_replay",
+        },
+    )
+    return True, emitted, "ok", False
 
 
 async def wait_for_motion_reached(q_goal, label="", mode="auto", seconds_eff=0.0, record_failure=True):
@@ -19832,6 +20757,19 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
         )
         seconds_eff = max(float(seconds_eff), loaded_floor)
     steps = max(4, int(seconds_eff * CONTROL_HZ))
+    step_frames = control_step_frames()
+    exec_profile = execution_stage_profile_start(
+        label or mode,
+        mode,
+        planned_s=seconds_eff,
+        steps=steps,
+        step_frames=step_frames,
+        source="move_to_profile",
+    )
+
+    def finish_exec_profile(result, reason_text=""):
+        return execution_stage_profile_finish(exec_profile, result=result, reason=reason_text)
+
     loaded_route_fast_motion = False
     try:
         loaded_route_fast_motion = bool(active_loaded_route_fast_exec(label or mode))
@@ -19860,6 +20798,32 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                 )
         except Exception:
             pass
+
+    if fast_sampled_replay_enabled(label=label, mode=mode):
+        ok_fast, emitted_fast, fast_reason, safe_fallback = await move_to_profile_sampled_replay(
+            q0,
+            q1,
+            seconds_eff,
+            label=label,
+            mode=mode,
+            task_id=task_id,
+            exec_profile=exec_profile,
+        )
+        if ok_fast:
+            finish_exec_profile("done", f"fast_sampled_replay:{fast_reason};samples={emitted_fast}")
+            return True
+        if bool(safe_fallback) and bool(FAST_REPLAY_FALLBACK_SLOW):
+            info_print(
+                "[FAST REPLAY FALLBACK]",
+                f"stage={label or mode}",
+                f"reason={fast_reason}",
+                "decision=slow_move_to_profile",
+                force_log=debug_diagnostics_enabled(),
+            )
+        else:
+            set_execution_failure_reason(f"execution_failed/fast_sampled_replay_failed:{label}:{mode}:{fast_reason}")
+            finish_exec_profile("failed", f"fast_sampled_replay:{fast_reason};samples={emitted_fast}")
+            return False
 
     carry_bucket_world_rad = None
     carry_max_err_rad = 0.0
@@ -19896,6 +20860,7 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
     for i in range(steps):
         if motion_cancel_requested(task_id):
             update_status(f"[MOVE STOPPED] {label}", force=True)
+            finish_exec_profile("cancelled", "motion_cancel_requested")
             return False
 
         u = float(i + 1) / steps
@@ -19966,7 +20931,9 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                             )
 
         q_final_cmd = q.copy()
+        apply_t = execution_stage_profile_now(exec_profile)
         ok, reason = CTRL.apply_target_direct(q, mode=mode)
+        execution_stage_profile_add_elapsed(exec_profile, "apply_target_ms", apply_t, "cmd_steps", 1)
         if not ok:
             if "physics view not ready" in str(reason).lower() or "robot not ready" in str(reason).lower():
                 ready, ready_reason, _ready_detail = await wait_for_articulation_action_ready(
@@ -19976,30 +20943,56 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                     record_failure=True,
                 )
                 if ready:
+                    apply_t = execution_stage_profile_now(exec_profile)
                     ok, reason = CTRL.apply_target_direct(q, mode=mode)
+                    execution_stage_profile_add_elapsed(exec_profile, "apply_target_ms", apply_t)
                 if not ok:
                     update_status(f"[DIG EXEC FAILED] {label}: action_channel_not_ready; {ready_reason}", force=True)
                     dataset_record_event("move_action_channel_not_ready", f"{label}:{mode}:{ready_reason}")
+                    finish_exec_profile("failed", f"action_channel_not_ready:{ready_reason}")
                     return False
             if not ok:
                 update_status(f"[MOVE BLOCKED] {reason}", force=True)
                 set_execution_failure_reason(f"execution_failed/move_blocked:{label}:{mode}:{reason}")
                 dataset_record_event("move_blocked", f"{label}:{mode}:{reason}")
+                finish_exec_profile("failed", f"move_blocked:{reason}")
                 return False
 
-        await step_updates(control_step_frames())
+        update_t = execution_stage_profile_now(exec_profile)
+        await step_updates(step_frames)
+        if isinstance(exec_profile, dict):
+            update_ms = (time.perf_counter() - float(update_t)) * 1000.0
+            exec_profile["update_calls"] = int(exec_profile.get("update_calls", 0) or 0) + 1
+            exec_profile["update_frames"] = int(exec_profile.get("update_frames", 0) or 0) + int(step_frames)
+            exec_profile.setdefault("update_ms_values", []).append(float(update_ms))
         if motion_cancel_requested(task_id):
             update_status(f"[MOVE STOPPED] {label}", force=True)
+            finish_exec_profile("cancelled", "motion_cancel_requested")
             return False
         if not loaded_route_fast_motion:
             if dataset_record_sample_due():
-                await dataset_record_sample_async(mode, q_cmd=CTRL.q_cmd.copy(), label=label)
+                if bool(EXEC_AB_DISABLE_DATASET_SAMPLE):
+                    if isinstance(exec_profile, dict):
+                        exec_profile["dataset_sample_skipped"] = int(exec_profile.get("dataset_sample_skipped", 0) or 0) + 1
+                else:
+                    sample_t = execution_stage_profile_now(exec_profile)
+                    await dataset_record_sample_async(mode, q_cmd=CTRL.q_cmd.copy(), label=label)
+                    execution_stage_profile_add_elapsed(exec_profile, "dataset_sample_ms", sample_t, "dataset_sample_count", 1)
+                    if isinstance(exec_profile, dict):
+                        camera_ms = STATE.pop("dataset_last_camera_capture_ms", None)
+                        if camera_ms is not None:
+                            execution_stage_profile_add_ms(exec_profile, "camera_ms", float(camera_ms), "camera_count", 1)
+                    execution_stage_profile_add_dataset_spans(exec_profile)
             notify_sand_site_tool_sample(mode)
-        if is_sand_contact_phase(contact_stage_name):
+        if is_sand_contact_phase(contact_stage_name) and bool(EXEC_AB_DISABLE_SAND_GATE):
+            if isinstance(exec_profile, dict):
+                exec_profile["gate_skipped"] = int(exec_profile.get("gate_skipped", 0) or 0) + 1
+        elif is_sand_contact_phase(contact_stage_name):
             try:
                 q_contact_real = q_real_near_command(get_real_joint_positions(), CTRL.q_cmd)
             except Exception:
                 q_contact_real = None
+            gate_t = execution_stage_profile_now(exec_profile)
             contact_report = update_sand_contact_progress(
                 contact_stage_name,
                 q_cmd=CTRL.q_cmd.copy(),
@@ -20007,6 +21000,7 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                 force=False,
                 log=True,
             )
+            execution_stage_profile_add_elapsed(exec_profile, "gate_ms", gate_t, "gate_count", 1)
             if (
                 is_sand_carry_posture_phase(contact_stage_name)
                 and q_contact_real is not None
@@ -20052,6 +21046,7 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                 )
                 if should_recover:
                     runtime_carry_recovery_last_time = now_recovery
+                    recovery_t = execution_stage_profile_now(exec_profile)
                     recovery_q, recovery_detail = sand_carry_runtime_recovery_target(
                         contact_stage_name,
                         q_contact_real,
@@ -20059,9 +21054,12 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                         recovery_count=runtime_carry_recovery_count,
                         allow_worse=score_override_stall,
                     )
+                    execution_stage_profile_add_elapsed(exec_profile, "recovery_ms", recovery_t, "recovery_count", 1)
                     if recovery_q is not None:
                         recovery_mode = f"{contact_stage_name}_runtime_recovery"
+                        recovery_apply_t = execution_stage_profile_now(exec_profile)
                         ok_recovery, recovery_reason = CTRL.apply_target_direct(recovery_q, mode=recovery_mode)
+                        execution_stage_profile_add_elapsed(exec_profile, "apply_target_ms", recovery_apply_t)
                         if ok_recovery:
                             runtime_carry_recovery_count += 1
                             q0 = np.array(recovery_q, dtype=np.float32).copy()
@@ -20116,7 +21114,13 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                                 },
                                 include_sand=True,
                             )
-                            await step_updates(control_step_frames())
+                            update_t = execution_stage_profile_now(exec_profile)
+                            await step_updates(step_frames)
+                            if isinstance(exec_profile, dict):
+                                update_ms = (time.perf_counter() - float(update_t)) * 1000.0
+                                exec_profile["update_calls"] = int(exec_profile.get("update_calls", 0) or 0) + 1
+                                exec_profile["update_frames"] = int(exec_profile.get("update_frames", 0) or 0) + int(step_frames)
+                                exec_profile.setdefault("update_ms_values", []).append(float(update_ms))
                             continue
                         info_print(
                             "[CURL HOLD RECOVERY]",
@@ -20139,6 +21143,7 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                                     "recovery_detail": recovery_detail,
                                 },
                             )
+                            finish_exec_profile("failed", fail_reason)
                             return False
                     else:
                         info_print(
@@ -20163,6 +21168,7 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                                     "recovery_detail": recovery_detail,
                                 },
                             )
+                            finish_exec_profile("failed", fail_reason)
                             return False
             if (
                 is_sand_carry_posture_phase(contact_stage_name)
@@ -20182,6 +21188,7 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                     data={"contact_report": contact_report},
                 )
                 info_print("[CURL HOLD RECOVERY]", f"stage={contact_stage_name}", "result=exhausted", fail_reason)
+                finish_exec_profile("failed", fail_reason)
                 return False
             bad_cut, bad_reason = sand_contact_bad_cut_geometry(contact_stage_name, contact_report)
             if bad_cut:
@@ -20206,6 +21213,7 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                     },
                     include_sand=True,
                 )
+            gate_t = execution_stage_profile_now(exec_profile)
             should_advance, advance_reason = sand_contact_stage_should_advance(
                 contact_stage_name,
                 contact_report,
@@ -20213,6 +21221,7 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                 q_real=q_contact_real,
                 seconds_eff=seconds_eff,
             )
+            execution_stage_profile_add_elapsed(exec_profile, "gate_ms", gate_t, "gate_count", 1)
             if should_advance:
                 contact_advanced = True
                 contact_advance_reason = advance_reason
@@ -20242,7 +21251,9 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                 )
                 break
         if not is_sand_contact_phase(contact_stage_name):
+            freeze_t = execution_stage_profile_now(exec_profile)
             check_freeze_state(f"move_profile:{mode}")
+            execution_stage_profile_add_elapsed(exec_profile, "freeze_check_ms", freeze_t, "freeze_check_count", 1)
 
     if carry_bucket_world_rad is not None:
         final_angles = chain_angles_from_q(CTRL.q_cmd, end_effector="load")
@@ -20274,6 +21285,7 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                     )
             except Exception:
                 pass
+        finish_exec_profile("done", f"sand_contact_advance:{contact_advance_reason}")
         return True
 
     if not await wait_for_motion_reached(q_final_cmd, label=label, mode=mode, seconds_eff=seconds_eff):
@@ -20290,6 +21302,7 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                     )
             except Exception:
                 pass
+        finish_exec_profile("failed", str(STATE.get("last_execution_failure_reason", "") or "path_deviation"))
         return False
 
     if bool(STATE.get("auto_collect_active", False)):
@@ -20303,6 +21316,7 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                 )
         except Exception:
             pass
+    finish_exec_profile("done", "ok")
     return True
 
 
@@ -22758,22 +23772,55 @@ async def set_joint_pose_direct_and_settle(
     settle_frames=0,
     task_id=None,
     record_failure=True,
+    ready_min_stable_frames=ACTION_READY_MIN_STABLE_FRAMES,
+    ready_max_frames=ACTION_READY_STAGE_MAX_WAIT_FRAMES,
 ):
+    debug_timeline_record(
+        "DIRECT_POSE_RESET",
+        stage=str(label),
+        result="ready_check_start",
+        data={
+            "min_stable_frames": int(ready_min_stable_frames),
+            "max_frames": int(ready_max_frames),
+        },
+    )
     ready, reason, _detail = await wait_for_articulation_action_ready(
         f"{label}_direct_pose",
-        min_stable_frames=ACTION_READY_MIN_STABLE_FRAMES,
-        max_frames=ACTION_READY_STAGE_MAX_WAIT_FRAMES,
+        min_stable_frames=ready_min_stable_frames,
+        max_frames=ready_max_frames,
         record_failure=False,
     )
     if not ready:
         update_status(f"[DIRECT POSE BLOCKED] {label}: action_channel_not_ready; {reason}", force=True)
         return False
     ok = set_joint_pose_direct(q_goal, label=label, mode=mode, update_ui=True)
+    debug_timeline_record(
+        "DIRECT_POSE_RESET",
+        stage=str(label),
+        result="state_set" if ok else "state_set_failed",
+        reason="ok" if ok else "set_joint_pose_direct_failed",
+        q_cmd=q_goal,
+    )
     frames = max(0, int(settle_frames))
-    for _ in range(frames):
+    debug_timeline_record(
+        "DIRECT_POSE_RESET",
+        stage=str(label),
+        result="settle_start",
+        data={"frames": int(frames)},
+    )
+    for frame_index in range(frames):
         if task_id is not None and not task_alive(task_id):
             return False
-        await step_updates(1)
+        await step_updates(
+            1,
+            trace_label=f"direct_pose_settle:{label}" if frame_index == 0 else "",
+        )
+    debug_timeline_record(
+        "DIRECT_POSE_RESET",
+        stage=str(label),
+        result="settle_ok",
+        data={"frames": int(frames)},
+    )
     if ok:
         reached = await wait_for_motion_reached(
             CTRL.q_cmd.copy(),
@@ -30412,9 +31459,10 @@ def reset_dig_plan():
     STATE["trace_render_dirty"] = True
     STATE["trace_render_signature"] = None
     clear_planning_runtime_caches("reset_dig_plan")
-    ensure_unload_marker(label="reset_plan")
-    if current_trace_mode() == 2:
-        draw_trace(force=True)
+    if debug_visual_authoring_allowed():
+        ensure_unload_marker(label="reset_plan")
+        if current_trace_mode() == 2:
+            draw_trace(force=True)
     update_status("[DIG PLAN] reset", force=True)
 
 
@@ -32277,6 +33325,18 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
         cumulative.append((start, acc, seg))
 
     step_frames = control_step_frames()
+    exec_profile = execution_stage_profile_start(
+        "loaded_route_group",
+        "loaded_route_group",
+        planned_s=total_seconds,
+        steps=max(1, int(total_seconds * CONTROL_HZ)),
+        step_frames=step_frames,
+        source="execute_loaded_route_continuous_group",
+    )
+
+    def finish_group_profile(result, reason_text=""):
+        return execution_stage_profile_finish(exec_profile, result=result, reason=reason_text)
+
     freeze_stride = max(4, int(CONTROL_HZ * 0.25))
     q_final_cmd = segments[-1]["q1"].copy()
     last_seg_name = segments[0]["name"]
@@ -32311,6 +33371,7 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
         if motion_cancel_requested(task_id):
             update_status("[MOVE STOPPED] loaded_route_group", force=True)
             close_loaded_group_audits("cancelled", "motion_cancel_requested")
+            finish_group_profile("cancelled", "motion_cancel_requested")
             return False, int(start_index)
         if time.time() - wall_start > max_wall_seconds:
             reason_text = (
@@ -32320,6 +33381,7 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
             set_execution_failure_reason(reason_text)
             update_status(f"[DIG EXEC FAILED] loaded_route_group: adaptive timeout", force=True)
             close_loaded_group_audits("failed", reason_text)
+            finish_group_profile("failed", reason_text)
             return False, int(start_index)
 
         corner_scale = loaded_route_corner_scale(path_time, cumulative)
@@ -32349,6 +33411,7 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
                 reason_text = "execution_failed/loaded_route_group_sample_failed"
                 set_execution_failure_reason(reason_text)
                 close_loaded_group_audits("failed", reason_text)
+                finish_group_profile("failed", reason_text)
                 return False, int(start_index)
             accel_scale, accel_report = loaded_route_accel_limit_scale(
                 q_sent_prev,
@@ -32377,7 +33440,9 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
         STATE["active_plan_stage_index"] = int(seg["index"])
 
         q_final_cmd = q.copy()
+        apply_t = execution_stage_profile_now(exec_profile)
         ok, send_reason = CTRL.apply_target_direct(q, mode=stage_name)
+        execution_stage_profile_add_elapsed(exec_profile, "apply_target_ms", apply_t, "cmd_steps", 1)
         if not ok:
             update_status(f"[MOVE BLOCKED] loaded_route_group:{stage_name}: {send_reason}", force=True)
             set_execution_failure_reason(f"execution_failed/move_blocked:loaded_route_group:{stage_name}:{send_reason}")
@@ -32392,12 +33457,20 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
                 include_sand="unload" in stage_name,
             )
             close_loaded_group_audits("failed", str(STATE.get("last_execution_failure_reason", "") or send_reason))
+            finish_group_profile("failed", str(STATE.get("last_execution_failure_reason", "") or send_reason))
             return False, int(start_index)
 
+        update_t = execution_stage_profile_now(exec_profile)
         await step_updates(step_frames)
+        if isinstance(exec_profile, dict):
+            update_ms = (time.perf_counter() - float(update_t)) * 1000.0
+            exec_profile["update_calls"] = int(exec_profile.get("update_calls", 0) or 0) + 1
+            exec_profile["update_frames"] = int(exec_profile.get("update_frames", 0) or 0) + int(step_frames)
+            exec_profile.setdefault("update_ms_values", []).append(float(update_ms))
         if motion_cancel_requested(task_id):
             update_status("[MOVE STOPPED] loaded_route_group", force=True)
             close_loaded_group_audits("cancelled", "motion_cancel_requested")
+            finish_group_profile("cancelled", "motion_cancel_requested")
             return False, int(start_index)
         if bool((accel_report or {}).get("ok", False)):
             try:
@@ -32452,7 +33525,9 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
                     f"critical_swing={bool(lag_report.get('critical_swing', False))}",
                 )
         if frame % freeze_stride == 0:
+            freeze_t = execution_stage_profile_now(exec_profile)
             check_freeze_state(f"loaded_route_group:{stage_name}")
+            execution_stage_profile_add_elapsed(exec_profile, "freeze_check_ms", freeze_t, "freeze_check_count", 1)
 
     final_seg = segments[-1]
     STATE["active_plan_stage_index"] = int(final_seg["index"])
@@ -32468,6 +33543,7 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
             include_sand=True,
         )
         close_loaded_group_audits("failed", str(STATE.get("last_execution_failure_reason", "") or "loaded_route_group_not_reached"))
+        finish_group_profile("failed", str(STATE.get("last_execution_failure_reason", "") or "loaded_route_group_not_reached"))
         return False, int(start_index)
 
     if not verify_unload_arrival(final_seg["name"], q_final_cmd):
@@ -32482,6 +33558,7 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
             include_sand=True,
         )
         close_loaded_group_audits("failed", str(STATE.get("last_execution_failure_reason", "") or "unload_arrival_failed"))
+        finish_group_profile("failed", str(STATE.get("last_execution_failure_reason", "") or "unload_arrival_failed"))
         return False, int(start_index)
 
     STATE["dig_plan_step_index"] = int(STATE.get("dig_plan_step_index", 0)) + len(segments)
@@ -32505,6 +33582,7 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
             include_sand=True,
         )
         close_loaded_group_audits("failed", str(STATE.get("last_execution_failure_reason", "") or "dump_failed"))
+        finish_group_profile("failed", str(STATE.get("last_execution_failure_reason", "") or "dump_failed"))
         return False, int(start_index)
 
     log_phase_ground("[DIG GUARD AFTER]", final_seg["name"])
@@ -32525,6 +33603,7 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
             f"next_index={next_index}",
             "dump_executed=True",
         )
+    finish_group_profile("done", "ok")
     return True, int(next_index)
 
 
@@ -33923,7 +35002,7 @@ async def main():
                     "main_loop passive until auto collect ends",
                     f"sleep_s={AUTO_COLLECT_PASSIVE_MAIN_SLEEP_S:.4f}",
                 )
-            if debug_visuals_enabled():
+            if debug_visuals_enabled() and debug_visual_authoring_allowed():
                 try:
                     if current_trace_mode() != 0:
                         draw_trace(force=False)

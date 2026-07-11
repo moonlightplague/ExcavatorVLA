@@ -81,14 +81,18 @@ NO_UI = env_bool("EXCAVATOR_NO_UI", False) or env_bool("EXCAVATOR_HEADLESS", Fal
 _INITIAL_LOG_MODE_RAW = str(os.environ.get("EXCAVATOR_LOG_MODE", "data") or "data").strip().lower()
 _INITIAL_DEBUG_VISUALS_VISIBLE = _INITIAL_LOG_MODE_RAW in ("debug", "profile", "trace")
 DATASET_SAMPLE_INTERVAL_DEFAULT = max(0.02, env_float("EXCAVATOR_DATASET_SAMPLE_INTERVAL", 0.20))
-DATASET_CAMERA_INTERVAL_DEFAULT = max(
-    0.10,
-    env_float("EXCAVATOR_DATASET_CAMERA_BACKGROUND_INTERVAL_S", 0.50),
-)
 DATASET_CAMERA_FREQUENCY_DEFAULT = max(
     1,
-    env_int("EXCAVATOR_DATASET_CAMERA_FREQUENCY", 2),
+    env_int("EXCAVATOR_DATASET_CAMERA_FREQUENCY", int(round(1.0 / DATASET_SAMPLE_INTERVAL_DEFAULT))),
 )
+DATASET_CAMERA_INTERVAL_DEFAULT = max(
+    0.02,
+    env_float(
+        "EXCAVATOR_DATASET_CAMERA_BACKGROUND_INTERVAL_S",
+        1.0 / float(DATASET_CAMERA_FREQUENCY_DEFAULT),
+    ),
+)
+DATASET_USE_SIM_TIME = env_bool("EXCAVATOR_DATASET_USE_SIM_TIME", True)
 CONTROL_STEP_FRAMES_LEGACY = 2
 CONTROL_STEP_FRAMES_ENV_RAW = os.environ.get("EXCAVATOR_CONTROL_STEP_FRAMES", "")
 EXEC_PROFILE_FORCE_ENABLED = env_bool("EXCAVATOR_EXEC_PROFILE", False)
@@ -100,6 +104,8 @@ FAST_SAMPLED_REPLAY = env_bool("EXCAVATOR_FAST_SAMPLED_REPLAY", False)
 FAST_REPLAY_SAMPLE_HZ = max(1.0, env_float("EXCAVATOR_FAST_REPLAY_SAMPLE_HZ", 5.0))
 FAST_REPLAY_PRE_DIG = env_bool("EXCAVATOR_FAST_REPLAY_PRE_DIG", True)
 FAST_REPLAY_FALLBACK_SLOW = env_bool("EXCAVATOR_FAST_REPLAY_FALLBACK_SLOW", True)
+FAST_REPLAY_CAMERA_GRACE_S = max(0.5, env_float("EXCAVATOR_FAST_REPLAY_CAMERA_GRACE_S", 3.0))
+FAST_REPLAY_CAMERA_FATAL_FAILURES = max(2, env_int("EXCAVATOR_FAST_REPLAY_CAMERA_FATAL_FAILURES", 3))
 
 
 def _load_optional_joint_space_planner():
@@ -342,9 +348,11 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_episode_uid": "",
     "dataset_episode_dir": "",
     "dataset_episode_start_time": 0.0,
+    "dataset_episode_start_sim_time": 0.0,
     "dataset_episode_freezes": 0,
     "dataset_last_sample_time": 0.0,
     "dataset_last_wall_sample_time": 0.0,
+    "dataset_last_sim_sample_time": 0.0,
     "dataset_last_train_sample_time": 0.0,
     "dataset_last_derivative_time": 0.0,
     "dataset_train_time_cursor": 0.0,
@@ -389,9 +397,14 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     not in ("0", "false", "no", "off"),
     "dataset_camera_background_interval_s": float(DATASET_CAMERA_INTERVAL_DEFAULT),
     "dataset_camera_background_min_idle_s": float(os.environ.get("EXCAVATOR_DATASET_CAMERA_BACKGROUND_MIN_IDLE_S", "0.02") or 0.02),
+    "dataset_camera_clock_source": "simulation" if DATASET_USE_SIM_TIME else "wall",
+    "dataset_camera_background_next_clock_time": 0.0,
+    "dataset_camera_background_last_clock_time": 0.0,
     "dataset_camera_warmup_status": {},
     "dataset_camera_run_warmup_status": {},
     "dataset_camera_run_warmup_run_id": "",
+    "dataset_camera_pose_sync_active": False,
+    "fast_replay_camera_sync_consecutive_failures": 0,
     "dataset_camera_dropped_incomplete_samples": 0,
     "dataset_image_dir": "",
     "dataset_async_writer_enabled": str(os.environ.get("EXCAVATOR_DATASET_ASYNC_WRITER", "1") or "1").strip().lower()
@@ -695,7 +708,7 @@ AUTO_COLLECT_GLOBAL_PLAN_FAILURE_LIMIT = 4
 AUTO_COLLECT_BETWEEN_EPISODE_FRAMES = 90
 AUTO_COLLECT_OWNS_STEP_CLOCK = env_bool("EXCAVATOR_AUTO_COLLECT_OWNS_CLOCK", True)
 AUTO_COLLECT_PASSIVE_MAIN_SLEEP_S = float(os.environ.get("EXCAVATOR_AUTO_COLLECT_PASSIVE_MAIN_SLEEP_S", "0.005") or 0.005)
-AUTO_COLLECT_RUN_CAMERA_PREFLIGHT = env_bool("EXCAVATOR_AUTO_COLLECT_RUN_CAMERA_PREFLIGHT", False)
+AUTO_COLLECT_RUN_CAMERA_PREFLIGHT = env_bool("EXCAVATOR_AUTO_COLLECT_RUN_CAMERA_PREFLIGHT", True)
 AUTO_COLLECT_SAND_RESET_POLICY = "once_per_run_after_home"
 AUTO_COLLECT_REUSE_READY_SAND_RESET = True
 AUTO_COLLECT_PRE_RESET_SETTLE_FRAMES = 45
@@ -1517,6 +1530,8 @@ def fast_sampled_replay_config_snapshot():
         "loaded_disable_reason": "live_particle_payload_guard_not_implemented",
         "metrics_policy": "stage_start_live_snapshot; intermediate_reuse; final_live_snapshot",
         "fallback_slow": bool(FAST_REPLAY_FALLBACK_SLOW),
+        "camera_grace_s": float(FAST_REPLAY_CAMERA_GRACE_S),
+        "camera_fatal_failures": int(FAST_REPLAY_CAMERA_FATAL_FAILURES),
     }
 
 
@@ -1852,6 +1867,19 @@ def simulation_timeline_is_playing():
         return bool(timeline.is_playing())
     except Exception:
         return True
+
+
+def dataset_simulation_time_seconds():
+    if HAS_OMNI_TIMELINE:
+        try:
+            timeline = omni.timeline.get_timeline_interface()
+            if timeline is not None:
+                value = float(timeline.get_current_time())
+                if math.isfinite(value):
+                    return value
+        except Exception:
+            pass
+    return float(time.time())
 
 
 def ensure_timeline_playing(label=""):
@@ -7152,6 +7180,13 @@ def dataset_record_sample_due(force=False):
     if force:
         return True
     interval = float(STATE.get("dataset_sample_interval", 0.10))
+    if DATASET_USE_SIM_TIME:
+        rows = int(STATE.get("dataset_samples", 0) or 0) - int(STATE.get("dataset_episode_sample_start", 0) or 0)
+        if rows <= 0:
+            return True
+        sim_now = dataset_simulation_time_seconds()
+        last_sim = float(STATE.get("dataset_last_sim_sample_time", sim_now))
+        return sim_now - last_sim >= interval
     return time.time() - float(STATE.get("dataset_last_wall_sample_time", STATE.get("dataset_last_sample_time", 0.0)) or 0.0) >= interval
 
 
@@ -7255,6 +7290,9 @@ def dataset_camera_start_background(label="auto_collect"):
     STATE["dataset_camera_background_submissions"] = 0
     STATE["dataset_camera_background_complete_captures"] = 0
     STATE["dataset_camera_background_failures"] = 0
+    STATE["dataset_camera_background_next_clock_time"] = 0.0
+    STATE["dataset_camera_background_last_clock_time"] = dataset_simulation_time_seconds()
+    STATE["dataset_camera_background_clock_source"] = str(STATE.get("dataset_camera_clock_source", "simulation"))
     STATE["dataset_camera_capture_backoff_until"] = 0.0
     STATE["dataset_camera_blocked_capture_consecutive"] = 0
     return register_async_task(
@@ -10829,7 +10867,10 @@ def dataset_joint_force_torque_observation():
         result["reason"] = "get_measured_joint_forces_unavailable"
         return result
     try:
-        values = reader(joint_indices=JOINT_INDICES)
+        # Joint reaction rows are indexed by child link: row 0 is the base,
+        # so each DOF's incoming-joint reaction lives at dof_index + 1.
+        reaction_link_indices = np.asarray(JOINT_INDICES, dtype=np.int32).reshape(-1) + 1
+        values = reader(joint_indices=reaction_link_indices)
         arr = np.array(values, dtype=np.float32)
         if arr.ndim == 1:
             arr = arr.reshape(1, -1)
@@ -10845,6 +10886,8 @@ def dataset_joint_force_torque_observation():
                 "available": True,
                 "reason": "ok",
                 "names": list(DOF_ORDER),
+                "reaction_link_indices": [int(v) for v in reaction_link_indices],
+                "indexing": "incoming_joint_link_row=dof_index+1;row0=base",
                 "components": ["force_x", "force_y", "force_z", "torque_x", "torque_y", "torque_z"],
                 "value": [[float(v) for v in row] for row in arr],
             }
@@ -11152,30 +11195,45 @@ def dataset_record_sample(
         return False
 
     wall_now = time.time()
+    sim_now = dataset_simulation_time_seconds()
     interval = float(STATE.get("dataset_sample_interval", 0.10))
-    if (not force) and wall_now - float(STATE.get("dataset_last_wall_sample_time", STATE.get("dataset_last_sample_time", 0.0)) or 0.0) < interval:
-        return False
+    if not force:
+        if DATASET_USE_SIM_TIME:
+            rows = int(STATE.get("dataset_samples", 0) or 0) - int(STATE.get("dataset_episode_sample_start", 0) or 0)
+            last_sim_gate = float(STATE.get("dataset_last_sim_sample_time", sim_now))
+            if rows > 0 and sim_now - last_sim_gate < interval:
+                return False
+        elif wall_now - float(STATE.get("dataset_last_wall_sample_time", STATE.get("dataset_last_sample_time", 0.0)) or 0.0) < interval:
+            return False
 
     try:
         episode_start = float(STATE.get("dataset_episode_start_time", wall_now) or wall_now)
+        episode_start_sim = float(STATE.get("dataset_episode_start_sim_time", sim_now))
         last_train_t = float(STATE.get("dataset_last_train_sample_time", 0.0) or 0.0)
         last_wall_sample = float(
             STATE.get("dataset_last_wall_sample_time", STATE.get("dataset_last_sample_time", 0.0)) or 0.0
         )
         has_episode_rows = int(STATE.get("dataset_samples", 0) or 0) > int(STATE.get("dataset_episode_sample_start", 0) or 0)
         if timestamp_override is None:
-            if has_episode_rows and last_wall_sample > 0.0:
+            if DATASET_USE_SIM_TIME:
+                train_t = max(0.0, float(sim_now) - episode_start_sim)
+                if has_episode_rows:
+                    train_t = max(train_t, last_train_t + 1.0e-4)
+                timestamp_source_text = "simulation"
+            elif has_episode_rows and last_wall_sample > 0.0:
                 train_t = last_train_t + max(1.0e-4, float(wall_now) - last_wall_sample)
+                timestamp_source_text = str(timestamp_source or "wall")
             else:
                 train_t = max(0.0, float(wall_now) - episode_start)
+                timestamp_source_text = str(timestamp_source or "wall")
             train_abs = episode_start + train_t
-            timestamp_source_text = str(timestamp_source or "wall")
         else:
             train_t = max(0.0, float(timestamp_override))
             if has_episode_rows:
                 train_t = max(train_t, last_train_t + 1.0e-4)
             train_abs = episode_start + train_t
             timestamp_source_text = str(timestamp_source or "planned")
+        sample_sim_time = episode_start_sim + train_t
         sample_spans = {}
 
         def mark_span(span_label, started, threshold_ms=5.0, data=None):
@@ -11319,6 +11377,8 @@ def dataset_record_sample(
             "t": float(train_t),
             "timestamp.source": timestamp_source_text,
             "timestamp.wall": float(wall_now),
+            "timestamp.simulation": float(sample_sim_time),
+            "timestamp.simulation.recorded": float(sim_now),
             "t.wall": float(wall_now) - episode_start,
             "metrics.mode": metrics_mode_text,
             "task": str(STATE.get("dataset_task_text", "Dig soil from the marked area and dump it into the target container.")),
@@ -11374,6 +11434,7 @@ def dataset_record_sample(
                     "episode_id": str(STATE.get("dataset_episode_uid", "")),
                     "timestamp": float(train_abs),
                     "timestamp.wall": float(wall_now),
+                    "timestamp.simulation": float(sample_sim_time),
                     "t_episode": float(train_t),
                     "t_wall": float(wall_now) - episode_start,
                     "phase": str(phase),
@@ -11385,6 +11446,7 @@ def dataset_record_sample(
 
         STATE["dataset_last_sample_time"] = wall_now
         STATE["dataset_last_wall_sample_time"] = wall_now
+        STATE["dataset_last_sim_sample_time"] = float(sim_now)
         STATE["dataset_last_train_sample_time"] = float(train_t)
         STATE["dataset_train_time_cursor"] = float(train_t)
         STATE["dataset_samples"] = int(STATE.get("dataset_samples", 0)) + 1
@@ -11419,6 +11481,29 @@ async def dataset_record_sample_async(
         camera_ms = (time.perf_counter() - span_t) * 1000.0
         STATE["dataset_last_camera_capture_ms"] = float(camera_ms)
         debug_profile_span("dataset_record_sample.camera_latest_cache", span_t, threshold_ms=4.0)
+        camera_info = camera_payload.get("observation.camera", {}) if isinstance(camera_payload, dict) else {}
+        if isinstance(camera_info, dict) and bool(camera_info.get("available", False)):
+            capture_q = camera_info.get("capture_q")
+            capture_q_cmd = camera_info.get("capture_q_cmd")
+            if capture_q is not None:
+                try:
+                    q_real = np.asarray(capture_q, dtype=np.float32).reshape(-1)[:4].copy()
+                except Exception:
+                    pass
+            if capture_q_cmd is not None:
+                try:
+                    q_cmd = np.asarray(capture_q_cmd, dtype=np.float32).reshape(-1)[:4].copy()
+                except Exception:
+                    pass
+            if timestamp_override is None and DATASET_USE_SIM_TIME:
+                capture_sim_time = camera_info.get("capture_pose_sim_time")
+                if capture_sim_time is not None:
+                    try:
+                        episode_start_sim = float(STATE.get("dataset_episode_start_sim_time", capture_sim_time))
+                        timestamp_override = max(0.0, float(capture_sim_time) - episode_start_sim)
+                        timestamp_source = "camera_simulation"
+                    except Exception:
+                        pass
     return dataset_record_sample(
         phase,
         q_cmd=q_cmd,
@@ -11459,39 +11544,95 @@ async def dataset_camera_wait_for_fresh_pose_capture(sample_index, pose_set_wall
     started = time.perf_counter()
     last_reason = "fresh_pose_capture_not_submitted"
 
-    while time.time() <= deadline:
-        if motion_cancel_requested(task_id):
-            return False, "motion_cancel_requested", updates, (time.perf_counter() - started) * 1000.0
+    def fresh_capture_ready():
+        latest_capture = STATE.get("dataset_camera_latest_capture")
+        if not isinstance(latest_capture, dict):
+            return False, 0, 0.0
+        latest_capture_seq = int(latest_capture.get("seq", 0) or 0)
+        latest_capture_started = float(latest_capture.get("capture_started_at", 0.0) or 0.0)
+        ready = latest_capture_seq > last_used_seq and latest_capture_started >= float(pose_set_wall)
+        return bool(ready), latest_capture_seq, latest_capture_started
 
-        latest = STATE.get("dataset_camera_latest_capture")
-        if isinstance(latest, dict):
-            latest_seq = int(latest.get("seq", 0) or 0)
-            latest_started = float(latest.get("capture_started_at", 0.0) or 0.0)
-            if latest_seq > last_used_seq and latest_started >= float(pose_set_wall):
-                return True, "fresh_pose_capture_ready", updates, (time.perf_counter() - started) * 1000.0
+    async def advance_until(wait_deadline, submit_if_idle=True):
+        nonlocal updates, last_reason
+        while time.time() <= float(wait_deadline):
+            if motion_cancel_requested(task_id):
+                return False, "motion_cancel_requested"
+            ready, _latest_seq, _latest_started = fresh_capture_ready()
+            if ready:
+                return True, "fresh_pose_capture_ready"
+            pending = STATE.get("dataset_camera_pending_capture")
+            pending_active = isinstance(pending, dict) and not bool(pending.get("done", False))
+            if submit_if_idle and not pending_active:
+                submitted, submit_reason = excavator_dataset_camera.submit_viewport_capture_triplet(
+                    runtime_module(),
+                    sample_index=int(sample_index),
+                )
+                last_reason = str(submit_reason or "capture_submit_failed")
+                if submitted:
+                    last_reason = "capture_submitted"
+            await step_updates(1)
+            updates += 1
+        ready, _latest_seq, _latest_started = fresh_capture_ready()
+        return bool(ready), "fresh_pose_capture_ready_after_deadline" if ready else last_reason
 
-        pending = STATE.get("dataset_camera_pending_capture")
-        pending_active = isinstance(pending, dict) and not bool(pending.get("done", False))
-        if not pending_active:
-            submitted, submit_reason = excavator_dataset_camera.submit_viewport_capture_triplet(
-                runtime_module(),
-                sample_index=int(sample_index),
-            )
-            last_reason = str(submit_reason or "capture_submit_failed")
-            if submitted:
-                last_reason = "capture_submitted"
+    ready, ready_reason = await advance_until(deadline, submit_if_idle=True)
+    if ready:
+        STATE["fast_replay_camera_sync_consecutive_failures"] = 0
+        return True, ready_reason, updates, (time.perf_counter() - started) * 1000.0
+    if ready_reason == "motion_cancel_requested":
+        return False, ready_reason, updates, (time.perf_counter() - started) * 1000.0
 
-        await step_updates(1)
-        updates += 1
+    # A valid pose-specific capture may complete in the update that crosses the
+    # base deadline. Give only that in-flight request a bounded completion grace.
+    pending = STATE.get("dataset_camera_pending_capture")
+    matching_pending = (
+        isinstance(pending, dict)
+        and not bool(pending.get("done", False))
+        and float(pending.get("started_at", 0.0) or 0.0) >= float(pose_set_wall)
+    )
+    if matching_pending:
+        grace_deadline = time.time() + float(FAST_REPLAY_CAMERA_GRACE_S)
+        ready, ready_reason = await advance_until(grace_deadline, submit_if_idle=False)
+        if ready:
+            STATE["fast_replay_camera_sync_consecutive_failures"] = 0
+            return True, "fresh_pose_capture_ready_in_grace", updates, (time.perf_counter() - started) * 1000.0
+        if ready_reason == "motion_cancel_requested":
+            return False, ready_reason, updates, (time.perf_counter() - started) * 1000.0
 
-    latest = STATE.get("dataset_camera_latest_capture")
-    latest_seq = int(latest.get("seq", 0) or 0) if isinstance(latest, dict) else 0
-    latest_started = float(latest.get("capture_started_at", 0.0) or 0.0) if isinstance(latest, dict) else 0.0
+    # Retry one complete triplet for this pose. The submit helper expires a
+    # genuinely stuck request before creating the replacement request.
+    retry_submitted, retry_reason = excavator_dataset_camera.submit_viewport_capture_triplet(
+        runtime_module(),
+        sample_index=int(sample_index),
+    )
+    last_reason = str(retry_reason or "fresh_pose_capture_retry_submit_failed")
+    if retry_submitted:
+        last_reason = "fresh_pose_capture_retry_submitted"
+        retry_deadline = time.time() + timeout_s + float(FAST_REPLAY_CAMERA_GRACE_S)
+        ready, ready_reason = await advance_until(retry_deadline, submit_if_idle=False)
+        if ready:
+            STATE["fast_replay_camera_sync_consecutive_failures"] = 0
+            return True, "fresh_pose_capture_ready_after_retry", updates, (time.perf_counter() - started) * 1000.0
+        if ready_reason == "motion_cancel_requested":
+            return False, ready_reason, updates, (time.perf_counter() - started) * 1000.0
+
+    ready, latest_seq, latest_started = fresh_capture_ready()
+    if ready:
+        STATE["fast_replay_camera_sync_consecutive_failures"] = 0
+        return True, "fresh_pose_capture_ready_final_check", updates, (time.perf_counter() - started) * 1000.0
+    consecutive_failures = int(STATE.get("fast_replay_camera_sync_consecutive_failures", 0) or 0) + 1
+    STATE["fast_replay_camera_sync_consecutive_failures"] = int(consecutive_failures)
+    failure_kind = (
+        "camera_pipeline_persistent_failure"
+        if consecutive_failures >= int(FAST_REPLAY_CAMERA_FATAL_FAILURES)
+        else "fresh_pose_capture_timeout"
+    )
     reason = (
-        "fresh_pose_capture_timeout:"
+        f"{failure_kind}:"
         f"sample={int(sample_index)};last_used_seq={last_used_seq};latest_seq={latest_seq};"
         f"latest_started={latest_started:.6f};pose_set_wall={float(pose_set_wall):.6f};"
-        f"last_reason={last_reason}"
+        f"last_reason={last_reason};consecutive_failures={consecutive_failures}"
     )
     return False, reason, updates, (time.perf_counter() - started) * 1000.0
 
@@ -13530,9 +13671,11 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
     STATE["dataset_camera_blocked_capture_consecutive"] = 0
     STATE["dataset_camera_pending_capture"] = None
     STATE["dataset_episode_start_time"] = time.time()
+    STATE["dataset_episode_start_sim_time"] = dataset_simulation_time_seconds()
     STATE["dataset_episode_freezes"] = 0
     STATE["dataset_last_sample_time"] = 0.0
     STATE["dataset_last_wall_sample_time"] = 0.0
+    STATE["dataset_last_sim_sample_time"] = 0.0
     STATE["dataset_last_train_sample_time"] = 0.0
     STATE["dataset_last_derivative_time"] = 0.0
     STATE["dataset_train_time_cursor"] = 0.0
@@ -13723,6 +13866,15 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
             "observation.images.2",
             "observation.camera",
         ],
+        "trajectory_fields_added_v5": [
+            "timestamp.simulation",
+            "timestamp.simulation.recorded",
+        ],
+        "timestamp_policy": {
+            "training_clock": "simulation" if DATASET_USE_SIM_TIME else "wall",
+            "wall_clock_field": "timestamp.wall",
+            "camera_alignment": "capture_pose_sim_time+capture_q",
+        },
         "paths": {
             "trajectory": STATE["dataset_path"],
             "events": STATE["dataset_event_path"],
@@ -15810,6 +15962,11 @@ def auto_scene_apply_candidate(candidate):
         )
         if not apply_default_unload_source_mesh():
             return False, "unload_source_mesh_refresh_failed_after_truck_move"
+        if debug_visuals_enabled():
+            ensure_unload_marker(
+                STATE.get("manual_unload_point"),
+                label="auto_scene_truck_mesh_final",
+            )
         ctx_after_unload_mesh = task_scene_context()
         candidate["applied_unload_point_xyz"] = np.array(ctx_after_unload_mesh.get("unload_point"), dtype=np.float32).reshape(-1)[:3].copy()
         candidate["applied_unload_selected_path"] = str(ctx_after_unload_mesh.get("manual_unload_selected_path", ""))
@@ -17026,7 +17183,7 @@ async def auto_collect_one_episode():
     auto_collect_attempt_progress(attempt, "begin_episode", "start")
     meta = auto_collect_begin_episode(attempt, target, plan_attempts, seq, initial_info=initial_info)
     auto_collect_attempt_progress(attempt, "begin_episode", "ok", detail=meta.get("episode_id", ""))
-    await dataset_camera_warmup_for_episode(label=f"auto_collect_episode_{attempt:06d}")
+    await dataset_camera_warmup_for_auto_run_once(label=f"auto_collect_episode_{attempt:06d}")
 
     shared_plan = STATE.get("current_dig_plan")
     if isinstance(shared_plan, dict):
@@ -17161,6 +17318,7 @@ async def auto_collect_loop(count, max_attempts=None):
     STATE["execution_profile_count"] = 0
     STATE["fast_sampled_replay_last_validation"] = {}
     STATE["fast_sampled_replay_validation_recent"] = []
+    STATE["fast_replay_camera_sync_consecutive_failures"] = 0
     STATE["debug_profile_summary"] = {}
     STATE["debug_profile_recent"] = []
     STATE["debug_profile_count"] = 0
@@ -20276,11 +20434,15 @@ async def move_to_profile_sampled_replay(
 
         sample_index = int(STATE.get("dataset_samples", 0)) - int(STATE.get("dataset_episode_sample_start", 0))
         pose_set_wall = time.time()
-        camera_ready, camera_reason, update_frames, update_ms = await dataset_camera_wait_for_fresh_pose_capture(
-            sample_index,
-            pose_set_wall,
-            task_id=task_id,
-        )
+        STATE["dataset_camera_pose_sync_active"] = True
+        try:
+            camera_ready, camera_reason, update_frames, update_ms = await dataset_camera_wait_for_fresh_pose_capture(
+                sample_index,
+                pose_set_wall,
+                task_id=task_id,
+            )
+        finally:
+            STATE["dataset_camera_pose_sync_active"] = False
         if isinstance(exec_profile, dict):
             exec_profile["update_calls"] = int(exec_profile.get("update_calls", 0) or 0) + 1
             exec_profile["update_frames"] = int(exec_profile.get("update_frames", 0) or 0) + int(update_frames)
@@ -20288,7 +20450,7 @@ async def move_to_profile_sampled_replay(
             execution_stage_profile_add_ms(exec_profile, "camera_pose_sync_ms", float(update_ms), "camera_pose_sync_count", 1)
         if not camera_ready:
             reason = f"fast_replay_camera_pose_sync_failed:{camera_reason}"
-            set_execution_failure_reason(f"execution_failed/{reason}:{label}:{mode}")
+            persistent_failure = str(camera_reason).startswith("camera_pipeline_persistent_failure:")
             dataset_record_event(
                 "fast_sampled_replay_camera_failed",
                 f"{label}:{mode}:{reason}",
@@ -20297,9 +20459,15 @@ async def move_to_profile_sampled_replay(
                     "planned_sample": int(sample_k),
                     "planned_samples": int(n_samples),
                     "update_frames": int(update_frames),
+                    "persistent_failure": bool(persistent_failure),
                 },
             )
-            return False, emitted, reason, False
+            if persistent_failure:
+                set_execution_failure_reason(f"execution_failed/{reason}:{label}:{mode}")
+                STATE["auto_collect_last_result"] = f"blocked={reason}"
+                STATE["auto_collect_stop_requested"] = True
+                return False, emitted, reason, False
+            return False, emitted, reason, True
         if motion_cancel_requested(task_id):
             return False, emitted, "motion_cancel_requested", False
 
@@ -20820,6 +20988,13 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
                 "decision=slow_move_to_profile",
                 force_log=debug_diagnostics_enabled(),
             )
+            try:
+                q0 = q_real_near_command(get_real_joint_positions(), CTRL.q_cmd)
+            except Exception:
+                q0 = np.array(CTRL.q_cmd, dtype=np.float32).reshape(-1)[:4].copy()
+            seconds_eff = estimate_stage_motion_seconds(q0, q1, requested_seconds=seconds)
+            steps = max(4, int(seconds_eff * CONTROL_HZ))
+            STATE["trace_active_motion"]["expires_at"] = time.time() + seconds_eff + 1.0
         else:
             set_execution_failure_reason(f"execution_failed/fast_sampled_replay_failed:{label}:{mode}:{fast_reason}")
             finish_exec_profile("failed", f"fast_sampled_replay:{fast_reason};samples={emitted_fast}")
@@ -21447,7 +21622,10 @@ PATH_FAST_SIDE_MAX_BLOCKERS = 3
 PATH_CLEARANCE_FRACTIONS = [0.25, 0.40, 0.60, 0.75]
 PATH_CLEARANCE_DURATION = 0.85
 PATH_OBSTACLE_MARGIN_XY = 0.18
-PATH_OBSTACLE_MARGIN_Z = 0.10
+PATH_OBSTACLE_MARGIN_Z = max(
+    0.0,
+    float(os.environ.get("EXCAVATOR_PATH_OBSTACLE_MARGIN_Z", "0.05") or 0.05),
+)
 PATH_OBSTACLE_OVER_CLEARANCE_Z = 0.45
 UNLOAD_BIN_WALL_OVERPASS_CLEARANCE_Z = 0.055
 UNLOAD_BIN_WALL_EXEC_EXTRA_CLEARANCE_Z = 0.28
@@ -21470,7 +21648,10 @@ PATH_RRT_SMOOTH_ALPHA = 0.55
 PATH_RRT_SMOOTH_BEND_WEIGHT = 0.35
 PATH_RRT_SMOOTH_MIN_IMPROVEMENT = 1.0e-4
 PATH_LINK_COLLISION_SEGMENT_SAMPLES = 4
-PATH_LINK_COLLISION_RADIUS_M = 0.10
+PATH_LINK_COLLISION_RADIUS_M = max(
+    0.0,
+    float(os.environ.get("EXCAVATOR_PATH_LINK_COLLISION_RADIUS_M", "0.06") or 0.06),
+)
 LOADED_ROUTE_TEST_PLAN_BUDGET_SECONDS = 30.0
 LOADED_ROUTE_MIN_STAGE_SECONDS = 1.80
 LOADED_ROUTE_FINAL_STAGE_SECONDS = 2.20
@@ -29151,7 +29332,7 @@ def staged_high_carry_unload_fallback(q_lift, q_pre_dump, deadline=None):
     except Exception:
         loaded_now = 0
     failures = []
-    fallback_deadline = time.time() + 4.0
+    fallback_deadline = time.time() + 6.0
     for boom_extra_deg, arm_extra_deg in [(10.0, -4.0), (18.0, -7.0), (26.0, -10.0), (34.0, -12.0), (42.0, -14.0)]:
         if planning_deadline_exceeded(fallback_deadline):
             break
@@ -29197,7 +29378,7 @@ def staged_high_carry_unload_fallback(q_lift, q_pre_dump, deadline=None):
             q_lift,
             q_high,
             "lift_carry",
-            samples=max(4, min(DIG_PLAN_PATH_CHECK_SAMPLES, 8)),
+            samples=PATH_CHECK_SAMPLES,
             deadline=fallback_deadline,
         )
         if not ok1:
@@ -29207,7 +29388,7 @@ def staged_high_carry_unload_fallback(q_lift, q_pre_dump, deadline=None):
             q_high,
             q_pre,
             "unload_to_bin",
-            samples=max(4, min(DIG_PLAN_PATH_CHECK_SAMPLES, 8)),
+            samples=PATH_CHECK_SAMPLES,
             deadline=fallback_deadline,
         )
         if not ok2:
@@ -29217,7 +29398,7 @@ def staged_high_carry_unload_fallback(q_lift, q_pre_dump, deadline=None):
                 "unload_to_bin",
                 "staged_high_carry_unload_fallback",
                 deadline=fallback_deadline,
-                samples=max(5, min(PATH_ROUTE_PLANNING_SAMPLE_COUNT, 9)),
+                samples=PATH_CHECK_SAMPLES,
             )
             if route2 is None:
                 failures.append(
@@ -30693,8 +30874,8 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
         force_log=debug_diagnostics_enabled(),
     )
 
-    direct_samples = 8 if loaded_route_test else DIG_PLAN_PATH_CHECK_SAMPLES
-    route_samples = 3 if loaded_route_test else PATH_ROUTE_PLANNING_SAMPLE_COUNT
+    direct_samples = 8 if loaded_route_test else PATH_CHECK_SAMPLES
+    route_samples = 3 if loaded_route_test else PATH_CHECK_SAMPLES
     direct_ok, kind, reason, sample, report = path_segment_check(
         q_lift, q_pre_dump, "unload_to_bin", samples=direct_samples, deadline=deadline
     )

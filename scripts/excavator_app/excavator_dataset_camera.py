@@ -18,7 +18,7 @@ except Exception:
     Image = None
 
 
-CAMERA_MODULE_VERSION = "dataset_camera_viewport_capture_v23_capture_1024_downsample"
+CAMERA_MODULE_VERSION = "dataset_camera_viewport_capture_v25_nonblocking_sim_clock"
 SYNC_STEP_ERROR_TEXT = "Synchronous call to `step`"
 
 
@@ -1815,7 +1815,22 @@ def empty_payload(rt, sample_index, reason="", views=None):
     }
 
 
-def store_latest_capture(rt, frames, views, sample_index, capture_started, capture_finished, source="viewport_capture"):
+def store_latest_capture(
+    rt,
+    frames,
+    views,
+    sample_index,
+    capture_started,
+    capture_finished,
+    source="viewport_capture",
+    capture_started_sim=None,
+    capture_finished_sim=None,
+    capture_pose_sim=None,
+    capture_q=None,
+    capture_q_cmd=None,
+    raw_capture_elapsed_ms=None,
+    postprocess_elapsed_ms=None,
+):
     required = [str(x) for x in rt.DATASET_CAMERA_NAMES]
     if not isinstance(frames, dict) or any(name not in frames for name in required):
         return False
@@ -1834,6 +1849,13 @@ def store_latest_capture(rt, frames, views, sample_index, capture_started, captu
         "capture_started_at": float(capture_started),
         "capture_finished_at": float(capture_finished),
         "capture_elapsed_ms": float(max(0.0, capture_finished - capture_started) * 1000.0),
+        "capture_started_sim_time": None if capture_started_sim is None else float(capture_started_sim),
+        "capture_finished_sim_time": None if capture_finished_sim is None else float(capture_finished_sim),
+        "capture_pose_sim_time": None if capture_pose_sim is None else float(capture_pose_sim),
+        "capture_q": None if capture_q is None else [float(x) for x in np.asarray(capture_q).reshape(-1)[:4]],
+        "capture_q_cmd": None if capture_q_cmd is None else [float(x) for x in np.asarray(capture_q_cmd).reshape(-1)[:4]],
+        "raw_capture_elapsed_ms": None if raw_capture_elapsed_ms is None else float(raw_capture_elapsed_ms),
+        "postprocess_elapsed_ms": None if postprocess_elapsed_ms is None else float(postprocess_elapsed_ms),
         "frames": safe_frames,
         "views": safe_views,
         "backend": backend(rt),
@@ -1892,6 +1914,13 @@ def latest_capture_payload(rt, sample_index):
             "capture_started_at": float(latest.get("capture_started_at", capture_finished) or capture_finished),
             "capture_finished_at": float(capture_finished),
             "capture_elapsed_ms": float(latest.get("capture_elapsed_ms", 0.0) or 0.0),
+            "capture_started_sim_time": latest.get("capture_started_sim_time"),
+            "capture_finished_sim_time": latest.get("capture_finished_sim_time"),
+            "capture_pose_sim_time": latest.get("capture_pose_sim_time"),
+            "capture_q": latest.get("capture_q"),
+            "capture_q_cmd": latest.get("capture_q_cmd"),
+            "raw_capture_elapsed_ms": latest.get("raw_capture_elapsed_ms"),
+            "postprocess_elapsed_ms": latest.get("postprocess_elapsed_ms"),
             "sample_timestamp": float(now),
             "frame_age_ms": float(max(0.0, now - capture_finished) * 1000.0),
             "source": str(latest.get("source", "latest_cache")),
@@ -2141,7 +2170,21 @@ def background_interval_seconds(rt):
         interval = 0.0
     if interval <= 0.0:
         interval = 0.50
-    return max(0.10, float(interval))
+    return max(0.02, float(interval))
+
+
+def background_clock_seconds(rt):
+    source = str(rt.STATE.get("dataset_camera_clock_source", "simulation") or "simulation").strip().lower()
+    if source == "simulation":
+        reader = getattr(rt, "dataset_simulation_time_seconds", None)
+        if callable(reader):
+            try:
+                value = float(reader())
+                if np.isfinite(value):
+                    return value, "simulation"
+            except Exception:
+                pass
+    return float(time.time()), "wall"
 
 
 def background_min_idle_seconds(rt):
@@ -2227,6 +2270,7 @@ def _finalize_pending_triplet(rt, triplet):
             return True
         triplet["done"] = True
         capture_finished = time.time()
+        capture_finished_sim, _clock_source = background_clock_seconds(rt)
         frames = triplet.get("frames", {})
         views = triplet.get("views", {})
         failures = list(triplet.get("failures", []) or [])
@@ -2278,6 +2322,8 @@ def _finalize_pending_triplet(rt, triplet):
         else:
             rt.STATE["dataset_camera_blocked_capture_consecutive"] = 0
         if not failures and not missing:
+            capture_started_wall = float(triplet.get("started_at", capture_finished) or capture_finished)
+            raw_finished_wall = float(triplet.get("raw_finished_at", capture_finished) or capture_finished)
             store_latest_capture(
                 rt,
                 frames,
@@ -2286,6 +2332,13 @@ def _finalize_pending_triplet(rt, triplet):
                 float(triplet.get("started_at", capture_finished) or capture_finished),
                 float(capture_finished),
                 source="viewport_capture_callback",
+                capture_started_sim=triplet.get("started_sim_time"),
+                capture_finished_sim=capture_finished_sim,
+                capture_pose_sim=triplet.get("capture_pose_sim_time"),
+                capture_q=triplet.get("capture_q"),
+                capture_q_cmd=triplet.get("capture_q_cmd"),
+                raw_capture_elapsed_ms=max(0.0, raw_finished_wall - capture_started_wall) * 1000.0,
+                postprocess_elapsed_ms=max(0.0, capture_finished - raw_finished_wall) * 1000.0,
             )
             rt.STATE["dataset_camera_background_complete_captures"] = (
                 int(rt.STATE.get("dataset_camera_background_complete_captures", 0) or 0) + 1
@@ -2310,6 +2363,7 @@ def submit_viewport_capture_triplet(rt, sample_index=-1):
     if not bool(rt.STATE.get("dataset_camera_enabled", True)):
         return False, "disabled"
     now = time.time()
+    started_sim_time, clock_source = background_clock_seconds(rt)
     backoff_reason = capture_backoff_reason(rt, now=now)
     if backoff_reason:
         return False, backoff_reason
@@ -2344,19 +2398,41 @@ def submit_viewport_capture_triplet(rt, sample_index=-1):
         "seq": int(seq),
         "sample_index": int(sample_index),
         "started_at": float(now),
+        "started_sim_time": float(started_sim_time),
+        "clock_source": str(clock_source),
         "generation": int(rt.STATE.get("dataset_camera_capture_generation", 0) or 0),
         "frames": {},
         "views": {},
         "failures": [],
         "pending": list(required),
+        "raw_pending": list(required),
         "helpers": [],
         "done": False,
     }
     rt.STATE["dataset_camera_pending_capture"] = triplet
     set_dataset_viewports_capture_active(rt, True)
 
+    def mark_raw_capture_done(name):
+        raw_pending = triplet.get("raw_pending")
+        if isinstance(raw_pending, list) and str(name) in raw_pending:
+            raw_pending.remove(str(name))
+        if not raw_pending:
+            triplet.setdefault("raw_finished_at", float(time.time()))
+            set_dataset_viewports_capture_active(rt, False)
+
     def make_callback(name, camera_path):
         def on_capture(capsule, buffer_size, width, height, fmt=None):
+            if triplet.get("capture_q") is None:
+                try:
+                    triplet["capture_q"] = np.asarray(rt.get_real_joint_positions(), dtype=np.float32).reshape(-1)[:4].copy()
+                except Exception:
+                    triplet["capture_q"] = None
+                try:
+                    triplet["capture_q_cmd"] = np.asarray(rt.CTRL.q_cmd, dtype=np.float32).reshape(-1)[:4].copy()
+                except Exception:
+                    triplet["capture_q_cmd"] = None
+                pose_sim_time, _pose_clock_source = background_clock_seconds(rt)
+                triplet["capture_pose_sim_time"] = float(pose_sim_time)
             view_payload = {
                 "available": False,
                 "name": str(name),
@@ -2367,42 +2443,83 @@ def submit_viewport_capture_triplet(rt, sample_index=-1):
                 if isinstance(viewports, dict) and isinstance(viewports.get(str(name), {}), dict)
                 else {},
             }
+
+            def finish_processed(rgb, norm_reason, stats, process_error=""):
+                try:
+                    view_payload["rgb_stats"] = stats if isinstance(stats, dict) else {}
+                    view_payload["normalize_reason"] = str(norm_reason or "")
+                    if process_error:
+                        view_payload["reason"] = str(process_error)
+                        triplet["failures"].append(f"{name}:{process_error}")
+                        return
+                    if rgb is None:
+                        view_payload["reason"] = str(norm_reason or "rgb_normalize_failed")
+                        triplet["failures"].append(f"{name}:{view_payload['reason']}")
+                        return
+                    valid, valid_reason = validate_rgb_content(rt, rgb, stats)
+                    if not valid:
+                        if str(valid_reason).startswith("black_frame"):
+                            rt.STATE["dataset_camera_black_rejected"] = int(
+                                rt.STATE.get("dataset_camera_black_rejected", 0) or 0
+                            ) + 1
+                        view_payload["reason"] = valid_reason
+                        triplet["failures"].append(f"{name}:{valid_reason}")
+                        return
+                    triplet["frames"][str(name)] = np.ascontiguousarray(rgb[:, :, :3])
+                    view_payload.update(
+                        {
+                            "available": True,
+                            "reason": "ok",
+                            "shape": [int(x) for x in rgb.shape],
+                            "dtype": str(rgb.dtype),
+                            "format": str(fmt),
+                        }
+                    )
+                finally:
+                    triplet["views"][str(name)] = view_payload
+                    pending_list = triplet.get("pending")
+                    if isinstance(pending_list, list) and str(name) in pending_list:
+                        pending_list.remove(str(name))
+                    _finalize_pending_triplet(rt, triplet)
+
             try:
                 rgb_raw = capsule_to_numpy_rgb(capsule, buffer_size, width, height)
-                rgb, norm_reason, stats = normalize_rgb_resolution(rt, rgb_raw)
-                view_payload["rgb_stats"] = stats
-                view_payload["normalize_reason"] = norm_reason
-                if rgb is None:
-                    view_payload["reason"] = norm_reason
-                    triplet["failures"].append(f"{name}:{norm_reason}")
-                    return
-                valid, valid_reason = validate_rgb_content(rt, rgb, stats)
-                if not valid:
-                    if str(valid_reason).startswith("black_frame"):
-                        rt.STATE["dataset_camera_black_rejected"] = int(rt.STATE.get("dataset_camera_black_rejected", 0) or 0) + 1
-                    view_payload["reason"] = valid_reason
-                    triplet["failures"].append(f"{name}:{valid_reason}")
-                    return
-                triplet["frames"][str(name)] = np.ascontiguousarray(rgb[:, :, :3])
-                view_payload.update(
-                    {
-                        "available": True,
-                        "reason": "ok",
-                        "shape": [int(x) for x in rgb.shape],
-                        "dtype": str(rgb.dtype),
-                        "format": str(fmt),
-                    }
-                )
             except Exception as exc:
                 reason = f"{type(exc).__name__}:{exc}"
-                view_payload["reason"] = reason
-                triplet["failures"].append(f"{name}:{reason}")
-            finally:
-                triplet["views"][str(name)] = view_payload
-                pending_list = triplet.get("pending")
-                if isinstance(pending_list, list) and str(name) in pending_list:
-                    pending_list.remove(str(name))
-                _finalize_pending_triplet(rt, triplet)
+                mark_raw_capture_done(name)
+                finish_processed(None, "raw_capture_failed", {}, process_error=reason)
+                return
+
+            mark_raw_capture_done(name)
+            try:
+                loop = asyncio.get_running_loop()
+                process_future = loop.run_in_executor(None, normalize_rgb_resolution, rt, rgb_raw)
+
+                def on_processed(done_future):
+                    try:
+                        rgb, norm_reason, stats = done_future.result()
+                        finish_processed(rgb, norm_reason, stats)
+                    except Exception as exc:
+                        finish_processed(
+                            None,
+                            "async_postprocess_failed",
+                            {},
+                            process_error=f"{type(exc).__name__}:{exc}",
+                        )
+
+                process_future.add_done_callback(on_processed)
+                triplet["helpers"].append(process_future)
+            except Exception:
+                try:
+                    rgb, norm_reason, stats = normalize_rgb_resolution(rt, rgb_raw)
+                    finish_processed(rgb, norm_reason, stats)
+                except Exception as exc:
+                    finish_processed(
+                        None,
+                        "sync_postprocess_failed",
+                        {},
+                        process_error=f"{type(exc).__name__}:{exc}",
+                    )
 
         return on_capture
 
@@ -2423,6 +2540,7 @@ def submit_viewport_capture_triplet(rt, sample_index=-1):
             triplet["failures"].append(f"{name}:dataset_viewport_missing")
             if name in triplet["pending"]:
                 triplet["pending"].remove(name)
+            mark_raw_capture_done(name)
             continue
         try:
             helper = capture_viewport_to_buffer(
@@ -2442,6 +2560,7 @@ def submit_viewport_capture_triplet(rt, sample_index=-1):
                         triplet["failures"].append(f"{_name}:{reason}")
                         if _name in triplet["pending"]:
                             triplet["pending"].remove(_name)
+                        mark_raw_capture_done(_name)
                         _finalize_pending_triplet(rt, triplet)
 
                 task.add_done_callback(_consume_task_result)
@@ -2460,6 +2579,7 @@ def submit_viewport_capture_triplet(rt, sample_index=-1):
             triplet["failures"].append(f"{name}:{reason}")
             if name in triplet["pending"]:
                 triplet["pending"].remove(name)
+            mark_raw_capture_done(name)
     _finalize_pending_triplet(rt, triplet)
     if not started_any:
         rt.STATE["dataset_camera_pending_capture"] = None
@@ -2501,11 +2621,21 @@ async def background_capture_loop(rt, label="dataset_camera_background"):
     rt.STATE["dataset_camera_background_label"] = str(label)
     failures = 0
     captures = 0
+    interval = background_interval_seconds(rt)
+    clock_now, clock_source = background_clock_seconds(rt)
+    # Let stage execution establish its first pose before the background
+    # producer submits a render. Fast replay owns the pose-specific first
+    # capture, while normal motion reaches this deadline after one sample tick.
+    next_capture_time = float(clock_now) + float(interval)
+    rt.STATE["dataset_camera_background_next_clock_time"] = float(next_capture_time)
+    rt.STATE["dataset_camera_background_last_clock_time"] = float(clock_now)
+    rt.STATE["dataset_camera_background_clock_source"] = str(clock_source)
     rt.info_print(
         "[DATASET CAMERA BACKGROUND]",
         "started",
         f"backend={backend(rt)}",
-        f"interval_s={background_interval_seconds(rt):.3f}",
+        f"interval_s={interval:.3f}",
+        f"clock={clock_source}",
     )
     try:
         while (
@@ -2515,27 +2645,37 @@ async def background_capture_loop(rt, label="dataset_camera_background"):
             and bool(str(rt.STATE.get("dataset_episode_uid", "") or ""))
             and bool(str(rt.STATE.get("dataset_episode_dir", "") or ""))
         ):
-            started = time.time()
-            submitted, reason = submit_viewport_capture_triplet(rt, sample_index=-1)
-            if submitted:
-                captures += 1
-                rt.STATE["dataset_camera_background_submissions"] = int(captures)
-                failures = 0
-            elif reason != "pending_capture_in_flight":
-                failures += 1
-                rt.STATE["dataset_camera_background_failures"] = int(failures)
-                if failures <= 3 or failures % 30 == 0:
-                    rt.info_print(
-                        "[WARN] [DATASET CAMERA BACKGROUND]",
-                        f"capture_failed={failures}",
-                        f"reason={reason}",
-                    )
-            elapsed = time.time() - started
-            delay = max(background_min_idle_seconds(rt), background_interval_seconds(rt) - elapsed)
-            if delay > 0.0:
-                await asyncio.sleep(delay)
-            else:
-                await asyncio.sleep(0)
+            clock_now, live_clock_source = background_clock_seconds(rt)
+            rt.STATE["dataset_camera_background_last_clock_time"] = float(clock_now)
+            rt.STATE["dataset_camera_background_clock_source"] = str(live_clock_source)
+            pending = rt.STATE.get("dataset_camera_pending_capture")
+            pending_active = isinstance(pending, dict) and not bool(pending.get("done", False))
+            pose_sync_active = bool(rt.STATE.get("dataset_camera_pose_sync_active", False))
+            if (
+                (not pose_sync_active)
+                and (not pending_active)
+                and float(clock_now) + 1.0e-9 >= float(next_capture_time)
+            ):
+                submitted, reason = submit_viewport_capture_triplet(rt, sample_index=-1)
+                if submitted:
+                    captures += 1
+                    rt.STATE["dataset_camera_background_submissions"] = int(captures)
+                    failures = 0
+                    next_capture_time = float(clock_now) + float(interval)
+                    rt.STATE["dataset_camera_background_next_clock_time"] = float(next_capture_time)
+                elif reason != "pending_capture_in_flight":
+                    failures += 1
+                    rt.STATE["dataset_camera_background_failures"] = int(failures)
+                    if failures <= 3 or failures % 30 == 0:
+                        rt.info_print(
+                            "[WARN] [DATASET CAMERA BACKGROUND]",
+                            f"capture_failed={failures}",
+                            f"reason={reason}",
+                        )
+            # Simulation time is advanced by the auto-collect execution task.
+            # A small wall-clock sleep keeps this observer out of the Kit ready
+            # queue until there is useful work, without owning another clock.
+            await asyncio.sleep(background_min_idle_seconds(rt))
     except asyncio.CancelledError:
         raise
     finally:
@@ -2884,11 +3024,15 @@ def config_snapshot(rt):
             "enabled_for_auto_collect": bool(background_capture_enabled(rt)),
             "interval_s": background_interval_seconds(rt),
             "min_idle_s": background_min_idle_seconds(rt),
+            "clock_source": str(rt.STATE.get("dataset_camera_background_clock_source", rt.STATE.get("dataset_camera_clock_source", "simulation"))),
+            "last_clock_time": float(rt.STATE.get("dataset_camera_background_last_clock_time", 0.0) or 0.0),
+            "next_clock_time": float(rt.STATE.get("dataset_camera_background_next_clock_time", 0.0) or 0.0),
             "latest_seq": int(rt.STATE.get("dataset_camera_latest_seq", 0) or 0),
             "running": bool(rt.STATE.get("dataset_camera_background_running", False)),
             "opportunistic_capture": bool(opportunistic_capture_enabled(rt)),
             "opportunistic_submissions": int(rt.STATE.get("dataset_camera_opportunistic_submissions", 0) or 0),
-            "note": "Throughput mode: background capture owns camera submissions at its interval; dataset samples only attach the latest complete triplet unless opportunistic capture is explicitly enabled.",
+            "postprocess": "executor_lanczos_validate",
+            "note": "Background capture is scheduled by simulation time; capture viewports are visible only during GPU readback, and CPU resize/validation runs in an executor.",
         },
         "capture_block_watchdog": {
             "threshold_ms": capture_block_watchdog_ms(rt),

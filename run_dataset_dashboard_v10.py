@@ -6091,6 +6091,7 @@ body.dark .topbar{background:rgba(15,23,42,.96);border-bottom-color:#334155;box-
 body.dark h1,body.dark h2,body.dark h3,body.dark .cameraPreviewTitle,body.dark .cameraCardTitle,body.dark .diagCardValue,body.dark .runMonitorTitle,body.dark .managerTable .nameCell{color:#f8fafc}
 body.dark .panel,body.dark .kpi,body.dark .diagCard,body.dark .subPanel,body.dark .managerPanel,body.dark .episodeSide,body.dark .vlaStatePanel,body.dark .timelinePaneHeader,body.dark .cameraPreview,body.dark .cameraCard,body.dark .miniChart,body.dark .finding,body.dark .action{background:#0f172a;border-color:#334155;color:#e5e7eb}
 body.dark input,body.dark select,body.dark button.secondary,body.dark .cameraPlayerBtn,body.dark .filterBtn,body.dark .runBadge,body.dark .unitLegend,body.dark .meshFrameBadge,body.dark .darkModeToggle{background:#111827;color:#e5e7eb;border-color:#475569}
+body.dark .chartSeriesToggleSvg rect,body.dark .chartUnitBadge{fill:#111827;stroke:#475569}body.dark .chartSeriesToggleSvg text,body.dark .chartUnitBadgeText{fill:#e5e7eb}
 body.dark button{border-color:#334155}
 body.dark .muted,body.dark .panelHint,body.dark .filterCount,body.dark .diagCardDetail,body.dark .diagCardTitle,body.dark .sideFooter,body.dark .sideSortHint,body.dark .chartLegend,body.dark .plotNote{color:#94a3b8}
 body.dark .tableWrap,body.dark .managerTableWrap,body.dark .episodeTabsList,body.dark .vlaStateGrid{background:#0b1220;border-color:#334155}
@@ -6125,7 +6126,7 @@ button.secondary{background:#fff;color:#111827;border-color:#cbd5e1}.linkBtn{bor
 .hero{margin-bottom:14px}.heroGrid{display:grid;grid-template-columns:280px minmax(0,1fr) minmax(0,1fr);gap:14px}.scoreBox{border-radius:14px;border:1px solid #e5e7eb;background:#f8fafc;padding:14px;min-height:160px}.scoreNumber{font-size:54px;line-height:1;font-weight:850;color:#101828}.scoreLabel{font-size:12px;color:#667085;text-transform:uppercase;letter-spacing:.05em}.scoreBar{height:10px;background:#e5e7eb;border-radius:999px;margin-top:14px;overflow:hidden}.scoreFill{height:100%;border-radius:999px;background:#175cd3}.chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}.chip{font-size:11px;border:1px solid #d0d5dd;border-radius:999px;padding:3px 8px;color:#344054;background:#fff}
 .finding,.action{border:1px solid #eaecf0;border-radius:10px;padding:9px 10px;margin-top:8px;background:#fff}.findingTitle{font-size:13px;font-weight:700;color:#101828}.findingDetail{font-size:12px;color:#667085;line-height:1.35;margin-top:3px}.sev-critical{border-left:4px solid #b42318}.sev-high{border-left:4px solid #f04438}.sev-medium{border-left:4px solid #f79009}.sev-info{border-left:4px solid #2e90fa}.action{font-size:13px;line-height:1.45;color:#344054;background:#fcfcfd}
 .barRows{display:grid;gap:8px}.barRow{display:grid;grid-template-columns:minmax(130px,260px) minmax(120px,1fr) 52px;gap:10px;align-items:center}.barLabel{font-size:12px;color:#344054;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.barTrack{height:14px;border-radius:999px;background:#eef2f6;overflow:hidden}.barFill{height:100%;border-radius:999px}.barVal{text-align:right;font-size:12px;color:#475467;font-variant-numeric:tabular-nums}.empty{font-size:12px;color:#98a2b3;padding:12px;border:1px dashed #d0d5dd;border-radius:10px;background:#fcfcfd}
-.chartBox{min-height:280px}.chart{display:block;width:100%;height:auto;border:1px solid #edf2f7;border-radius:10px;background:#fff;overflow:visible}.chartLegend{display:flex;flex-wrap:wrap;gap:10px;margin-top:7px;font-size:12px;color:#475467}.legendItem{display:inline-flex;align-items:center;gap:5px}.legendDot{width:9px;height:9px;border-radius:999px;display:inline-block}.timelineChart{margin-top:10px}.timelineChart .chart{min-height:210px}.timelineGrid{display:grid;grid-template-columns:1fr;gap:10px}.detailGrid{display:grid;grid-template-columns:minmax(420px,5fr) minmax(560px,7fr);gap:14px;align-items:start}
+.chartBox{min-height:280px}.chart{display:block;width:100%;height:auto;border:1px solid #edf2f7;border-radius:10px;background:#fff;overflow:visible}.chartLegend{display:flex;flex-wrap:wrap;gap:10px;margin-top:7px;font-size:12px;color:#475467}.legendItem{display:inline-flex;align-items:center;gap:5px}.legendDot{width:9px;height:9px;border-radius:999px;display:inline-block}.timelineChart{margin-top:10px}.timelineChart .chart{min-height:210px}.timelineGrid{display:grid;grid-template-columns:1fr;gap:10px}.chartSeriesToggleSvg{cursor:pointer;outline:none}.chartSeriesToggleSvg rect{fill:#fff;stroke:#d0d5dd}.chartSeriesToggleSvg text{fill:#475467;font-size:10.5px;font-weight:750;pointer-events:none}.chartSeriesToggleSvg[aria-pressed="true"] rect{fill:#f8fafc}.chartSeriesToggleSvg[aria-pressed="false"]{opacity:.45}.chartSeriesToggleSvg:focus rect{stroke:#175cd3;stroke-width:1.5}.chartUnitBadgeText{pointer-events:none}.detailGrid{display:grid;grid-template-columns:minmax(420px,5fr) minmax(560px,7fr);gap:14px;align-items:start}
 table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.tableWrap{max-height:560px;overflow:auto;border:1px solid #eaecf0;border-radius:10px;background:#fff}th,td{padding:8px 9px;border-bottom:1px solid #eaecf0;text-align:left;vertical-align:top}th{position:sticky;top:0;background:#f8fafc;color:#475467;font-size:11px;text-transform:uppercase;letter-spacing:.04em;z-index:1}td{color:#344054}.sortable{cursor:pointer;user-select:none;color:#175cd3}tbody tr{cursor:pointer}tbody tr:hover{background:#f8fafc}tbody tr.selected{background:#e0f2fe}.reasonCell{max-width:360px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pill{display:inline-block;border-radius:999px;padding:2px 8px;font-size:11px;font-weight:700}.pill.trainable,.pill.success,.gate-pass{background:#ecfdf3;color:#067647}.pill.rejected,.gate-fail{background:#fef3f2;color:#b42318}.pill.failed{background:#fff1f3;color:#912018}.pill.diagnostic,.gate-warn{background:#fffaeb;color:#b54708}.gate-pass,.gate-fail,.gate-warn{border-radius:999px;padding:3px 7px;font-weight:700;font-size:11px}.metricsTable td:nth-child(n+2),.metricsTable th:nth-child(n+2){text-align:right;font-variant-numeric:tabular-nums}.schemaGrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.codeBox{white-space:pre-wrap;font-size:12px;max-height:320px;overflow:auto;background:#0f172a;color:#e2e8f0;padding:12px;border-radius:10px}.reportHint{padding:8px 10px;background:#f8fafc;border:1px solid #eaecf0;border-radius:10px;color:#667085;font-size:12px;margin-top:8px;word-break:break-all}
 @media(max-width:1280px){.kpis{grid-template-columns:repeat(4,minmax(0,1fr))}.heroGrid,.detailGrid{grid-template-columns:1fr}.span3,.span4,.span5,.span6,.span7,.span8{grid-column:span 12}.controls{grid-template-columns:1fr}.controls label{display:none}.barRow{grid-template-columns:minmax(110px,210px) 1fr 44px}}
 @media(max-width:720px){.shell{padding:12px}.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.kpiValue{font-size:20px}.panel{padding:12px}.schemaGrid{grid-template-columns:1fr}}
@@ -6313,6 +6314,10 @@ body main details>summary:after,.managerPanel>summary:after,.detailsPanel>summar
         <div id="cameraPreview" class="cameraPreview"><div class="empty">Select an attempt to preview Cam 0/1/2.</div></div>
         <div class="timelineGrid">
           <div id="bucketChart" class="timelineChart"></div>
+          <div id="bucketTipXyzChart" class="timelineChart"></div>
+          <div id="bucketLoadXyzChart" class="timelineChart"></div>
+          <div id="digTargetXyzChart" class="timelineChart"></div>
+          <div id="unloadLandingXyzChart" class="timelineChart"></div>
           <div id="qChart" class="timelineChart"></div>
           <div id="dqChart" class="timelineChart"></div>
           <div id="ddqChart" class="timelineChart"></div>
@@ -6358,6 +6363,8 @@ const statusPalette = {
 };
 const lineColors = ["#175cd3","#067647","#b54708","#d92d20","#6941c6","#0086c9"];
 const stagePalette = ["#dbeafe","#dcfce7","#fef3c7","#fee2e2","#ede9fe","#cffafe","#fce7f3","#e2e8f0"];
+const chartSeriesVisibility = new Map();
+const chartRenderConfigs = new Map();
 let currentRun = null;
 let currentEpisodeIndex = null;
 let selectedEpisodeTrash = new Set();
@@ -7102,7 +7109,13 @@ function renderEpisode(data){
   updateTrashEpisodeButton(ep);
   renderCameraPreview(data);
   renderVlaObservationPreview(data);
-  const s=data.series||{}; drawLineChart("bucketChart","Bucket sand holding",s.t,[{name:"bucket_from_pile",values:s.bucket_from_pile},{name:"bucket_total",values:s.bucket_total}],data.stage_spans,"particles"); drawVectorChart("qChart","Joint angles",s.t,s.q_deg,data.stage_spans,"deg"); drawVectorChart("dqChart","Joint velocity",s.t,s.dq_deg_s,data.stage_spans,"deg/s"); drawVectorChart("ddqChart","Joint acceleration",s.t,s.ddq_deg_s2,data.stage_spans,"deg/s²"); drawVectorChart("effortChart","Measured joint effort",s.t,s.effort,data.stage_spans,"effort");
+  const s=data.series||{};
+  drawLineChart("bucketChart","Bucket sand holding",s.t,[{name:"bucket_from_pile",values:s.bucket_from_pile},{name:"bucket_total",values:s.bucket_total}],data.stage_spans,"particles");
+  drawVlaSpatialCharts(data.vla_observation_preview||{},data.stage_spans||[]);
+  drawVectorChart("qChart","Joint angles",s.t,s.q_deg,data.stage_spans,"deg");
+  drawVectorChart("dqChart","Joint velocity",s.t,s.dq_deg_s,data.stage_spans,"deg/s");
+  drawVectorChart("ddqChart","Joint acceleration",s.t,s.ddq_deg_s2,data.stage_spans,"deg/s²");
+  drawVectorChart("effortChart","Measured joint effort",s.t,s.effort,data.stage_spans,"effort");
   updateTimelineCursors();
   markSelectedTab(ep.episode_index);
   syncEpisodeInspectorHeight();
@@ -7589,8 +7602,78 @@ function chartFrame(width=760,height=220){const l=88,r=34,t=36,b=58; return {w:w
 function extent(vals){const arr=numeric(vals).filter(v=>Math.abs(v)<1e12); if(!arr.length)return[0,1]; let lo=Math.min(...arr),hi=Math.max(...arr); if(Math.abs(hi-lo)<1e-9){lo-=1;hi+=1} const pad=(hi-lo)*0.08; return[lo-pad,hi+pad]}
 function drawAxes(parts,f,x0,x1,y0,y1,opts={}){parts.push(`<rect x="${f.l}" y="${f.t}" width="${f.pw}" height="${f.ph}" fill="#fcfcfd" stroke="#d0d5dd"/>`); for(let i=0;i<=4;i++){const x=f.l+f.pw*i/4,y=f.t+f.ph*i/4; parts.push(`<line x1="${x.toFixed(1)}" y1="${f.t}" x2="${x.toFixed(1)}" y2="${f.t+f.ph}" stroke="#eef2f6"/>`); parts.push(`<line x1="${f.l}" y1="${y.toFixed(1)}" x2="${f.l+f.pw}" y2="${y.toFixed(1)}" stroke="#eef2f6"/>`)} const xs=opts.xSuffix||""; parts.push(`<text x="${f.l}" y="${f.h-22}" font-size="11" fill="#667085">${fmtAxis(x0)}${esc(xs)}</text>`); parts.push(`<text x="${f.l+f.pw}" y="${f.h-22}" text-anchor="end" font-size="11" fill="#667085">${fmtAxis(x1)}${esc(xs)}</text>`); parts.push(`<text x="${f.l-8}" y="${f.t+f.ph}" text-anchor="end" font-size="11" fill="#667085">${fmtAxis(y0)}</text>`); parts.push(`<text x="${f.l-8}" y="${f.t+10}" text-anchor="end" font-size="11" fill="#667085">${fmtAxis(y1)}</text>`)}
 function drawStageRects(parts,spans,scaleX,top,height){const seen=new Map(); let next=0; for(const span of spans||[]){if(!seen.has(span.stage))seen.set(span.stage,stagePalette[next++%stagePalette.length]); const x=scaleX(span.start),w=Math.max(1,scaleX(span.end)-x); parts.push(`<rect x="${x.toFixed(1)}" y="${top}" width="${w.toFixed(1)}" height="${height}" fill="${seen.get(span.stage)}" opacity="0.44"><title>${esc(span.stage)}</title></rect>`)}}
-function drawLineChart(targetId,title,xs,lines,spans,unit){const f=chartFrame(980,270); xs=xs||[]; const xVals=numeric(xs); const x0=xVals.length?Math.min(...xVals):0,x1=xVals.length?Math.max(...xVals):1; const allY=[]; for(const line of lines){for(const v of line.values||[]) if(finite(Number(v))) allY.push(Number(v))} const [y0,y1]=extent(allY); const sx=x=>f.l+(Number(x)-x0)/(x1-x0||1)*f.pw; const sy=y=>f.t+f.ph-(Number(y)-y0)/(y1-y0||1)*f.ph; const currentX=sx(currentCameraTime()); const parts=[`<svg class="chart timelineSvgClickable" viewBox="0 0 ${f.w} ${f.h}" data-left="${f.l}" data-plot-width="${f.pw}" data-x0="${x0}" data-x1="${x1}" role="img">`,`<text x="14" y="22" font-size="15" font-weight="750" fill="#101828">${esc(title)}</text>`]; let lx=230; if(unit){parts.push(`<rect x="${lx}" y="9" width="${Math.max(48,unit.length*7+26)}" height="18" rx="9" fill="#ffffff" stroke="#d0d5dd"/><text x="${lx+10}" y="22" font-size="11" font-weight="750" fill="#475467">unit: ${esc(unit)}</text>`); lx+=Math.max(58,unit.length*7+36);} lines.forEach((line,li)=>{const color=lineColors[li%lineColors.length]; parts.push(`<circle cx="${lx}" cy="17" r="4.5" fill="${color}"/><text x="${lx+8}" y="21" font-size="11" fill="#475467">${esc(line.name)}</text>`); lx+=Math.max(76,String(line.name||"").length*6+22);}); drawAxes(parts,f,x0,x1,y0,y1,{xSuffix:"s"}); drawStageRects(parts,spans,sx,f.t,f.ph); lines.forEach((line,li)=>{const pts=[];(line.values||[]).forEach((v,i)=>{if(finite(Number(v))&&finite(Number(xs[i])))pts.push(`${sx(xs[i]).toFixed(1)},${sy(v).toFixed(1)}`)}); if(pts.length) parts.push(`<polyline points="${pts.join(" ")}" fill="none" stroke="${lineColors[li%lineColors.length]}" stroke-width="1.9"/>`)}); parts.push(`<line class="timelineCursor" data-left="${f.l}" data-plot-width="${f.pw}" data-x0="${x0}" data-x1="${x1}" x1="${currentX.toFixed(1)}" y1="${f.t}" x2="${currentX.toFixed(1)}" y2="${f.t+f.ph}" stroke="#f04438" stroke-width="2.1" stroke-dasharray="4 3"/>`); parts.push(`</svg>`); const target=$(targetId); if(target){target.innerHTML=parts.join(""); bindTimelineSvgInteractions(target);}}
+function chartSeriesVisibilityKey(targetId,lineName){return `${String(targetId)}::${String(lineName)}`}
+function chartSeriesIsVisible(targetId,lineName){const key=chartSeriesVisibilityKey(targetId,lineName); return !chartSeriesVisibility.has(key)||chartSeriesVisibility.get(key)!==false}
+function drawLineChart(targetId,title,xs,lines,spans,unit){
+  const config={targetId,title,xs:xs||[],lines:lines||[],spans:spans||[],unit:unit||""};
+  chartRenderConfigs.set(String(targetId),config);
+  const f=chartFrame(980,270), xValues=config.xs, xVals=numeric(xValues);
+  const x0=xVals.length?Math.min(...xVals):0, x1=xVals.length?Math.max(...xVals):1;
+  const visibleLines=config.lines.filter(line=>chartSeriesIsVisible(targetId,line.name));
+  const allY=[];
+  for(const line of visibleLines){for(const value of line.values||[]) if(finite(Number(value))) allY.push(Number(value))}
+  const [y0,y1]=extent(allY);
+  const sx=x=>f.l+(Number(x)-x0)/(x1-x0||1)*f.pw;
+  const sy=y=>f.t+f.ph-(Number(y)-y0)/(y1-y0||1)*f.ph;
+  const currentX=sx(currentCameraTime());
+  const parts=[`<svg class="chart timelineSvgClickable" viewBox="0 0 ${f.w} ${f.h}" data-left="${f.l}" data-plot-width="${f.pw}" data-x0="${x0}" data-x1="${x1}" role="img">`,`<text x="14" y="22" font-size="15" font-weight="750" fill="#101828">${esc(title)}</text>`];
+  const unitLabel=unit?`unit: ${String(unit)}`:"";
+  const unitWidth=unitLabel?Math.max(54,unitLabel.length*6.4+20):0;
+  const unitX=unitLabel?f.w-14-unitWidth:f.w-14;
+  if(unitLabel){parts.push(`<rect class="chartUnitBadge" x="${unitX.toFixed(1)}" y="7" width="${unitWidth.toFixed(1)}" height="20" rx="6" fill="#ffffff" stroke="#d0d5dd"/><text class="chartUnitBadgeText" x="${(unitX+unitWidth/2).toFixed(1)}" y="17" text-anchor="middle" dominant-baseline="middle" font-size="11" font-weight="750" fill="#475467">${esc(unitLabel)}</text>`)}
+  const controlGap=6;
+  const controlWidths=config.lines.map(line=>Math.max(48,Math.min(154,String(line.name||"").length*6.2+30)));
+  const controlsWidth=controlWidths.reduce((sum,width)=>sum+width,0)+controlGap*Math.max(0,controlWidths.length-1);
+  const titleEnd=Math.min(430,20+String(title||"").length*8.1);
+  const controlsRight=unitLabel?unitX-10:f.w-14;
+  let controlX=Math.max(titleEnd+12,controlsRight-controlsWidth);
+  config.lines.forEach((line,lineIndex)=>{
+    const width=controlWidths[lineIndex], visible=chartSeriesIsVisible(targetId,line.name), color=lineColors[lineIndex%lineColors.length];
+    parts.push(`<g class="chartSeriesToggleSvg" data-chart-series-index="${lineIndex}" role="button" tabindex="0" aria-label="Toggle ${esc(line.name)}" aria-pressed="${visible?"true":"false"}"><rect x="${controlX.toFixed(1)}" y="7" width="${width.toFixed(1)}" height="20" rx="6" stroke="${color}"/><circle cx="${(controlX+11).toFixed(1)}" cy="17" r="3.5" fill="${color}"/><text x="${(controlX+19).toFixed(1)}" y="17" dominant-baseline="middle">${esc(line.name)}</text></g>`);
+    controlX+=width+controlGap;
+  });
+  drawAxes(parts,f,x0,x1,y0,y1,{xSuffix:"s"});
+  drawStageRects(parts,config.spans,sx,f.t,f.ph);
+  config.lines.forEach((line,lineIndex)=>{
+    if(!chartSeriesIsVisible(targetId,line.name)) return;
+    const points=[];
+    (line.values||[]).forEach((value,index)=>{if(finite(Number(value))&&finite(Number(xValues[index]))) points.push(`${sx(xValues[index]).toFixed(1)},${sy(value).toFixed(1)}`)});
+    if(points.length) parts.push(`<polyline points="${points.join(" ")}" fill="none" stroke="${lineColors[lineIndex%lineColors.length]}" stroke-width="1.9"/>`);
+  });
+  parts.push(`<line class="timelineCursor" data-left="${f.l}" data-plot-width="${f.pw}" data-x0="${x0}" data-x1="${x1}" x1="${currentX.toFixed(1)}" y1="${f.t}" x2="${currentX.toFixed(1)}" y2="${f.t+f.ph}" stroke="#f04438" stroke-width="2.1" stroke-dasharray="4 3"/>`,`</svg>`);
+  const target=$(targetId);
+  if(!target) return;
+  target.innerHTML=parts.join("");
+  const toggleSeries=(control,event)=>{
+    if(event) event.stopPropagation();
+    const line=config.lines[Number(control.dataset.chartSeriesIndex)];
+    if(!line) return;
+    const key=chartSeriesVisibilityKey(targetId,line.name);
+    chartSeriesVisibility.set(key,!chartSeriesIsVisible(targetId,line.name));
+    const latest=chartRenderConfigs.get(String(targetId));
+    if(latest) drawLineChart(latest.targetId,latest.title,latest.xs,latest.lines,latest.spans,latest.unit);
+  };
+  target.querySelectorAll("[data-chart-series-index]").forEach(control=>{
+    control.addEventListener("click",event=>toggleSeries(control,event));
+    control.addEventListener("keydown",event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();toggleSeries(control,event)}});
+  });
+  bindTimelineSvgInteractions(target);
+}
 function drawVectorChart(targetId,title,xs,vectors,spans,unit){drawLineChart(targetId,title,xs,jointNames.map((name,j)=>({name,values:(vectors||[]).map(row=>Array.isArray(row)?row[j]:null)})),spans,unit)}
+function drawVlaSpatialChart(targetId,title,preview,fieldNames,seriesNames,spans){
+  const names=Array.isArray(preview.names)?preview.names:[], rows=Array.isArray(preview.rows)?preview.rows:[];
+  const indices=fieldNames.map(name=>names.indexOf(name));
+  if(!rows.length||indices.some(index=>index<0)){const target=$(targetId); if(target) target.innerHTML='<div class="empty">Spatial XYZ unavailable.</div>'; return}
+  const xs=rows.map(row=>Number(row.t));
+  const lines=indices.map((valueIndex,index)=>({name:seriesNames[index],values:rows.map(row=>row.valid===true&&Array.isArray(row.values)?row.values[valueIndex]:null)}));
+  drawLineChart(targetId,title,xs,lines,spans,"m");
+}
+function drawVlaSpatialCharts(preview,spans){
+  drawVlaSpatialChart("bucketTipXyzChart","Bucket tip XYZ · world",preview,["bucket_tip_x","bucket_tip_y","bucket_tip_z"],["X","Y","Z"],spans);
+  drawVlaSpatialChart("bucketLoadXyzChart","Bucket load point XYZ · world",preview,["bucket_load_x","bucket_load_y","bucket_load_z"],["X","Y","Z"],spans);
+  drawVlaSpatialChart("digTargetXyzChart","Dig target XYZ · initial body frame",preview,["dig_target_local_x","dig_target_local_y","dig_target_local_z"],["X · forward","Y · left","Z · up"],spans);
+  drawVlaSpatialChart("unloadLandingXyzChart","Unload landing XYZ · initial body frame",preview,["unload_landing_local_x","unload_landing_local_y","unload_landing_local_z"],["X · forward","Y · left","Z · up"],spans);
+}
 
 function cleanPolygon(poly){if(!Array.isArray(poly))return[]; const out=[]; for(const pt of poly){if(Array.isArray(pt)&&finite(Number(pt[0]))&&finite(Number(pt[1]))) out.push([Number(pt[0]),Number(pt[1])])} return out}
 function polygonCenter(poly){const clean=cleanPolygon(poly); if(!clean.length)return null; let sx=0,sy=0; for(const p of clean){sx+=p[0];sy+=p[1]} return[sx/clean.length,sy/clean.length]}

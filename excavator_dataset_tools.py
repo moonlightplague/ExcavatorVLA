@@ -30,7 +30,7 @@ SEGMENT_FILES = {
 
 LEROBOT_EXPORT_SCHEMA = "excavator_lerobot_export_v3"
 LEROBOT_CODEBASE_VERSION = "v3.0"
-LEROBOT_TASK_PROMPT_VERSION = "excavator_relative_task_v2"
+LEROBOT_TASK_PROMPT_VERSION = "excavator_relative_task_v3_heading_frame"
 LEROBOT_STATE_SCHEMA_VERSION = "excavator_state_v3_28d_plus_4effort_phase_index10"
 LEROBOT_CANONICAL_PHASE_NAMES = [
     "pre_dig",
@@ -1641,6 +1641,16 @@ def is_generic_lerobot_task_text(text: object) -> bool:
     return normalized == generic or ("marked area" in normalized and "target container" in normalized) or legacy_generated
 
 
+def is_generated_relative_lerobot_task_text(text: object) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    relative_generated = (
+        normalized.startswith("excavate one scoop of sand from the sand pile ")
+        and "then carry and dump the collected material into the truck bed " in normalized
+        and "excavator's initial base pose" in normalized
+    )
+    return bool(relative_generated)
+
+
 def _nested_value(data: object, path: Sequence[str], default=None):
     cur = data
     for key in path:
@@ -1703,9 +1713,9 @@ def _direction_label_from_xy(
     dy = float(point_xy[1]) - float(origin_xy[1])
     if abs(dx) + abs(dy) < 1.0e-6:
         return "nearby"
-    # In this scene, yaw=0 points roughly toward +Y, so local-front angle is
-    # world yaw + 90 degrees.  Positive local angle is left of the excavator.
-    forward_angle = (float(robot_yaw_rad or 0.0) + math.pi * 0.5)
+    # Match the exported local state frame: +X is forward and +Y is left.
+    # robot_yaw_rad rotates that local +X heading into the world XY frame.
+    forward_angle = float(robot_yaw_rad or 0.0)
     angle = math.atan2(dy, dx) - forward_angle
     while angle <= -math.pi:
         angle += 2.0 * math.pi
@@ -1751,7 +1761,11 @@ def build_episode_task_text(
             explicit_values.extend([source.get("task"), source.get("dataset_task_text")])
     for value in explicit_values:
         text = str(value or "").strip()
-        if text and not is_generic_lerobot_task_text(text):
+        if (
+            text
+            and not is_generic_lerobot_task_text(text)
+            and not is_generated_relative_lerobot_task_text(text)
+        ):
             return text
 
     scene = _episode_scene_dict(episode_row, episode_meta)

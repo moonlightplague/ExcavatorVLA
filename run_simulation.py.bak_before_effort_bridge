@@ -21,49 +21,6 @@ import importlib
 import importlib.util
 import builtins
 
-
-def _read_bridge_measured_effort(
-    articulation,
-    joint_indices,
-):
-    import numpy as np
-    """
-    Return measured effort in the exact order used
-    by the effort18 training dataset:
-
-      [swing, boom, arm, bucket]
-    """
-    effort = np.asarray(
-        articulation.get_measured_joint_efforts(
-            joint_indices=joint_indices,
-        ),
-        dtype=np.float32,
-    ).reshape(-1)
-
-    if effort.size < 4:
-        raise RuntimeError(
-            "Expected at least four measured "
-            "joint-effort values, but got "
-            f"shape {effort.shape}: "
-            f"{effort.tolist()}"
-        )
-
-    effort = effort[:4]
-
-    if not np.all(
-        np.isfinite(
-            effort
-        )
-    ):
-        raise RuntimeError(
-            "Measured joint effort contains "
-            "NaN or Inf: "
-            f"{effort.tolist()}"
-        )
-
-    return effort
-
-
 # This standalone pipeline owns sand creation.
 # excavator_runtime.py must not schedule any later sand reset.
 os.environ["EXCAVATOR_SINGLE_SAND_CREATE"] = "1"
@@ -1710,7 +1667,6 @@ def main(args):
                 "joint_positions": q.tolist(),
                 "joint_velocities": qd.tolist(),
                 "observation_state": observation_state,
-                "observation_effort": _read_bridge_measured_effort(robot, np.arange(4, dtype=np.int32)).tolist(),
                 "task_text": task_text,
                 "primary_camera": primary_camera,
                 "rgb_shape": primary_rgb["rgb_shape"],

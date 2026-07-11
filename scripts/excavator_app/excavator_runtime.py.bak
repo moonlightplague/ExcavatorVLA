@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import copy
 import hashlib
 import importlib
@@ -78,13 +78,6 @@ def env_int(name, default):
 
 
 NO_UI = env_bool("EXCAVATOR_NO_UI", False) or env_bool("EXCAVATOR_HEADLESS", False)
-
-# When enabled, run_simulation.py owns the only sand creation.
-# All delayed, UI-ready, world-ready, and auto-collect reset requests become no-ops.
-SINGLE_SAND_CREATE_MODE = env_bool(
-    "EXCAVATOR_SINGLE_SAND_CREATE",
-    False,
-)
 _INITIAL_LOG_MODE_RAW = str(os.environ.get("EXCAVATOR_LOG_MODE", "data") or "data").strip().lower()
 _INITIAL_DEBUG_VISUALS_VISIBLE = _INITIAL_LOG_MODE_RAW in ("debug", "profile", "trace")
 DATASET_SAMPLE_INTERVAL_DEFAULT = max(0.02, env_float("EXCAVATOR_DATASET_SAMPLE_INTERVAL", 0.20))
@@ -410,7 +403,7 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "auto_collect_run_id": "",
     "auto_collect_last_result": "",
     "auto_collect_task": None,
-    "auto_collect_sand_reset_done": bool(SINGLE_SAND_CREATE_MODE),
+    "auto_collect_sand_reset_done": False,
     "auto_collect_initial_pose": None,
     "auto_collect_initial_pose_id": "",
     "auto_scene_random_truck_enabled": True,
@@ -510,7 +503,7 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dig_candidate_result_cache_get_attempts": 0,
     "dig_candidate_result_cache_puts": 0,
     "rigid_obstacle_numpy_cache": None,
-    "sand_site_stable_reset_done": bool(SINGLE_SAND_CREATE_MODE),
+    "sand_site_stable_reset_done": False,
     "sand_site_reset_active": False,
     "sand_site_last_reset_label": "",
     "replay_active": False,
@@ -684,11 +677,7 @@ AUTO_COLLECT_BETWEEN_EPISODE_FRAMES = 90
 AUTO_COLLECT_OWNS_STEP_CLOCK = env_bool("EXCAVATOR_AUTO_COLLECT_OWNS_CLOCK", True)
 AUTO_COLLECT_PASSIVE_MAIN_SLEEP_S = float(os.environ.get("EXCAVATOR_AUTO_COLLECT_PASSIVE_MAIN_SLEEP_S", "0.005") or 0.005)
 AUTO_COLLECT_RUN_CAMERA_PREFLIGHT = env_bool("EXCAVATOR_AUTO_COLLECT_RUN_CAMERA_PREFLIGHT", False)
-AUTO_COLLECT_SAND_RESET_POLICY = (
-    "disabled"
-    if SINGLE_SAND_CREATE_MODE
-    else "once_per_run_after_home"
-)
+AUTO_COLLECT_SAND_RESET_POLICY = "once_per_run_after_home"
 AUTO_COLLECT_REUSE_READY_SAND_RESET = True
 AUTO_COLLECT_PRE_RESET_SETTLE_FRAMES = 45
 AUTO_COLLECT_RESET_SETTLE_FRAMES = 180
@@ -836,22 +825,8 @@ SAND_SNAPSHOT_MAX_AGE = 0.35
 SAND_SNAPSHOT_GRID_RES = 64
 SAND_SNAPSHOT_GRID_MAX_RES = 96
 SAND_SNAPSHOT_CELL_RADIUS_LIMIT = 10
-AUTO_RESET_SAND_AFTER_WORLD_READY = (
-    False
-    if SINGLE_SAND_CREATE_MODE
-    else env_bool(
-        "EXCAVATOR_AUTO_RESET_SAND_AFTER_WORLD_READY",
-        False,
-    )
-)
-AUTO_RESET_SAND_AFTER_UI_READY = (
-    False
-    if SINGLE_SAND_CREATE_MODE
-    else env_bool(
-        "EXCAVATOR_AUTO_RESET_SAND_AFTER_UI_READY",
-        True,
-    )
-)
+AUTO_RESET_SAND_AFTER_WORLD_READY = False
+AUTO_RESET_SAND_AFTER_UI_READY = True
 AUTO_RESET_SAND_UI_READY_DELAY_FRAMES = 60
 SAND_RESET_SETTLE_MIN_FRAMES = 240
 SAND_RESET_SETTLE_MAX_FRAMES = 840
@@ -7778,21 +7753,6 @@ async def wait_for_sand_settled_on_ground(label="sand_settle"):
 
 async def reset_sand_site_stably(label=""):
     label = str(label or "sand_reset")
-
-    if SINGLE_SAND_CREATE_MODE:
-        STATE["auto_collect_sand_reset_done"] = True
-        STATE["sand_site_stable_reset_done"] = True
-        STATE["sand_site_reset_active"] = False
-        STATE["sand_site_last_reset_label"] = (
-            f"blocked_single_create:{label}"
-        )
-        info_print(
-            "[SAND RESET BLOCKED]",
-            f"label={label}",
-            "reason=EXCAVATOR_SINGLE_SAND_CREATE",
-            force_log=True,
-        )
-        return True
     if label in ("after_ui_ready", "after_world_ready") and bool(STATE.get("auto_collect_active", False)):
         info_print("[SAND RESET] skipped", f"label={label}", "reason=auto_collect_active")
         return False
@@ -7946,21 +7906,6 @@ async def reset_sand_site_stably(label=""):
 
 
 def request_sand_site_stable_reset(label="ui"):
-    if SINGLE_SAND_CREATE_MODE:
-        STATE["auto_collect_sand_reset_done"] = True
-        STATE["sand_site_stable_reset_done"] = True
-        STATE["sand_site_reset_active"] = False
-        STATE["sand_site_last_reset_label"] = (
-            f"blocked_single_create:{label}"
-        )
-        info_print(
-            "[SAND RESET REQUEST BLOCKED]",
-            f"label={label}",
-            "reason=EXCAVATOR_SINGLE_SAND_CREATE",
-            force_log=True,
-        )
-        return True
-
     try:
         register_async_task("sand_reset", reset_sand_site_stably(label), replace=True)
         return True
@@ -7973,21 +7918,6 @@ builtins._EXCAVATOR_STABLE_SAND_RESET = request_sand_site_stable_reset
 
 
 async def delayed_startup_sand_reset():
-    if SINGLE_SAND_CREATE_MODE:
-        STATE["auto_collect_sand_reset_done"] = True
-        STATE["sand_site_stable_reset_done"] = True
-        STATE["sand_site_reset_active"] = False
-        STATE["sand_site_last_reset_label"] = (
-            "blocked_single_create:after_ui_ready"
-        )
-        info_print(
-            "[SAND RESET]",
-            "delayed startup reset disabled",
-            "reason=EXCAVATOR_SINGLE_SAND_CREATE",
-            force_log=True,
-        )
-        return True
-
     await step_updates(max(1, int(AUTO_RESET_SAND_UI_READY_DELAY_FRAMES)))
     if not STATE.get("running", False):
         return
@@ -33669,26 +33599,8 @@ async def main():
     if debug_diagnostics_enabled():
         print_motion_constraint_diagnostics("ready")
     apply_debug_visuals_visibility(bool(STATE.get("debug_visuals_visible", False)), force_status=False)
-    if (
-        sand_site_active()
-        and AUTO_RESET_SAND_AFTER_UI_READY
-        and not SINGLE_SAND_CREATE_MODE
-    ):
-        register_async_task(
-            "startup_sand_reset",
-            delayed_startup_sand_reset(),
-            replace=True,
-        )
-    elif SINGLE_SAND_CREATE_MODE:
-        STATE["auto_collect_sand_reset_done"] = True
-        STATE["sand_site_stable_reset_done"] = True
-        STATE["sand_site_reset_active"] = False
-        info_print(
-            "[SAND RESET]",
-            "startup_sand_reset was not registered",
-            "reason=EXCAVATOR_SINGLE_SAND_CREATE",
-            force_log=True,
-        )
+    if sand_site_active() and AUTO_RESET_SAND_AFTER_UI_READY:
+        register_async_task("startup_sand_reset", delayed_startup_sand_reset(), replace=True)
 
     while STATE["running"]:
         auto_collect_owns_clock = bool(AUTO_COLLECT_OWNS_STEP_CLOCK and STATE.get("auto_collect_active", False))

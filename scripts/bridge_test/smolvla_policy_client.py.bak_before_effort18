@@ -43,100 +43,18 @@ def rgb_to_tensor(rgb, device):
 
 
 def make_state(reply, device):
-    """
-    Final effort18 checkpoint input order:
-
-      0:14  = original observation_state
-      14:18 = measured effort
-
-    The measured-effort order must be:
-      [swing, boom, arm, bucket]
-    """
     if "observation_state" not in reply:
         raise RuntimeError(
             "Bridge reply is missing observation_state. "
-            f"Available reply keys: {sorted(reply.keys())}"
+            "The active simulation server has not been updated to send the full 14D observation state. "
+            "Update run_simulation.py or sand_site_tcp_bridge_server.py to include observation_state in the reply."
         )
-
-    base_state = np.asarray(
-        reply["observation_state"],
-        dtype=np.float32,
-    ).reshape(-1)
-
-    # Also support a future server that already sends the full 18D state.
-    if base_state.shape[0] == 18:
-        state18 = base_state
-
-    elif base_state.shape[0] == 14:
-        effort_raw = None
-        effort_key = None
-
-        # Support the likely bridge field names.
-        for key in (
-            "observation_effort",
-            "observation.effort",
-            "joint_efforts",
-            "joint_effort",
-            "measured_effort",
-            "effort",
-        ):
-            if key in reply and reply[key] is not None:
-                effort_raw = reply[key]
-                effort_key = key
-                break
-
-        if effort_raw is None:
-            raise RuntimeError(
-                "The final checkpoint requires an 18D state, but "
-                "the bridge only sent the 14D observation_state and "
-                "no measured-effort field was found. "
-                f"Available reply keys: {sorted(reply.keys())}"
-            )
-
-        effort = np.asarray(
-            effort_raw,
-            dtype=np.float32,
-        ).reshape(-1)
-
-        if effort.shape[0] < 4:
-            raise RuntimeError(
-                f"Expected at least 4 measured-effort values from "
-                f"reply[{effort_key!r}], got shape {effort.shape}: "
-                f"{effort.tolist()}"
-            )
-
-        state18 = np.concatenate(
-            [
-                base_state,
-                effort[:4],
-            ],
-            axis=0,
+    arr = np.asarray(reply["observation_state"], dtype=np.float32).reshape(-1)
+    if arr.shape[0] != 14:
+        raise ValueError(
+            f"Expected observation_state shape (14,), got {arr.shape}: {arr.tolist()}"
         )
-
-    else:
-        raise RuntimeError(
-            "Expected observation_state to contain either "
-            f"14 or 18 values, got {base_state.shape}: "
-            f"{base_state.tolist()}"
-        )
-
-    if state18.shape != (18,):
-        raise RuntimeError(
-            f"Expected final state shape (18,), "
-            f"got {state18.shape}"
-        )
-
-    if not np.all(np.isfinite(state18)):
-        raise RuntimeError(
-            f"18D state contains NaN or Inf: "
-            f"{state18.tolist()}"
-        )
-
-    return (
-        torch.from_numpy(state18)
-        .unsqueeze(0)
-        .to(device=device, dtype=torch.float32)
-    )
+    return torch.from_numpy(arr[:14]).unsqueeze(0).to(device)
 
 
 def load_normalization_stats(ckpt_dir):
@@ -173,52 +91,30 @@ def load_normalization_stats(ckpt_dir):
     return state_mean, state_std, action_mean, action_std
 
 
-def action_to_joint_velocities(action, num_joints):
+def action_to_joint_velocities(action, num_joints, max_vel=1.0):
     """
     Model action order and bridge joint order:
-
       0 = swing
       1 = boom
       2 = arm
       3 = bucket
-
-    The checkpoint output is sent directly after unnormalization.
-    No max-velocity clipping and no extra multiplier are applied.
     """
     a = action.detach().float().cpu().numpy()
 
     if a.ndim == 2:
         a = a[0]
 
-    a = np.asarray(
-        a,
-        dtype=np.float32,
-    ).reshape(-1)
+    a = np.asarray(a, dtype=np.float32).reshape(-1)
 
     if a.shape[0] < 4:
         raise ValueError(
-            f"Expected at least 4 action values, "
-            f"got {a.shape}"
+            f"Expected at least 4 action values, got {a.shape}"
         )
 
-    a = a[:4]
+    a = np.clip(a[:4], -max_vel, max_vel)
 
-    if not np.all(np.isfinite(a)):
-        raise RuntimeError(
-            f"Policy action contains NaN or Inf: "
-            f"{a.tolist()}"
-        )
-
-    vel = np.zeros(
-        num_joints,
-        dtype=np.float32,
-    )
-
-    n = min(
-        num_joints,
-        4,
-    )
-
+    vel = np.zeros(num_joints, dtype=np.float32)
+    n = min(num_joints, 4)
     vel[:n] = a[:n]
 
     return vel
@@ -304,9 +200,17 @@ def main():
         default=os.environ.get("SMOLVLA_VLM", ""),
     )
 
+    parser.add_argument(
+        "--task",
+        default="Dig soil from the marked area and dump it into the target container.",
+    )
+
+    parser.add_argument("--max-vel", type=float, default=1.0)
     parser.add_argument("--ticks", type=int, default=4)
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--sleep", type=float, default=0.01)
+    parser.add_argument("--action-scale", type=float, default=1.0, help="Scale factor applied to action_std during unnormalization")
+    parser.add_argument("--action-multiplier", type=float, default=3.0, help="Multiplier applied to action after unnormalization")
     parser.add_argument("--dump-dir", default="", help="Save first 10 frames' inputs to this directory, then exit.")
 
     args = parser.parse_args()
@@ -335,14 +239,16 @@ def main():
         state_std_t = torch.from_numpy(state_std).to(device=device, dtype=torch.float32) if state_std is not None else None
         action_mean_t = torch.from_numpy(action_mean).to(device=device, dtype=torch.float32) if action_mean is not None else None
         action_std_t = torch.from_numpy(action_std).to(device=device, dtype=torch.float32) if action_std is not None else None
+        if action_std_t is not None:
+            action_std_t = action_std_t * args.action_scale
+            print(f"[INFO] action_scale={args.action_scale}, scaled_std={action_std_t.cpu().numpy().round(4).tolist()}")
         has_norm = state_mean_t is not None and state_std_t is not None and action_mean_t is not None and action_std_t is not None
     except Exception as e:
         print(f"[WARN] failed to load normalization stats: {e}")
         has_norm = False
 
-    print("[INFO] task text will be read from the simulator bridge")
-    language_tokens = None
-    language_mask = None
+    print("[INFO] loading language tokenizer...")
+    language_tokens, language_mask = load_language_tokens(args.task, args.vlm, device)
 
     if hasattr(policy, "reset"):
         policy.reset()
@@ -362,41 +268,16 @@ def main():
         os.makedirs(dump_dir, exist_ok=True)
 
     try:
-        task_text = None
-
+        task_text = args.task
         for step in range(args.steps):
             write_json(sock, cmd)
             reply = read_json(sock)
 
-            bridge_task = str(
-                reply.get(
-                    "task_text",
-                    "",
-                )
-            ).strip()
-
-            if not bridge_task:
-                raise RuntimeError(
-                    "Bridge reply is missing task_text. "
-                    f"Available reply keys: "
-                    f"{sorted(reply.keys())}"
-                )
-
-            if bridge_task != task_text:
-                task_text = bridge_task
-
-                print(
-                    f"[INFO] task_text from bridge: "
-                    f"{task_text}"
-                )
-
-                language_tokens, language_mask = (
-                    load_language_tokens(
-                        task_text,
-                        args.vlm,
-                        device,
-                    )
-                )
+            if step == 0 and reply.get("task_text"):
+                task_text = str(reply["task_text"])
+                if task_text != args.task:
+                    print(f"[INFO] task_text from bridge: {task_text}")
+                    language_tokens, language_mask = load_language_tokens(task_text, args.vlm, device)
 
             rgb = decode_rgb(reply)
             camera_rgbs = decode_camera_images(reply, np_module=np)
@@ -432,9 +313,9 @@ def main():
 
             batch = {
                 "observation.state": state,
-                "observation.images.0": image0,
-                "observation.images.1": image1,
-                "observation.images.2": image2,
+                "observation.images.camera1": image0,
+                "observation.images.camera2": image1,
+                "observation.images.camera3": image2,
 
                 "task": [task_text],
 
@@ -448,12 +329,15 @@ def main():
             if has_norm:
                 action = action * action_std_t + action_mean_t
 
+            action = action * args.action_multiplier
+
             q = reply.get("joint_positions", [])
             num_joints = len(q) if len(q) > 0 else 4
 
             vel = action_to_joint_velocities(
                 action,
                 num_joints=num_joints,
+                max_vel=args.max_vel,
             )
 
             cmd = {

@@ -15,60 +15,10 @@ Important:
 import argparse
 import sys
 import os
-import math
 import ctypes
 import importlib
 import importlib.util
 import builtins
-
-
-def _read_bridge_measured_effort(
-    articulation,
-    joint_indices,
-):
-    import numpy as np
-    """
-    Return measured effort in the exact order used
-    by the effort18 training dataset:
-
-      [swing, boom, arm, bucket]
-    """
-    effort = np.asarray(
-        articulation.get_measured_joint_efforts(
-            joint_indices=joint_indices,
-        ),
-        dtype=np.float32,
-    ).reshape(-1)
-
-    if effort.size < 4:
-        raise RuntimeError(
-            "Expected at least four measured "
-            "joint-effort values, but got "
-            f"shape {effort.shape}: "
-            f"{effort.tolist()}"
-        )
-
-    effort = effort[:4]
-
-    if not np.all(
-        np.isfinite(
-            effort
-        )
-    ):
-        raise RuntimeError(
-            "Measured joint effort contains "
-            "NaN or Inf: "
-            f"{effort.tolist()}"
-        )
-
-    return effort
-
-
-# This standalone pipeline owns sand creation.
-# excavator_runtime.py must not schedule any later sand reset.
-os.environ["EXCAVATOR_SINGLE_SAND_CREATE"] = "1"
-os.environ["EXCAVATOR_AUTO_RESET_SAND_AFTER_WORLD_READY"] = "0"
-os.environ["EXCAVATOR_AUTO_RESET_SAND_AFTER_UI_READY"] = "0"
 
 try:
     from PIL import Image
@@ -207,11 +157,7 @@ CAMERA_PRIM_PATHS = {
     "1": "/World/URDF_real3/swing_link/Camera_1",
     "2": "/World/URDF_real3/swing_link/Camera_2",
 }
-
-# The visible Isaac Sim viewport remains on this camera while a separate
-# off-screen capture viewport cycles through all three model cameras.
-DISPLAY_CAMERA_NAME = "0"
-CAMERA_PRIM_PATH = CAMERA_PRIM_PATHS[DISPLAY_CAMERA_NAME]
+CAMERA_PRIM_PATH = CAMERA_PRIM_PATHS["1"]
 
 
 # TCP Bridge settings
@@ -438,18 +384,14 @@ def main(args):
     import omni.kit.app
     import omni.timeline
 
-    from pxr import Usd, UsdGeom, Gf, UsdLux, UsdPhysics, PhysxSchema, Sdf
+    from pxr import UsdGeom, Gf, UsdLux, UsdPhysics, PhysxSchema, Sdf
 
     from isaacsim.core.api.world import World
     from isaacsim.core.prims import SingleArticulation
     from isaacsim.core.utils.stage import add_reference_to_stage, get_current_stage
     from isaacsim.core.utils.types import ArticulationAction
 
-    from omni.kit.viewport.utility import (
-        get_active_viewport,
-        capture_viewport_to_buffer,
-        create_viewport_window,
-    )
+    from omni.kit.viewport.utility import get_active_viewport, capture_viewport_to_buffer
 
     def wait_for_stage_loading_complete(
         label,
@@ -883,10 +825,7 @@ def main(args):
         print("[WARN] Could not get robot.joint_names:", repr(e), flush=True)
 
     # -----------------------------------------------------------------
-    # Viewport setup
-    #
-    # The visible viewport stays on one fixed camera. A second off-screen
-    # viewport is used only for the three-camera model input capture.
+    # Viewport capture setup
     # -----------------------------------------------------------------
     viewport = get_active_viewport()
     if viewport is None:
@@ -907,50 +846,14 @@ def main(args):
         simulation_app.close()
         return
 
-    display_camera_name = (
-        DISPLAY_CAMERA_NAME
-        if DISPLAY_CAMERA_NAME in active_camera_paths
-        else next(iter(active_camera_paths))
-    )
-    display_camera_path = active_camera_paths[display_camera_name]
-    viewport.camera_path = display_camera_path
+    active_capture_camera_name = next(iter(active_camera_paths))
+    active_capture_camera_path = active_camera_paths[active_capture_camera_name]
+    viewport.camera_path = active_capture_camera_path
 
-    capture_camera_name = next(iter(active_camera_paths))
-    capture_camera_path = active_camera_paths[capture_camera_name]
-
-    capture_viewport_window = create_viewport_window(
-        name="SmolVLA Capture Viewport",
-        usd_context_name="",
-        width=CAPTURE_WIDTH,
-        height=CAPTURE_HEIGHT,
-        position_x=-3000,
-        position_y=-3000,
-        camera_path=Sdf.Path(capture_camera_path),
-    )
-
-    if capture_viewport_window is None:
-        raise RuntimeError(
-            "Failed to create the dedicated SmolVLA capture viewport. "
-            "The visible viewport will not be used for camera switching."
-        )
-
-    capture_viewport = capture_viewport_window.viewport_api
-    capture_viewport.camera_path = capture_camera_path
-
-    print("[INFO] Model capture cameras:", flush=True)
+    print("[INFO] Active viewport capture cameras:", flush=True)
     for camera_name, camera_path in active_camera_paths.items():
         print(f"  {camera_name}: {camera_path}", flush=True)
-
-    print(
-        "[INFO] Visible viewport fixed to:",
-        f"{display_camera_name}: {display_camera_path}",
-        flush=True,
-    )
-    print(
-        "[INFO] Dedicated off-screen capture viewport created:",
-        capture_camera_path,
-        flush=True,
-    )
+    print(f"[INFO] Initial viewport camera set to: {active_capture_camera_path}", flush=True)
 
     if not timeline.is_playing():
         timeline.play()
@@ -974,7 +877,7 @@ def main(args):
 
     # Test viewport capture from every active camera.
     test_rgbs = capture_rgb_from_cameras(
-        viewport=capture_viewport,
+        viewport=viewport,
         camera_paths=active_camera_paths,
         world=world,
         simulation_app=simulation_app,
@@ -984,12 +887,6 @@ def main(args):
         height=CAPTURE_HEIGHT,
         wait_frames=CAPTURE_WAIT_FRAMES,
     )
-
-    viewport.camera_path = display_camera_path
-
-    for _ in range(2):
-        world.step(render=True)
-        simulation_app.update()
 
     for camera_name, test_rgb in test_rgbs.items():
         print(
@@ -1014,116 +911,6 @@ def main(args):
         label="final sand creation",
         timeout_updates=3600,
         stable_updates=120,
-    )
-
-    def inspect_existing_particle_sand():
-        """
-        Detect particle sand already authored in the loaded USD scene.
-
-        Runtime STATE cannot detect this automatically, so checking only
-        real_sand_enabled may incorrectly trigger a second generation.
-        """
-        sand_root = "/World/SandSite"
-        candidates = []
-
-        root_prim = stage.GetPrimAtPath(sand_root)
-        if not root_prim.IsValid():
-            return {
-                "exists": False,
-                "particle_count": 0,
-                "points_path": "",
-                "particle_system_path": "",
-            }
-
-        particle_system_path = ""
-        for prim in stage.Traverse():
-            path = str(prim.GetPath())
-
-            if not (
-                path == sand_root
-                or path.startswith(sand_root + "/")
-            ):
-                continue
-
-            if prim.GetTypeName() == "PhysxParticleSystem":
-                particle_system_path = path
-            elif "particlesystem" in path.lower():
-                particle_system_path = particle_system_path or path
-
-            if prim.IsA(UsdGeom.Points):
-                try:
-                    points = UsdGeom.Points(prim).GetPointsAttr().Get()
-                    count = len(points) if points is not None else 0
-                except Exception:
-                    count = 0
-
-                candidates.append((count, path))
-
-        candidates.sort(reverse=True)
-
-        if candidates and candidates[0][0] > 0:
-            particle_count, points_path = candidates[0]
-            return {
-                "exists": True,
-                "particle_count": int(particle_count),
-                "points_path": points_path,
-                "particle_system_path": particle_system_path,
-            }
-
-        return {
-            "exists": False,
-            "particle_count": 0,
-            "points_path": "",
-            "particle_system_path": particle_system_path,
-        }
-
-
-    def synchronize_runtime_with_existing_sand(
-        sand_module,
-        existing_sand,
-    ):
-        """
-        Make sand_site_runtime status reflect the particle set loaded from USD.
-        This does not create, clear, or rebuild any prim.
-        """
-        state = getattr(sand_module, "STATE", None)
-
-        if isinstance(state, dict):
-            state["real_sand_enabled"] = True
-            state["real_sand_particle_count"] = int(
-                existing_sand["particle_count"]
-            )
-            state["real_sand_error"] = ""
-            state["real_sand_points_path"] = str(
-                existing_sand["points_path"]
-            )
-            state["particle_system_path"] = str(
-                existing_sand["particle_system_path"]
-            )
-
-        store_runtime_api = getattr(
-            sand_module,
-            "store_runtime_api",
-            None,
-        )
-        if callable(store_runtime_api):
-            store_runtime_api()
-
-        print(
-            "[SAND] Reusing USD-authored particle sand:",
-            f"points={existing_sand['points_path']}",
-            f"particles={existing_sand['particle_count']}",
-            f"system={existing_sand['particle_system_path']}",
-            flush=True,
-        )
-
-
-    existing_sand_before_runtime = inspect_existing_particle_sand()
-
-    print(
-        "[SAND] USD sand before runtime import:",
-        existing_sand_before_runtime,
-        flush=True,
     )
 
     # -----------------------------------------------------------------
@@ -1224,16 +1011,6 @@ def main(args):
     )
 
     if sand_amount > 0:
-        existing_sand_after_runtime = (
-            inspect_existing_particle_sand()
-        )
-
-        if existing_sand_after_runtime["exists"]:
-            synchronize_runtime_with_existing_sand(
-                sand_module,
-                existing_sand_after_runtime,
-            )
-
         sand_api = getattr(
             builtins,
             "_SAND_SITE",
@@ -1265,48 +1042,11 @@ def main(args):
             flush=True,
         )
 
-        creation_guard = getattr(
-            builtins,
-            "_EXCAVATOR_SAND_CREATED_ONCE",
-            None,
-        )
-
-        if (
-            existing_sand_after_runtime["exists"]
-            and existing_sand_after_runtime["particle_count"] > 0
-        ):
-            builtins._EXCAVATOR_SAND_CREATED_ONCE = {
-                "source": "usd_scene",
-                "particle_count": int(
-                    existing_sand_after_runtime[
-                        "particle_count"
-                    ]
-                ),
-                "points_path": str(
-                    existing_sand_after_runtime[
-                        "points_path"
-                    ]
-                ),
-            }
-            print(
-                "[SAND] USD scene already contains particle sand; "
-                "explicit creation is disabled",
-                flush=True,
-            )
-        elif already_enabled and existing_particle_count > 0:
-            builtins._EXCAVATOR_SAND_CREATED_ONCE = {
-                "source": "runtime_import",
-                "particle_count": existing_particle_count,
-            }
+        if already_enabled and existing_particle_count > 0:
             print(
                 "[SAND] Runtime already created particle sand; "
                 "skipping explicit creation",
                 flush=True,
-            )
-        elif creation_guard is not None:
-            raise RuntimeError(
-                "Sand creation was already attempted in this process: "
-                f"{creation_guard}"
             )
         else:
             create_once = (
@@ -1330,29 +1070,7 @@ def main(args):
                 flush=True,
             )
 
-            final_existing_check = (
-                inspect_existing_particle_sand()
-            )
-
-            if final_existing_check["exists"]:
-                raise RuntimeError(
-                    "Refusing to create particle sand because the "
-                    "USD scene already contains particles: "
-                    f"{final_existing_check}"
-                )
-
-            builtins._EXCAVATOR_SAND_CREATED_ONCE = {
-                "source": "run_simulation",
-                "state": "creating",
-            }
-
             creation_result = create_once()
-
-            builtins._EXCAVATOR_SAND_CREATED_ONCE = {
-                "source": "run_simulation",
-                "state": "created",
-                "result": str(creation_result),
-            }
 
             if hasattr(creation_result, "__await__"):
                 raise RuntimeError(
@@ -1549,24 +1267,16 @@ def main(args):
     print("[INFO] Simulation running. Press Ctrl+C to exit.")
 
     # Run simulation loop.
-    PHYSICS_DT = 1.0 / 60.0
     while simulation_app.is_running():
         if not command_queue.empty():
             cmd = command_queue.get()
 
+            action = make_action_from_command(cmd)
+            if action is not None:
+                robot.apply_action(action)
+
             ticks = int(cmd.get("ticks", 4))
             ticks = max(1, min(ticks, 120))
-
-            if cmd.get("joint_velocities") is not None and cmd.get("joint_positions") is None:
-                q_now = np.asarray(robot.get_joint_positions(), dtype=np.float32).reshape(-1)[:4]
-                vel = np.asarray(cmd["joint_velocities"], dtype=np.float32).reshape(-1)[:4]
-                q_target = q_now + vel * float(ticks) * PHYSICS_DT
-                action = ArticulationAction(joint_positions=q_target)
-                robot.apply_action(action)
-            else:
-                action = make_action_from_command(cmd)
-                if action is not None:
-                    robot.apply_action(action)
 
             for _ in range(ticks):
                 world.step(render=True)
@@ -1575,10 +1285,8 @@ def main(args):
             q = np.asarray(robot.get_joint_positions(), dtype=np.float32)
             qd = np.asarray(robot.get_joint_velocities(), dtype=np.float32)
 
-            viewport.camera_path = display_camera_path
-
             rgb_by_camera = capture_rgb_from_cameras(
-                viewport=capture_viewport,
+                viewport=viewport,
                 camera_paths=active_camera_paths,
                 world=world,
                 simulation_app=simulation_app,
@@ -1588,8 +1296,6 @@ def main(args):
                 height=CAPTURE_HEIGHT,
                 wait_frames=CAPTURE_WAIT_FRAMES,
             )
-
-            viewport.camera_path = display_camera_path
 
             encoded_cameras = {}
             for camera_name, rgb in rgb_by_camera.items():
@@ -1614,104 +1320,9 @@ def main(args):
             )
             primary_rgb = encoded_cameras[primary_camera]
 
-            # Compute full 14D observation_state matching dataset schema:
-            # [base_x, base_y, base_yaw, swing, boom, arm, bucket,
-            #  bucket_load_estimate, tip_x, tip_y, tip_z, load_x, load_y, load_z]
-            try:
-                base_pos, base_ori = robot.get_world_pose()
-                base_x = float(base_pos[0])
-                base_y = float(base_pos[1])
-                qw = float(base_ori[3])
-                qx = float(base_ori[0])
-                qy = float(base_ori[1])
-                qz = float(base_ori[2])
-                base_yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
-            except Exception:
-                base_x, base_y, base_yaw = 0.0, 0.0, 0.0
-
-            joint_positions = np.asarray(q, dtype=np.float32).reshape(-1)[:4]
-
-            tip_xyz = [0.0, 0.0, 0.0]
-            load_xyz = [0.0, 0.0, 0.0]
-            try:
-                bucket_prim = stage.GetPrimAtPath("/World/URDF_real3/bucket_link")
-                if bucket_prim.IsValid():
-                    xform = UsdGeom.Xformable(bucket_prim)
-                    world_xf = xform.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
-                    tip_local = Gf.Vec3d(0.75, 0.0, -0.18)
-                    load_local = Gf.Vec3d(0.35, 0.0, 0.08)
-                    tip_world = world_xf.Transform(tip_local)
-                    load_world = world_xf.Transform(load_local)
-                    tip_xyz = [float(tip_world[0]), float(tip_world[1]), float(tip_world[2])]
-                    load_xyz = [float(load_world[0]), float(load_world[1]), float(load_world[2])]
-            except Exception:
-                pass
-
-            observation_state = [
-                base_x,
-                base_y,
-                base_yaw,
-                float(joint_positions[0]),
-                float(joint_positions[1]),
-                float(joint_positions[2]),
-                float(joint_positions[3]),
-                0.0,
-                tip_xyz[0],
-                tip_xyz[1],
-                tip_xyz[2],
-                load_xyz[0],
-                load_xyz[1],
-                load_xyz[2],
-            ]
-
-            task_text = "Dig soil from the marked area and dump it into the target container."
-            try:
-                sand_x = float(getattr(sand_module, "SAND_CENTER_X", 0.0))
-                sand_y = float(getattr(sand_module, "SAND_CENTER_Y", 6.7))
-                sand_xy = (sand_x, sand_y)
-                truck_prim = stage.GetPrimAtPath("/World/DumpTruck")
-                if truck_prim.IsValid():
-                    truck_xf = UsdGeom.Xformable(truck_prim)
-                    truck_pos = truck_xf.ComputeLocalToWorldTransform(Usd.TimeCode.Default()).ExtractTranslation()
-                    unload_xy = (float(truck_pos[0]), float(truck_pos[1]))
-                else:
-                    unload_xy = None
-
-                robot_xy = (base_x, base_y)
-                robot_yaw = base_yaw
-
-                def _dir_label(point_xy, origin_xy):
-                    if point_xy is None or origin_xy is None:
-                        return "nearby"
-                    dx = point_xy[0] - origin_xy[0]
-                    dy = point_xy[1] - origin_xy[1]
-                    dist = abs(dx) + abs(dy)
-                    if dist < 1e-6:
-                        return "nearby"
-                    fwd = robot_yaw + math.pi * 0.5
-                    angle = math.atan2(dy, dx) - fwd
-                    labels = ["front", "front-left", "left", "rear-left",
-                              "rear", "rear-right", "right", "front-right"]
-                    idx = int(math.floor((math.degrees(angle) + 22.5) % 360.0 / 45.0))
-                    return labels[idx % len(labels)]
-
-                sand_dir = _dir_label(sand_xy, robot_xy)
-                unload_dir = _dir_label(unload_xy, robot_xy)
-                sand_s = f"({sand_x:.2f}, {sand_y:.2f})"
-                unload_s = f"({unload_xy[0]:.2f}, {unload_xy[1]:.2f})" if unload_xy else "the target container"
-                task_text = (
-                    f"Dig soil from the sand pile near {sand_s}, {sand_dir} of the excavator, "
-                    f"and dump it into the truck bed near {unload_s}, {unload_dir} of the excavator."
-                )
-            except Exception:
-                pass
-
             reply = {
                 "joint_positions": q.tolist(),
                 "joint_velocities": qd.tolist(),
-                "observation_state": observation_state,
-                "observation_effort": _read_bridge_measured_effort(robot, np.arange(4, dtype=np.int32)).tolist(),
-                "task_text": task_text,
                 "primary_camera": primary_camera,
                 "rgb_shape": primary_rgb["rgb_shape"],
                 "rgb_dtype": primary_rgb["rgb_dtype"],
@@ -1764,3 +1375,4 @@ if __name__ == "__main__":
         parser.error("--sand-settle-frames must be at least 1")
 
     main(args)
+

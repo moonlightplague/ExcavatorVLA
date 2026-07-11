@@ -26,7 +26,6 @@ def _read_bridge_measured_effort(
     articulation,
     joint_indices,
 ):
-    import numpy as np
     """
     Return measured effort in the exact order used
     by the effort18 training dataset:

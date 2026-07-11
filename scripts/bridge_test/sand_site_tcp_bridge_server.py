@@ -15,6 +15,7 @@ for SmolVLA clients.
 
 import asyncio
 import ctypes
+import math
 import os
 import sys
 
@@ -74,6 +75,33 @@ def _robot():
     if robot is None:
         raise RuntimeError("excavator runtime ROBOT is not ready yet.")
     return robot
+
+
+def _direction_label_from_xy(point_xy, origin_xy, robot_yaw_rad):
+    if point_xy is None or origin_xy is None or len(point_xy) < 2 or len(origin_xy) < 2:
+        return "nearby"
+    dx = float(point_xy[0]) - float(origin_xy[0])
+    dy = float(point_xy[1]) - float(origin_xy[1])
+    if abs(dx) + abs(dy) < 1.0e-6:
+        return "nearby"
+    forward_angle = (float(robot_yaw_rad or 0.0) + math.pi * 0.5)
+    angle = math.atan2(dy, dx) - forward_angle
+    while angle <= -math.pi:
+        angle += 2.0 * math.pi
+    while angle > math.pi:
+        angle -= 2.0 * math.pi
+    labels = [
+        "front",
+        "front-left",
+        "left",
+        "rear-left",
+        "rear",
+        "rear-right",
+        "right",
+        "front-right",
+    ]
+    index = int(math.floor(((math.degrees(angle) + 22.5) % 360.0) / 45.0))
+    return labels[index % len(labels)]
 
 
 def _camera_paths():
@@ -188,6 +216,37 @@ async def _handle_client(reader, writer):
             q = np.asarray(robot.get_joint_positions(), dtype=np.float32)
             qd = np.asarray(robot.get_joint_velocities(), dtype=np.float32)
 
+            rt = _runtime_module()
+            obs_state = None
+            task_text = ""
+            try:
+                obs_fn = getattr(rt, "dataset_observation_state", None)
+                if callable(obs_fn):
+                    obs_state = obs_fn(q_real=q)
+                if obs_state is not None and len(obs_state) >= 3:
+                    robot_xy = [float(obs_state[0]), float(obs_state[1])]
+                    robot_yaw = float(obs_state[2])
+                    sand_module = sys.modules.get("excavator_app.sand_site_runtime")
+                    if sand_module is not None:
+                        sand_xy = [float(sand_module.SAND_CENTER_X), float(sand_module.SAND_CENTER_Y)]
+                    else:
+                        sand_xy = None
+                    try:
+                        unload = rt.unload_bin_dump_point()
+                        unload_xy = [float(unload[0]), float(unload[1])]
+                    except Exception:
+                        unload_xy = None
+                    sand_dir = _direction_label_from_xy(sand_xy, robot_xy, robot_yaw)
+                    unload_dir = _direction_label_from_xy(unload_xy, robot_xy, robot_yaw)
+                    sand_str = f"({sand_xy[0]:.2f}, {sand_xy[1]:.2f})" if sand_xy else "the marked area"
+                    unload_str = f"({unload_xy[0]:.2f}, {unload_xy[1]:.2f})" if unload_xy else "the target container"
+                    task_text = (
+                        f"Dig soil from the sand pile near {sand_str}, {sand_dir} of the excavator, "
+                        f"and dump it into the truck bed near {unload_str}, {unload_dir} of the excavator."
+                    )
+            except Exception as exc:
+                print("[sand-site-bridge] observation_state/task_text compute failed:", repr(exc), flush=True)
+
             rgbs = await _capture_cameras(viewport, camera_paths)
             primary_name = "1" if "1" in rgbs else next(iter(rgbs))
             primary_rgb = rgbs[primary_name]
@@ -202,6 +261,10 @@ async def _handle_client(reader, writer):
                 "primary_camera": primary_name,
                 "cameras": cameras,
             }
+            if obs_state is not None:
+                reply["observation_state"] = obs_state
+            if task_text:
+                reply["task_text"] = task_text
             reply.update(encode_rgb_payload(primary_rgb, np_module=np, camera_path=camera_paths[primary_name]))
             await async_write_json(writer, reply)
 

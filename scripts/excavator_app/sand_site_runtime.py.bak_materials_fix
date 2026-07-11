@@ -3991,15 +3991,10 @@ def create_real_sand_only():
     after_paths = stage_prim_paths()
     created_paths = after_paths - before_paths
 
-    material_parent_path = str(
-        Sdf.Path(material_path).GetParentPath()
-    )
-
     allowed_exact_paths = {
         root,
         points_path,
         system_path,
-        material_parent_path,
         material_path,
     }
 

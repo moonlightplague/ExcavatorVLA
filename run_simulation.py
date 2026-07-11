@@ -1546,21 +1546,28 @@ def main(args):
 
     asyncio.ensure_future(start_bridge_server())
 
-    print("[INFO] Simulation running. Press Ctrl+C to exit.")
+    # From this point onward the bridge owns simulation time.  Keeping the
+    # timeline paused also lets viewport captures and UI updates render without
+    # advancing physics while the VLA client is running inference.
+    timeline.pause()
+
+    print(
+        "[INFO] Simulation running in bridge-lockstep mode: "
+        "each command advances exactly 1/30 s. Press Ctrl+C to exit."
+    )
 
     # Run simulation loop.
     PHYSICS_DT = 1.0 / 60.0
+    BRIDGE_STEP_SECONDS = 1.0 / 30.0
+    BRIDGE_STEP_TICKS = int(round(BRIDGE_STEP_SECONDS / PHYSICS_DT))
     while simulation_app.is_running():
         if not command_queue.empty():
             cmd = command_queue.get()
 
-            ticks = int(cmd.get("ticks", 4))
-            ticks = max(1, min(ticks, 120))
-
             if cmd.get("joint_velocities") is not None and cmd.get("joint_positions") is None:
                 q_now = np.asarray(robot.get_joint_positions(), dtype=np.float32).reshape(-1)[:4]
                 vel = np.asarray(cmd["joint_velocities"], dtype=np.float32).reshape(-1)[:4]
-                q_target = q_now + vel * float(ticks) * PHYSICS_DT
+                q_target = q_now + vel * BRIDGE_STEP_SECONDS
                 action = ArticulationAction(joint_positions=q_target)
                 robot.apply_action(action)
             else:
@@ -1568,9 +1575,15 @@ def main(args):
                 if action is not None:
                     robot.apply_action(action)
 
-            for _ in range(ticks):
-                world.step(render=True)
-                simulation_app.update()
+            # Advance two 60 Hz physics ticks (exactly 1/30 s), then freeze
+            # before observation capture and before waiting for another input.
+            timeline.play()
+            try:
+                for _ in range(BRIDGE_STEP_TICKS):
+                    world.step(render=True)
+                    simulation_app.update()
+            finally:
+                timeline.pause()
 
             q = np.asarray(robot.get_joint_positions(), dtype=np.float32)
             qd = np.asarray(robot.get_joint_velocities(), dtype=np.float32)
@@ -1722,6 +1735,8 @@ def main(args):
             response_queue.put(reply)
 
         else:
+            # With the timeline paused this pumps rendering, networking, and UI
+            # events without allowing simulation time to elapse.
             world.step(render=True)
             simulation_app.update()
 

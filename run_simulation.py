@@ -152,6 +152,9 @@ SCENE_USD_PATH = os.path.join(PROJECT_DIR, "assets/usd/excavator_scene.usd")
 ROBOT_PRIM_PATH = "/World/URDF_real3"
 SAND_RUNTIME_PATH = os.path.join(PROJECT_DIR, "scripts", "excavator_app", "sand_site_runtime.py")
 
+# The excavator starts with zero yaw and its arm facing world +X.
+# World +Y is therefore slightly left of the arm.
+SAND_INITIAL_CENTER = (-0.5, 9.2)
 
 def _load_sand_runtime():
     """
@@ -417,6 +420,259 @@ def capture_rgb_from_cameras(viewport, camera_paths, world, simulation_app, capt
     return rgb_by_camera
 
 
+
+_JOINT_LIMITS_PRINTED = False
+
+
+def _print_joint_limits_once(
+    articulation,
+):
+    """
+    Print articulation joint names, current positions,
+    and USD lower/upper limits once.
+
+    The first four controlled joints are expected to be:
+
+      0 = swing
+      1 = boom
+      2 = arm
+      3 = bucket
+    """
+    global _JOINT_LIMITS_PRINTED
+
+    if _JOINT_LIMITS_PRINTED:
+        return
+
+    import numpy as np
+
+    limits = None
+    source = None
+
+    # --------------------------------------------------------
+    # API 1
+    # --------------------------------------------------------
+
+    if hasattr(
+        articulation,
+        "get_dof_limits",
+    ):
+        try:
+            limits = np.asarray(
+                articulation.get_dof_limits(),
+                dtype=np.float32,
+            )
+
+            source = (
+                "articulation."
+                "get_dof_limits()"
+            )
+
+        except Exception as exc:
+            print(
+                "[JOINT LIMITS] "
+                "get_dof_limits failed:",
+                repr(exc),
+            )
+
+    # --------------------------------------------------------
+    # API 2
+    # --------------------------------------------------------
+
+    if limits is None:
+
+        try:
+            view = (
+                articulation
+                ._articulation_view
+            )
+
+            limits = np.asarray(
+                view.get_dof_limits(),
+                dtype=np.float32,
+            )
+
+            source = (
+                "_articulation_view."
+                "get_dof_limits()"
+            )
+
+        except Exception as exc:
+            print(
+                "[JOINT LIMITS] "
+                "articulation view failed:",
+                repr(exc),
+            )
+
+    # --------------------------------------------------------
+    # Remove a leading batch dimension when present:
+    #
+    #   [1, num_dofs, 2]
+    #       ->
+    #   [num_dofs, 2]
+    # --------------------------------------------------------
+
+    if (
+        limits is not None
+        and limits.ndim == 3
+        and limits.shape[0] == 1
+    ):
+        limits = limits[0]
+
+    # --------------------------------------------------------
+    # Joint names
+    # --------------------------------------------------------
+
+    names = None
+
+    for attribute_name in (
+        "dof_names",
+        "joint_names",
+    ):
+        try:
+            value = getattr(
+                articulation,
+                attribute_name,
+            )
+
+            if value is not None:
+                names = list(value)
+                break
+
+        except Exception:
+            pass
+
+    # --------------------------------------------------------
+    # Current joint positions
+    # --------------------------------------------------------
+
+    try:
+        q = np.asarray(
+            articulation
+            .get_joint_positions(),
+            dtype=np.float32,
+        ).reshape(-1)
+
+    except Exception as exc:
+        q = None
+
+        print(
+            "[JOINT LIMITS] "
+            "failed to read q:",
+            repr(exc),
+        )
+
+    print()
+    print(
+        "=" * 72
+    )
+
+    print(
+        "[JOINT LIMITS] source:",
+        source,
+    )
+
+    print(
+        "[JOINT LIMITS] names:",
+        names,
+    )
+
+    print(
+        "[JOINT LIMITS] current q:",
+        (
+            q.tolist()
+            if q is not None
+            else None
+        ),
+    )
+
+    print(
+        "[JOINT LIMITS] raw limits:"
+    )
+
+    print(
+        limits
+    )
+
+    if (
+        limits is not None
+        and limits.ndim == 2
+        and limits.shape[1] >= 2
+    ):
+
+        print()
+
+        print(
+            "[JOINT LIMITS] "
+            "first four controlled joints:"
+        )
+
+        labels = [
+            "swing",
+            "boom",
+            "arm",
+            "bucket",
+        ]
+
+        count = min(
+            4,
+            limits.shape[0],
+        )
+
+        for index in range(count):
+
+            lower = float(
+                limits[index, 0]
+            )
+
+            upper = float(
+                limits[index, 1]
+            )
+
+            current = (
+                float(q[index])
+                if (
+                    q is not None
+                    and index < q.size
+                )
+                else float("nan")
+            )
+
+            distance_to_lower = (
+                current - lower
+            )
+
+            distance_to_upper = (
+                upper - current
+            )
+
+            name = (
+                names[index]
+                if (
+                    names is not None
+                    and index < len(names)
+                )
+                else labels[index]
+            )
+
+            print(
+                f"  index={index} "
+                f"name={name} "
+                f"q={current:.6f} "
+                f"lower={lower:.6f} "
+                f"upper={upper:.6f} "
+                f"to_lower={distance_to_lower:.6f} "
+                f"to_upper={distance_to_upper:.6f}"
+            )
+
+    print(
+        "=" * 72
+    )
+
+    print()
+
+    _JOINT_LIMITS_PRINTED = True
+
+
 def main(args):
     """Main entry point for standalone launch."""
 
@@ -570,7 +826,7 @@ def main(args):
 
     # Import asset converter for GLB conversion.
     # This import passed your test, so we keep it.
-    import omni.kit.asset_converter as asset_converter
+    # import omni.kit.asset_converter as asset_converter
 
     print("=" * 60)
     print("ExcavatorVLA Standalone Launcher")
@@ -782,57 +1038,57 @@ def main(args):
     world.scene.add(robot)
 
     # Load dump truck using GLB converter.
-    TRUCK_GLB_PATH = "/root/Documents/trae_projects/vla_test/assets/glb/no-brand_dump_truck.glb"
-    TRUCK_USD_PATH = "/root/Documents/trae_projects/vla_test/assets/glb/no-brand_dump_truck.usd"
+    # TRUCK_GLB_PATH = "/root/Documents/trae_projects/vla_test/assets/glb/no-brand_dump_truck.glb"
+    # TRUCK_USD_PATH = "/root/Documents/trae_projects/vla_test/assets/glb/no-brand_dump_truck.usd"
 
-    if os.path.exists(TRUCK_GLB_PATH):
-        truck_prim_path = "/World/DumpTruck"
+    # if os.path.exists(TRUCK_GLB_PATH):
+    #     truck_prim_path = "/World/DumpTruck"
 
-        # Convert GLB to USD if USD doesn't exist.
-        if not os.path.exists(TRUCK_USD_PATH):
-            print(f"[INFO] Converting GLB to USD: {TRUCK_GLB_PATH}")
+    #     # Convert GLB to USD if USD doesn't exist.
+    #     if not os.path.exists(TRUCK_USD_PATH):
+    #         print(f"[INFO] Converting GLB to USD: {TRUCK_GLB_PATH}")
 
-            context = asset_converter.AssetConverterContext()
-            context.ignore_materials = False
-            context.export_preview_surface = True
-            context.use_meter_as_world_unit = True
+    #         context = asset_converter.AssetConverterContext()
+    #         context.ignore_materials = False
+    #         context.export_preview_surface = True
+    #         context.use_meter_as_world_unit = True
 
-            converter_instance = asset_converter.get_instance()
-            task = converter_instance.create_converter_task(
-                TRUCK_GLB_PATH,
-                TRUCK_USD_PATH,
-                None,
-                context,
-            )
+    #         converter_instance = asset_converter.get_instance()
+    #         task = converter_instance.create_converter_task(
+    #             TRUCK_GLB_PATH,
+    #             TRUCK_USD_PATH,
+    #             None,
+    #             context,
+    #         )
 
-            while not task.is_finished():
-                omni.kit.app.get_app().update()
+    #         while not task.is_finished():
+    #             omni.kit.app.get_app().update()
 
-            if task.get_status() != asset_converter.Status.SUCCESS:
-                print(f"[ERROR] Failed to convert GLB: {task.get_status()}")
-            else:
-                print(f"[INFO] GLB converted successfully to: {TRUCK_USD_PATH}")
+    #         if task.get_status() != asset_converter.Status.SUCCESS:
+    #             print(f"[ERROR] Failed to convert GLB: {task.get_status()}")
+    #         else:
+    #             print(f"[INFO] GLB converted successfully to: {TRUCK_USD_PATH}")
 
-        # Load converted USD file.
-        if os.path.exists(TRUCK_USD_PATH):
-            if not stage.GetPrimAtPath(truck_prim_path).IsValid():
-                truck_prim = stage.DefinePrim(truck_prim_path, "Xform")
+    #     # Load converted USD file.
+    #     if os.path.exists(TRUCK_USD_PATH):
+    #         if not stage.GetPrimAtPath(truck_prim_path).IsValid():
+    #             truck_prim = stage.DefinePrim(truck_prim_path, "Xform")
 
-                xform = UsdGeom.Xformable(truck_prim)
-                xform.AddTranslateOp().Set(Gf.Vec3d(4.14439, 6.72012, 1.0))
-                xform.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, 0.0))
-                xform.AddScaleOp().Set(Gf.Vec3f(100.0, 100.0, 100.0))
+    #             xform = UsdGeom.Xformable(truck_prim)
+    #             xform.AddTranslateOp().Set(Gf.Vec3d(4.14439, 6.72012, 1.0))
+    #             xform.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+    #             xform.AddScaleOp().Set(Gf.Vec3f(100.0, 100.0, 100.0))
 
-                refs = truck_prim.GetReferences()
-                refs.AddReference(assetPath=TRUCK_USD_PATH)
+    #             refs = truck_prim.GetReferences()
+    #             refs.AddReference(assetPath=TRUCK_USD_PATH)
 
-                print(f"[INFO] Loaded truck model at: {truck_prim_path}")
-            else:
-                print(f"[INFO] Truck already exists at: {truck_prim_path}")
-        else:
-            print(f"[WARN] Truck USD file not found: {TRUCK_USD_PATH}")
-    else:
-        print(f"[WARN] Truck GLB file not found: {TRUCK_GLB_PATH}")
+    #             print(f"[INFO] Loaded truck model at: {truck_prim_path}")
+    #         else:
+    #             print(f"[INFO] Truck already exists at: {truck_prim_path}")
+    #     else:
+    #         print(f"[WARN] Truck USD file not found: {TRUCK_USD_PATH}")
+    # else:
+    #     print(f"[WARN] Truck GLB file not found: {TRUCK_GLB_PATH}")
 
     # Start physics directly, without a world-level reset.
     timeline = omni.timeline.get_timeline_interface()
@@ -871,6 +1127,7 @@ def main(args):
 
 
     print("[INFO] World initialized")
+    _print_joint_limits_once(robot)
     print("[INFO] Robot joint positions:", robot.get_joint_positions())
     try:
         print("[INFO] DOF names:", robot.dof_names, flush=True)
@@ -1220,6 +1477,34 @@ def main(args):
         "[SAND] Parameter mode verified before creation:",
         actual_sand_mode,
         mode_result,
+        flush=True,
+    )
+
+    apply_auto_scene_parameters = (
+        sand_api.get("apply_auto_scene_parameters")
+        or getattr(
+            sand_module,
+            "apply_auto_scene_parameters",
+            None,
+        )
+    )
+
+    if not callable(apply_auto_scene_parameters):
+        raise RuntimeError(
+            "Sand runtime does not expose apply_auto_scene_parameters"
+        )
+
+    sand_position_result = apply_auto_scene_parameters(
+        sand_center_xy=SAND_INITIAL_CENTER,
+        rebuild=False,
+    )
+
+    sand_api = getattr(builtins, "_SAND_SITE", sand_api)
+
+    print(
+        "[SAND] Initial center configured:",
+        SAND_INITIAL_CENTER,
+        sand_position_result,
         flush=True,
     )
 

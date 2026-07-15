@@ -6316,8 +6316,6 @@ body main details>summary:after,.managerPanel>summary:after,.detailsPanel>summar
           <div id="bucketChart" class="timelineChart"></div>
           <div id="bucketTipXyzChart" class="timelineChart"></div>
           <div id="bucketLoadXyzChart" class="timelineChart"></div>
-          <div id="digTargetXyzChart" class="timelineChart"></div>
-          <div id="unloadLandingXyzChart" class="timelineChart"></div>
           <div id="qChart" class="timelineChart"></div>
           <div id="dqChart" class="timelineChart"></div>
           <div id="ddqChart" class="timelineChart"></div>
@@ -7671,8 +7669,6 @@ function drawVlaSpatialChart(targetId,title,preview,fieldNames,seriesNames,spans
 function drawVlaSpatialCharts(preview,spans){
   drawVlaSpatialChart("bucketTipXyzChart","Bucket tip XYZ · world",preview,["bucket_tip_x","bucket_tip_y","bucket_tip_z"],["X","Y","Z"],spans);
   drawVlaSpatialChart("bucketLoadXyzChart","Bucket load point XYZ · world",preview,["bucket_load_x","bucket_load_y","bucket_load_z"],["X","Y","Z"],spans);
-  drawVlaSpatialChart("digTargetXyzChart","Dig target XYZ · initial body frame",preview,["dig_target_local_x","dig_target_local_y","dig_target_local_z"],["X · forward","Y · left","Z · up"],spans);
-  drawVlaSpatialChart("unloadLandingXyzChart","Unload landing XYZ · initial body frame",preview,["unload_landing_local_x","unload_landing_local_y","unload_landing_local_z"],["X · forward","Y · left","Z · up"],spans);
 }
 
 function cleanPolygon(poly){if(!Array.isArray(poly))return[]; const out=[]; for(const pt of poly){if(Array.isArray(pt)&&finite(Number(pt[0]))&&finite(Number(pt[1]))) out.push([Number(pt[0]),Number(pt[1])])} return out}

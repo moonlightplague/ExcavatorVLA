@@ -2424,7 +2424,12 @@ def submit_viewport_capture_triplet(rt, sample_index=-1):
         def on_capture(capsule, buffer_size, width, height, fmt=None):
             if triplet.get("capture_q") is None:
                 try:
-                    triplet["capture_q"] = np.asarray(rt.get_real_joint_positions(), dtype=np.float32).reshape(-1)[:4].copy()
+                    q_real = np.asarray(rt.get_real_joint_positions(), dtype=np.float32).reshape(-1)[:4]
+                    q_cmd = np.asarray(rt.CTRL.q_cmd, dtype=np.float32).reshape(-1)[:4]
+                    triplet["capture_q"] = np.asarray(
+                        rt.q_real_near_command(q_real, q_cmd),
+                        dtype=np.float32,
+                    ).reshape(-1)[:4].copy()
                 except Exception:
                     triplet["capture_q"] = None
                 try:

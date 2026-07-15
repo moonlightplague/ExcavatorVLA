@@ -1,5 +1,11 @@
 # Excavator Auto Dataset Schema, Cost, and Optimization Report
 
+> Status note (2026-07-15): this is a historical analysis snapshot. For the
+> current 28D state + 4D effort export contract and the existing 18D checkpoint
+> deployment handoff, start at `docs/README.md`. Exported `meta/info.json`,
+> checkpoint metadata, and the constants in `excavator_dataset_tools.py` are
+> the canonical machine-readable specification.
+
 This report describes the current excavator auto dataset format, the LeRobot v3 export folder, the latest measured runtime cost, and the highest-value optimization plan.
 
 Latest checked run:

@@ -473,12 +473,19 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "sand_snapshot_last": None,
     "bucket_load_fast_last_time": 0.0,
     "bucket_load_fast_last": None,
-    "bucket_load_spatial_hits": 0,
-    "bucket_load_spatial_misses": 0,
-    "bucket_load_spatial_fallbacks": 0,
+    "bucket_load_prefilter_calls": 0,
+    "bucket_load_prefilter_input_particles": 0,
+    "bucket_load_prefilter_world_aabb_candidates": 0,
+    "bucket_load_prefilter_local_obb_candidates": 0,
     "dataset_metrics_frame_cache": None,
     "dataset_metrics_frame_hits": 0,
     "dataset_metrics_frame_misses": 0,
+    "dataset_static_scene_context_cache": None,
+    "dataset_static_scene_context_hits": 0,
+    "dataset_static_scene_context_misses": 0,
+    "dataset_environment_surface_cache": None,
+    "dataset_environment_surface_hits": 0,
+    "dataset_environment_surface_misses": 0,
     "dataset_record_sample_spans": {},
     "auto_collect_episode_sand_snapshot": None,
     "auto_collect_episode_sand_snapshot_time": 0.0,
@@ -692,6 +699,8 @@ LIFT_CARRY_MIN_RETAINED_FROM_CUT_FRACTION = 0.55
 LIFT_CARRY_SOFT_RETAINED_FROM_CUT_FRACTION = 0.45
 LIFT_CARRY_MIN_ABSOLUTE_BUCKET_PARTICLES = 1200
 LIFT_CARRY_HIGH_LOAD_RECOVERY_PARTICLES = 2000
+LIFT_CARRY_RECOVERY_MAX_SCORE_DROP = 3.0
+LIFT_CARRY_RECOVERY_CANDIDATE_PENALTY = 35.0
 MANUAL_FREEZE_STOP_ENABLED = True
 AUTO_FREEZE_STOP_ENABLED = True
 
@@ -847,16 +856,6 @@ SAND_METRICS_INTERVAL = 0.45
 BUCKET_LOAD_FAST_AABB_MARGIN = 0.06
 BUCKET_LOAD_FAST_CACHE_INTERVAL = 0.02
 DATASET_METRICS_FRAME_CACHE_SECONDS = float(os.environ.get("EXCAVATOR_DATASET_METRICS_FRAME_CACHE_SECONDS", "0.045") or 0.045)
-BUCKET_LOAD_SPATIAL_INDEX_ENABLED = str(os.environ.get("EXCAVATOR_BUCKET_LOAD_SPATIAL_INDEX", "1") or "1").strip().lower() not in (
-    "0",
-    "false",
-    "no",
-    "off",
-)
-BUCKET_LOAD_SPATIAL_GRID_RES_XY = int(os.environ.get("EXCAVATOR_BUCKET_LOAD_SPATIAL_GRID_XY", "48") or 48)
-BUCKET_LOAD_SPATIAL_GRID_RES_Z = int(os.environ.get("EXCAVATOR_BUCKET_LOAD_SPATIAL_GRID_Z", "24") or 24)
-BUCKET_LOAD_SPATIAL_MIN_PARTICLES = int(os.environ.get("EXCAVATOR_BUCKET_LOAD_SPATIAL_MIN_PARTICLES", "20000") or 20000)
-BUCKET_LOAD_SPATIAL_MAX_QUERY_CELLS = int(os.environ.get("EXCAVATOR_BUCKET_LOAD_SPATIAL_MAX_QUERY_CELLS", "4096") or 4096)
 SAND_SNAPSHOT_MAX_AGE = 0.35
 SAND_SNAPSHOT_GRID_RES = 64
 SAND_SNAPSHOT_GRID_MAX_RES = 96
@@ -6257,7 +6256,7 @@ def sand_metrics_from_bucket_fast(bucket_metrics, base_metrics=None, scope="buck
 
 def phase_metrics_requires_full(label):
     text = str(label).lower()
-    if text in {"after_dump_settle", "episode_metrics"}:
+    if text in {"after_lift", "post_lift", "after_dump_settle", "episode_metrics"}:
         return True
     full_tokens = ("final", "score", "preflight")
     return any(token in text for token in full_tokens)
@@ -7356,7 +7355,7 @@ def debug_round_vec(value, n=None, digits=3):
 def debug_compact_sand_counts(metrics=None):
     try:
         if metrics is None:
-            metrics = sand_metrics_current(force=False)
+            metrics = hot_bucket_sand_metrics(label="debug_compact", force=False)
         sand = compact_sand_metrics(metrics)
         if not sand.get("available", False):
             return {"ok": False}
@@ -7508,6 +7507,8 @@ def planner_config_snapshot():
         "control_step_frames_env": str(CONTROL_STEP_FRAMES_ENV_RAW or ""),
         "planning_path_penalty_cache_max": PLANNING_PATH_PENALTY_CACHE_MAX,
         "dig_plan_max_candidates": DIG_PLAN_MAX_CANDIDATES,
+        "dig_plan_primary_full_top_k": DIG_PLAN_PRIMARY_FULL_TOPK,
+        "dig_plan_candidate_ordering": "cheap_rank_v1",
         "dig_plan_beam_size": DIG_PLAN_BEAM_SIZE,
         "dig_plan_topk_ik": DIG_PLAN_TOPK_IK,
         "dig_plan_path_check_samples": DIG_PLAN_PATH_CHECK_SAMPLES,
@@ -7641,12 +7642,9 @@ def sand_config_snapshot():
             "bucket_vol_ui": "closed_count_volume_calc_viz",
         },
         "sand_metrics_interval": SAND_METRICS_INTERVAL,
-        "bucket_load_spatial_index": {
-            "enabled": bool(BUCKET_LOAD_SPATIAL_INDEX_ENABLED),
-            "grid_xy": int(BUCKET_LOAD_SPATIAL_GRID_RES_XY),
-            "grid_z": int(BUCKET_LOAD_SPATIAL_GRID_RES_Z),
-            "min_particles": int(BUCKET_LOAD_SPATIAL_MIN_PARTICLES),
-            "max_query_cells": int(BUCKET_LOAD_SPATIAL_MAX_QUERY_CELLS),
+        "bucket_load_prefilter": {
+            "mode": "world_aabb_then_bucket_local_obb_then_closed_mesh",
+            "per_sample_particle_sort": False,
             "exact_bucket_local_filter": True,
         },
     }
@@ -9238,7 +9236,7 @@ def maybe_draw_bucket_sand_count_debug(force=False):
         return False
 
 
-def dataset_particle_snapshot(label="", build_bucket_index=False):
+def dataset_particle_snapshot(label=""):
     points = sand_particle_positions()
     if points is None:
         return {"available": False, "points": None, "label": str(label), "created_at": float(time.time())}
@@ -9248,86 +9246,8 @@ def dataset_particle_snapshot(label="", build_bucket_index=False):
         "points": pts,
         "label": str(label),
         "created_at": float(time.time()),
-        "bucket_spatial_index": None,
     }
-    if build_bucket_index:
-        snapshot["bucket_spatial_index"] = build_bucket_particle_spatial_index(pts)
     return snapshot
-
-
-def build_bucket_particle_spatial_index(points):
-    if not bool(BUCKET_LOAD_SPATIAL_INDEX_ENABLED):
-        return None
-    if points is None:
-        return None
-    pts = np.asarray(points, dtype=np.float32)
-    if pts.ndim != 2 or pts.shape[1] < 3 or len(pts) < int(BUCKET_LOAD_SPATIAL_MIN_PARTICLES):
-        return None
-    t0 = time.perf_counter()
-    pts = np.ascontiguousarray(pts[:, :3], dtype=np.float32)
-    try:
-        bbox_min = np.min(pts, axis=0).astype(np.float32) - np.array([0.02, 0.02, 0.02], dtype=np.float32)
-        bbox_max = np.max(pts, axis=0).astype(np.float32) + np.array([0.02, 0.02, 0.02], dtype=np.float32)
-        span = np.maximum(bbox_max - bbox_min, np.array([1.0e-4, 1.0e-4, 1.0e-4], dtype=np.float32))
-        rx = max(4, int(BUCKET_LOAD_SPATIAL_GRID_RES_XY))
-        ry = max(4, int(BUCKET_LOAD_SPATIAL_GRID_RES_XY))
-        rz = max(4, int(BUCKET_LOAD_SPATIAL_GRID_RES_Z))
-        ix = np.clip(np.floor((pts[:, 0] - bbox_min[0]) / span[0] * rx).astype(np.int32), 0, rx - 1)
-        iy = np.clip(np.floor((pts[:, 1] - bbox_min[1]) / span[1] * ry).astype(np.int32), 0, ry - 1)
-        iz = np.clip(np.floor((pts[:, 2] - bbox_min[2]) / span[2] * rz).astype(np.int32), 0, rz - 1)
-        flat = ix + iy * rx + iz * rx * ry
-        order = np.argsort(flat, kind="mergesort")
-        sorted_flat = flat[order]
-        unique, starts, counts = np.unique(sorted_flat, return_index=True, return_counts=True)
-        cell_slices = {int(cell): (int(start), int(start + count)) for cell, start, count in zip(unique, starts, counts)}
-        return {
-            "points": pts,
-            "bbox_min": bbox_min,
-            "bbox_max": bbox_max,
-            "span": span,
-            "res": (int(rx), int(ry), int(rz)),
-            "order": order,
-            "cell_slices": cell_slices,
-            "build_ms": float((time.perf_counter() - t0) * 1000.0),
-        }
-    except Exception:
-        return None
-
-
-def bucket_spatial_aabb_indices(index, aabb_min, aabb_max):
-    if not isinstance(index, dict) or aabb_min is None or aabb_max is None:
-        return None
-    try:
-        bbox_min = np.array(index["bbox_min"], dtype=np.float32).reshape(3)
-        span = np.array(index["span"], dtype=np.float32).reshape(3)
-        rx, ry, rz = [int(x) for x in index["res"]]
-        amin = np.array(aabb_min, dtype=np.float32).reshape(3)
-        amax = np.array(aabb_max, dtype=np.float32).reshape(3)
-        lo = np.minimum(amin, amax)
-        hi = np.maximum(amin, amax)
-        c0 = np.floor((lo - bbox_min) / np.maximum(span, 1.0e-6) * np.array([rx, ry, rz], dtype=np.float32)).astype(np.int32)
-        c1 = np.floor((hi - bbox_min) / np.maximum(span, 1.0e-6) * np.array([rx, ry, rz], dtype=np.float32)).astype(np.int32)
-        c0 = np.clip(c0, [0, 0, 0], [rx - 1, ry - 1, rz - 1])
-        c1 = np.clip(c1, [0, 0, 0], [rx - 1, ry - 1, rz - 1])
-        cell_count = int(c1[0] - c0[0] + 1) * int(c1[1] - c0[1] + 1) * int(c1[2] - c0[2] + 1)
-        if cell_count <= 0 or cell_count > int(BUCKET_LOAD_SPATIAL_MAX_QUERY_CELLS):
-            return None
-        chunks = []
-        order = index["order"]
-        cell_slices = index["cell_slices"]
-        for iz in range(int(c0[2]), int(c1[2]) + 1):
-            z_off = iz * rx * ry
-            for iy in range(int(c0[1]), int(c1[1]) + 1):
-                yz_off = z_off + iy * rx
-                for ix in range(int(c0[0]), int(c1[0]) + 1):
-                    sl = cell_slices.get(int(yz_off + ix))
-                    if sl is not None:
-                        chunks.append(order[sl[0] : sl[1]])
-        if not chunks:
-            return np.zeros(0, dtype=np.int64)
-        return np.concatenate(chunks).astype(np.int64, copy=False)
-    except Exception:
-        return None
 
 
 @debug_profiled("bucket_load_fast_current", threshold_ms=1.0)
@@ -9381,7 +9301,6 @@ def bucket_load_fast_current(force=False, points=None):
         return dict(metrics)
     pts = np.ascontiguousarray(pts[:, :3], dtype=np.float32)
 
-    spatial_index = None
     load_volume_source = ""
     if bool(SAND_BUCKET_LOAD_VOLUME_ENABLED):
         aabb_min, aabb_max = bucket_load_volume_world_aabb(expand=BUCKET_LOAD_FAST_AABB_MARGIN)
@@ -9396,31 +9315,21 @@ def bucket_load_fast_current(force=False, points=None):
         candidate_pts = pts
         source_detail = "full_projection_fallback"
     else:
-        if isinstance(snapshot, dict) and bool(BUCKET_LOAD_SPATIAL_INDEX_ENABLED):
-            spatial_index = snapshot.get("bucket_spatial_index")
-            if not isinstance(spatial_index, dict):
-                spatial_index = build_bucket_particle_spatial_index(pts)
-                snapshot["bucket_spatial_index"] = spatial_index
-        spatial_idx = bucket_spatial_aabb_indices(spatial_index, aabb_min, aabb_max) if isinstance(spatial_index, dict) else None
-        if spatial_idx is not None:
-            prefilter_pts = pts[spatial_idx]
-            candidate_mask = np.all(prefilter_pts >= aabb_min.reshape(1, 3), axis=1) & np.all(
-                prefilter_pts <= aabb_max.reshape(1, 3),
-                axis=1,
-            )
-            candidate_idx = spatial_idx[np.nonzero(candidate_mask)[0]].astype(np.int64, copy=False)
-            candidate_pts = pts[candidate_idx]
-            STATE["bucket_load_spatial_hits"] = int(STATE.get("bucket_load_spatial_hits", 0) or 0) + 1
-            source_detail = "bucket_spatial_grid_exact_aabb"
-        else:
-            candidate_mask = np.all(pts >= aabb_min.reshape(1, 3), axis=1) & np.all(pts <= aabb_max.reshape(1, 3), axis=1)
-            candidate_idx = np.nonzero(candidate_mask)[0].astype(np.int64, copy=False)
-            candidate_pts = pts[candidate_idx]
-            if isinstance(snapshot, dict) and bool(BUCKET_LOAD_SPATIAL_INDEX_ENABLED):
-                STATE["bucket_load_spatial_misses"] = int(STATE.get("bucket_load_spatial_misses", 0) or 0) + 1
-            else:
-                STATE["bucket_load_spatial_fallbacks"] = int(STATE.get("bucket_load_spatial_fallbacks", 0) or 0) + 1
-            source_detail = "bucket_world_aabb"
+        candidate_mask = np.all(pts >= aabb_min.reshape(1, 3), axis=1) & np.all(
+            pts <= aabb_max.reshape(1, 3),
+            axis=1,
+        )
+        candidate_idx = np.nonzero(candidate_mask)[0].astype(np.int64, copy=False)
+        candidate_pts = pts[candidate_idx]
+        source_detail = "bucket_world_aabb"
+
+    STATE["bucket_load_prefilter_calls"] = int(STATE.get("bucket_load_prefilter_calls", 0) or 0) + 1
+    STATE["bucket_load_prefilter_input_particles"] = int(
+        STATE.get("bucket_load_prefilter_input_particles", 0) or 0
+    ) + int(len(pts))
+    STATE["bucket_load_prefilter_world_aabb_candidates"] = int(
+        STATE.get("bucket_load_prefilter_world_aabb_candidates", 0) or 0
+    ) + int(len(candidate_pts))
 
     if len(candidate_pts) == 0:
         mass = sand_particle_mass()
@@ -9429,6 +9338,7 @@ def bucket_load_fast_current(force=False, points=None):
             "metrics_scope": "bucket_fast",
             "particle_count": int(len(pts)),
             "candidate_count": 0,
+            "obb_candidate_count": 0,
             "bucket_count": 0,
             "bucket_from_pile_count": 0,
             "bucket_from_initial_count": 0,
@@ -9464,10 +9374,29 @@ def bucket_load_fast_current(force=False, points=None):
         STATE["bucket_load_fast_last_time"] = now
         return dict(metrics)
 
+    local_candidate_positions = np.arange(len(local), dtype=np.int64)
+    if bool(SAND_BUCKET_LOAD_VOLUME_ENABLED):
+        local_min, local_max = bucket_load_volume_local_bounds(expand=BUCKET_LOAD_FAST_AABB_MARGIN)
+        if local_min is not None and local_max is not None:
+            local_obb_mask = np.all(local >= local_min.reshape(1, 3), axis=1) & np.all(
+                local <= local_max.reshape(1, 3),
+                axis=1,
+            )
+            local_candidate_positions = np.nonzero(local_obb_mask)[0].astype(np.int64, copy=False)
+            source_detail += "+bucket_local_obb"
+    local_candidates = local[local_candidate_positions]
+    STATE["bucket_load_prefilter_local_obb_candidates"] = int(
+        STATE.get("bucket_load_prefilter_local_obb_candidates", 0) or 0
+    ) + int(len(local_candidates))
+
     if not load_volume_source:
         _, _, load_volume_source = bucket_load_volume_mesh_local()
-    strict = bucket_load_volume_mask_from_local(local) if bool(SAND_BUCKET_LOAD_VOLUME_ENABLED) else np.zeros(len(local), dtype=bool)
-    bucket_idx = candidate_idx[np.nonzero(strict)[0]]
+    strict = (
+        bucket_load_volume_mask_from_local(local_candidates)
+        if bool(SAND_BUCKET_LOAD_VOLUME_ENABLED)
+        else np.zeros(len(local_candidates), dtype=bool)
+    )
+    bucket_idx = candidate_idx[local_candidate_positions[np.nonzero(strict)[0]]]
     bucket_count = int(len(bucket_idx))
     initial_mask = initial_pile_mask_for_points(pts, fallback_pile_mask=None)
     if not isinstance(initial_mask, np.ndarray) or len(initial_mask) != len(pts) or int(np.count_nonzero(initial_mask)) <= 0:
@@ -9479,12 +9408,10 @@ def bucket_load_fast_current(force=False, points=None):
     source_tracking = "initial_mask"
     notes = [source_detail]
     if bool(SAND_BUCKET_LOAD_VOLUME_ENABLED):
-        notes.append("narrow=load_volume_mesh")
+        notes.append("narrow=bucket_local_obb+load_volume_mesh")
         notes.append(f"volume_source={load_volume_source}")
     else:
         notes.append("narrow=disabled_no_bucket_volume")
-    if isinstance(spatial_index, dict):
-        notes.append(f"spatial_build_ms={float(spatial_index.get('build_ms', 0.0) or 0.0):.3f}")
     from_pile_bucket_count = raw_from_pile_bucket_count
     if bucket_count >= int(SAND_SOURCE_FALLBACK_MIN_REGION_COUNT):
         ratio = float(raw_from_pile_bucket_count) / max(1.0, float(bucket_count))
@@ -9498,6 +9425,7 @@ def bucket_load_fast_current(force=False, points=None):
         "metrics_scope": "bucket_fast",
         "particle_count": int(len(pts)),
         "candidate_count": int(len(candidate_pts)),
+        "obb_candidate_count": int(len(local_candidates)),
         "bucket_count": int(bucket_count),
         "bucket_from_pile_count": int(from_pile_bucket_count),
         "bucket_from_initial_count": int(raw_from_pile_bucket_count),
@@ -9515,6 +9443,7 @@ def bucket_load_fast_current(force=False, points=None):
     perf["bucket_fast_ms"] = float(metrics["metrics_ms"])
     perf["bucket_fast_particles"] = int(len(pts))
     perf["bucket_fast_candidates"] = int(len(candidate_pts))
+    perf["bucket_fast_obb_candidates"] = int(len(local_candidates))
     STATE["sand_perf_last"] = perf
     return dict(metrics)
 
@@ -9537,7 +9466,7 @@ def capture_initial_pile_particle_ids():
 
 
 @debug_profiled("sand_metrics_current", threshold_ms=2.0)
-def sand_metrics_current(force=False, snapshot=None):
+def sand_metrics_current(force=False, snapshot=None, label=""):
     now = time.time()
     t0 = time.perf_counter()
     if (
@@ -9546,6 +9475,14 @@ def sand_metrics_current(force=False, snapshot=None):
         and now - float(STATE.get("sand_metrics_last_time", 0.0)) < SAND_METRICS_INTERVAL
     ):
         return dict(STATE["sand_metrics_last"])
+
+    increment_runtime_counter("sand_metrics_full_region_scans", 1)
+    scan_label = str(label or "unspecified")
+    scan_labels = STATE.get("sand_metrics_full_region_scan_labels")
+    if not isinstance(scan_labels, dict):
+        scan_labels = {}
+    scan_labels[scan_label] = int(scan_labels.get(scan_label, 0) or 0) + 1
+    STATE["sand_metrics_full_region_scan_labels"] = scan_labels
 
     if isinstance(snapshot, dict):
         points = snapshot.get("points")
@@ -9675,14 +9612,18 @@ def dataset_metrics_frame_bundle(label="", q_real=None, need_full=False, force=F
         if need_full and not isinstance(cache.get("full_metrics"), dict):
             span_t = time.perf_counter()
             snapshot = cache.get("snapshot")
-            cache["full_metrics"] = sand_metrics_current(force=True, snapshot=snapshot if isinstance(snapshot, dict) else None)
+            cache["full_metrics"] = sand_metrics_current(
+                force=True,
+                snapshot=snapshot if isinstance(snapshot, dict) else None,
+                label=f"frame_cache:{cache.get('label', 'unknown')}",
+            )
             debug_profile_span("dataset_metrics_frame.full_sand_metrics", span_t, threshold_ms=8.0)
             STATE["dataset_metrics_frame_cache"] = cache
         return cache
 
     increment_runtime_counter("dataset_metrics_frame_misses", 1)
     span_t = time.perf_counter()
-    snapshot = dataset_particle_snapshot(label=label or "dataset_metrics_frame", build_bucket_index=True)
+    snapshot = dataset_particle_snapshot(label=label or "dataset_metrics_frame")
     debug_profile_span("dataset_metrics_frame.snapshot", span_t, threshold_ms=4.0)
 
     span_t = time.perf_counter()
@@ -9692,7 +9633,7 @@ def dataset_metrics_frame_bundle(label="", q_real=None, need_full=False, force=F
     full_metrics = None
     if need_full:
         span_t = time.perf_counter()
-        full_metrics = sand_metrics_current(force=True, snapshot=snapshot)
+        full_metrics = sand_metrics_current(force=True, snapshot=snapshot, label=f"frame:{label or 'unknown'}")
         debug_profile_span("dataset_metrics_frame.full_sand_metrics", span_t, threshold_ms=8.0)
 
     bundle = {
@@ -9713,7 +9654,11 @@ def dataset_metrics_frame_full(label="", q_real=None, force=False):
     if isinstance(full, dict):
         return dict(full)
     snapshot = bundle.get("snapshot") if isinstance(bundle, dict) else None
-    metrics = sand_metrics_current(force=True, snapshot=snapshot if isinstance(snapshot, dict) else None)
+    metrics = sand_metrics_current(
+        force=True,
+        snapshot=snapshot if isinstance(snapshot, dict) else None,
+        label=f"frame_fallback:{label or 'unknown'}",
+    )
     if isinstance(bundle, dict):
         bundle["full_metrics"] = dict(metrics or {})
         STATE["dataset_metrics_frame_cache"] = bundle
@@ -9728,6 +9673,30 @@ def dataset_metrics_frame_fast(label="", q_real=None, force=False):
         base_metrics=STATE.get("sand_metrics_last"),
         scope="dataset_bucket_fast",
     )
+
+
+def hot_bucket_sand_metrics(label="hot_bucket", q_real=None, force=False):
+    """Return current bucket occupancy without scanning pile/bin/spill regions."""
+    try:
+        return dataset_metrics_frame_fast(label=str(label), q_real=q_real, force=bool(force))
+    except Exception:
+        try:
+            snapshot = dataset_particle_snapshot(label=str(label))
+            bucket_metrics = bucket_load_fast_current(force=bool(force), points=snapshot)
+            return sand_metrics_from_bucket_fast(
+                bucket_metrics,
+                base_metrics=STATE.get("sand_metrics_last"),
+                scope="hot_bucket_fallback",
+            )
+        except Exception as exc:
+            return {
+                "available": False,
+                "metrics_scope": "hot_bucket_failed",
+                "reason": f"{type(exc).__name__}:{exc}",
+                "bucket_count": 0,
+                "bucket_from_pile_count": 0,
+                "bucket_from_initial_count": 0,
+            }
 
 
 def is_sand_contact_phase(mode):
@@ -9932,14 +9901,7 @@ def phase_collision_context(mode):
 
 
 def sand_contact_snapshot(force=False):
-    use_bucket_fast = bool(STATE.get("dataset_recording", False) or STATE.get("auto_collect_active", False))
-    if use_bucket_fast:
-        try:
-            metrics = dataset_metrics_frame_fast(label="sand_contact")
-        except Exception:
-            metrics = sand_metrics_current(force=False)
-    else:
-        metrics = sand_metrics_current(force=force)
+    metrics = hot_bucket_sand_metrics(label="sand_contact", force=force)
     try:
         tip = bucket_tip_pos()
     except Exception:
@@ -10439,7 +10401,7 @@ def sand_contact_stage_can_advance(q_goal, label="", mode="auto", seconds_eff=0.
         bucket_real_deg = rad_to_deg(float(q_real[bucket_idx]))
         retain_report = carry_material_report_for_q(q_real, end_effector="load")
         retains_material = bool(retain_report.get("retains_material", False))
-        metrics = sand_metrics_current(force=True)
+        metrics = hot_bucket_sand_metrics(label=f"carry_advance:{stage_name}", q_real=q_real, force=True)
         bucket_loaded = int(metrics.get("bucket_from_pile_count", 0) or 0) if isinstance(metrics, dict) else 0
         bucket_err = float(err_deg[bucket_idx]) if len(err_deg) > bucket_idx else float(max_err)
         real_loaded_hold = real_loaded_secure_hold_allowed(retain_report, loaded_count=bucket_loaded)
@@ -10592,7 +10554,7 @@ def sand_contact_stage_should_advance(stage_name, report, q_cmd=None, q_real=Non
             bucket_err = max_err
             retain_report = {}
             retains_material = False
-        metrics = sand_metrics_current(force=True)
+        metrics = hot_bucket_sand_metrics(label=f"carry_progress:{stage_name}", q_real=q_real, force=True)
         bucket_loaded = int(metrics.get("bucket_from_pile_count", 0) or 0) if isinstance(metrics, dict) else 0
         real_loaded_hold = real_loaded_secure_hold_allowed(retain_report, loaded_count=bucket_loaded)
         if (
@@ -10991,7 +10953,14 @@ def dataset_rigid_clearance_summary():
     return best
 
 
-def dataset_local_height_patch(target=None, radius=0.42, grid=3):
+def dataset_local_height_patch(
+    target=None,
+    radius=0.42,
+    grid=3,
+    snapshot=None,
+    refresh_snapshot=True,
+    fallback_query=True,
+):
     if target is None:
         return {
             "available": False,
@@ -11012,7 +10981,8 @@ def dataset_local_height_patch(target=None, radius=0.42, grid=3):
         }
     grid = max(1, int(grid))
     radius = max(0.05, float(radius))
-    snapshot = get_sand_snapshot(force=False, label="dataset_height_patch", max_age=0.75)
+    if snapshot is None and refresh_snapshot:
+        snapshot = get_sand_snapshot(force=False, label="dataset_height_patch", max_age=0.75)
     values = []
     sources = []
     offsets = np.linspace(-radius, radius, grid)
@@ -11023,7 +10993,7 @@ def dataset_local_height_patch(target=None, radius=0.42, grid=3):
             y = float(p[1] + dy)
             z = sand_snapshot_surface_height(snapshot, x, y)
             source = "snapshot"
-            if z is None:
+            if z is None and fallback_query:
                 try:
                     z, source = sand_surface_query_at_xy(x, y)
                 except Exception:
@@ -11043,24 +11013,95 @@ def dataset_local_height_patch(target=None, radius=0.42, grid=3):
     }
 
 
+def dataset_static_scene_context():
+    """Reuse scene geometry that cannot change during a recorded episode."""
+    episode_key = str(STATE.get("dataset_episode_uid", "") or STATE.get("active_task_name", "") or "")
+    cache = STATE.get("dataset_static_scene_context_cache")
+    if episode_key and isinstance(cache, dict) and cache.get("episode_key") == episode_key:
+        cached_context = cache.get("context")
+        if isinstance(cached_context, dict):
+            increment_runtime_counter("dataset_static_scene_context_hits", 1)
+            return cached_context
+    increment_runtime_counter("dataset_static_scene_context_misses", 1)
+    context = task_scene_context()
+    if episode_key:
+        STATE["dataset_static_scene_context_cache"] = {
+            "episode_key": episode_key,
+            "context": context,
+        }
+    return context
+
+
+def dataset_environment_surface_context(target=None):
+    """Read surface features without creating a new full-particle snapshot."""
+    if target is None:
+        return {
+            "surface_z": None,
+            "surface_source": "missing_target",
+            "local_height_patch": dataset_local_height_patch(target=None),
+        }
+    try:
+        p = np.array(target, dtype=np.float32).reshape(-1)[:3]
+    except Exception:
+        return {
+            "surface_z": None,
+            "surface_source": "bad_target",
+            "local_height_patch": dataset_local_height_patch(target=None),
+        }
+
+    snapshot = STATE.get("planning_sand_snapshot") if bool(STATE.get("planning_sand_snapshot_active", False)) else None
+    if not isinstance(snapshot, dict):
+        snapshot = STATE.get("sand_snapshot_last")
+    if not isinstance(snapshot, dict):
+        snapshot = STATE.get("auto_collect_episode_sand_snapshot")
+    snapshot = snapshot if isinstance(snapshot, dict) else None
+    if snapshot is None:
+        snapshot_version = None
+    else:
+        created_at = float(snapshot.get("created_at", 0.0) or 0.0)
+        snapshot_version = ("created_at", created_at) if created_at > 0.0 else ("object", int(id(snapshot)))
+    episode_key = str(STATE.get("dataset_episode_uid", "") or STATE.get("active_task_name", "") or "")
+    target_sig = tuple(round(float(value), 3) for value in p[:3])
+    cache_key = (episode_key, target_sig, snapshot_version)
+    cache = STATE.get("dataset_environment_surface_cache")
+    if isinstance(cache, dict) and cache.get("key") == cache_key:
+        context = cache.get("context")
+        if isinstance(context, dict):
+            increment_runtime_counter("dataset_environment_surface_hits", 1)
+            return context
+
+    increment_runtime_counter("dataset_environment_surface_misses", 1)
+    surface_z = sand_snapshot_surface_height(snapshot, float(p[0]), float(p[1]))
+    surface_source = "cached_particle_snapshot" if surface_z is not None else "missing_cached_particle_surface"
+    context = {
+        "surface_z": None if surface_z is None else float(surface_z),
+        "surface_source": surface_source,
+        "local_height_patch": dataset_local_height_patch(
+            target=p,
+            radius=0.42,
+            grid=3,
+            snapshot=snapshot,
+            refresh_snapshot=False,
+            fallback_query=False,
+        ),
+    }
+    STATE["dataset_environment_surface_cache"] = {"key": cache_key, "context": context}
+    return context
+
+
 def dataset_environment_summary(target=None):
-    ctx = task_scene_context()
+    ctx = dataset_static_scene_context()
     api = get_sand_site_api()
     if target is None:
         target = get_target_pos() if TARGET_PATH else None
-    surface_z = None
-    surface_source = ""
-    if target is not None:
-        try:
-            surface_z, surface_source = sand_surface_query_at_xy(float(target[0]), float(target[1]))
-        except Exception:
-            surface_z = None
-            surface_source = "query_failed"
+    surface = dataset_environment_surface_context(target)
+    surface_z = surface.get("surface_z")
+    surface_source = str(surface.get("surface_source", ""))
     return {
         "dig_target": vec_list(target, 3),
         "sand_surface_z": None if surface_z is None else float(surface_z),
         "sand_surface_source": str(surface_source),
-        "local_height_patch": dataset_local_height_patch(target=target, radius=0.42, grid=3),
+        "local_height_patch": surface.get("local_height_patch", {}),
         "soil": {
             "sand_site_active": bool(api is not None and sand_site_active()),
             "fidelity": None if api is None else api.get("sand_fidelity"),
@@ -12140,15 +12181,31 @@ def auto_collect_write_run_summary():
                 "rigid_obstacle_cache_version": int(STATE.get("rigid_obstacle_cache_version", 0) or 0),
                 "rigid_obstacle_numpy_cached": isinstance(STATE.get("rigid_obstacle_numpy_cache"), dict),
             },
-            "bucket_load_spatial": {
-                "enabled": bool(BUCKET_LOAD_SPATIAL_INDEX_ENABLED),
-                "hits": int(STATE.get("bucket_load_spatial_hits", 0) or 0),
-                "misses": int(STATE.get("bucket_load_spatial_misses", 0) or 0),
-                "fallbacks": int(STATE.get("bucket_load_spatial_fallbacks", 0) or 0),
+            "bucket_load_prefilter": {
+                "mode": "world_aabb_then_bucket_local_obb_then_closed_mesh",
+                "per_sample_particle_sort": False,
+                "calls": int(STATE.get("bucket_load_prefilter_calls", 0) or 0),
+                "input_particles": int(STATE.get("bucket_load_prefilter_input_particles", 0) or 0),
+                "world_aabb_candidates": int(STATE.get("bucket_load_prefilter_world_aabb_candidates", 0) or 0),
+                "local_obb_candidates": int(STATE.get("bucket_load_prefilter_local_obb_candidates", 0) or 0),
                 "dataset_metrics_frame_hits": int(STATE.get("dataset_metrics_frame_hits", 0) or 0),
                 "dataset_metrics_frame_misses": int(STATE.get("dataset_metrics_frame_misses", 0) or 0),
-                "grid_xy": int(BUCKET_LOAD_SPATIAL_GRID_RES_XY),
-                "grid_z": int(BUCKET_LOAD_SPATIAL_GRID_RES_Z),
+            },
+            "dataset_static_scene_context": {
+                "scope": "episode",
+                "hits": int(STATE.get("dataset_static_scene_context_hits", 0) or 0),
+                "misses": int(STATE.get("dataset_static_scene_context_misses", 0) or 0),
+            },
+            "dataset_environment_surface": {
+                "policy": "reuse_latest_existing_snapshot_no_hot_path_refresh",
+                "hits": int(STATE.get("dataset_environment_surface_hits", 0) or 0),
+                "misses": int(STATE.get("dataset_environment_surface_misses", 0) or 0),
+            },
+            "sand_metrics_policy": {
+                "hot_path": "bucket_closed_volume_only",
+                "full_region_gates": ["preflight", "after_lift", "after_dump_settle", "episode_metrics"],
+                "full_region_scans": int(STATE.get("sand_metrics_full_region_scans", 0) or 0),
+                "full_region_scan_labels": dict(STATE.get("sand_metrics_full_region_scan_labels", {}) or {}),
             },
             "stage_timing_summary": dict(STATE.get("stage_timing_summary", {}) or {}),
             "stage_timing_recent": list(STATE.get("stage_timing_recent", []) or [])[-32:],
@@ -12473,7 +12530,7 @@ def auto_collect_plan_summary(seq):
 def auto_collect_episode_metrics():
     q_real = get_real_joint_positions()
     q_cmd = CTRL.q_cmd.copy()
-    sand_metrics = sand_metrics_current(force=True)
+    sand_metrics = sand_metrics_current(force=True, label="episode_metrics")
     update_episode_quality_trackers(sand_metrics, "episode_metrics", q_cmd=q_cmd, q_real=q_real, action=None)
     final_bucket = int(sand_metrics.get("bucket_from_pile_count", 0) or 0) if isinstance(sand_metrics, dict) else 0
     final_bin = int(STATE.get("dataset_final_bin_from_pile_particles", 0) or 0)
@@ -12817,7 +12874,7 @@ def auto_collect_preflight_report(target_successes=None):
     if isinstance(snapshot, dict):
         STATE["auto_collect_episode_sand_snapshot"] = snapshot
         STATE["auto_collect_episode_sand_snapshot_time"] = float(time.time())
-    metrics = sand_metrics_current(force=True, snapshot=snapshot)
+    metrics = sand_metrics_current(force=True, snapshot=snapshot, label="preflight")
     particles = snapshot.get("points") if isinstance(snapshot, dict) else None
     particle_count = int(len(particles)) if particles is not None else int(metrics.get("particle_count", 0) or 0)
     settle = snapshot.get("settle") if isinstance(snapshot, dict) and isinstance(snapshot.get("settle"), dict) else sand_settle_status(points=particles, ctx=ctx)
@@ -17380,9 +17437,21 @@ async def auto_collect_loop(count, max_attempts=None):
         "dig_candidate_result_cache_puts",
         "dataset_metrics_frame_hits",
         "dataset_metrics_frame_misses",
+        "dataset_static_scene_context_hits",
+        "dataset_static_scene_context_misses",
+        "dataset_environment_surface_hits",
+        "dataset_environment_surface_misses",
+        "bucket_load_prefilter_calls",
+        "bucket_load_prefilter_input_particles",
+        "bucket_load_prefilter_world_aabb_candidates",
+        "bucket_load_prefilter_local_obb_candidates",
+        "sand_metrics_full_region_scans",
     ]:
         STATE[key] = 0
+    STATE["sand_metrics_full_region_scan_labels"] = {}
     STATE["dataset_metrics_frame_cache"] = None
+    STATE["dataset_static_scene_context_cache"] = None
+    STATE["dataset_environment_surface_cache"] = None
     clear_planning_runtime_caches("auto_collect_loop_start")
     STATE["debug_timeline_path"] = ""
     STATE["auto_collect_sand_reset_done"] = False
@@ -20202,8 +20271,22 @@ def block_invalid_dig_plan_contract(task_label="dig_plan"):
 
 def sync_motion_start_q(label=""):
     try:
-        q_real = q_real_near_command(get_real_joint_positions(), CTRL.q_cmd)
-        q_start = CTRL.clip_limits(np.array(q_real, dtype=np.float32).copy())
+        q_real_raw = np.array(get_real_joint_positions(), dtype=np.float32).reshape(-1)[:4].copy()
+        q_start = CTRL.clip_limits(q_real_raw)
+        swing_idx = CTRL.name_to_idx["swing"]
+        q_start[swing_idx] = swing_articulation_state_angle(q_start[swing_idx])
+        old_cmd_swing = float(CTRL.q_cmd[swing_idx])
+        new_start_swing = float(q_start[swing_idx])
+        branch_turns = abs(old_cmd_swing - new_start_swing) / (2.0 * math.pi)
+        if branch_turns >= 0.5 and abs(swing_delta(old_cmd_swing, new_start_swing)) <= deg_to_rad(1.0):
+            info_print(
+                "[SWING BRANCH SYNC]",
+                f"label={label}",
+                f"logical_cmd={rad_to_deg(old_cmd_swing):.2f}deg",
+                f"physical_start={rad_to_deg(new_start_swing):.2f}deg",
+                "reason=equivalent_continuous_angle",
+                force_log=debug_diagnostics_enabled(),
+            )
         CTRL.q_cmd = q_start.copy()
         CTRL.q_safe = q_start.copy()
         STATE["dataset_current_q_goal"] = q_start.copy()
@@ -20412,7 +20495,7 @@ async def move_to_profile_sampled_replay(
         q = interpolate_q_motion(q0, q1, s, mode=mode, label=label)
 
         apply_t = execution_stage_profile_now(exec_profile)
-        ok_state = set_robot_joint_state(q, label=f"{label}_fast_replay")
+        ok_state = set_robot_joint_state(q, label=f"{label}_fast_replay", wrap_continuous_swing=True)
         execution_stage_profile_add_elapsed(exec_profile, "apply_target_ms", apply_t, "cmd_steps", 1)
         if not ok_state:
             set_execution_failure_reason(f"execution_failed/fast_replay_set_joint_state_failed:{label}:{mode}")
@@ -20616,7 +20699,11 @@ async def wait_for_motion_reached(q_goal, label="", mode="auto", seconds_eff=0.0
                     warning_ok = bool((carry_report or {}).get("gravity_carry_warning_ok", False))
                     if warning_ok:
                         try:
-                            warning_metrics = sand_metrics_current(force=False)
+                            warning_metrics = hot_bucket_sand_metrics(
+                                label=f"carry_warning:{label}",
+                                q_real=q_check,
+                                force=False,
+                            )
                             warning_loaded = (
                                 int(warning_metrics.get("bucket_from_pile_count", 0) or 0)
                                 if isinstance(warning_metrics, dict)
@@ -20781,7 +20868,11 @@ async def wait_for_motion_reached(q_goal, label="", mode="auto", seconds_eff=0.0
             q_real = q_goal
         carry_ok, carry_report = gravity_carry_closed_for_q(q_real)
         try:
-            carry_metrics = sand_metrics_current(force=False)
+            carry_metrics = hot_bucket_sand_metrics(
+                label=f"carry_timeout:{label}",
+                q_real=q_real,
+                force=False,
+            )
             carry_loaded = int(carry_metrics.get("bucket_from_pile_count", 0) or 0) if isinstance(carry_metrics, dict) else 0
         except Exception:
             carry_loaded = 0
@@ -20900,10 +20991,10 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
             f"bucket_delta={rad_to_deg(float(q1[bucket_idx] - q0[bucket_idx])):.2f}deg",
             force_log=debug_diagnostics_enabled(),
         )
-    if "lift_carry" in str(label or mode).lower():
-        bucket_idx = CTRL.name_to_idx.get("bucket", 3)
-        q1[bucket_idx] = float(q0[bucket_idx])
-        q1 = CTRL.clip_limits(q1)
+    # The lift planner already validates the complete four-joint goal, including
+    # the bucket orientation relative to gravity. Re-freezing the bucket here
+    # made the executed pose differ from the scored pose and defeated
+    # coordinated close/lift recovery for a loaded bucket.
     if mode_requires_loaded_carry_bucket(mode, label):
         q1 = force_loaded_carry_bucket_q(q1, reference=q0, label=label or mode)
     q_final_cmd = q1.copy()
@@ -21526,6 +21617,10 @@ IK_COST_WEIGHTS = np.array([0.35, 0.45, 0.55, 4.50], dtype=np.float32)
 DIG_PLAN_BEAM_SIZE = 3
 DIG_PLAN_TOPK_IK = 2
 DIG_PLAN_MAX_CANDIDATES = 10
+DIG_PLAN_PRIMARY_FULL_TOPK = max(
+    1,
+    int(os.environ.get("EXCAVATOR_DIG_PLAN_PRIMARY_FULL_TOPK", "3") or 3),
+)
 DIG_PLAN_PATH_CHECK_SAMPLES = 6
 DIG_PLAN_MAX_BUILD_SECONDS = 10.0
 DIG_PLAN_EARLY_ACCEPT_DEFAULT = "0" if EXPERT_PLANNER_V1_ENABLED else "1"
@@ -23871,7 +23966,23 @@ def swing_target_near(target, current):
     return current + swing_delta(target, current)
 
 
-def set_robot_joint_state(q, label="state"):
+def swing_articulation_state_angle(target):
+    """Map an unbounded continuous swing command into the PhysX state interval."""
+    raw_lo, raw_hi = FINAL_LIMITS_RAD.get("swing", (-math.pi, math.pi))
+    lo = float(min(raw_lo, raw_hi))
+    hi = float(max(raw_lo, raw_hi))
+    target = float(target)
+    turn = 2.0 * math.pi
+    k_min = int(math.ceil((lo - target) / turn - 1.0e-9))
+    k_max = int(math.floor((hi - target) / turn + 1.0e-9))
+    candidates = [target + turn * float(k) for k in range(k_min, k_max + 1)]
+    if candidates:
+        wrapped = wrap_angle(target)
+        return float(min(candidates, key=lambda value: abs(float(value) - wrapped)))
+    return float(min(max(target, lo), hi))
+
+
+def set_robot_joint_state(q, label="state", wrap_continuous_swing=False):
     if ROBOT is None:
         info_print(f"[WARN] {label}: ROBOT not ready for joint state set")
         return False
@@ -23882,7 +23993,13 @@ def set_robot_joint_state(q, label="state"):
         info_print(f"[WARN] {label}: physics view not ready for joint state set")
         return False
 
-    q_state = CTRL.clip_action_limits(q)
+    if wrap_continuous_swing:
+        q_state = CTRL.clip_limits(q)
+        swing_idx = CTRL.name_to_idx["swing"]
+        q_state[swing_idx] = swing_articulation_state_angle(q_state[swing_idx])
+        q_state = CTRL.clip_action_limits(q_state)
+    else:
+        q_state = CTRL.clip_action_limits(q)
     try:
         ROBOT.set_joint_positions(q_state, joint_indices=JOINT_INDICES)
     except TypeError:
@@ -28841,16 +28958,18 @@ def carry_material_report_for_q(q_pose, end_effector="load"):
 
 
 def secure_phase_delta_report(current_metrics=None):
-    current_metrics = sand_metrics_current(force=True) if current_metrics is None else current_metrics
+    current_metrics = hot_bucket_sand_metrics(label="secure_phase_delta", force=True) if current_metrics is None else current_metrics
     current_metrics = current_metrics if isinstance(current_metrics, dict) else {}
     current_bucket = int(current_metrics.get("bucket_from_pile_count", 0) or 0)
-    current_spill = int(current_metrics.get("spill_from_pile_count", 0) or 0)
+    metrics_scope = str(current_metrics.get("metrics_scope", "full"))
+    spill_observed = metrics_scope not in {"dataset_bucket_fast", "hot_bucket_fallback", "bucket_fast_only"}
+    current_spill = int(current_metrics.get("spill_from_pile_count", 0) or 0) if spill_observed else 0
     baseline_name, baseline_sand = secure_material_baseline_sand()
     baseline_sand = baseline_sand if isinstance(baseline_sand, dict) else {}
     start_bucket = int(baseline_sand.get("bucket_from_pile", current_bucket) or 0)
-    start_spill = int(baseline_sand.get("raw_region_spill_from_pile", current_spill) or 0)
+    start_spill = int(baseline_sand.get("raw_region_spill_from_pile", current_spill) or 0) if spill_observed else 0
     bucket_loss = max(0, start_bucket - current_bucket)
-    spill_delta = max(0, current_spill - start_spill)
+    spill_delta = max(0, current_spill - start_spill) if spill_observed else 0
     spill_limit = max(
         int(SECURE_HOLD_MAX_SPILL_PARTICLES),
         int(float(max(current_bucket, start_bucket, 1)) * float(SECURE_HOLD_MAX_SPILL_FRACTION)),
@@ -28862,7 +28981,7 @@ def secure_phase_delta_report(current_metrics=None):
     retained_fraction = 1.0 if start_bucket <= 0 else float(current_bucket) / float(max(1, start_bucket))
     min_retained_fraction = float(SECURE_HOLD_MIN_RETAINED_FROM_CUT_FRACTION)
     fraction_ok = bool(start_bucket <= 0 or retained_fraction >= min_retained_fraction)
-    spill_ok = bool(spill_delta <= spill_limit)
+    spill_ok = bool(not spill_observed or spill_delta <= spill_limit)
     bucket_count_ok = bool(current_bucket >= int(CURL_HOLD_MIN_BUCKET_PARTICLES))
     material_retained_ok = bool(bucket_loss <= loss_limit and fraction_ok and bucket_count_ok)
     ok = bool(material_retained_ok or not bool(SECURE_MATERIAL_LOSS_HARD_GATE))
@@ -28899,6 +29018,7 @@ def secure_phase_delta_report(current_metrics=None):
         "spill_delta": int(spill_delta),
         "spill_limit": int(spill_limit),
         "spill_ok": bool(spill_ok),
+        "spill_observed": bool(spill_observed),
         "spill_accepted": bool(ok and not spill_ok),
     }
 
@@ -28916,6 +29036,14 @@ def secure_post_gate_report(q_start, current_metrics=None):
     # still near vertical and dump most of the material.
     carry_ok = bool(geometry_retains or real_loaded_hold)
     delta_ok = bool(delta_report.get("ok", False))
+    high_load_lift_recovery_allowed = bool(
+        delta_ok
+        and not carry_ok
+        and transitional_loaded_hold
+        and bucket_after >= int(LIFT_CARRY_HIGH_LOAD_RECOVERY_PARTICLES)
+        and bool(carry_report.get("loaded_carry_joint_ok", False))
+        and not bool(carry_report.get("dump_branch_for_carry", False))
+    )
     ok = carry_ok and delta_ok
     if ok:
         reason = "ok"
@@ -28941,11 +29069,13 @@ def secure_post_gate_report(q_start, current_metrics=None):
         "geometry_retains_material": bool(geometry_retains),
         "real_loaded_hold_allowed": bool(real_loaded_hold),
         "transitional_loaded_hold_allowed": bool(transitional_loaded_hold),
+        "high_load_lift_recovery_allowed": bool(high_load_lift_recovery_allowed),
+        "high_load_lift_recovery_threshold": int(LIFT_CARRY_HIGH_LOAD_RECOVERY_PARTICLES),
     }
 
 
 def post_lift_material_gate_report(current_metrics=None, q_pose=None):
-    current_metrics = sand_metrics_current(force=True) if current_metrics is None else current_metrics
+    current_metrics = sand_metrics_current(force=True, label="post_lift_gate_fallback") if current_metrics is None else current_metrics
     current_metrics = current_metrics if isinstance(current_metrics, dict) else {}
     current_bucket = int(current_metrics.get("bucket_from_pile_count", 0) or 0)
     current_spill = int(current_metrics.get("spill_from_pile_count", 0) or 0)
@@ -29076,7 +29206,7 @@ def staged_carry_safe_projection_candidates(q_start):
     boom_idx = CTRL.name_to_idx["boom"]
     arm_idx = CTRL.name_to_idx["arm"]
     try:
-        metrics_now = sand_metrics_current(force=False)
+        metrics_now = hot_bucket_sand_metrics(label="staged_carry_projection", q_real=q_start, force=False)
         loaded_now = int(metrics_now.get("bucket_from_pile_count", 0) or 0) if isinstance(metrics_now, dict) else 0
     except Exception:
         loaded_now = 0
@@ -29200,11 +29330,24 @@ def staged_lift_candidates(q_start):
     except Exception:
         lift_start_load_z = None
     try:
-        metrics_now = sand_metrics_current(force=False)
+        metrics_now = hot_bucket_sand_metrics(label="staged_lift_candidates", q_real=q_start, force=False)
         loaded_now = int(metrics_now.get("bucket_from_pile_count", 0) or 0) if isinstance(metrics_now, dict) else 0
     except Exception:
         loaded_now = 0
-    for boom_lift_deg, arm_retract_deg in [(8.0, -3.0), (14.0, -6.0), (20.0, -9.0), (26.0, -12.0), (32.0, -14.0)]:
+    start_carry_report = carry_material_report_for_q(q_start, end_effector="load")
+    start_carry_score = carry_report_score(start_carry_report)
+    for boom_lift_deg, arm_retract_deg in [
+        (6.0, 0.0),
+        (8.0, -3.0),
+        (10.0, 1.0),
+        (14.0, -6.0),
+        (16.0, 0.0),
+        (20.0, -9.0),
+        (22.0, 2.0),
+        (26.0, -12.0),
+        (32.0, -14.0),
+        (38.0, -16.0),
+    ]:
         q = q_start.copy()
         q[boom_idx] = float(q[boom_idx]) + deg_to_rad(boom_lift_deg)
         q[arm_idx] = float(q[arm_idx]) + deg_to_rad(arm_retract_deg)
@@ -29229,7 +29372,12 @@ def staged_lift_candidates(q_start):
             carry_report["adjusted_real_loaded_hold_allowed"] = bool(adjusted_real_hold)
             carry_report["forced_loaded_carry_report"] = forced_report
         elif isinstance(carry_report, dict):
-            carry_report = dict(carry_report)
+            # Recovery candidates must execute the exact pose that was scored.
+            # Keeping q at the unadjusted base while attaching an adjusted
+            # report makes planning and post-lift truth disagree.
+            q = q_adjusted.copy()
+            carry_report = dict(adjusted_report or carry_report)
+            carry_report["projection_source"] = "carry_hold_adjusted_recovery"
             carry_report["forced_loaded_carry_report"] = forced_report
             carry_report["adjusted_actual_report"] = adjusted_report
         bucket_deg = rad_to_deg(float(q[bucket_idx]))
@@ -29247,14 +29395,24 @@ def staged_lift_candidates(q_start):
         retains_material = bool((carry_report or {}).get("retains_material", False))
         real_material_hold = bool(real_loaded_secure_hold_allowed(carry_report, loaded_count=loaded_now))
         transitional_material_hold = bool(loaded_transitional_hold_allowed(carry_report, loaded_count=loaded_now))
-        if not (retains_material or real_material_hold):
+        candidate_carry_score = carry_report_score(carry_report)
+        high_load_recovery_candidate = bool(
+            loaded_now >= int(LIFT_CARRY_HIGH_LOAD_RECOVERY_PARTICLES)
+            and transitional_material_hold
+            and bool((carry_report or {}).get("loaded_carry_joint_ok", False))
+            and not bool((carry_report or {}).get("dump_branch_for_carry", False))
+            and candidate_carry_score
+            >= float(start_carry_score) - float(LIFT_CARRY_RECOVERY_MAX_SCORE_DROP)
+        )
+        if not (retains_material or real_material_hold or high_load_recovery_candidate):
             rows.append({
                 "ok": False,
                 "q": q,
                 "reason": (
                     "carry_would_spill_before_lift:"
                     f"pour_above_load_z={fmt_optional((carry_report or {}).get('pour_above_load_z'))}; "
-                    f"transitional_hold={bool(transitional_material_hold)}"
+                    f"transitional_hold={bool(transitional_material_hold)}; "
+                    f"carry_score={candidate_carry_score:.2f}/{start_carry_score:.2f}"
                 ),
                 "carry_report": carry_report,
                 "transitional_material_hold": bool(transitional_material_hold),
@@ -29300,7 +29458,11 @@ def staged_lift_candidates(q_start):
         score = (
             float(motion.get("cost", 0.0) or 0.0)
             + carry_spill_risk_penalty(carry_report)
-            + (24.0 if transitional_material_hold and not (retains_material or real_material_hold) else 0.0)
+            + (
+                float(LIFT_CARRY_RECOVERY_CANDIDATE_PENALTY)
+                if high_load_recovery_candidate and not (retains_material or real_material_hold)
+                else 0.0
+            )
         )
         rows.append({
             "ok": True,
@@ -29312,6 +29474,9 @@ def staged_lift_candidates(q_start):
             "retains_material": bool(retains_material),
             "real_material_hold": bool(real_material_hold),
             "transitional_material_hold": bool(transitional_material_hold and not retains_material),
+            "high_load_recovery_candidate": bool(high_load_recovery_candidate),
+            "carry_score_before": float(start_carry_score),
+            "carry_score_after": float(candidate_carry_score),
             "preserve_loaded_bucket": False,
             "loaded_now": int(loaded_now),
             "boom_lift_deg": float(boom_lift_deg),
@@ -29327,7 +29492,7 @@ def staged_high_carry_unload_fallback(q_lift, q_pre_dump, deadline=None):
     q_lift = np.array(q_lift, dtype=np.float32).reshape(-1)[:4].copy()
     q_pre_dump = np.array(q_pre_dump, dtype=np.float32).reshape(-1)[:4].copy()
     try:
-        metrics_now = sand_metrics_current(force=False)
+        metrics_now = hot_bucket_sand_metrics(label="staged_high_carry", q_real=q_lift, force=False)
         loaded_now = int(metrics_now.get("bucket_from_pile_count", 0) or 0) if isinstance(metrics_now, dict) else 0
     except Exception:
         loaded_now = 0
@@ -29435,7 +29600,7 @@ def staged_dig_secure_candidates(q_start, loaded_count_hint=None):
     boom_idx = CTRL.name_to_idx.get("boom", 1)
     arm_idx = CTRL.name_to_idx.get("arm", 2)
     try:
-        metrics_now = sand_metrics_current(force=False)
+        metrics_now = hot_bucket_sand_metrics(label="staged_secure_candidates", q_real=q_start, force=False)
         loaded_now = int(metrics_now.get("bucket_from_pile_count", 0) or 0) if isinstance(metrics_now, dict) else 0
     except Exception:
         loaded_now = 0
@@ -29923,7 +30088,7 @@ def staged_dig_secure_candidates(q_start, loaded_count_hint=None):
     valid_secure = [row for row in secure_rows if bool(row.get("ok", False))]
     if not valid_secure:
         try:
-            cut_metrics = sand_metrics_current(force=True)
+            cut_metrics = hot_bucket_sand_metrics(label="staged_secure_failure", q_real=q_start, force=True)
             cut_bucket = int(cut_metrics.get("bucket_from_pile_count", 0) or 0) if isinstance(cut_metrics, dict) else 0
         except Exception:
             cut_bucket = 0
@@ -30196,12 +30361,20 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
     else:
         secure_metrics = record_phase_metrics("after_secure_load")
         secure_gate = secure_post_gate_report(q_start, current_metrics=secure_metrics)
+    deferred_high_load_lift = bool(
+        not bool(secure_gate.get("ok", False))
+        and secure_gate.get("high_load_lift_recovery_allowed", False)
+    )
     candidate["post_secure_gate"] = secure_gate
     STATE["dig_plan_candidate"] = candidate
     debug_timeline_record(
         "SECURE_GATE",
         stage="post_lift" if post_lift_reentry else "secure_load",
-        result="ok" if bool(secure_gate.get("ok", False)) else "project_required",
+        result=(
+            "ok"
+            if bool(secure_gate.get("ok", False))
+            else ("deferred_lift_recovery" if deferred_high_load_lift else "project_required")
+        ),
         reason=str(secure_gate.get("reason", "")),
         q_cmd=q_start,
         q_real=q_start,
@@ -30212,7 +30385,29 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
     carry_safe_points = []
     carry_safe_stages = []
     q_lift_start = q_start.copy()
-    if not bool(secure_gate.get("ok", False)):
+    if deferred_high_load_lift:
+        warning = (
+            "warning/high_load_deferred_carry_recovery:"
+            f"bucket={int((secure_gate.get('material_delta') or {}).get('bucket_after', 0) or 0)};"
+            f"reason={str(secure_gate.get('reason', 'carry_not_safe'))}"
+        )
+        candidate["high_load_deferred_carry_recovery"] = {
+            "enabled": True,
+            "warning": warning,
+            "secure_gate": secure_gate,
+        }
+        STATE["dataset_gravity_carry_warning"] = warning
+        dataset_record_event(
+            "high_load_deferred_carry_recovery",
+            warning,
+            data=candidate["high_load_deferred_carry_recovery"],
+        )
+        info_print(
+            "[CARRY RECOVERY DEFERRED TO LIFT]",
+            warning,
+            "decision=plan_coordinated_lift_then_post_lift_truth_gate",
+        )
+    if not bool(secure_gate.get("ok", False)) and not deferred_high_load_lift:
         if not bool(secure_gate.get("spill_gate_ok", False)):
             reason = str(secure_gate.get("reason", "secure_material_loss"))
             candidate["post_secure_projection"] = {
@@ -30235,7 +30430,7 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
                 include_sand=True,
             )
             return False
-    if not bool(secure_gate.get("ok", False)):
+    if not bool(secure_gate.get("ok", False)) and not deferred_high_load_lift:
         recovery_count = int(candidate.get("staged_secure_recovery_count", 0) or 0)
         bucket_idx = CTRL.name_to_idx.get("bucket", 3)
         current_bucket_deg = rad_to_deg(float(q_start[bucket_idx]))
@@ -30255,7 +30450,7 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
             loaded_for_recovery = 0
         if loaded_for_recovery <= 0:
             try:
-                metrics_now = sand_metrics_current(force=False)
+                metrics_now = hot_bucket_sand_metrics(label="staged_secure_recovery", q_real=q_start, force=False)
                 loaded_for_recovery = int(metrics_now.get("bucket_from_pile_count", 0) or 0) if isinstance(metrics_now, dict) else 0
             except Exception:
                 loaded_for_recovery = 0
@@ -30351,7 +30546,7 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
                     f"bucket_real={current_bucket_deg:.2f}deg",
                 )
                 return True
-    if not bool(secure_gate.get("ok", False)):
+    if not bool(secure_gate.get("ok", False)) and not deferred_high_load_lift:
         if bool(candidate.get("staged_secure_carry_safe_appended", False)):
             reason = "secure_carry_safe_still_not_retaining:" + str(
                 secure_gate.get("reason", "current pose does not retain material")
@@ -30518,9 +30713,28 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
             info_print("[DIG PLAN STAGED FAILED]", "stage=lift_carry", reason)
             return False
 
-        lift = sorted(valid_lift, key=lambda row: float(row.get("score", 1.0e9)))[0]
+        strict_lift = [
+            row
+            for row in valid_lift
+            if bool(row.get("retains_material", False)) or bool(row.get("real_material_hold", False))
+        ]
+        lift_pool = strict_lift if strict_lift else valid_lift
+        lift = sorted(lift_pool, key=lambda row: float(row.get("score", 1.0e9)))[0]
         q_lift = np.array(lift["q"], dtype=np.float32).copy()
         lift_duration = float(lift.get("duration", 1.1) or 1.1)
+        lift_selection = "strict_retaining" if strict_lift else "high_load_recovery"
+        info_print(
+            "[LIFT CARRY SELECT]",
+            f"selection={lift_selection}",
+            f"strict={len(strict_lift)}",
+            f"valid={len(valid_lift)}",
+            f"loaded={int(lift.get('loaded_now', 0) or 0)}",
+            f"boom_lift={float(lift.get('boom_lift_deg', 0.0)):.1f}deg",
+            f"arm_retract={float(lift.get('arm_retract_deg', 0.0)):.1f}deg",
+            f"carry_score={float(lift.get('carry_score_before', 0.0) or 0.0):.2f}"
+            f"->{float(lift.get('carry_score_after', 0.0) or 0.0):.2f}",
+            f"q_goal={q_deg_values(q_lift, wrap_swing_for_display=True)}",
+        )
         lift_row = make_stage_row_from_q(
             "lift_carry",
             q_lift,
@@ -30535,7 +30749,12 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
                     "boom_lift_deg": float(lift.get("boom_lift_deg", 0.0)),
                     "arm_retract_deg": float(lift.get("arm_retract_deg", 0.0)),
                     "preserve_loaded_bucket": bool(lift.get("preserve_loaded_bucket", False)),
-                    "deferred_bucket_safe_until_after_lift": False,
+                    "deferred_bucket_safe_until_after_lift": bool(deferred_high_load_lift),
+                    "selection": str(lift_selection),
+                    "high_load_recovery_candidate": bool(lift.get("high_load_recovery_candidate", False)),
+                    "loaded_particles": int(lift.get("loaded_now", 0) or 0),
+                    "carry_score_before": float(lift.get("carry_score_before", 0.0) or 0.0),
+                    "carry_score_after": float(lift.get("carry_score_after", 0.0) or 0.0),
                 },
             },
         )
@@ -31133,6 +31352,112 @@ def should_append_staged_post_secure_load_after_stage(stage_name):
     return False
 
 
+def dig_plan_candidate_cheap_rank(target_xyz, candidate, original_index=0):
+    """Order primitive candidates without running the full staged planner.
+
+    This is deliberately a soft ordering heuristic. A poor result never rejects a
+    candidate; candidates outside the primary window remain available as fallback.
+    """
+    candidate = dict(candidate or {})
+    detail = {
+        "version": "dig_candidate_cheap_rank_v1",
+        "original_index": int(original_index),
+        "reachable_points": 0,
+        "unreachable_points": 0,
+        "joint_hint_violations": 0,
+        "pre_dig_corridor_obstacles": 0,
+        "fill_potential": 0.0,
+        "motion_proxy": 0.0,
+    }
+    try:
+        specs = dig_plan_specs_from_candidate(target_xyz, dict(candidate))
+    except Exception as exc:
+        detail["error"] = f"spec_build_failed:{type(exc).__name__}:{exc}"
+        return 1.0e6 + float(original_index), detail
+
+    reach_rows = []
+    for phase, point, bucket_deg, _bucket_world, effector, _duration, _required in specs:
+        if str(phase) == "unload_to_bin":
+            continue
+        try:
+            ok, reason, reach = auto_dig_fast_reach_check(
+                point,
+                q_seed=CTRL.q_cmd,
+                end_effector=str(effector or "tip"),
+            )
+        except Exception as exc:
+            ok, reason, reach = False, f"reach_check_failed:{type(exc).__name__}:{exc}", {}
+        reach_rows.append({"phase": str(phase), "ok": bool(ok), "reason": str(reason), **dict(reach or {})})
+        if ok:
+            detail["reachable_points"] += 1
+        else:
+            detail["unreachable_points"] += 1
+
+        if bucket_deg is not None:
+            try:
+                bucket_rad = deg_to_rad(float(bucket_deg))
+                lo, hi = FINAL_LIMITS_RAD["bucket"]
+                if bucket_rad < float(lo) - 1.0e-5 or bucket_rad > float(hi) + 1.0e-5:
+                    detail["joint_hint_violations"] += 1
+            except Exception:
+                pass
+    detail["reach"] = reach_rows
+
+    try:
+        pre_point = next(np.array(spec[1], dtype=np.float32) for spec in specs if str(spec[0]) == "pre_dig")
+        current_tip = predicted_end_world_point(CTRL.q_cmd, end_effector="tip", reference_q=CTRL.q_cmd)
+        detail["pre_dig_corridor_obstacles"] = int(len(obstacle_bboxes_for_segment_xy(current_tip, pre_point)))
+    except Exception:
+        detail["pre_dig_corridor_obstacles"] = 0
+
+    fill_terms = []
+    for key in ("insert_depth", "mid_depth", "mid_pull", "exit_pull", "lift_height"):
+        try:
+            fill_terms.append(max(0.0, float(candidate.get(key, 0.0) or 0.0)))
+        except Exception:
+            pass
+    detail["fill_potential"] = min(2.0, float(sum(fill_terms)))
+    try:
+        detail["motion_proxy"] = float(
+            max(0.0, float(candidate.get("approach_offset", 0.0) or 0.0))
+            + max(0.0, float(candidate.get("exit_pull", 0.0) or 0.0))
+            + 0.5 * max(0.0, float(candidate.get("lift_height", 0.0) or 0.0))
+        )
+    except Exception:
+        detail["motion_proxy"] = 0.0
+
+    cheap_cost = (
+        120.0 * float(detail["unreachable_points"])
+        + 30.0 * float(detail["joint_hint_violations"])
+        + 8.0 * float(detail["pre_dig_corridor_obstacles"])
+        + 2.5 * float(detail["motion_proxy"])
+        - 12.0 * float(detail["fill_potential"])
+        + 1.0e-4 * float(original_index)
+    )
+    detail["cheap_cost"] = float(cheap_cost)
+    return float(cheap_cost), detail
+
+
+def rank_dig_plan_candidates_cheap(target_xyz, candidates):
+    ranked = []
+    for original_index, candidate in enumerate(candidates or []):
+        cheap_cost, detail = dig_plan_candidate_cheap_rank(target_xyz, candidate, original_index=original_index)
+        ranked.append(
+            {
+                "candidate": dict(candidate),
+                "candidate_id": str((candidate or {}).get("id", f"candidate_{original_index}")),
+                "cheap_cost": float(cheap_cost),
+                "detail": detail,
+                "original_index": int(original_index),
+            }
+        )
+    ranked.sort(key=lambda row: (float(row["cheap_cost"]), int(row["original_index"])))
+    for rank, row in enumerate(ranked, start=1):
+        row["rank"] = int(rank)
+        row["detail"]["rank"] = int(rank)
+    return ranked
+
+
 def dig_plan_expert_rank_cost(row, candidate, legacy_score=0.0, reports=None):
     planner_cost = float((row or {}).get("planner_cost", 1.0e9) or 1.0e9)
     if not bool(EXPERT_PLANNER_V1_ENABLED):
@@ -31267,6 +31592,17 @@ def dig_plan_staged_prefix_early_accept_ok(row, evaluated_count):
     return True, f"staged_prefix_ready:{terminal}", terminal
 
 
+def dig_plan_staged_prefix_quality_ready(row):
+    prefix_stages, reason = staged_prefix_stages_from_failure(row)
+    if not prefix_stages:
+        return False, "", reason
+    semantic = [dig_plan_semantic_phase_name(str(stage.get("phase", ""))) for stage in prefix_stages if isinstance(stage, dict)]
+    terminal = str(next((phase for phase in reversed(semantic) if phase != "clearance_route"), ""))
+    if terminal not in ("pull_exit_cut", "secure_load"):
+        return False, terminal, f"staged_prefix_terminal_not_ready:{terminal}"
+    return True, terminal, f"staged_prefix_ready:{terminal}"
+
+
 def plan_dig_sequence_from_target(target_xyz, max_seconds=None):
     STATE["last_dig_plan_candidates"] = []
     STATE["dig_plan_candidate"] = None
@@ -31289,18 +31625,48 @@ def plan_dig_sequence_from_target(target_xyz, max_seconds=None):
         "best_cost": None,
         "best_candidate": "",
         "timeout": False,
+        "candidate_ordering": "cheap_rank_v1",
+        "primary_full_top_k": 0,
+        "primary_window_complete": False,
+        "primary_staged_ready_count": 0,
+        "fallback_evaluated": 0,
+        "selection_scope": "",
+        "cheap_rank_ms": 0.0,
+        "cheap_rank": [],
     }
 
     candidates = adaptive_dig_plan_candidates(target_xyz)
+    cheap_rank_t0 = time.perf_counter()
+    cheap_rank_rows = rank_dig_plan_candidates_cheap(target_xyz, candidates)
+    plan_summary["cheap_rank_ms"] = float((time.perf_counter() - cheap_rank_t0) * 1000.0)
+    candidates = [dict(row["candidate"]) for row in cheap_rank_rows]
+    cheap_rank_by_id = {str(row["candidate_id"]): row for row in cheap_rank_rows}
+    primary_full_top_k = min(len(candidates), max(1, int(DIG_PLAN_PRIMARY_FULL_TOPK)))
     budget_source = max_seconds if max_seconds is not None else STATE.get("dig_plan_build_budget_seconds", DIG_PLAN_MAX_BUILD_SECONDS)
     budget_seconds = float(budget_source or DIG_PLAN_MAX_BUILD_SECONDS)
     plan_summary["budget_seconds"] = float(budget_seconds)
     plan_summary["candidate_count"] = int(len(candidates))
-    deadline = time.time() + budget_seconds
+    plan_summary["primary_full_top_k"] = int(primary_full_top_k)
+    plan_summary["cheap_rank"] = [
+        {
+            "rank": int(row["rank"]),
+            "candidate": str(row["candidate_id"]),
+            "cheap_cost": float(row["cheap_cost"]),
+            "reachable_points": int(row["detail"].get("reachable_points", 0)),
+            "unreachable_points": int(row["detail"].get("unreachable_points", 0)),
+            "joint_hint_violations": int(row["detail"].get("joint_hint_violations", 0)),
+            "pre_dig_corridor_obstacles": int(row["detail"].get("pre_dig_corridor_obstacles", 0)),
+            "fill_potential": float(row["detail"].get("fill_potential", 0.0)),
+        }
+        for row in cheap_rank_rows
+    ]
+    rank_elapsed_seconds = max(0.0, time.perf_counter() - plan_t0)
+    remaining_budget_seconds = max(0.0, budget_seconds - rank_elapsed_seconds)
+    deadline = time.time() + remaining_budget_seconds
     previous_perf_deadline = STATE.get("dig_plan_active_perf_deadline")
-    STATE["dig_plan_active_perf_deadline"] = time.perf_counter() + budget_seconds
+    STATE["dig_plan_active_perf_deadline"] = time.perf_counter() + remaining_budget_seconds
     try:
-        for candidate in candidates:
+        for candidate_index, candidate in enumerate(candidates):
             if planning_deadline_exceeded(deadline):
                 plan_summary["timeout"] = True
                 info_print(
@@ -31331,6 +31697,14 @@ def plan_dig_sequence_from_target(target_xyz, max_seconds=None):
             )
             row = dict(detail or {})
             row["candidate"] = dict(candidate)
+            cheap_row = cheap_rank_by_id.get(str(candidate.get("id", "")))
+            if isinstance(cheap_row, dict):
+                row["cheap_rank"] = int(cheap_row.get("rank", candidate_index + 1))
+                row["cheap_cost"] = float(cheap_row.get("cheap_cost", 0.0))
+                row["cheap_rank_detail"] = dict(cheap_row.get("detail", {}))
+            row["full_plan_window"] = "primary" if candidate_index < primary_full_top_k else "fallback"
+            if candidate_index >= primary_full_top_k:
+                plan_summary["fallback_evaluated"] = int(plan_summary.get("fallback_evaluated", 0)) + 1
             early_accept_this = False
             if seq:
                 if plan_summary.get("first_plan_ms") is None:
@@ -31408,6 +31782,36 @@ def plan_dig_sequence_from_target(target_xyz, max_seconds=None):
             STATE["last_dig_plan_candidates"].append(row)
             plan_summary["evaluated"] = int(len(STATE.get("last_dig_plan_candidates", [])))
             if early_accept_this:
+                plan_summary["selection_scope"] = "configured_early_accept"
+                break
+            evaluated_count = int(plan_summary["evaluated"])
+            if evaluated_count == primary_full_top_k:
+                plan_summary["primary_window_complete"] = True
+                if best is not None:
+                    plan_summary["selection_scope"] = "best_of_primary_top_k"
+                    break
+                primary_rows = list(STATE.get("last_dig_plan_candidates", []))[:primary_full_top_k]
+                staged_ready = []
+                for primary_row in primary_rows:
+                    staged_ok, staged_terminal, _staged_reason = dig_plan_staged_prefix_quality_ready(primary_row)
+                    if staged_ok:
+                        staged_ready.append((primary_row, staged_terminal))
+                plan_summary["primary_staged_ready_count"] = int(len(staged_ready))
+                if primary_rows and len(staged_ready) == len(primary_rows):
+                    best_failure = min(
+                        (item[0] for item in staged_ready),
+                        key=lambda failure: (
+                            -int(failure.get("planned_prefix", 0) or 0),
+                            float(failure.get("best_partial_cost", 1.0e9) or 1.0e9),
+                        ),
+                    )
+                    plan_summary["selection_scope"] = "best_staged_prefix_of_primary_top_k"
+                    plan_summary["staged_prefix_terminal_phase"] = str(
+                        dig_plan_staged_prefix_quality_ready(best_failure)[1]
+                    )
+                    break
+            if candidate_index >= primary_full_top_k and best is not None:
+                plan_summary["selection_scope"] = "progressive_fallback_first_success"
                 break
     finally:
         STATE["dig_plan_active_perf_deadline"] = previous_perf_deadline
@@ -31439,6 +31843,11 @@ def plan_dig_sequence_from_target(target_xyz, max_seconds=None):
         f"elapsed_ms={fmt_optional(plan_summary.get('elapsed_ms'))}",
         f"best_ready={plan_summary.get('best_ready')}",
         f"best_cost={fmt_optional(plan_summary.get('best_cost'))}",
+        f"cheap_rank_ms={fmt_optional(plan_summary.get('cheap_rank_ms'))}",
+        f"primary_topk={plan_summary.get('primary_full_top_k')}",
+        f"primary_staged={plan_summary.get('primary_staged_ready_count')}",
+        f"fallback={plan_summary.get('fallback_evaluated')}",
+        f"scope={plan_summary.get('selection_scope')}",
         f"early_accept={plan_summary.get('early_accept')}",
         f"staged_prefix={plan_summary.get('staged_prefix_early_accept')}",
         f"terminal={plan_summary.get('staged_prefix_terminal_phase')}",

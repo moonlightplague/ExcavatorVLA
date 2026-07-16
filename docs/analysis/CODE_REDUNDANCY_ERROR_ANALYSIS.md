@@ -1,5 +1,10 @@
 # Code Redundancy And Error Analysis
 
+> Historical static audit (2026-07-01). File counts, paths, runtime size,
+> temporary-code findings, and unresolved-item claims have not been revalidated
+> against the current working tree. Do not treat this report as a current defect
+> list without checking the referenced source first.
+
 This report reviews the current Python scripts in the ExcavatorVLA workspace for redundant, invalid, dead, or error-prone code. It is based on static analysis only; Isaac Sim runtime behavior was not executed.
 
 ## Scope And Method

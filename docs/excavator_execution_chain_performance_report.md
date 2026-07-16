@@ -1,5 +1,16 @@
 # Excavator Auto-Collect Execution Chain and Performance Report
 
+> Historical performance report. The measured Isaac/Kit update costs and run
+> evidence remain useful, but this file is not the current call-chain or clock
+> specification. Since this report was written,
+> `begin_auto_dataset_episode()` became `auto_collect_begin_episode()`,
+> `execute_dig_plan_sequence()` was replaced by the
+> `execute_dig_target_ball()` / `execute_dig_plan_step()` chain, auto collect
+> became the sole step-clock owner by default, camera capture gained a
+> background scheduler, and exported sample/derivative time now defaults to
+> simulation/train time rather than wall time. See
+> `docs/current_runtime_architecture.md` for the audited 2026-07-15 chain.
+
 本报告用于交给外部专家分析当前自动采集速度问题。核心问题是：
 
 > 路径规划通常几十秒以内，但一个 attempt 的动作执行经常需要数分钟。按直觉 4 自由度机械臂只需要控制 4 个关节角度，为什么执行比规划还慢？

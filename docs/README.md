@@ -35,15 +35,29 @@ configuration take precedence over older prose documents.
 
 ## Deployment Handoff
 
+- [Current runtime architecture](current_runtime_architecture.md): canonical
+  auto-collect, planning, execution, clock, camera, and sampling call chain as
+  audited against the 2026-07-15 working tree.
 - [18D SmolVLA deployment handoff](vla_18d_deployment_handoff.md): immediate
   guidance for the existing 14D state + 4D effort checkpoints, including the
   current simulator slowdown diagnosis and a later 32D migration path.
 - [Execution-chain performance report](excavator_execution_chain_performance_report.md):
-  data-generator execution and Isaac update costs.
+  historical July 2026 run measurements; its old call-chain names and wall-time
+  timestamp description are superseded by the current runtime architecture.
 - [Path-planning analysis](excavator_path_planning_analysis.md): dig and unload
-  planning architecture.
+  planning architecture with a current-delta note for cheap ranking and Top-K.
 - [Profile-mode stall postmortem](profile_mode_scene_commit_stall_postmortem.md):
   resolved mode-specific scene-commit stall.
+
+## Historical Reports
+
+The following files are retained as dated evidence, not current source maps:
+
+| Document | Status |
+| --- | --- |
+| `analysis/excavator_dataset_schema_analysis.md` | Historical schema/performance analysis; current 28D + 4D export metadata wins. |
+| `analysis/SCRIPT_FUNCTION_MEMO_INDEX.md` | Generated 2026-07-01; paths, line numbers, and function inventory are stale. |
+| `analysis/CODE_REDUNDANCY_ERROR_ANALYSIS.md` | Static audit from 2026-07-01; findings require revalidation before action. |
 
 ## Compatibility Rule
 

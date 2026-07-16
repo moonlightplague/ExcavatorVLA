@@ -1,5 +1,10 @@
 # Script Function Memo Index
 
+> Historical generated index (2026-07-01). Its project path, line numbers,
+> function inventory, and entry-point list are stale relative to the current
+> working tree. Keep it only as a historical navigation artifact; use `rg` and
+> `docs/current_runtime_architecture.md` for current code navigation.
+
 Generated for the ExcavatorVLA workspace. This is a code-navigation memo, not a behavioral specification.
 
 ## Scope

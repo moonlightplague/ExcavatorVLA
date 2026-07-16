@@ -2,6 +2,17 @@
 
 Date: 2026-07-09
 
+Current-status note (audited 2026-07-15): the shared validators and the dig vs
+loaded-unload split described below still exist. The candidate-selection layer
+has since gained `rank_dig_plan_candidates_cheap()` and `cheap_rank_v1`.
+`build_dig_plan_from_current_target()` now cheaply ranks all adaptive
+candidates, fully plans the primary Top-K window (default 3), compares complete
+plans with expert cost, and then uses qualified staged-prefix or progressive
+fallback selection. `PLAN_BUILD_SUMMARY` records this selection scope. Older
+line numbers and statements that imply every candidate receives full planning
+should be treated as historical. See `current_runtime_architecture.md` for the
+current top-level chain.
+
 This note summarizes the current path planning implementation in
 `scripts/excavator_app/excavator_runtime.py` for expert review. The main
 question is whether "reach to dip sand" and "unload to truck" use the same

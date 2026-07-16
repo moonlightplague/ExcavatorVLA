@@ -4,6 +4,10 @@ Date: 2026-07-11
 
 Status: Resolved and verified in a subsequent profile-mode run.
 
+Revalidated: 2026-07-15. The referenced debug-visual authoring guard and
+single-owner auto-collect clock invariant remain present in the current working
+tree. This document is a resolved incident record, not an active issue report.
+
 ## 1. Problem Summary
 
 Excavator auto-collect could run multiple attempts normally in `data` mode,
@@ -290,4 +294,3 @@ visibility without allowing diagnostics to alter execution stability.
   - launcher update profiling
 - `excavator_auto_dataset/run_20260711_195642/debug_timeline.jsonl`
   - decisive attempt-2 scene-commit trace
-

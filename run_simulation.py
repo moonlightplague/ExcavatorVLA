@@ -2128,7 +2128,7 @@ def main(args):
                         )
                     )
                     world.step(render=True)
-                    simulation_app.update()
+                    # simulation_app.update()
             finally:
                 timeline.pause()
             physics_done = time.perf_counter()

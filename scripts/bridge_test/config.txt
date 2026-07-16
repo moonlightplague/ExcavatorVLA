@@ -19,6 +19,12 @@ CKPT=/root/gpufree-data/outputs/train/excavator_smolvla_3cam_effort18_gop4_lr5e5
 
 VLM=/root/gpufree-data/checkpoints/SmolVLM2-500M-Video-Instruct
 
+DATASET_META=${SMOLVLA_DATASET_META:-}
+if [ -z "$DATASET_META" ]; then
+  echo "ERROR: set SMOLVLA_DATASET_META to the old 18D training dataset root or meta/info.json"
+  exit 2
+fi
+
 LOG_DIR=/root/gpufree-data/excavator_logs
 
 VIDEO_ROOT=/root/gpufree-data/excavator_videos
@@ -50,8 +56,7 @@ echo "$VIDEO_DIR"
 echo
 echo "Expected:"
 echo "12000 frames per camera"
-echo "30 FPS"
-echo "400 seconds"
+echo "Playback/control FPS read from $DATASET_META"
 echo "=================================================="
 
 set -o pipefail
@@ -64,12 +69,11 @@ scripts/bridge_test/smolvla_policy_client.py \
   --port 5555 \
   --ckpt "$CKPT" \
   --vlm "$VLM" \
-  --ticks 1 \
+  --dataset-meta "$DATASET_META" \
   --warmup-steps 10 \
   --replan-interval 0 \
   --steps 12000 \
   --record-video-dir "$VIDEO_DIR" \
-  --record-video-fps 30 \
   --record-video-codec mp4v \
   --swing-min-gain 0.25 \
   --boom-activity-ref 0.05 \

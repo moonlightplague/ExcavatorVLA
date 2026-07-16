@@ -20,6 +20,8 @@ import ctypes
 import importlib
 import importlib.util
 import builtins
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 
 def _read_bridge_measured_effort(
@@ -136,6 +138,18 @@ PROJECT_DIR = os.path.abspath(
 _add_import_roots(PROJECT_DIR)
 _clear_runtime_module_cache()
 
+from excavator_common.deployment_contract import (
+    ACTION_NAMES_4D,
+    CAMERA_KEYS,
+    CANONICAL_DOF_NAMES,
+    PHYSICS_HZ,
+    PROTOCOL_VERSION,
+    PhysicsTickScheduler,
+    canonical_values,
+    resolve_canonical_dof_indices,
+    validate_client_contract,
+)
+
 print(
     "[INFO] Run simulation project root:",
     PROJECT_DIR,
@@ -230,6 +244,8 @@ MODEL_IMAGE_WIDTH = 256
 MODEL_IMAGE_HEIGHT = 256
 CAPTURE_WAIT_FRAMES = 5
 PENDING_VIEWPORT_CAPTURE_HELPERS = []
+LAST_CAPTURE_TIMING_MS = {}
+CAPTURE_RESIZE_EXECUTOR = ThreadPoolExecutor(max_workers=3)
 
 
 # ---------------------------------------------------------------------
@@ -328,96 +344,105 @@ def resize_rgb_for_model(rgb, np_module):
     )
 
 
-def capture_rgb_from_viewport(viewport, world, simulation_app, capture_viewport_to_buffer, np_module,
-                              width=CAPTURE_WIDTH, height=CAPTURE_HEIGHT,
-                              wait_frames=CAPTURE_WAIT_FRAMES):
+def capture_rgb_from_persistent_viewports(
+    capture_views,
+    simulation_app,
+    capture_viewport_to_buffer,
+    np_module,
+    wait_frames=CAPTURE_WAIT_FRAMES,
+):
+    """Capture all fixed-camera viewports in one render window.
+
+    Each camera owns a persistent viewport, so there is no camera switching or
+    settle delay.  All callbacks are submitted before Kit is advanced.
     """
-    Capture RGB image from the active viewport.
+    global LAST_CAPTURE_TIMING_MS
 
-    This replaces:
-        camera.initialize()
-        camera.get_rgb()
+    capture_start = time.perf_counter()
+    results = {}
+    holders = []
 
-    It avoids Isaac Sim Camera RGB annotator / syntheticdata bug.
-    """
-    result = {"done": False, "rgb": None}
+    for camera_name, entry in capture_views.items():
+        result = {"done": False, "rgb": None, "error": ""}
+        results[camera_name] = result
+        window = entry.get("window")
+        if window is not None:
+            try:
+                window.visible = True
+            except Exception:
+                pass
 
-    helper_holder = {"done": False, "helper": None}
+        def on_capture(capsule, buffer_size, width, height, fmt, _result=result):
+            try:
+                rgba = capsule_to_numpy_rgba(
+                    capsule,
+                    buffer_size,
+                    width,
+                    height,
+                    np_module,
+                )
+                _result["rgb"] = np_module.ascontiguousarray(rgba[:, :, :3])
+            except Exception as exc:
+                _result["error"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                _result["done"] = True
 
-    def on_capture(capsule, buffer_size, w, h, fmt):
-        try:
-            rgba = capsule_to_numpy_rgba(capsule, buffer_size, w, h, np_module)
+        holder = {
+            "done": False,
+            "helper": capture_viewport_to_buffer(entry["viewport"], on_capture),
+        }
+        holders.append(holder)
+        PENDING_VIEWPORT_CAPTURE_HELPERS.append(holder)
 
-            if rgba.ndim != 3 or rgba.shape[-1] < 3:
-                raise RuntimeError(f"Unexpected viewport buffer shape: {rgba.shape}")
-
-            rgb = rgba[:, :, :3].copy()
-            result["rgb"] = rgb
-
-        except Exception as e:
-            print(f"[WARN] viewport capture failed: {repr(e)}", flush=True)
-
-        finally:
-            result["done"] = True
-            helper_holder["done"] = True
-
-    # Request one viewport capture.
-    helper_holder["helper"] = capture_viewport_to_buffer(viewport, on_capture)
-    PENDING_VIEWPORT_CAPTURE_HELPERS.append(helper_holder)
-
-    # Pump frames until callback finishes.
-    for _ in range(wait_frames):
-        world.step(render=True)
+    render_updates = 0
+    for _ in range(max(1, int(wait_frames))):
+        # The bridge pauses the timeline before deployment capture, so this
+        # renders all persistent viewports without advancing simulation time.
         simulation_app.update()
-
-        if result["done"]:
+        render_updates += 1
+        if all(result["done"] for result in results.values()):
             break
 
+    for holder in holders:
+        holder["done"] = True
     cleanup_viewport_capture_helpers(force=False)
 
-    if result["rgb"] is None:
-        print("[WARN] viewport capture returned None, using black image", flush=True)
-        return np_module.zeros(
-            (MODEL_IMAGE_HEIGHT, MODEL_IMAGE_WIDTH, 3),
-            dtype=np_module.uint8,
-        )
+    raw_frames = {}
+    for camera_name, result in results.items():
+        entry = capture_views[camera_name]
+        window = entry.get("window")
+        if window is not None:
+            try:
+                window.visible = False
+            except Exception:
+                pass
+        if result["rgb"] is None:
+            print(
+                f"[WARN] persistent viewport capture failed [{camera_name}]: "
+                f"{result.get('error') or 'timeout'}",
+                flush=True,
+            )
+            raw_frames[camera_name] = np_module.zeros(
+                (MODEL_IMAGE_HEIGHT, MODEL_IMAGE_WIDTH, 3),
+                dtype=np_module.uint8,
+            )
+        else:
+            raw_frames[camera_name] = result["rgb"]
 
-    rgb = result["rgb"]
+    capture_done = time.perf_counter()
+    futures = {
+        name: CAPTURE_RESIZE_EXECUTOR.submit(resize_rgb_for_model, rgb, np_module)
+        for name, rgb in raw_frames.items()
+    }
+    resized = {name: future.result() for name, future in futures.items()}
+    resize_done = time.perf_counter()
 
-    if rgb.dtype != np_module.uint8:
-        rgb = np_module.clip(rgb, 0, 255).astype(np_module.uint8)
-
-    if rgb.ndim == 3 and rgb.shape[-1] == 4:
-        rgb = rgb[:, :, :3]
-
-    return resize_rgb_for_model(rgb, np_module)
-
-
-def capture_rgb_from_cameras(viewport, camera_paths, world, simulation_app, capture_viewport_to_buffer, np_module,
-                             width=CAPTURE_WIDTH, height=CAPTURE_HEIGHT,
-                             wait_frames=CAPTURE_WAIT_FRAMES,
-                             settle_frames=2):
-    rgb_by_camera = {}
-
-    for camera_name, camera_path in camera_paths.items():
-        viewport.camera_path = camera_path
-
-        for _ in range(settle_frames):
-            world.step(render=True)
-            simulation_app.update()
-
-        rgb_by_camera[camera_name] = capture_rgb_from_viewport(
-            viewport=viewport,
-            world=world,
-            simulation_app=simulation_app,
-            capture_viewport_to_buffer=capture_viewport_to_buffer,
-            np_module=np_module,
-            width=width,
-            height=height,
-            wait_frames=wait_frames,
-        )
-
-    return rgb_by_camera
+    LAST_CAPTURE_TIMING_MS = {
+        "camera_render_copy": (capture_done - capture_start) * 1000.0,
+        "camera_resize": (resize_done - capture_done) * 1000.0,
+        "camera_render_updates": int(render_updates),
+    }
+    return resized
 
 
 
@@ -686,7 +711,7 @@ def main(args):
         "headless": False,
         "width": 1024,
         "height": 1024,
-        "renderer": "RayTracedLighting",
+        "renderer": str(args.renderer),
     })
 
     # Import remaining Isaac Sim modules after SimulationApp is created.
@@ -816,10 +841,11 @@ def main(args):
         return hidden
 
     # Import bridge server components.
-    import asyncio
     import base64
     import json
+    import socket
     import struct
+    import threading
     import zlib
     import numpy as np
     import queue
@@ -1139,6 +1165,46 @@ def main(args):
     except Exception as e:
         print("[WARN] Could not get robot.joint_names:", repr(e), flush=True)
 
+    raw_dof_names = [str(name) for name in robot.dof_names]
+    canonical_to_raw = resolve_canonical_dof_indices(raw_dof_names)
+    canonical_joint_indices = np.asarray(canonical_to_raw, dtype=np.int32)
+    print(
+        "[BRIDGE CONTRACT] DOF mapping:",
+        f"raw_dof_names={raw_dof_names}",
+        f"canonical_names={list(CANONICAL_DOF_NAMES)}",
+        f"canonical_to_raw={list(canonical_to_raw)}",
+        flush=True,
+    )
+
+    def read_canonical_joint_positions():
+        raw = np.asarray(robot.get_joint_positions(), dtype=np.float32).reshape(-1)
+        return raw, np.asarray(
+            canonical_values(raw, canonical_to_raw),
+            dtype=np.float32,
+        )
+
+    def read_canonical_joint_velocities():
+        raw = np.asarray(robot.get_joint_velocities(), dtype=np.float32).reshape(-1)
+        return raw, np.asarray(
+            canonical_values(raw, canonical_to_raw),
+            dtype=np.float32,
+        )
+
+    canonical_joint_limits = None
+    try:
+        raw_limits = np.asarray(robot.get_dof_limits(), dtype=np.float32)
+        if raw_limits.ndim == 3:
+            raw_limits = raw_limits[0]
+        if raw_limits.ndim == 2 and raw_limits.shape[1] >= 2:
+            canonical_joint_limits = raw_limits[canonical_joint_indices, :2].copy()
+            print(
+                "[BRIDGE CONTRACT] canonical_joint_limits_rad=",
+                canonical_joint_limits.tolist(),
+                flush=True,
+            )
+    except Exception as exc:
+        print("[WARN] Could not resolve canonical joint limits:", repr(exc), flush=True)
+
     # -----------------------------------------------------------------
     # Viewport setup
     #
@@ -1172,27 +1238,32 @@ def main(args):
     display_camera_path = active_camera_paths[display_camera_name]
     viewport.camera_path = display_camera_path
 
-    capture_camera_name = next(iter(active_camera_paths))
-    capture_camera_path = active_camera_paths[capture_camera_name]
-
-    capture_viewport_window = create_viewport_window(
-        name="SmolVLA Capture Viewport",
-        usd_context_name="",
-        width=CAPTURE_WIDTH,
-        height=CAPTURE_HEIGHT,
-        position_x=-3000,
-        position_y=-3000,
-        camera_path=Sdf.Path(capture_camera_path),
-    )
-
-    if capture_viewport_window is None:
-        raise RuntimeError(
-            "Failed to create the dedicated SmolVLA capture viewport. "
-            "The visible viewport will not be used for camera switching."
+    capture_views = {}
+    for capture_index, (camera_name, camera_path) in enumerate(active_camera_paths.items()):
+        capture_window = create_viewport_window(
+            name=f"SmolVLA Capture Viewport {camera_name}",
+            usd_context_name="",
+            width=CAPTURE_WIDTH,
+            height=CAPTURE_HEIGHT,
+            position_x=-3000 - (capture_index * (CAPTURE_WIDTH + 20)),
+            position_y=-3000,
+            camera_path=Sdf.Path(camera_path),
         )
-
-    capture_viewport = capture_viewport_window.viewport_api
-    capture_viewport.camera_path = capture_camera_path
+        if capture_window is None:
+            raise RuntimeError(
+                f"Failed to create persistent capture viewport for camera {camera_name}."
+            )
+        capture_api = capture_window.viewport_api
+        capture_api.camera_path = camera_path
+        try:
+            capture_window.visible = False
+        except Exception:
+            pass
+        capture_views[camera_name] = {
+            "window": capture_window,
+            "viewport": capture_api,
+            "camera_path": camera_path,
+        }
 
     print("[INFO] Model capture cameras:", flush=True)
     for camera_name, camera_path in active_camera_paths.items():
@@ -1204,8 +1275,8 @@ def main(args):
         flush=True,
     )
     print(
-        "[INFO] Dedicated off-screen capture viewport created:",
-        capture_camera_path,
+        "[INFO] Persistent off-screen capture viewports created:",
+        list(capture_views),
         flush=True,
     )
 
@@ -1230,15 +1301,11 @@ def main(args):
         simulation_app.update()
 
     # Test viewport capture from every active camera.
-    test_rgbs = capture_rgb_from_cameras(
-        viewport=capture_viewport,
-        camera_paths=active_camera_paths,
-        world=world,
+    test_rgbs = capture_rgb_from_persistent_viewports(
+        capture_views=capture_views,
         simulation_app=simulation_app,
         capture_viewport_to_buffer=capture_viewport_to_buffer,
         np_module=np,
-        width=CAPTURE_WIDTH,
-        height=CAPTURE_HEIGHT,
         wait_frames=CAPTURE_WAIT_FRAMES,
     )
 
@@ -1748,88 +1815,207 @@ def main(args):
         )
 
 
+    # The standalone launcher intentionally does not import the full excavator
+    # runtime.  This is the same closed proxy profile used by that runtime when
+    # an authored bucket-volume mesh is unavailable.
+    bucket_load_profile_xz = np.asarray(
+        [
+            [-0.08, 0.43],
+            [-0.08, -0.08],
+            [0.18, -0.30],
+            [0.78, -0.24],
+            [0.90, 0.12],
+            [0.54, 0.50],
+        ],
+        dtype=np.float32,
+    )
+    bucket_load_y_min = -0.50
+    bucket_load_y_max = 0.50
+
+    def points_in_polygon_2d(points_xz, polygon_xz):
+        pts = np.asarray(points_xz, dtype=np.float32).reshape(-1, 2)
+        poly = np.asarray(polygon_xz, dtype=np.float32).reshape(-1, 2)
+        inside = np.zeros(len(pts), dtype=bool)
+        if len(pts) == 0 or len(poly) < 3:
+            return inside
+        x = pts[:, 0]
+        z = pts[:, 1]
+        xj, zj = float(poly[-1, 0]), float(poly[-1, 1])
+        for vertex in poly:
+            xi, zi = float(vertex[0]), float(vertex[1])
+            crosses = ((zi > z) != (zj > z)) & (
+                x < (xj - xi) * (z - zi) / (zj - zi + 1.0e-9) + xi
+            )
+            inside ^= crosses
+            xj, zj = xi, zi
+        return inside
+
+    def estimate_bucket_load_particles():
+        start = time.perf_counter()
+        result = {
+            "count": 0,
+            "source": "closed_proxy_profile",
+            "candidate_count": 0,
+            "particle_count": 0,
+            "elapsed_ms": 0.0,
+        }
+        try:
+            runtime_api = getattr(builtins, "_SAND_SITE", sand_api)
+            positions_fn = runtime_api.get("particle_positions_fn") if isinstance(runtime_api, dict) else None
+            if not callable(positions_fn):
+                result["source"] = "particle_positions_unavailable"
+                return result
+            points = np.asarray(positions_fn(), dtype=np.float32).reshape(-1, 3)
+            result["particle_count"] = int(len(points))
+            if len(points) == 0:
+                return result
+
+            bucket_prim = stage.GetPrimAtPath("/World/URDF_real3/bucket_link")
+            if not bucket_prim.IsValid():
+                result["source"] = "bucket_prim_unavailable"
+                return result
+            world_xf = UsdGeom.Xformable(bucket_prim).ComputeLocalToWorldTransform(
+                Usd.TimeCode.Default()
+            )
+            inverse_xf = world_xf.GetInverse()
+
+            local_min = np.asarray(
+                [bucket_load_profile_xz[:, 0].min(), bucket_load_y_min, bucket_load_profile_xz[:, 1].min()],
+                dtype=np.float32,
+            )
+            local_max = np.asarray(
+                [bucket_load_profile_xz[:, 0].max(), bucket_load_y_max, bucket_load_profile_xz[:, 1].max()],
+                dtype=np.float32,
+            )
+            world_corners = []
+            for x_value in (local_min[0], local_max[0]):
+                for y_value in (local_min[1], local_max[1]):
+                    for z_value in (local_min[2], local_max[2]):
+                        p = world_xf.Transform(
+                            Gf.Vec3d(float(x_value), float(y_value), float(z_value))
+                        )
+                        world_corners.append([float(p[0]), float(p[1]), float(p[2])])
+            world_corners = np.asarray(world_corners, dtype=np.float32)
+            world_min = world_corners.min(axis=0) - 0.02
+            world_max = world_corners.max(axis=0) + 0.02
+            candidate_mask = np.all(points >= world_min, axis=1) & np.all(points <= world_max, axis=1)
+            candidates = points[candidate_mask]
+            result["candidate_count"] = int(len(candidates))
+            if len(candidates) == 0:
+                return result
+
+            local = np.empty_like(candidates)
+            for index, point in enumerate(candidates):
+                transformed = inverse_xf.Transform(
+                    Gf.Vec3d(float(point[0]), float(point[1]), float(point[2]))
+                )
+                local[index] = [
+                    float(transformed[0]),
+                    float(transformed[1]),
+                    float(transformed[2]),
+                ]
+            inside_y = (local[:, 1] >= bucket_load_y_min) & (local[:, 1] <= bucket_load_y_max)
+            inside_xz = points_in_polygon_2d(local[:, [0, 2]], bucket_load_profile_xz)
+            result["count"] = int(np.count_nonzero(inside_y & inside_xz))
+            return result
+        except Exception as exc:
+            result["source"] = f"error:{type(exc).__name__}:{exc}"
+            return result
+        finally:
+            result["elapsed_ms"] = (time.perf_counter() - start) * 1000.0
+
     # TCP Bridge Server functions.
     # No USD prims, references, or other scene objects may be
     # created after the sand block above.
     command_queue = queue.Queue()
     response_queue = queue.Queue()
 
-    async def read_json(reader):
-        header = await reader.readexactly(4)
-        n = struct.unpack("!I", header)[0]
-        data = await reader.readexactly(n)
-        return json.loads(data.decode("utf-8"))
+    bridge_stop = threading.Event()
+    bridge_ready = threading.Event()
+    bridge_network_state = {"error": "", "connected": False, "connection_id": 0}
 
-    async def write_json(writer, obj):
-        data = json.dumps(obj).encode("utf-8")
-        writer.write(struct.pack("!I", len(data)))
-        writer.write(data)
-        await writer.drain()
+    def recv_exact(sock, size):
+        chunks = []
+        remaining = int(size)
+        while remaining > 0:
+            chunk = sock.recv(remaining)
+            if not chunk:
+                raise ConnectionError("socket closed")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
 
-    def make_action_from_command(cmd):
-        has_pos = "joint_positions" in cmd and cmd["joint_positions"] is not None
-        has_vel = "joint_velocities" in cmd and cmd["joint_velocities"] is not None
-        has_eff = "joint_efforts" in cmd and cmd["joint_efforts"] is not None
+    def read_json_socket(sock):
+        size = struct.unpack("!I", recv_exact(sock, 4))[0]
+        if size <= 0 or size > 128 * 1024 * 1024:
+            raise ValueError(f"invalid bridge message size: {size}")
+        return json.loads(recv_exact(sock, size).decode("utf-8"))
 
-        if sum([has_pos, has_vel, has_eff]) > 1:
-            raise ValueError("Send only one of joint_positions, joint_velocities, joint_efforts per command.")
+    def write_json_socket(sock, obj):
+        data = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+        sock.sendall(struct.pack("!I", len(data)) + data)
 
-        if has_pos:
-            return ArticulationAction(
-                joint_positions=np.asarray(cmd["joint_positions"], dtype=np.float32)
-            )
-
-        if has_vel:
-            return ArticulationAction(
-                joint_velocities=np.asarray(cmd["joint_velocities"], dtype=np.float32)
-            )
-
-        if has_eff:
-            return ArticulationAction(
-                joint_efforts=np.asarray(cmd["joint_efforts"], dtype=np.float32)
-            )
-
-        return None
-
-    async def handle_client(reader, writer):
-        peer = writer.get_extra_info("peername")
-        print(f"[bridge] Client connected: {peer}")
-
+    def bridge_network_worker():
         try:
-            while True:
-                cmd = await read_json(reader)
-
-                command_queue.put(cmd)
-
-                while response_queue.empty():
-                    await asyncio.sleep(0.001)
-
-                reply = response_queue.get()
-                await write_json(writer, reply)
-
-        except asyncio.IncompleteReadError:
-            print(f"[bridge] Client disconnected: {peer}")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
+                server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                server_socket.bind((HOST, PORT))
+                server_socket.listen(1)
+                server_socket.settimeout(0.5)
+                bridge_ready.set()
+                print(f"[bridge] TCP server listening on {HOST}:{PORT}", flush=True)
+                while not bridge_stop.is_set():
+                    try:
+                        client_socket, peer = server_socket.accept()
+                    except socket.timeout:
+                        continue
+                    print(f"[bridge] Client connected: {peer}", flush=True)
+                    bridge_network_state["connected"] = True
+                    bridge_network_state["connection_id"] += 1
+                    connection_id = int(bridge_network_state["connection_id"])
+                    try:
+                        with client_socket:
+                            while not bridge_stop.is_set():
+                                message = read_json_socket(client_socket)
+                                if not isinstance(message, dict):
+                                    raise ValueError("bridge message must be a JSON object")
+                                message["_bridge_connection_id"] = connection_id
+                                command_queue.put(message)
+                                reply = response_queue.get()
+                                write_json_socket(client_socket, reply)
+                    except (ConnectionError, OSError) as exc:
+                        print(f"[bridge] Client disconnected: {peer}: {exc}", flush=True)
+                    except Exception as exc:
+                        print(f"[bridge] Client error: {peer}: {repr(exc)}", flush=True)
+                    finally:
+                        bridge_network_state["connected"] = False
         except Exception as exc:
-            print(f"[bridge] Error: {repr(exc)}")
-        finally:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
+            bridge_network_state["error"] = repr(exc)
+            bridge_ready.set()
+            print(f"[bridge] Server failed: {repr(exc)}", flush=True)
 
-    _server = None
-
-    async def start_bridge_server():
-        nonlocal _server
-        _server = await asyncio.start_server(handle_client, HOST, PORT)
-        print(f"[bridge] TCP server listening on {HOST}:{PORT}")
-        print("[bridge] You can now connect with the external client or GUI client.")
-
-        async with _server:
-            await _server.serve_forever()
-
-    asyncio.ensure_future(start_bridge_server())
+    bridge_thread = threading.Thread(
+        target=bridge_network_worker,
+        name="ExcavatorBridgeNetwork",
+        daemon=True,
+    )
+    bridge_thread.start()
+    if not bridge_ready.wait(timeout=5.0):
+        raise RuntimeError("Timed out starting TCP bridge server")
+    if bridge_network_state["error"]:
+        raise RuntimeError(f"TCP bridge startup failed: {bridge_network_state['error']}")
+    builtins._EXCAVATOR_BRIDGE_RUNTIME = {
+        "owner": os.path.abspath(__file__),
+        "protocol_version": PROTOCOL_VERSION,
+        "host": HOST,
+        "port": PORT,
+        "timing_mode": "deterministic_lockstep",
+        "raw_dof_names": list(raw_dof_names),
+        "canonical_dof_names": list(CANONICAL_DOF_NAMES),
+        "canonical_to_raw": list(canonical_to_raw),
+        "camera_paths": dict(active_camera_paths),
+        "camera_mode": "per_camera_persistent_viewport",
+    }
 
     # From this point onward the bridge owns simulation time.  Keeping the
     # timeline paused also lets viewport captures and UI updates render without
@@ -1838,57 +2024,130 @@ def main(args):
 
     print(
         "[INFO] Simulation running in bridge-lockstep mode: "
-        "each command advances exactly 1/30 s. Press Ctrl+C to exit."
+        "each command advances exactly 1/training_fps s. Press Ctrl+C to exit."
     )
 
     # Run simulation loop.
-    PHYSICS_DT = 1.0 / 60.0
-    BRIDGE_STEP_SECONDS = 1.0 / 30.0
-    BRIDGE_STEP_TICKS = int(round(BRIDGE_STEP_SECONDS / PHYSICS_DT))
+    PHYSICS_DT = 1.0 / PHYSICS_HZ
+    active_contract = None
+    active_connection_id = None
+    tick_scheduler = None
+    last_idle_ui_update = 0.0
+    idle_ui_interval = 1.0 / max(0.1, float(args.idle_ui_hz))
     while simulation_app.is_running():
         if not command_queue.empty():
             cmd = command_queue.get()
 
-            if cmd.get("joint_velocities") is not None and cmd.get("joint_positions") is None:
-                q_now = np.asarray(robot.get_joint_positions(), dtype=np.float32).reshape(-1)[:4]
-                vel = np.asarray(cmd["joint_velocities"], dtype=np.float32).reshape(-1)[:4]
-                q_target = q_now + vel * BRIDGE_STEP_SECONDS
-                action = ArticulationAction(joint_positions=q_target)
-                robot.apply_action(action)
-            else:
-                action = make_action_from_command(cmd)
-                if action is not None:
-                    robot.apply_action(action)
+            if cmd.get("type") == "handshake":
+                try:
+                    active_contract = validate_client_contract(cmd)
+                    active_connection_id = int(cmd["_bridge_connection_id"])
+                    tick_scheduler = PhysicsTickScheduler(active_contract["training_fps"])
+                    reply = {
+                        "type": "handshake_ack",
+                        "ok": True,
+                        "protocol_version": PROTOCOL_VERSION,
+                        "physics_hz": PHYSICS_HZ,
+                        "training_fps": active_contract["training_fps"],
+                        "timing_mode": "deterministic_lockstep",
+                        "raw_dof_names": raw_dof_names,
+                        "canonical_dof_names": list(CANONICAL_DOF_NAMES),
+                        "canonical_to_raw": list(canonical_to_raw),
+                        "action_names": list(ACTION_NAMES_4D),
+                        "camera_keys": list(CAMERA_KEYS),
+                        "normalization_hash": active_contract.get("normalization_hash", ""),
+                    }
+                    print("[BRIDGE CONTRACT] accepted:", reply, flush=True)
+                except Exception as exc:
+                    active_contract = None
+                    active_connection_id = None
+                    tick_scheduler = None
+                    reply = {
+                        "type": "handshake_ack",
+                        "ok": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                    print("[BRIDGE CONTRACT] rejected:", reply["error"], flush=True)
+                response_queue.put(reply)
+                continue
 
-            # Advance two 60 Hz physics ticks (exactly 1/30 s), then freeze
-            # before observation capture and before waiting for another input.
+            if active_contract is None or tick_scheduler is None:
+                response_queue.put({
+                    "type": "error",
+                    "error": "A valid protocol-v2 handshake is required before motion.",
+                })
+                continue
+            if int(cmd.get("_bridge_connection_id", -1)) != active_connection_id:
+                response_queue.put({
+                    "type": "error",
+                    "error": "This TCP connection has not completed the deployment handshake.",
+                })
+                continue
+            if "ticks" in cmd:
+                response_queue.put({
+                    "type": "error",
+                    "error": "ticks is not accepted in protocol v2; cadence comes from training_fps.",
+                })
+                continue
+
+            bridge_step_start = time.perf_counter()
+            bridge_step_ticks = tick_scheduler.next_ticks()
+            bridge_step_seconds = float(bridge_step_ticks) * PHYSICS_DT
+
+            if cmd.get("joint_velocities") is not None and cmd.get("joint_positions") is None:
+                _, q_target = read_canonical_joint_positions()
+                vel = np.asarray(cmd["joint_velocities"], dtype=np.float32).reshape(-1)
+                if vel.shape != (4,) or not np.all(np.isfinite(vel)):
+                    response_queue.put({
+                        "type": "error",
+                        "error": f"Expected four finite canonical joint velocities, got {vel.tolist()}",
+                    })
+                    continue
+            else:
+                response_queue.put({
+                    "type": "error",
+                    "error": "Protocol v2 deployment accepts joint_velocities only.",
+                })
+                continue
+
+            physics_start = time.perf_counter()
             timeline.play()
             try:
-                for _ in range(BRIDGE_STEP_TICKS):
-                    world.step(render=True)
-                    simulation_app.update()
+                for _ in range(bridge_step_ticks):
+                    q_target = q_target + vel * PHYSICS_DT
+                    if canonical_joint_limits is not None:
+                        q_target = np.clip(
+                            q_target,
+                            canonical_joint_limits[:, 0],
+                            canonical_joint_limits[:, 1],
+                        )
+                    robot.apply_action(
+                        ArticulationAction(
+                            joint_positions=q_target.astype(np.float32),
+                            joint_indices=canonical_joint_indices,
+                        )
+                    )
+                    world.step(render=False)
             finally:
                 timeline.pause()
+            physics_done = time.perf_counter()
 
-            q = np.asarray(robot.get_joint_positions(), dtype=np.float32)
-            qd = np.asarray(robot.get_joint_velocities(), dtype=np.float32)
+            q_raw, q = read_canonical_joint_positions()
+            qd_raw, qd = read_canonical_joint_velocities()
 
             viewport.camera_path = display_camera_path
 
-            rgb_by_camera = capture_rgb_from_cameras(
-                viewport=capture_viewport,
-                camera_paths=active_camera_paths,
-                world=world,
+            rgb_by_camera = capture_rgb_from_persistent_viewports(
+                capture_views=capture_views,
                 simulation_app=simulation_app,
                 capture_viewport_to_buffer=capture_viewport_to_buffer,
                 np_module=np,
-                width=CAPTURE_WIDTH,
-                height=CAPTURE_HEIGHT,
                 wait_frames=CAPTURE_WAIT_FRAMES,
             )
 
             viewport.camera_path = display_camera_path
 
+            encode_start = time.perf_counter()
             encoded_cameras = {}
             for camera_name, rgb in rgb_by_camera.items():
                 rgb = np.asarray(rgb)
@@ -1906,6 +2165,7 @@ def main(args):
                     "rgb_dtype": str(rgb.dtype),
                     "rgb_zlib_b64": base64.b64encode(rgb_compressed).decode("ascii"),
                 }
+            encode_done = time.perf_counter()
 
             primary_camera = (
                 "front" if "front" in encoded_cameras else next(iter(encoded_cameras))
@@ -1928,6 +2188,7 @@ def main(args):
                 base_x, base_y, base_yaw = 0.0, 0.0, 0.0
 
             joint_positions = np.asarray(q, dtype=np.float32).reshape(-1)[:4]
+            bucket_load_metrics = estimate_bucket_load_particles()
 
             tip_xyz = [0.0, 0.0, 0.0]
             load_xyz = [0.0, 0.0, 0.0]
@@ -1953,7 +2214,7 @@ def main(args):
                 float(joint_positions[1]),
                 float(joint_positions[2]),
                 float(joint_positions[3]),
-                0.0,
+                float(bucket_load_metrics["count"]),
                 tip_xyz[0],
                 tip_xyz[1],
                 tip_xyz[2],
@@ -2007,25 +2268,48 @@ def main(args):
             reply = {
                 "joint_positions": q.tolist(),
                 "joint_velocities": qd.tolist(),
+                "raw_joint_positions": q_raw.tolist(),
+                "raw_joint_velocities": qd_raw.tolist(),
                 "observation_state": observation_state,
-                "observation_effort": _read_bridge_measured_effort(robot, np.arange(4, dtype=np.int32)).tolist(),
+                "observation_effort": _read_bridge_measured_effort(
+                    robot,
+                    canonical_joint_indices,
+                ).tolist(),
+                "bucket_load_metrics": bucket_load_metrics,
                 "task_text": task_text,
                 "primary_camera": primary_camera,
                 "rgb_shape": primary_rgb["rgb_shape"],
                 "rgb_dtype": primary_rgb["rgb_dtype"],
                 "rgb_zlib_b64": primary_rgb["rgb_zlib_b64"],
                 "cameras": encoded_cameras,
+                "bridge_timing": {
+                    "physics_ms": (physics_done - physics_start) * 1000.0,
+                    **dict(LAST_CAPTURE_TIMING_MS),
+                    "encode_ms": (encode_done - encode_start) * 1000.0,
+                    "bucket_load_ms": float(bucket_load_metrics.get("elapsed_ms", 0.0)),
+                    "total_server_ms": (time.perf_counter() - bridge_step_start) * 1000.0,
+                    "physics_ticks": int(bridge_step_ticks),
+                    "simulated_seconds": float(bridge_step_seconds),
+                    "training_fps": float(active_contract["training_fps"]),
+                },
             }
 
             response_queue.put(reply)
 
         else:
-            # With the timeline paused this pumps rendering, networking, and UI
-            # events without allowing simulation time to elapse.
-            world.step(render=True)
-            simulation_app.update()
+            # Network I/O runs on a dedicated thread.  Keep the paused UI
+            # responsive at a low rate instead of continuously RayTracing while
+            # the policy uses the GPU.
+            now = time.perf_counter()
+            if now - last_idle_ui_update >= idle_ui_interval:
+                simulation_app.update()
+                last_idle_ui_update = now
+            else:
+                time.sleep(min(0.002, idle_ui_interval))
 
+    bridge_stop.set()
     cleanup_viewport_capture_helpers(force=True)
+    CAPTURE_RESIZE_EXECUTOR.shutdown(wait=True)
     simulation_app.close()
 
 
@@ -2052,6 +2336,17 @@ if __name__ == "__main__":
         default=240,
         help="Simulation frames used to settle generated particles before the TCP bridge starts.",
     )
+    parser.add_argument(
+        "--renderer",
+        default="RayTracedLighting",
+        help="Isaac renderer used when policy observations are captured.",
+    )
+    parser.add_argument(
+        "--idle-ui-hz",
+        type=float,
+        default=5.0,
+        help="Paused UI refresh rate while waiting for policy inference; camera viewports stay hidden.",
+    )
     args = parser.parse_args()
 
     if args.headless:
@@ -2062,5 +2357,7 @@ if __name__ == "__main__":
 
     if args.sand_settle_frames < 1:
         parser.error("--sand-settle-frames must be at least 1")
+    if args.idle_ui_hz <= 0.0:
+        parser.error("--idle-ui-hz must be positive")
 
     main(args)

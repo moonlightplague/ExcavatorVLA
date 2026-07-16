@@ -28,6 +28,12 @@ from excavator_common.bridge_protocol import (
     read_json,
     write_json,
 )
+from excavator_common.deployment_contract import (
+    build_client_contract,
+    load_training_fps,
+    sha256_files,
+    validate_training_fps,
+)
 
 
 class MultiCameraVideoRecorder:
@@ -301,6 +307,38 @@ def make_state(reply, device):
         torch.from_numpy(state18)
         .unsqueeze(0)
         .to(device=device, dtype=torch.float32)
+    )
+
+
+def _feature_shape(feature):
+    if isinstance(feature, dict):
+        value = feature.get("shape")
+    else:
+        value = getattr(feature, "shape", None)
+    if value is None:
+        return None
+    return tuple(int(item) for item in value)
+
+
+def validate_policy_feature_contract(policy):
+    config = getattr(policy, "config", None)
+    input_features = getattr(config, "input_features", None)
+    output_features = getattr(config, "output_features", None)
+    if not isinstance(input_features, dict) or not isinstance(output_features, dict):
+        raise RuntimeError("Checkpoint config does not expose input_features/output_features")
+    state_shape = _feature_shape(input_features.get("observation.state"))
+    action_shape = _feature_shape(output_features.get("action"))
+    if state_shape != (18,):
+        raise RuntimeError(f"Checkpoint observation.state shape must be (18,), got {state_shape}")
+    if action_shape != (4,):
+        raise RuntimeError(f"Checkpoint action shape must be (4,), got {action_shape}")
+    camera_keys = tuple(f"observation.images.{index}" for index in range(3))
+    missing_cameras = [key for key in camera_keys if key not in input_features]
+    if missing_cameras:
+        raise RuntimeError(f"Checkpoint is missing camera features: {missing_cameras}")
+    print(
+        "[BRIDGE CONTRACT] checkpoint features: "
+        f"state_shape={state_shape} action_shape={action_shape} cameras={list(camera_keys)}"
     )
 
 
@@ -822,11 +860,21 @@ def main():
     parser.add_argument("--port", type=int, default=5555)
     parser.add_argument("--ckpt", default=os.environ.get("SMOLVLA_CKPT", ""))
     parser.add_argument("--vlm", default=os.environ.get("SMOLVLA_VLM", ""))
-    parser.add_argument("--ticks", type=int, default=4)
+    parser.add_argument(
+        "--dataset-meta",
+        default=os.environ.get("SMOLVLA_DATASET_META", ""),
+        help="Old training dataset root or meta/info.json; its fps drives bridge cadence.",
+    )
+    parser.add_argument(
+        "--training-fps",
+        type=float,
+        default=0.0,
+        help="Explicit diagnostic fallback when dataset metadata is unavailable.",
+    )
     parser.add_argument("--warmup-steps", type=int, default=0)
     parser.add_argument("--replan-interval", type=int, default=0)
     parser.add_argument("--steps", type=int, default=200)
-    parser.add_argument("--sleep", type=float, default=0.01)
+    parser.add_argument("--sleep", type=float, default=0.0)
     parser.add_argument(
         "--record-video-dir",
         default="",
@@ -838,8 +886,8 @@ def main():
     parser.add_argument(
         "--record-video-fps",
         type=float,
-        default=30.0,
-        help="Encoded playback FPS. At 30 FPS, 4800 steps become 160 seconds.",
+        default=0.0,
+        help="Encoded playback FPS; 0 uses the checkpoint training dataset FPS.",
     )
     parser.add_argument(
         "--record-video-codec",
@@ -1174,8 +1222,8 @@ def main():
 
     if args.height_trend_window < 2:
         raise SystemExit("--height-trend-window must be >= 2")
-    if args.record_video_fps <= 0:
-        raise SystemExit("--record-video-fps must be > 0")
+    if args.record_video_fps < 0:
+        raise SystemExit("--record-video-fps must be >= 0 (0 uses training FPS)")
     if len(args.record_video_codec) != 4:
         raise SystemExit("--record-video-codec must contain exactly four characters")
     if (
@@ -1222,6 +1270,7 @@ def main():
     policy = SmolVLAPolicy.from_pretrained(args.ckpt)
     policy.eval()
     policy.to(device)
+    validate_policy_feature_contract(policy)
 
     print("[INFO] loading normalization stats...")
     state_mean = state_std = action_mean = action_std = None
@@ -1252,6 +1301,21 @@ def main():
         has_norm = False
         state_mean_t = state_std_t = action_mean_t = action_std_t = None
 
+    if not has_norm:
+        raise RuntimeError(
+            "The 18D deployment requires checkpoint state/action normalization statistics."
+        )
+    if tuple(np.asarray(state_mean).shape) != (18,) or tuple(np.asarray(state_std).shape) != (18,):
+        raise RuntimeError(
+            f"Expected 18D state normalization, got mean={np.asarray(state_mean).shape} "
+            f"std={np.asarray(state_std).shape}"
+        )
+    if tuple(np.asarray(action_mean).shape) != (4,) or tuple(np.asarray(action_std).shape) != (4,):
+        raise RuntimeError(
+            f"Expected 4D action normalization, got mean={np.asarray(action_mean).shape} "
+            f"std={np.asarray(action_std).shape}"
+        )
+
     if state_mean is not None and state_std is not None and len(state_mean) >= 18:
         effort_train_mean = np.asarray(state_mean[14:18], dtype=np.float32)
         effort_train_std = np.maximum(
@@ -1280,7 +1344,41 @@ def main():
     sock.connect((args.host, args.port))
     print(f"[INFO] connected to {args.host}:{args.port}")
 
-    cmd = {"ticks": args.ticks}
+    if args.dataset_meta:
+        training_fps, dataset_meta_path = load_training_fps(args.dataset_meta)
+        if args.training_fps > 0.0 and abs(training_fps - args.training_fps) > 1.0e-6:
+            raise RuntimeError(
+                f"--training-fps={args.training_fps} disagrees with {dataset_meta_path}: {training_fps}"
+            )
+        print(f"[BRIDGE CONTRACT] training_fps={training_fps} source={dataset_meta_path}")
+    elif args.training_fps > 0.0:
+        training_fps = validate_training_fps(args.training_fps)
+        print(
+            "[WARN] training FPS supplied explicitly rather than read from meta/info.json: "
+            f"{training_fps}"
+        )
+    else:
+        raise RuntimeError(
+            "Set --dataset-meta/SMOLVLA_DATASET_META to the old training dataset meta/info.json."
+        )
+
+    normalization_paths = [
+        Path(args.ckpt) / "policy_preprocessor_step_5_normalizer_processor.safetensors",
+        Path(args.ckpt) / "policy_postprocessor_step_0_unnormalizer_processor.safetensors",
+    ]
+    normalization_hash = sha256_files(normalization_paths)
+    if not normalization_hash:
+        raise RuntimeError("Could not hash checkpoint normalization assets")
+    handshake = build_client_contract(training_fps, normalization_hash=normalization_hash)
+    write_json(sock, handshake)
+    handshake_reply = read_json(sock)
+    if not handshake_reply.get("ok", False):
+        raise RuntimeError(f"Bridge handshake rejected: {handshake_reply}")
+    if handshake_reply.get("normalization_hash", "") != normalization_hash:
+        raise RuntimeError("Bridge handshake normalization identity mismatch")
+    print("[BRIDGE CONTRACT] accepted:", handshake_reply)
+
+    cmd = {"joint_velocities": [0.0, 0.0, 0.0, 0.0]}
     dump_dir = args.dump_dir
     dump_frames = []
     dump_limit = 10
@@ -1289,15 +1387,20 @@ def main():
 
     video_recorder = None
     if args.record_video_dir:
+        record_video_fps = (
+            float(args.record_video_fps)
+            if float(args.record_video_fps) > 0.0
+            else float(training_fps)
+        )
         video_recorder = MultiCameraVideoRecorder(
             output_dir=args.record_video_dir,
-            fps=args.record_video_fps,
+            fps=record_video_fps,
             codec=args.record_video_codec,
             camera_ids=("0", "1", "2"),
         )
         print(
             "[VIDEO] recording enabled: one frame per non-warmup policy step; "
-            f"output_dir={args.record_video_dir}, fps={args.record_video_fps:.3f}"
+            f"output_dir={args.record_video_dir}, fps={record_video_fps:.3f}"
         )
 
     # ========================================================
@@ -1382,6 +1485,19 @@ def main():
     home_swing_q = None
     return_swing_error = 0.0
     return_to_pile_steps = 0
+    timing_samples = {
+        "roundtrip_ms": [],
+        "client_prepare_ms": [],
+        "inference_ms": [],
+        "server_total_ms": [],
+        "physics_ms": [],
+        "camera_render_copy_ms": [],
+        "camera_resize_ms": [],
+        "encode_ms": [],
+        "bucket_load_ms": [],
+    }
+    simulated_seconds_total = 0.0
+    deployment_wall_start = time.perf_counter()
 
     def reset_height_trend(current_tip_z):
         nonlocal tip_history, descent_confirm_count
@@ -1400,8 +1516,13 @@ def main():
             is_warmup = loop_step < args.warmup_steps
             step = loop_step - args.warmup_steps
 
+            policy_loop_start = time.perf_counter()
             write_json(sock, cmd)
             reply = read_json(sock)
+            reply_received = time.perf_counter()
+            roundtrip_ms = (reply_received - policy_loop_start) * 1000.0
+            if reply.get("type") == "error":
+                raise RuntimeError(f"Bridge error: {reply.get('error')}")
 
             raw_observation_state = np.asarray(
                 reply["observation_state"], dtype=np.float32
@@ -1542,8 +1663,26 @@ def main():
             ):
                 reset_policy_queue(policy, f"periodic replan at step {step}")
 
+            inference_start = time.perf_counter()
             with torch.no_grad():
                 action = policy.select_action(batch)
+            inference_ms = (time.perf_counter() - inference_start) * 1000.0
+            server_timing = reply.get("bridge_timing", {})
+            simulated_seconds_total += float(server_timing.get("simulated_seconds", 0.0))
+            timing_samples["roundtrip_ms"].append(float(roundtrip_ms))
+            timing_samples["client_prepare_ms"].append(
+                float((inference_start - reply_received) * 1000.0)
+            )
+            timing_samples["inference_ms"].append(float(inference_ms))
+            for sample_key, reply_key in (
+                ("server_total_ms", "total_server_ms"),
+                ("physics_ms", "physics_ms"),
+                ("camera_render_copy_ms", "camera_render_copy"),
+                ("camera_resize_ms", "camera_resize"),
+                ("encode_ms", "encode_ms"),
+                ("bucket_load_ms", "bucket_load_ms"),
+            ):
+                timing_samples[sample_key].append(float(server_timing.get(reply_key, 0.0)))
             if has_norm:
                 action = action * action_std_t + action_mean_t
 
@@ -1551,7 +1690,6 @@ def main():
                 num_joints = len(raw_q) if len(raw_q) > 0 else 4
                 cmd = {
                     "joint_velocities": [0.0] * num_joints,
-                    "ticks": args.ticks,
                 }
                 discarded = (
                     action.detach().float().cpu().numpy().round(4).tolist()
@@ -2632,7 +2770,6 @@ def main():
 
             cmd = {
                 "joint_velocities": vel.tolist(),
-                "ticks": args.ticks,
             }
 
             print(
@@ -2691,7 +2828,10 @@ def main():
                 f"load_raw_debug={raw_load_particles:.1f} "
                 f"effort_key={effort_key} "
                 f"rgb_mean={float(rgb.mean()):.2f} "
-                f"cameras={sorted(camera_rgbs.keys())}"
+                f"cameras={sorted(camera_rgbs.keys())} "
+                f"infer_ms={inference_ms:.1f} "
+                f"server_ms={float(reply.get('bridge_timing', {}).get('total_server_ms', 0.0)):.1f} "
+                f"loop_ms={(time.perf_counter() - policy_loop_start) * 1000.0:.1f}"
             )
 
             time.sleep(args.sleep)
@@ -2700,6 +2840,24 @@ def main():
         print("\n[INFO] interrupted, sending zero velocity")
 
     finally:
+        print("[TIMING SUMMARY] p50/p95/max milliseconds")
+        for timing_name, timing_values in timing_samples.items():
+            if not timing_values:
+                continue
+            values = np.asarray(timing_values, dtype=np.float64)
+            print(
+                f"[TIMING SUMMARY] {timing_name}: "
+                f"p50={np.percentile(values, 50):.1f} "
+                f"p95={np.percentile(values, 95):.1f} "
+                f"max={np.max(values):.1f} n={len(values)}"
+            )
+        deployment_wall_seconds = max(1.0e-9, time.perf_counter() - deployment_wall_start)
+        print(
+            "[TIMING SUMMARY] "
+            f"simulated_seconds={simulated_seconds_total:.3f} "
+            f"wall_seconds={deployment_wall_seconds:.3f} "
+            f"real_time_factor={simulated_seconds_total / deployment_wall_seconds:.4f}"
+        )
         try:
             num_joints = (
                 len(raw_q)
@@ -2708,7 +2866,6 @@ def main():
             )
             zero = {
                 "joint_velocities": [0.0] * num_joints,
-                "ticks": args.ticks,
             }
             write_json(sock, zero)
         except Exception:

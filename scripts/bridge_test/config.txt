@@ -14,6 +14,7 @@ export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_HUB_DISABLE_TELEMETRY=1
 export TOKENIZERS_PARALLELISM=false
+export SMOLVLA_DATASET_META=/root/gpufree-data/datasets/meta/info.json
 
 CKPT=/root/gpufree-data/outputs/train/excavator_smolvla_3cam_effort18_gop4_lr5e5_b128_epoch20/checkpoints/033000/pretrained_model
 

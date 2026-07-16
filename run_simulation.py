@@ -2127,7 +2127,8 @@ def main(args):
                             joint_indices=canonical_joint_indices,
                         )
                     )
-                    world.step(render=False)
+                    world.step(render=True)
+                    simulation_app.update()
             finally:
                 timeline.pause()
             physics_done = time.perf_counter()

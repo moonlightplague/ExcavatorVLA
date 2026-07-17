@@ -38,29 +38,32 @@ scripts/bridge_test/sand_site_tcp_bridge_server.py
 | joint velocity 4D | finite difference of canonical joint positions on simulation time, with shortest swing delta | derived online, matches dataset sampling |
 | measured effort 4D | `get_measured_joint_efforts()`, resolved by DOF name | direct simulator state |
 | bucket tip/load XYZ | training runtime `bucket_tip_pos()` / `bucket_load_pos()` | direct FK/world transform |
-| bucket load | particles inside the authored `bucket_cut` closed volume | simulator oracle |
+| bucket load | initial-pile source particles inside the authored `bucket_cut` closed volume, including the dataset's 32-particle/0.60 source fallback | simulator oracle, same dataset semantics |
 | bucket load rate | finite difference of the live bucket count on simulation time | derived online |
 | dig target | episode task/target provider or active plan | required task context |
 | unload landing | selected unload mesh target or episode task provider | required task context |
 | truck relative heading | selected truck prim transform | simulator world model |
-| phase index | deployment phase supervisor or active expert plan | not a physical sensor |
+| phase index | external supervisor, or the simulator's monotonic state/geometry FSM | derived semantic context, not a physical sensor |
 | task prompt | same episode task provider used for target context | required task context |
 | three RGB images | dataset camera prims 0/1/2 | direct simulator render |
 
-## Hard Requirement: Phase Is Not Observable
+## Phase Handling
 
 `phase_index` is an expert stage label. A pure end-to-end VLA cannot measure it
-from an articulation or camera API without another estimator. Deployment must
-choose one explicit architecture:
+directly from an articulation or camera API. Deployment therefore supports two
+explicit modes:
 
-1. A hierarchical controller owns the phase state and sends `phase_name` or
-   `phase_index` to the observation bridge.
-2. A separately validated phase estimator supplies it.
-3. Retrain a portable policy without `phase_index`.
+1. `phase_mode=external`: a hierarchical controller owns the phase state and
+   sends `phase_name` or `phase_index`.
+2. `phase_mode=auto`: the simulator runs a monotonic 10-stage FSM using bucket
+   tip/load geometry, dig/unload target distance, bucket load/rate, and joint
+   motion. The reply reports `phase_source=simulator_auto_fsm` plus transition
+   diagnostics.
 
-The bridge deliberately does not fill a missing phase with zero. It returns
-`observation_32d_ready=false` and an error, so a 32D policy cannot move with a
-silently invalid input.
+Auto mode prevents a missing supervisor from becoming a constant zero phase.
+It is an estimator, not hidden ground truth. A checkpoint that learned a very
+strong dependence on exact expert stage boundaries should use external mode,
+or be retrained with the same inferred phase labels.
 
 ## Episode Context
 
@@ -68,17 +71,15 @@ At the beginning of an episode, send one bridge command with:
 
 ```json
 {
-  "reset_observation_context": true,
   "observation_context": {
-    "phase_name": "pre_dig",
+    "phase_mode": "auto",
     "dig_target_xyz": [0.0, 6.5, 0.4],
     "unload_landing_xyz": [-6.8, -7.8, 4.2],
     "initial_origin_xy": [0.0, 0.0],
     "initial_heading_rad": 1.57,
     "truck_yaw_rad": -2.1,
     "task_text": "Excavate one scoop from the pile in front of the excavator and dump it into the truck bed."
-  },
-  "ticks": 1
+  }
 }
 ```
 
@@ -88,8 +89,10 @@ An editable template is available at:
 scripts/bridge_test/observation_context.example.json
 ```
 
-The phase supervisor may update only `phase_name` on later commands. Initial
-origin and heading remain fixed for the episode, matching export behavior.
+For external mode, set `"phase_mode": "external"` and include `phase_name` or
+`phase_index`; the supervisor may update those phase fields on later commands.
+Initial origin and heading remain fixed for the episode, matching export
+behavior.
 
 If target, landing, or truck heading is omitted, the full runtime may use its
 active target, selected unload mesh, and truck prim. Their resolved source is
@@ -140,8 +143,9 @@ scripts/bridge_test/smolvla_policy_client_32d.py
 That server keeps the legacy 18D handshake as the default and adds a separate
 `state_28d_plus_effort_4d` handshake. The new handshake is accepted only when
 the authored `/World/URDF_real3/bucket_link/bucket_cut/node_/mesh_` is a valid
-closed mesh and all three cameras are available. The client must supply an
-episode context JSON and update `phase_name` as its phase supervisor advances.
+closed mesh, an initial-pile source-particle mask can be captured, and all
+three cameras are available. The client must supply target, unload landing,
+and task text. `phase_mode=auto` does not require a separate stage input.
 
 Example client command:
 
@@ -162,8 +166,8 @@ schema_version == excavator_state_v3_28d_plus_4effort_phase_index10
 state names exactly match all 28 exported names
 effort names exactly match [swing, boom, arm, bucket]
 all 32 values are finite
-bucket_load changes when particles enter/leave bucket_cut
-phase source is supervisor or active expert plan, never a constant fallback
+bucket_load uses initial-pile particles inside bucket_cut, not a hand-written proxy
+phase source is external_supervisor or simulator_auto_fsm, never a constant fallback
 target/landing remain fixed in the initial heading frame for the episode
 truck sin/cos matches the current truck transform
 camera keys 0/1/2 are present and fresh

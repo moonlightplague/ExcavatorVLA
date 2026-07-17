@@ -155,6 +155,227 @@ def joint_velocity_from_samples(
     )
 
 
+def source_tracked_bucket_load(
+    bucket_count: int,
+    bucket_from_initial_count: int,
+    fallback_min_region_count: int = 32,
+    fallback_min_source_ratio: float = 0.60,
+) -> dict:
+    """Apply the dataset's initial-pile source fallback to a closed-volume count."""
+    total = max(0, int(bucket_count))
+    from_initial = max(0, min(total, int(bucket_from_initial_count)))
+    min_count = max(0, int(fallback_min_region_count))
+    min_ratio = float(fallback_min_source_ratio)
+    if not math.isfinite(min_ratio) or not 0.0 <= min_ratio <= 1.0:
+        raise ObservationContractError(
+            f"fallback_min_source_ratio must be in [0, 1], got {min_ratio!r}"
+        )
+    ratio = float(from_initial) / max(1.0, float(total))
+    if total >= min_count and ratio < min_ratio:
+        return {
+            "count": total,
+            "bucket_count": total,
+            "bucket_from_initial_count": from_initial,
+            "source_ratio": ratio,
+            "source_tracking": "bucket_region_fallback",
+        }
+    return {
+        "count": from_initial,
+        "bucket_count": total,
+        "bucket_from_initial_count": from_initial,
+        "source_ratio": ratio,
+        "source_tracking": "initial_mask",
+    }
+
+
+class DeploymentPhaseEstimator:
+    """Infer the dataset's monotonic 10-stage phase from live simulator state."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.phase_index = 0
+        self.phase_elapsed = 0.0
+        self.previous_load_z = None
+        self.stage_entry_bucket_joint = None
+        self.max_bucket_load = 0.0
+        self.last_transition_reason = "episode_start"
+
+    def update(
+        self,
+        dt: float,
+        joint_positions_4d: Sequence[float],
+        bucket_tip_world_xyz: Sequence[float],
+        bucket_load_world_xyz: Sequence[float],
+        bucket_load_estimate: float,
+        bucket_load_rate: float,
+        dig_target_world_xyz: Sequence[float],
+        unload_landing_world_xyz: Sequence[float],
+    ) -> dict:
+        delta_time = float(dt)
+        if not math.isfinite(delta_time) or delta_time <= 0.0:
+            raise ObservationContractError(
+                f"phase estimator dt must be positive and finite: {dt!r}"
+            )
+        joints = _finite_vector(joint_positions_4d, 4, "joint_positions_4d")
+        tip = _finite_vector(bucket_tip_world_xyz, 3, "bucket_tip_world_xyz")
+        load_point = _finite_vector(
+            bucket_load_world_xyz,
+            3,
+            "bucket_load_world_xyz",
+        )
+        dig_target = _finite_vector(
+            dig_target_world_xyz,
+            3,
+            "dig_target_world_xyz",
+        )
+        unload_landing = _finite_vector(
+            unload_landing_world_xyz,
+            3,
+            "unload_landing_world_xyz",
+        )
+        load_count = float(bucket_load_estimate)
+        load_rate = float(bucket_load_rate)
+        if not math.isfinite(load_count) or not math.isfinite(load_rate):
+            raise ObservationContractError(
+                "phase estimator bucket load/count rate must be finite"
+            )
+
+        self.phase_elapsed += delta_time
+        self.max_bucket_load = max(self.max_bucket_load, load_count)
+        tip_dx = tip[0] - dig_target[0]
+        tip_dy = tip[1] - dig_target[1]
+        tip_dz = tip[2] - dig_target[2]
+        dig_tip_xy = math.hypot(tip_dx, tip_dy)
+        dig_tip_distance = math.sqrt(
+            tip_dx * tip_dx + tip_dy * tip_dy + tip_dz * tip_dz
+        )
+        unload_dx = load_point[0] - unload_landing[0]
+        unload_dy = load_point[1] - unload_landing[1]
+        unload_dz = load_point[2] - unload_landing[2]
+        unload_load_xy = math.hypot(unload_dx, unload_dy)
+        unload_load_distance = math.sqrt(
+            unload_dx * unload_dx
+            + unload_dy * unload_dy
+            + unload_dz * unload_dz
+        )
+        if self.previous_load_z is None:
+            load_vertical_velocity = 0.0
+        else:
+            load_vertical_velocity = (
+                load_point[2] - float(self.previous_load_z)
+            ) / delta_time
+        self.previous_load_z = load_point[2]
+
+        enough_load = load_count >= 16.0
+        strong_load = load_count >= 32.0
+        transition_reason = ""
+        phase = int(self.phase_index)
+        if phase == 0 and dig_tip_distance <= 1.25:
+            transition_reason = "tip_entered_dig_approach"
+        elif (
+            phase == 1
+            and dig_tip_xy <= 0.65
+            and tip[2] <= dig_target[2] + 0.55
+        ):
+            transition_reason = "tip_reached_contact_neighborhood"
+        elif (
+            phase == 2
+            and self.phase_elapsed >= 0.30
+            and (
+                strong_load
+                or (
+                    dig_tip_xy <= 0.65
+                    and tip[2] <= dig_target[2] + 0.25
+                )
+            )
+        ):
+            transition_reason = "insert_depth_or_load_reached"
+        elif (
+            phase == 3
+            and self.phase_elapsed >= 0.45
+            and (
+                strong_load
+                or load_rate > 5.0
+                or (
+                    dig_tip_xy <= 0.80
+                    and tip[2] <= dig_target[2] + 0.40
+                )
+            )
+        ):
+            transition_reason = "pull_mid_progress_reached"
+        elif phase == 4 and self.phase_elapsed >= 0.35 and enough_load:
+            entry_bucket = (
+                joints[3]
+                if self.stage_entry_bucket_joint is None
+                else float(self.stage_entry_bucket_joint)
+            )
+            closed_delta = entry_bucket - joints[3]
+            if (
+                closed_delta >= math.radians(12.0)
+                or load_vertical_velocity > 0.025
+                or self.phase_elapsed >= 1.50
+            ):
+                transition_reason = "loaded_bucket_curled_or_rising"
+        elif (
+            phase == 5
+            and self.phase_elapsed >= 0.30
+            and enough_load
+            and load_point[2] >= dig_target[2] + 0.35
+        ):
+            transition_reason = "bucket_exited_cut"
+        elif (
+            phase == 6
+            and self.phase_elapsed >= 0.30
+            and enough_load
+            and load_point[2] >= dig_target[2] + 0.65
+        ):
+            transition_reason = "secure_load_above_surface"
+        elif (
+            phase == 7
+            and self.phase_elapsed >= 0.40
+            and enough_load
+            and load_point[2] >= dig_target[2] + 1.00
+        ):
+            transition_reason = "carry_height_reached"
+        elif (
+            phase == 8
+            and self.phase_elapsed >= 0.40
+            and (
+                unload_load_xy <= 1.80
+                or unload_load_distance <= 2.25
+            )
+        ):
+            transition_reason = "bucket_reached_unload_neighborhood"
+
+        if transition_reason and self.phase_index < len(CANONICAL_PHASE_NAMES) - 1:
+            self.phase_index += 1
+            self.phase_elapsed = 0.0
+            self.stage_entry_bucket_joint = joints[3]
+            self.last_transition_reason = transition_reason
+
+        return {
+            "phase_index": int(self.phase_index),
+            "phase_name": CANONICAL_PHASE_NAMES[int(self.phase_index)],
+            "phase_source": "simulator_auto_fsm",
+            "phase_elapsed": float(self.phase_elapsed),
+            "transition_reason": str(
+                transition_reason or self.last_transition_reason
+            ),
+            "dig_tip_distance": float(dig_tip_distance),
+            "dig_tip_xy": float(dig_tip_xy),
+            "unload_load_distance": float(unload_load_distance),
+            "unload_load_xy": float(unload_load_xy),
+            "load_height_above_dig_target": float(
+                load_point[2] - dig_target[2]
+            ),
+            "load_vertical_velocity": float(load_vertical_velocity),
+            "bucket_load_estimate": float(load_count),
+            "bucket_load_rate": float(load_rate),
+        }
+
+
 def build_state_28d(
     base_state_14d: Sequence[float],
     joint_velocity_4d: Sequence[float],

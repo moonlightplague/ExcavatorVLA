@@ -139,6 +139,16 @@ def build_client_contract(
     else:
         raise ValueError(f"Unsupported observation schema: {schema!r}")
     context = dict(observation_context or {})
+    if schema == OBSERVATION_SCHEMA_28D_PLUS_EFFORT:
+        has_external_phase = (
+            context.get("phase_index") is not None
+            or context.get("phase_name") is not None
+            or context.get("phase") is not None
+        )
+        context.setdefault(
+            "phase_mode",
+            "external" if has_external_phase else "auto",
+        )
     return {
         "type": "handshake",
         "protocol_version": PROTOCOL_VERSION,
@@ -186,7 +196,6 @@ def validate_client_contract(contract):
         if not isinstance(context, dict):
             raise ValueError("28D deployment requires an observation_context object")
         required = (
-            "phase_name",
             "dig_target_xyz",
             "unload_landing_xyz",
             "task_text",
@@ -194,6 +203,20 @@ def validate_client_contract(contract):
         missing = [name for name in required if context.get(name) is None]
         if missing:
             raise ValueError(f"28D deployment context is missing: {missing}")
+        phase_mode = str(context.get("phase_mode") or "").strip().lower()
+        if phase_mode not in ("auto", "external"):
+            raise ValueError(
+                "28D deployment phase_mode must be 'auto' or 'external'"
+            )
+        has_external_phase = (
+            context.get("phase_index") is not None
+            or context.get("phase_name") is not None
+            or context.get("phase") is not None
+        )
+        if phase_mode == "external" and not has_external_phase:
+            raise ValueError(
+                "28D external phase_mode requires phase_index or phase_name"
+            )
     else:
         raise ValueError(f"Unsupported observation schema: {schema!r}")
     if tuple(contract.get("action_names", ())) != ACTION_NAMES_4D:

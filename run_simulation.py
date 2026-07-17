@@ -1845,6 +1845,13 @@ def main(args):
     bucket_volume_mesh_path = (
         "/World/URDF_real3/bucket_link/bucket_cut/node_/mesh_"
     )
+    bucket_source_tracker = {
+        "available": False,
+        "mask": None,
+        "particle_count": 0,
+        "source_count": 0,
+        "reason": "not_captured",
+    }
 
     def mesh_faces_from_usd(mesh):
         counts = list(mesh.GetFaceVertexCountsAttr().Get() or [])
@@ -2020,7 +2027,90 @@ def main(args):
             xj, zj = xi, zi
         return inside
 
-    def estimate_bucket_load_particles():
+    def capture_initial_pile_source_mask():
+        result = {
+            "available": False,
+            "mask": None,
+            "particle_count": 0,
+            "source_count": 0,
+            "reason": "",
+        }
+        try:
+            runtime_api = getattr(builtins, "_SAND_SITE", sand_api)
+            positions_fn = (
+                runtime_api.get("particle_positions_fn")
+                if isinstance(runtime_api, dict)
+                else None
+            )
+            if not callable(positions_fn):
+                result["reason"] = "particle_positions_unavailable"
+                return result
+            points = np.asarray(
+                positions_fn(),
+                dtype=np.float32,
+            ).reshape(-1, 3)
+            result["particle_count"] = int(len(points))
+            if len(points) == 0:
+                result["reason"] = "missing_particles"
+                return result
+
+            context = (
+                runtime_api.get("scene_context")
+                if isinstance(runtime_api, dict)
+                else None
+            )
+            if callable(context):
+                context = context()
+            if not isinstance(context, dict):
+                result["reason"] = "sand_scene_context_unavailable"
+                return result
+            center = np.asarray(
+                context.get("pile_center"),
+                dtype=np.float32,
+            ).reshape(-1)[:3]
+            radius = np.asarray(
+                context.get("diggable_radius"),
+                dtype=np.float32,
+            ).reshape(-1)[:2]
+            if center.shape != (3,) or radius.shape != (2,):
+                result["reason"] = "invalid_pile_geometry"
+                return result
+            radius = np.maximum(
+                radius,
+                np.asarray([0.05, 0.05], dtype=np.float32),
+            )
+            floor_z = float(context.get("sand_floor_z", center[2]))
+            fill_height = max(
+                0.05,
+                float(context.get("sand_fill_height", 0.25)),
+            )
+            z_min = min(-0.05, floor_z - 0.10)
+            z_expected_max = floor_z + fill_height + 0.75
+            dx = (points[:, 0] - center[0]) / float(radius[0])
+            dy = (points[:, 1] - center[1]) / float(radius[1])
+            pile_mask = (
+                (dx * dx + dy * dy <= 1.0)
+                & (points[:, 2] >= z_min)
+                & (points[:, 2] <= z_expected_max)
+            )
+            source_count = int(np.count_nonzero(pile_mask))
+            if source_count <= 0:
+                result["reason"] = "initial_pile_mask_empty"
+                return result
+            result.update(
+                {
+                    "available": True,
+                    "mask": np.asarray(pile_mask, dtype=bool),
+                    "source_count": source_count,
+                    "reason": "ok",
+                }
+            )
+            return result
+        except Exception as exc:
+            result["reason"] = f"{type(exc).__name__}:{exc}"
+            return result
+
+    def estimate_bucket_load_particles(source_tracking_required=False):
         start = time.perf_counter()
         result = {
             "count": 0,
@@ -2033,6 +2123,15 @@ def main(args):
             "authored_volume_reason": str(bucket_volume_topology["reason"]),
             "candidate_count": 0,
             "particle_count": 0,
+            "bucket_count": 0,
+            "bucket_from_pile_count": 0,
+            "bucket_from_initial_count": 0,
+            "source_tracking": (
+                "initial_mask"
+                if source_tracking_required
+                else "all_particles_legacy"
+            ),
+            "source_tracking_valid": not bool(source_tracking_required),
             "elapsed_ms": 0.0,
         }
         try:
@@ -2093,6 +2192,7 @@ def main(args):
             world_min = world_corners.min(axis=0) - 0.02
             world_max = world_corners.max(axis=0) + 0.02
             candidate_mask = np.all(points >= world_min, axis=1) & np.all(points <= world_max, axis=1)
+            candidate_indices = np.nonzero(candidate_mask)[0]
             candidates = points[candidate_mask]
             result["candidate_count"] = int(len(candidates))
             if len(candidates) == 0:
@@ -2120,7 +2220,59 @@ def main(args):
                     bucket_load_profile_xz,
                 )
                 inside = inside_y & inside_xz
-            result["count"] = int(np.count_nonzero(inside))
+            bucket_count = int(np.count_nonzero(inside))
+            result["bucket_count"] = bucket_count
+            if source_tracking_required:
+                initial_mask = bucket_source_tracker.get("mask")
+                if (
+                    not bool(bucket_source_tracker.get("available", False))
+                    or not isinstance(initial_mask, np.ndarray)
+                    or len(initial_mask) != len(points)
+                ):
+                    result["source_tracking"] = "initial_mask_unavailable"
+                    result["source_tracking_valid"] = False
+                    result["source_tracking_reason"] = str(
+                        bucket_source_tracker.get(
+                            "reason",
+                            "particle_count_changed",
+                        )
+                    )
+                    return result
+                inside_candidate_indices = candidate_indices[
+                    np.nonzero(inside)[0]
+                ]
+                raw_from_pile = int(
+                    np.count_nonzero(initial_mask[inside_candidate_indices])
+                )
+                source_result = (
+                    vla_observation_contract.source_tracked_bucket_load(
+                        bucket_count=bucket_count,
+                        bucket_from_initial_count=raw_from_pile,
+                    )
+                )
+                from_pile = int(source_result["count"])
+                result.update(
+                    {
+                        "count": int(from_pile),
+                        "bucket_from_pile_count": int(from_pile),
+                        "bucket_from_initial_count": int(raw_from_pile),
+                        "source_tracking": str(
+                            source_result["source_tracking"]
+                        ),
+                        "source_ratio": float(
+                            source_result["source_ratio"]
+                        ),
+                        "source_tracking_valid": True,
+                    }
+                )
+            else:
+                result.update(
+                    {
+                        "count": bucket_count,
+                        "bucket_from_pile_count": bucket_count,
+                        "bucket_from_initial_count": bucket_count,
+                    }
+                )
             return result
         except Exception as exc:
             result["source"] = f"error:{type(exc).__name__}:{exc}"
@@ -2273,6 +2425,7 @@ def main(args):
     active_connection_id = None
     tick_scheduler = None
     active_observation_context = {}
+    active_phase_estimator = None
     deployment_previous_q = None
     deployment_previous_load = None
     deployment_elapsed_seconds = 0.0
@@ -2290,6 +2443,7 @@ def main(args):
                     active_observation_context = dict(
                         active_contract.get("observation_context") or {}
                     )
+                    active_phase_estimator = None
                     deployment_previous_q = None
                     deployment_previous_load = None
                     deployment_elapsed_seconds = 0.0
@@ -2302,6 +2456,19 @@ def main(args):
                                 "28D deployment requires the authored bucket_cut "
                                 f"closed mesh: {bucket_volume_topology['reason']}"
                             )
+                        bucket_source_tracker.clear()
+                        bucket_source_tracker.update(
+                            capture_initial_pile_source_mask()
+                        )
+                        if not bool(bucket_source_tracker["available"]):
+                            raise ValueError(
+                                "28D deployment cannot reproduce the dataset's "
+                                "initial-pile bucket-load semantics: "
+                                f"{bucket_source_tracker['reason']}"
+                            )
+                        active_phase_estimator = (
+                            vla_observation_contract.DeploymentPhaseEstimator()
+                        )
                         base_x, base_y, base_yaw = read_robot_base_pose()
                         _, initial_q = read_canonical_joint_positions()
                         active_observation_context.setdefault(
@@ -2323,6 +2490,9 @@ def main(args):
                         "physics_hz": PHYSICS_HZ,
                         "training_fps": active_contract["training_fps"],
                         "observation_schema": active_contract["observation_schema"],
+                        "phase_mode": str(
+                            active_observation_context.get("phase_mode") or ""
+                        ),
                         "state_names": list(active_contract["state_names"]),
                         "effort_names": list(active_contract.get("effort_names") or []),
                         "timing_mode": "deterministic_lockstep",
@@ -2338,6 +2508,7 @@ def main(args):
                     active_contract = None
                     active_connection_id = None
                     tick_scheduler = None
+                    active_phase_estimator = None
                     reply = {
                         "type": "handshake_ack",
                         "ok": False,
@@ -2375,7 +2546,10 @@ def main(args):
                     continue
                 immutable_change = None
                 for key, value in context_update.items():
-                    if key in ("phase_name", "phase_index") or value is None:
+                    if (
+                        key in ("phase_name", "phase_index", "phase")
+                        or value is None
+                    ):
                         continue
                     if (
                         key in active_observation_context
@@ -2493,7 +2667,13 @@ def main(args):
                 base_x, base_y, base_yaw = 0.0, 0.0, 0.0
 
             joint_positions = np.asarray(q, dtype=np.float32).reshape(-1)[:4]
-            bucket_load_metrics = estimate_bucket_load_particles()
+            use_dataset_bucket_source_tracking = bool(
+                active_contract["observation_schema"]
+                == OBSERVATION_SCHEMA_28D_PLUS_EFFORT
+            )
+            bucket_load_metrics = estimate_bucket_load_particles(
+                source_tracking_required=use_dataset_bucket_source_tracking,
+            )
 
             tip_xyz = [0.0, 0.0, 0.0]
             load_xyz = [0.0, 0.0, 0.0]
@@ -2598,11 +2778,23 @@ def main(args):
             observation_state_28d = None
             observation_32d_ready = False
             observation_32d_error = ""
+            observation_phase_report = {}
+            observation_phase_source = ""
             if (
                 active_contract["observation_schema"]
                 == OBSERVATION_SCHEMA_28D_PLUS_EFFORT
             ):
                 try:
+                    if not bool(
+                        bucket_load_metrics.get(
+                            "source_tracking_valid",
+                            False,
+                        )
+                    ):
+                        raise vla_observation_contract.ObservationContractError(
+                            "bucket load initial-pile source tracking is invalid: "
+                            f"{bucket_load_metrics.get('source_tracking_reason', '')}"
+                        )
                     task_text = str(
                         active_observation_context.get("task_text") or ""
                     ).strip()
@@ -2610,22 +2802,69 @@ def main(args):
                         raise vla_observation_contract.ObservationContractError(
                             "observation_context.task_text is missing"
                         )
-                    phase = (
-                        active_observation_context.get("phase_index")
-                        if active_observation_context.get("phase_index") is not None
-                        else active_observation_context.get("phase_name")
+                    dig_target_xyz = active_observation_context.get(
+                        "dig_target_xyz"
                     )
+                    unload_landing_xyz = active_observation_context.get(
+                        "unload_landing_xyz"
+                    )
+                    phase_mode = str(
+                        active_observation_context.get("phase_mode") or "auto"
+                    ).strip().lower()
+                    if phase_mode == "external":
+                        phase = active_observation_context.get("phase_index")
+                        if phase is None:
+                            phase = active_observation_context.get("phase_name")
+                        if phase is None:
+                            phase = active_observation_context.get("phase")
+                        observation_phase_source = "external_supervisor"
+                        observation_phase_report = {
+                            "phase_index": int(
+                                vla_observation_contract.canonical_phase_index(
+                                    phase
+                                )
+                            ),
+                            "phase_name": (
+                                vla_observation_contract.CANONICAL_PHASE_NAMES[
+                                    vla_observation_contract.canonical_phase_index(
+                                        phase
+                                    )
+                                ]
+                            ),
+                            "phase_source": observation_phase_source,
+                        }
+                    elif phase_mode == "auto":
+                        if active_phase_estimator is None:
+                            raise vla_observation_contract.ObservationContractError(
+                                "simulator phase estimator is unavailable"
+                            )
+                        observation_phase_report = (
+                            active_phase_estimator.update(
+                                dt=bridge_step_seconds,
+                                joint_positions_4d=joint_positions,
+                                bucket_tip_world_xyz=tip_xyz,
+                                bucket_load_world_xyz=load_xyz,
+                                bucket_load_estimate=current_bucket_load,
+                                bucket_load_rate=deployment_bucket_load_rate,
+                                dig_target_world_xyz=dig_target_xyz,
+                                unload_landing_world_xyz=unload_landing_xyz,
+                            )
+                        )
+                        phase = observation_phase_report["phase_index"]
+                        observation_phase_source = str(
+                            observation_phase_report["phase_source"]
+                        )
+                    else:
+                        raise vla_observation_contract.ObservationContractError(
+                            f"unsupported phase_mode: {phase_mode!r}"
+                        )
                     observation_state_28d = (
                         vla_observation_contract.build_state_28d(
                             base_state_14d=observation_state,
                             joint_velocity_4d=deployment_joint_velocity,
                             phase=phase,
-                            dig_target_world_xyz=active_observation_context.get(
-                                "dig_target_xyz"
-                            ),
-                            unload_landing_world_xyz=active_observation_context.get(
-                                "unload_landing_xyz"
-                            ),
+                            dig_target_world_xyz=dig_target_xyz,
+                            unload_landing_world_xyz=unload_landing_xyz,
                             initial_origin_xy=active_observation_context.get(
                                 "initial_origin_xy"
                             ),
@@ -2642,6 +2881,21 @@ def main(args):
                 except Exception as exc:
                     observation_32d_error = f"{type(exc).__name__}: {exc}"
 
+            reply_observation_context = dict(active_observation_context)
+            if observation_phase_report:
+                reply_observation_context.update(
+                    {
+                        "resolved_phase_index": int(
+                            observation_phase_report["phase_index"]
+                        ),
+                        "resolved_phase_name": str(
+                            observation_phase_report["phase_name"]
+                        ),
+                        "resolved_phase_source": str(
+                            observation_phase_report["phase_source"]
+                        ),
+                    }
+                )
             reply = {
                 "joint_positions": q.tolist(),
                 "joint_velocities": qd.tolist(),
@@ -2664,7 +2918,9 @@ def main(args):
                         },
                     }
                 ),
-                "observation_context": dict(active_observation_context),
+                "observation_context": reply_observation_context,
+                "phase_report": dict(observation_phase_report),
+                "phase_source": str(observation_phase_source),
                 "bucket_load_metrics": bucket_load_metrics,
                 "task_text": task_text,
                 "primary_camera": primary_camera,

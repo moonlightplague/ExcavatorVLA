@@ -52,7 +52,7 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertEqual(len(checked["state_names"]), 28)
         self.assertEqual(len(checked["effort_names"]), 4)
 
-    def test_28d_contract_rejects_missing_phase_context(self):
+    def test_28d_contract_defaults_to_auto_phase_without_external_stage(self):
         payload = contract.build_client_contract(
             5,
             observation_schema=contract.OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
@@ -62,7 +62,24 @@ class DeploymentContractTests(unittest.TestCase):
                 "task_text": "Excavate one scoop.",
             },
         )
-        with self.assertRaisesRegex(ValueError, "missing"):
+        checked = contract.validate_client_contract(payload)
+        self.assertEqual(
+            checked["observation_context"]["phase_mode"],
+            "auto",
+        )
+
+    def test_28d_external_phase_rejects_missing_phase_context(self):
+        payload = contract.build_client_contract(
+            5,
+            observation_schema=contract.OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
+            observation_context={
+                "phase_mode": "external",
+                "dig_target_xyz": [0.0, 6.5, 0.4],
+                "unload_landing_xyz": [-6.8, -7.8, 4.2],
+                "task_text": "Excavate one scoop.",
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "requires"):
             contract.validate_client_contract(payload)
 
     def test_load_training_fps(self):

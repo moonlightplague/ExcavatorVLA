@@ -343,8 +343,16 @@ def main():
                 "observation_context": context,
             }
             if step == 0 or step % 25 == 0:
+                resolved_context = reply.get("observation_context")
+                resolved_context = (
+                    resolved_context
+                    if isinstance(resolved_context, dict)
+                    else {}
+                )
                 print(
-                    f"[STEP {step:05d}] phase={context.get('phase_name')} "
+                    f"[STEP {step:05d}] "
+                    f"phase={resolved_context.get('resolved_phase_name', context.get('phase_name'))} "
+                    f"phase_source={reply.get('phase_source', '')} "
                     f"action_rad_s={velocity.round(5).tolist()} "
                     f"bucket_load={state[7]:.1f}"
                 )

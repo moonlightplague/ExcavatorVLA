@@ -1,5 +1,5 @@
 {
-  "phase_name": "pre_dig",
+  "phase_mode": "auto",
   "dig_target_xyz": [
     0.0,
     6.5,

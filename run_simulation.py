@@ -178,6 +178,7 @@ TRUCK_ROOT_PATH = deployment_scene_contract.TRUCK_ROOT_PATH
 TRUCK_BED_COLLISION_PATH = (
     deployment_scene_contract.TRUCK_BED_COLLISION_PATH
 )
+_ACTIVE_SAND_COLLISION_RESTORE = None
 
 def _load_sand_runtime():
     """
@@ -712,6 +713,7 @@ def _print_joint_limits_once(
 
 def main(args):
     """Main entry point for standalone launch."""
+    global _ACTIVE_SAND_COLLISION_RESTORE
 
     # Import Isaac Sim modules after Isaac Sim Python env is set up.
     from isaacsim import SimulationApp
@@ -1590,6 +1592,110 @@ def main(args):
     if truck_pose_timeline_was_playing:
         timeline.play()
 
+    def suspend_excavator_collisions_for_sand_init():
+        """Disable every excavator collider and retain its original state."""
+        robot_prim = stage.GetPrimAtPath(ROBOT_PRIM_PATH)
+        if not robot_prim.IsValid():
+            raise RuntimeError(
+                f"Cannot suspend collisions; robot prim is missing: {ROBOT_PRIM_PATH}"
+            )
+
+        snapshots = []
+        for prim in Usd.PrimRange(robot_prim):
+            try:
+                if not prim.HasAPI(UsdPhysics.CollisionAPI):
+                    continue
+                collision_api = UsdPhysics.CollisionAPI(prim)
+                enabled_attr = collision_api.GetCollisionEnabledAttr()
+                original_value = (
+                    enabled_attr.Get() if enabled_attr.IsValid() else None
+                )
+                originally_enabled = (
+                    True if original_value is None else bool(original_value)
+                )
+                if not enabled_attr.IsValid():
+                    enabled_attr = collision_api.CreateCollisionEnabledAttr()
+                enabled_attr.Set(False)
+                snapshots.append(
+                    (str(prim.GetPath()), originally_enabled)
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to suspend excavator collider "
+                    f"{prim.GetPath()}: {exc}"
+                ) from exc
+
+        if not snapshots:
+            raise RuntimeError(
+                f"No CollisionAPI prims found below {ROBOT_PRIM_PATH}"
+            )
+
+        simulation_app.update()
+        still_enabled = []
+        for path, _ in snapshots:
+            prim = stage.GetPrimAtPath(path)
+            value = UsdPhysics.CollisionAPI(
+                prim
+            ).GetCollisionEnabledAttr().Get()
+            if value is None or bool(value):
+                still_enabled.append(path)
+        if still_enabled:
+            raise RuntimeError(
+                "Excavator collision suspension did not take effect: "
+                f"{still_enabled}"
+            )
+
+        print(
+            "[SAND INIT] Excavator collisions suspended:",
+            f"colliders={len(snapshots)}",
+            flush=True,
+        )
+        return snapshots
+
+    def restore_excavator_collisions_after_sand_init(snapshots):
+        """Restore the per-collider enabled states saved before sand init."""
+        failures = []
+        for path, originally_enabled in snapshots:
+            prim = stage.GetPrimAtPath(path)
+            if not prim.IsValid() or not prim.HasAPI(UsdPhysics.CollisionAPI):
+                failures.append(f"{path}:missing_or_no_collision_api")
+                continue
+            try:
+                enabled_attr = UsdPhysics.CollisionAPI(
+                    prim
+                ).GetCollisionEnabledAttr()
+                if not enabled_attr.IsValid():
+                    enabled_attr = UsdPhysics.CollisionAPI(
+                        prim
+                    ).CreateCollisionEnabledAttr()
+                enabled_attr.Set(bool(originally_enabled))
+            except Exception as exc:
+                failures.append(f"{path}:{type(exc).__name__}:{exc}")
+
+        simulation_app.update()
+        for path, originally_enabled in snapshots:
+            prim = stage.GetPrimAtPath(path)
+            if not prim.IsValid() or not prim.HasAPI(UsdPhysics.CollisionAPI):
+                continue
+            actual_value = UsdPhysics.CollisionAPI(
+                prim
+            ).GetCollisionEnabledAttr().Get()
+            if bool(actual_value) != bool(originally_enabled):
+                failures.append(
+                    f"{path}:expected={originally_enabled}:actual={actual_value}"
+                )
+
+        if failures:
+            raise RuntimeError(
+                "Failed to restore excavator collision state after sand init: "
+                f"{failures}"
+            )
+        print(
+            "[SAND INIT] Excavator collisions restored:",
+            f"colliders={len(snapshots)}",
+            flush=True,
+        )
+
     def inspect_existing_particle_sand():
         """
         Detect particle sand already authored in the loaded USD scene.
@@ -1707,6 +1813,7 @@ def main(args):
     # Do not add or reference any USD scene objects after this block.
     # -----------------------------------------------------------------
     sand_amount = int(args.sand_amount)
+    excavator_collision_snapshots = []
 
     if not os.path.isfile(SAND_RUNTIME_PATH):
         raise FileNotFoundError(
@@ -1717,6 +1824,14 @@ def main(args):
         f"[SAND] Loading runtime: {SAND_RUNTIME_PATH}",
         flush=True,
     )
+
+    if sand_amount > 0:
+        excavator_collision_snapshots = (
+            suspend_excavator_collisions_for_sand_init()
+        )
+        _ACTIVE_SAND_COLLISION_RESTORE = lambda snapshots=tuple(
+            excavator_collision_snapshots
+        ): restore_excavator_collisions_after_sand_init(snapshots)
 
     enable_gpu_particle_physics()
 
@@ -2056,6 +2171,12 @@ def main(args):
             f"error={status.get('real_sand_error', '')}",
             flush=True,
         )
+
+        restore_excavator_collisions_after_sand_init(
+            excavator_collision_snapshots
+        )
+        _ACTIVE_SAND_COLLISION_RESTORE = None
+        excavator_collision_snapshots = []
 
 
     # Hide sand BBox/range/debug visuals after particle settling.
@@ -3501,4 +3622,17 @@ if __name__ == "__main__":
     if args.idle_ui_hz <= 0.0:
         parser.error("--idle-ui-hz must be positive")
 
-    main(args)
+    try:
+        main(args)
+    finally:
+        pending_collision_restore = _ACTIVE_SAND_COLLISION_RESTORE
+        _ACTIVE_SAND_COLLISION_RESTORE = None
+        if callable(pending_collision_restore):
+            try:
+                pending_collision_restore()
+            except Exception as exc:
+                print(
+                    "[ERROR] Emergency excavator collision restoration failed:",
+                    repr(exc),
+                    flush=True,
+                )

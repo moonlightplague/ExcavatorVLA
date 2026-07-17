@@ -57,6 +57,29 @@ class DeploymentSceneContractTests(unittest.TestCase):
         self.assertNotIn("SAND_INITIAL_CENTER", source)
         self.assertIn("prim_local_yaw_z_deg(truck_prim)", source)
 
+    def test_sand_init_temporarily_suspends_excavator_collisions(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "run_simulation.py"
+        ).read_text(encoding="utf-8")
+        suspend_call = source.index(
+            "suspend_excavator_collisions_for_sand_init()",
+            source.index("sand_amount = int(args.sand_amount)"),
+        )
+        settle_loop = source.index(
+            "range(max(1, int(args.sand_settle_frames)))",
+            suspend_call,
+        )
+        restore_call = source.index(
+            "restore_excavator_collisions_after_sand_init(",
+            settle_loop,
+        )
+        self.assertLess(suspend_call, settle_loop)
+        self.assertLess(settle_loop, restore_call)
+        self.assertIn(
+            "pending_collision_restore = _ACTIVE_SAND_COLLISION_RESTORE",
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

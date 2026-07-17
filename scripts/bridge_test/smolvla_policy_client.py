@@ -23,6 +23,7 @@ from excavator_common.bridge_protocol import (
     read_json,
     write_json,
 )
+from excavator_common import vla_observation_contract
 
 
 def rgb_to_tensor(rgb, device):
@@ -40,42 +41,162 @@ def rgb_to_tensor(rgb, device):
     return x
 
 
-def make_state(reply, device):
-    """
-    New LeRobot dataset uses 14D observation.state:
+def require_camera_rgbs(camera_rgbs):
+    required = ("0", "1", "2")
+    missing = [name for name in required if name not in camera_rgbs]
+    if missing:
+        raise RuntimeError(
+            f"Bridge reply is missing required cameras {missing}; "
+            f"available={sorted(camera_rgbs)}"
+        )
+    validated = {}
+    for name in required:
+        rgb = np.asarray(camera_rgbs[name], dtype=np.uint8)
+        if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.shape[0] < 2 or rgb.shape[1] < 2:
+            raise RuntimeError(f"Camera {name} has invalid RGB shape: {rgb.shape}")
+        if not np.any(rgb):
+            raise RuntimeError(f"Camera {name} returned an all-zero RGB frame")
+        validated[name] = rgb
+    return validated
 
-      base_x
-      base_y
-      base_yaw
-      swing
-      boom
-      arm
-      bucket
-      bucket_load_estimate
-      bucket_tip_x
-      bucket_tip_y
-      bucket_tip_z
-      bucket_load_x
-      bucket_load_y
-      bucket_load_z
 
-    Bridge may not provide exactly these fields yet, so this function tries:
-      1. reply["observation_state"]
-      2. reply["state"]
-      3. reply["joint_positions"], padded to 14D
-    """
-    if "observation_state" in reply:
-        arr = np.asarray(reply["observation_state"], dtype=np.float32)
-    elif "state" in reply:
-        arr = np.asarray(reply["state"], dtype=np.float32)
+def make_state(reply, device, expected_state_dim):
+    if int(expected_state_dim) == 28:
+        if not bool(reply.get("observation_32d_ready", False)):
+            raise RuntimeError(
+                "Bridge cannot provide the checkpoint's 28D state: "
+                f"{reply.get('observation_32d_error', 'unknown error')}"
+            )
+        state = np.asarray(
+            reply.get("observation_state_28d"),
+            dtype=np.float32,
+        ).reshape(-1)
     else:
-        arr = np.asarray(reply.get("joint_positions", []), dtype=np.float32)
+        state = np.asarray(reply.get("observation_state"), dtype=np.float32).reshape(-1)
+        if int(expected_state_dim) == 18 and state.shape == (14,):
+            effort = np.asarray(
+                reply.get("observation_effort"),
+                dtype=np.float32,
+            ).reshape(-1)
+            if effort.shape != (4,):
+                raise RuntimeError(
+                    "Legacy 18D checkpoint requires bridge 14D state + 4D effort; "
+                    f"got state={state.shape}, effort={effort.shape}"
+                )
+            state = np.concatenate([state, effort], axis=0)
+    if state.shape != (int(expected_state_dim),):
+        raise RuntimeError(
+            f"Expected observation.state shape ({expected_state_dim},), got "
+            f"{state.shape}: {state.tolist()}"
+        )
+    if not np.all(np.isfinite(state)):
+        raise RuntimeError(f"observation.state contains NaN or Inf: {state.tolist()}")
+    return torch.from_numpy(state).unsqueeze(0).to(device=device, dtype=torch.float32)
 
-    state = np.zeros(14, dtype=np.float32)
-    n = min(14, len(arr))
-    state[:n] = arr[:n]
 
-    return torch.from_numpy(state).unsqueeze(0).to(device)
+def make_effort(reply, device, expected_effort_dim):
+    if int(expected_effort_dim) <= 0:
+        return None
+    effort = np.asarray(reply.get("observation_effort"), dtype=np.float32).reshape(-1)
+    if effort.shape != (int(expected_effort_dim),):
+        raise RuntimeError(
+            f"Expected observation.effort shape ({expected_effort_dim},), got "
+            f"{effort.shape}: {effort.tolist()}"
+        )
+    if not np.all(np.isfinite(effort)):
+        raise RuntimeError(f"observation.effort contains NaN or Inf: {effort.tolist()}")
+    return torch.from_numpy(effort).unsqueeze(0).to(device=device, dtype=torch.float32)
+
+
+def _feature_shape_from_object(value, feature_name):
+    if isinstance(value, dict):
+        if feature_name in value:
+            spec = value[feature_name]
+            if isinstance(spec, dict):
+                shape = spec.get("shape")
+                if isinstance(shape, (list, tuple)) and shape:
+                    return int(shape[0])
+        for child in value.values():
+            result = _feature_shape_from_object(child, feature_name)
+            if result is not None:
+                return result
+    elif isinstance(value, list):
+        for child in value:
+            result = _feature_shape_from_object(child, feature_name)
+            if result is not None:
+                return result
+    return None
+
+
+def checkpoint_feature_dims(checkpoint_dir, state_dim_override=0, effort_dim_override=-1):
+    state_dim = int(state_dim_override or 0)
+    effort_dim = int(effort_dim_override)
+    for filename in ("config.json", "train_config.json", "policy_preprocessor.json"):
+        path = Path(checkpoint_dir) / filename
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if state_dim <= 0:
+            found = _feature_shape_from_object(data, "observation.state")
+            if found is not None:
+                state_dim = int(found)
+        if effort_dim < 0:
+            found = _feature_shape_from_object(data, "observation.effort")
+            if found is not None:
+                effort_dim = int(found)
+
+    if state_dim not in (14, 18, 28):
+        raise RuntimeError(
+            "Cannot establish checkpoint observation.state dimension. "
+            "Use --state-dim 14, 18, or 28 and verify it against training metadata."
+        )
+    if effort_dim < 0:
+        effort_dim = 4 if state_dim == 28 else 0
+    if effort_dim not in (0, 4):
+        raise RuntimeError(f"Unsupported observation.effort dimension: {effort_dim}")
+    if state_dim == 28 and effort_dim != 4:
+        raise RuntimeError(
+            "The 28D checkpoint contract requires a separate 4D "
+            "observation.effort feature."
+        )
+    return state_dim, effort_dim
+
+
+def validate_bridge_contract(reply, state_dim, effort_dim):
+    contract = reply.get("observation_contract")
+    if not isinstance(contract, dict):
+        raise RuntimeError("Bridge reply is missing observation_contract metadata")
+    if int(state_dim) != 28:
+        return
+    state_spec = contract.get("observation.state")
+    effort_spec = contract.get("observation.effort")
+    action_spec = contract.get("action")
+    expected_state_names = list(vla_observation_contract.STATE_NAMES_28D)
+    expected_effort_names = list(vla_observation_contract.EFFORT_NAMES_4D)
+    expected_action_names = list(vla_observation_contract.ACTION_NAMES_4D)
+    if not isinstance(state_spec, dict) or state_spec.get("names") != expected_state_names:
+        raise RuntimeError("Bridge observation.state names/order do not match the 28D contract")
+    if not isinstance(effort_spec, dict) or effort_spec.get("names") != expected_effort_names:
+        raise RuntimeError("Bridge observation.effort names/order do not match the 4D contract")
+    if not isinstance(action_spec, dict) or action_spec.get("names") != expected_action_names:
+        raise RuntimeError("Bridge action names/order do not match the canonical 4D contract")
+    if str(action_spec.get("unit", "")).strip().lower() != "rad/s":
+        raise RuntimeError(f"Bridge action unit must be rad/s, got {action_spec.get('unit')!r}")
+    if int(effort_dim) != 4:
+        raise RuntimeError(f"Bridge effort dimension mismatch: expected 4, got {effort_dim}")
+
+
+def load_observation_context(path):
+    if not str(path or "").strip():
+        return None
+    context_path = Path(path).expanduser()
+    data = json.loads(context_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Observation context must be a JSON object: {context_path}")
+    return data
 
 
 def action_to_joint_velocities(action, num_joints, max_vel=1.0):
@@ -86,11 +207,7 @@ def action_to_joint_velocities(action, num_joints, max_vel=1.0):
       action[2] = arm
       action[3] = bucket
 
-    Bridge joint_velocities order:
-      vel[0] = bucket
-      vel[1] = arm
-      vel[2] = boom
-      vel[3] = swing
+    Bridge joint_velocities order is the same canonical order.
     """
     a = action.detach().float().cpu().numpy()
 
@@ -102,14 +219,8 @@ def action_to_joint_velocities(action, num_joints, max_vel=1.0):
 
     vel = np.zeros(num_joints, dtype=np.float32)
 
-    if num_joints >= 4:
-        vel[0] = a[3]  # bucket
-        vel[1] = a[2]  # arm
-        vel[2] = a[1]  # boom
-        vel[3] = a[0]  # swing
-    else:
-        n = min(num_joints, 4)
-        vel[:n] = a[:n]
+    n = min(num_joints, 4)
+    vel[:n] = a[:n]
 
     return vel
 
@@ -203,6 +314,13 @@ def main():
     parser.add_argument("--ticks", type=int, default=4)
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--sleep", type=float, default=0.01)
+    parser.add_argument("--state-dim", type=int, default=0)
+    parser.add_argument("--effort-dim", type=int, default=-1)
+    parser.add_argument(
+        "--observation-context",
+        default="",
+        help="JSON file updated by the deployment task/phase supervisor.",
+    )
 
     args = parser.parse_args()
 
@@ -217,6 +335,15 @@ def main():
     print("[INFO] local VLM:", args.vlm)
 
     patch_checkpoint_paths(args.ckpt, args.vlm)
+    state_dim, effort_dim = checkpoint_feature_dims(
+        args.ckpt,
+        state_dim_override=args.state_dim,
+        effort_dim_override=args.effort_dim,
+    )
+    print(
+        f"[INFO] checkpoint observation contract: state_dim={state_dim} "
+        f"effort_dim={effort_dim}"
+    )
 
     print("[INFO] loading SmolVLA policy...")
     policy = SmolVLAPolicy.from_pretrained(args.ckpt)
@@ -236,26 +363,45 @@ def main():
     cmd = {
         "ticks": args.ticks,
     }
+    initial_context = load_observation_context(args.observation_context)
+    if initial_context is not None:
+        cmd["reset_observation_context"] = True
+        cmd["observation_context"] = initial_context
 
     try:
         for step in range(args.steps):
             write_json(sock, cmd)
             reply = read_json(sock)
+            if step == 0:
+                validate_bridge_contract(reply, state_dim, effort_dim)
 
             rgb = decode_rgb(reply)
-            camera_rgbs = decode_camera_images(reply, np_module=np)
-            rgb0 = camera_rgbs.get("0", rgb)
-            rgb1 = camera_rgbs.get("1", rgb)
+            camera_rgbs = require_camera_rgbs(
+                decode_camera_images(reply, np_module=np)
+            )
+            rgb0 = camera_rgbs["0"]
+            rgb1 = camera_rgbs["1"]
+            rgb2 = camera_rgbs["2"]
             image0 = rgb_to_tensor(rgb0, device)
             image1 = rgb_to_tensor(rgb1, device)
-            state = make_state(reply, device)
+            image2 = rgb_to_tensor(rgb2, device)
+            state = make_state(reply, device, state_dim)
+            effort = make_effort(reply, device, effort_dim)
+            bridge_task = str(reply.get("task_text", "") or "").strip()
+            if bridge_task and bridge_task != args.task:
+                args.task = bridge_task
+                language_tokens, language_mask = load_language_tokens(
+                    args.task,
+                    args.vlm,
+                    device,
+                )
 
             batch = {
                 # Match training dataset keys
                 "observation.state": state,
                 "observation.images.0": image0,
                 "observation.images.1": image1,
-                # "observation.images.2": image,
+                "observation.images.2": image2,
 
                 # Raw task string used by LeRobot preprocessor-style pipelines
                 "task": [args.task],
@@ -264,6 +410,8 @@ def main():
                 "observation.language.tokens": language_tokens,
                 "observation.language.attention_mask": language_mask,
             }
+            if effort is not None:
+                batch["observation.effort"] = effort
 
             with torch.no_grad():
                 action = policy.select_action(batch)
@@ -281,6 +429,9 @@ def main():
                 "joint_velocities": vel.tolist(),
                 "ticks": args.ticks,
             }
+            context = load_observation_context(args.observation_context)
+            if context is not None:
+                cmd["observation_context"] = context
 
             print(
                 f"[STEP {step:04d}] "

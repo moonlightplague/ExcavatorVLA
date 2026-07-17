@@ -38,6 +38,15 @@ configuration take precedence over older prose documents.
 - [Current runtime architecture](current_runtime_architecture.md): canonical
   auto-collect, planning, execution, clock, camera, and sampling call chain as
   audited against the 2026-07-15 working tree.
+- [32D collection code guide](vla_32d_collection_code_guide.md): source-level
+  data lineage from the raw 14D state and 4D effort through the exported 28D
+  state, action, cameras, phases, timestamps, and LeRobot rows.
+- [32D calculation audit](vla_32d_calculation_audit.md): verified calculations,
+  mixed-rate and temporal-alignment findings, measured data evidence, and the
+  recommended repair order.
+- [32D deployment contract](vla_32d_deployment_contract.md): live simulator
+  sources, bridge payload, phase-supervisor requirement, and startup acceptance
+  checks for the 28D state plus 4D effort model input.
 - [18D SmolVLA deployment handoff](vla_18d_deployment_handoff.md): immediate
   guidance for the existing 14D state + 4D effort checkpoints, including the
   current simulator slowdown diagnosis and a later 32D migration path.

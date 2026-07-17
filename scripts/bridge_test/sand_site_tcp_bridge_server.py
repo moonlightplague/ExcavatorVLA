@@ -40,8 +40,8 @@ from excavator_common.bridge_protocol import (  # noqa: E402
     async_read_json,
     async_write_json,
     encode_rgb_payload,
-    make_articulation_action,
 )
+from excavator_common import vla_observation_contract  # noqa: E402
 
 
 HOST = os.environ.get("EXCAVATOR_BRIDGE_HOST", "0.0.0.0")
@@ -74,6 +74,34 @@ def _robot():
     if robot is None:
         raise RuntimeError("excavator runtime ROBOT is not ready yet.")
     return robot
+
+
+def _canonical_articulation_action(cmd):
+    fields = [
+        ("joint_positions", "joint_positions"),
+        ("joint_velocities", "joint_velocities"),
+        ("joint_efforts", "joint_efforts"),
+    ]
+    provided = [(key, arg_name) for key, arg_name in fields if cmd.get(key) is not None]
+    if len(provided) > 1:
+        raise ValueError(
+            "Send only one of joint_positions, joint_velocities, joint_efforts per command."
+        )
+    if not provided:
+        return None
+
+    rt = _runtime_module()
+    indices = np.asarray(getattr(rt, "JOINT_INDICES", None), dtype=np.int32).reshape(-1)
+    if len(indices) != 4:
+        raise RuntimeError(f"canonical joint index mapping is unavailable: {indices.tolist()}")
+    key, arg_name = provided[0]
+    values = np.asarray(cmd[key], dtype=np.float32).reshape(-1)
+    if len(values) != 4 or not np.all(np.isfinite(values)):
+        raise ValueError(f"{key} must contain four finite canonical values")
+    return ArticulationAction(
+        joint_indices=indices,
+        **{arg_name: values},
+    )
 
 
 def _camera_paths():
@@ -143,11 +171,15 @@ async def _capture_viewport_rgb(viewport):
     _capture_helpers[:] = [holder for holder in _capture_helpers if not holder.get("done")]
 
     if result["rgb"] is None:
-        if result["error"]:
-            print("[sand-site-bridge] viewport capture failed:", result["error"], flush=True)
-        return np.zeros((1, 1, 3), dtype=np.uint8)
+        detail = result["error"] or "capture callback did not produce an RGB frame"
+        raise RuntimeError(f"viewport capture failed: {detail}")
 
-    return result["rgb"]
+    rgb = np.asarray(result["rgb"], dtype=np.uint8)
+    if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.shape[0] < 2 or rgb.shape[1] < 2:
+        raise RuntimeError(f"viewport capture returned an invalid RGB shape: {rgb.shape}")
+    if not np.any(rgb):
+        raise RuntimeError("viewport capture returned an all-zero RGB frame")
+    return rgb
 
 
 async def _capture_cameras(viewport, camera_paths):
@@ -168,8 +200,12 @@ async def _handle_client(reader, writer):
         raise RuntimeError("No active viewport found. Open Isaac Sim with GUI rendering enabled.")
 
     camera_paths = _camera_paths()
-    if not camera_paths:
-        raise RuntimeError("No dataset camera prims found. Run main.py and wait until the runtime is ready.")
+    missing_cameras = sorted({"0", "1", "2"} - set(camera_paths))
+    if missing_cameras:
+        raise RuntimeError(
+            "Dataset camera prims are incomplete; "
+            f"missing={missing_cameras}, available={sorted(camera_paths)}"
+        )
 
     print("[sand-site-bridge] cameras:", camera_paths, flush=True)
 
@@ -177,16 +213,35 @@ async def _handle_client(reader, writer):
         while True:
             cmd = await async_read_json(reader)
 
-            action = make_articulation_action(cmd, ArticulationAction, np)
+            rt = _runtime_module()
+            context = cmd.get("observation_context")
+            reset_context = bool(cmd.get("reset_observation_context", False))
+            if context is not None or reset_context:
+                rt.deployment_observation_context_update(
+                    context=context,
+                    reset=reset_context,
+                )
+
+            action = _canonical_articulation_action(cmd)
             if action is not None:
                 _robot().apply_action(action)
 
             ticks = max(1, min(int(cmd.get("ticks", 4) or 4), 120))
             await _next_frames(ticks)
 
-            robot = _robot()
-            q = np.asarray(robot.get_joint_positions(), dtype=np.float32)
-            qd = np.asarray(robot.get_joint_velocities(), dtype=np.float32)
+            q = np.asarray(rt.get_real_joint_positions(), dtype=np.float32)
+            qd = np.asarray(rt.deployment_canonical_joint_velocity(), dtype=np.float32)
+            bucket_metrics = rt.bucket_load_fast_current(force=False)
+            observation_state_14d = rt.dataset_observation_state(
+                q_real=q,
+                bucket_load_metrics=bucket_metrics,
+            )
+            effort_report = rt.dataset_joint_effort_observation()
+            observation_effort = (
+                effort_report.get("observation.effort")
+                if isinstance(effort_report, dict)
+                else None
+            )
 
             rgbs = await _capture_cameras(viewport, camera_paths)
             primary_name = "1" if "1" in rgbs else next(iter(rgbs))
@@ -199,9 +254,26 @@ async def _handle_client(reader, writer):
             reply = {
                 "joint_positions": q.tolist(),
                 "joint_velocities": qd.tolist(),
+                "observation_state": observation_state_14d,
+                "observation_effort": observation_effort,
+                "observation_contract": vla_observation_contract.schema_payload(),
                 "primary_camera": primary_name,
                 "cameras": cameras,
             }
+            try:
+                reply.update(rt.deployment_vla_observation_payload())
+            except Exception as exc:
+                reply["observation_state_28d"] = None
+                reply["observation_32d_ready"] = False
+                reply["observation_32d_error"] = f"{type(exc).__name__}: {exc}"
+            else:
+                reply["observation_32d_ready"] = True
+            if not str(reply.get("task_text", "") or "").strip():
+                reply["task_text"] = str(
+                    (rt.STATE.get("deployment_observation_context") or {}).get("task_text")
+                    or rt.STATE.get("dataset_task_text", "")
+                    or ""
+                )
             reply.update(encode_rgb_payload(primary_rgb, np_module=np, camera_path=camera_paths[primary_name]))
             await async_write_json(writer, reply)
 

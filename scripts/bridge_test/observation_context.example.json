@@ -1,0 +1,20 @@
+{
+  "phase_name": "pre_dig",
+  "dig_target_xyz": [
+    0.0,
+    6.5,
+    0.4
+  ],
+  "unload_landing_xyz": [
+    -6.8,
+    -7.8,
+    4.2
+  ],
+  "initial_origin_xy": [
+    0.0,
+    0.0
+  ],
+  "initial_heading_rad": 1.5707963267948966,
+  "truck_yaw_rad": -2.1,
+  "task_text": "Excavate one scoop from the sand pile in front of the excavator and dump the collected material into the truck bed."
+}

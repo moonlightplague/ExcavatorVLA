@@ -1,10 +1,11 @@
+import math
 import os
 import socket
 import tempfile
 import unittest
 from pathlib import Path
 
-from excavator_common import bridge_protocol, geometry, paths
+from excavator_common import bridge_protocol, geometry, paths, vla_observation_contract
 
 try:
     import numpy as np
@@ -77,6 +78,57 @@ class GeometryTests(unittest.TestCase):
         self.assertAlmostEqual(cy, 0.5)
         self.assertTrue(geometry.point_in_polygon_xy(0.5, 0.5, hull))
         self.assertFalse(geometry.point_in_polygon_xy(2.0, 2.0, hull))
+
+
+class VLAObservationContractTests(unittest.TestCase):
+    def test_phase_mapping_includes_loaded_transit(self):
+        self.assertEqual(vla_observation_contract.canonical_phase_index("pre_dig"), 0)
+        self.assertEqual(vla_observation_contract.canonical_phase_index("loaded_transit"), 8)
+        self.assertEqual(vla_observation_contract.canonical_phase_index("clearance_route_post_2"), 8)
+        self.assertEqual(vla_observation_contract.canonical_phase_index("unload_to_bin"), 9)
+
+    def test_joint_velocity_uses_shortest_swing_delta(self):
+        velocity = vla_observation_contract.joint_velocity_from_samples(
+            [-math.radians(179.0), 0.3, -0.4, 0.5],
+            [math.radians(179.0), 0.2, -0.2, 0.1],
+            0.5,
+        )
+        self.assertAlmostEqual(velocity[0], math.radians(4.0), places=6)
+        self.assertAlmostEqual(velocity[1], 0.2, places=6)
+        self.assertAlmostEqual(velocity[2], -0.4, places=6)
+        self.assertAlmostEqual(velocity[3], 0.8, places=6)
+
+    def test_build_state_28d_uses_initial_heading_frame(self):
+        state = vla_observation_contract.build_state_28d(
+            base_state_14d=[0.0] * 14,
+            joint_velocity_4d=[1.0, 2.0, 3.0, 4.0],
+            phase="loaded_transit",
+            dig_target_world_xyz=[1.0, 0.0, 2.0],
+            unload_landing_world_xyz=[0.0, 2.0, 3.0],
+            initial_origin_xy=[0.0, 0.0],
+            initial_heading_rad=0.5 * 3.141592653589793,
+            truck_yaw_rad=3.141592653589793,
+            bucket_load_rate=12.0,
+        )
+        self.assertEqual(len(state), 28)
+        self.assertEqual(state[14:18], [1.0, 2.0, 3.0, 4.0])
+        self.assertEqual(state[18], 8.0)
+        self.assertAlmostEqual(state[19], 0.0, places=6)
+        self.assertAlmostEqual(state[20], -1.0, places=6)
+        self.assertAlmostEqual(state[22], 2.0, places=6)
+        self.assertAlmostEqual(state[23], 0.0, places=6)
+        self.assertAlmostEqual(state[25], 1.0, places=6)
+        self.assertAlmostEqual(state[26], 0.0, places=6)
+        self.assertEqual(state[27], 12.0)
+
+    def test_validate_payload_rejects_missing_effort(self):
+        with self.assertRaises(vla_observation_contract.ObservationContractError):
+            vla_observation_contract.validate_payload(
+                {
+                    "observation_state_28d": [0.0] * 28,
+                    "observation_effort": None,
+                }
+            )
 
 
 if __name__ == "__main__":

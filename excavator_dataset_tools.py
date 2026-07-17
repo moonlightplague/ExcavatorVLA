@@ -1841,7 +1841,7 @@ def lerobot_task_text(
 
 def canonical_lerobot_phase_index(phase: object) -> Optional[int]:
     text = str(phase or "").strip().lower()
-    if "clearance_route_post" in text or "staged_unload" in text or "high_carry" in text:
+    if text == "loaded_transit" or "clearance_route_post" in text or "staged_unload" in text or "high_carry" in text:
         return 8
     if "unload_to_bin" in text or "unload_pre_dump_align" in text or "unload" in text or "dump" in text:
         return 9

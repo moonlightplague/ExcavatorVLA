@@ -43,6 +43,8 @@ from isaacsim.core.api.world import World
 from isaacsim.core.prims import SingleArticulation
 from isaacsim.core.utils.types import ArticulationAction
 
+from excavator_common import vla_observation_contract
+
 from . import auto_dataset_collect
 from . import excavator_dataset_camera
 from . import ik_calculation
@@ -10862,7 +10864,7 @@ def dataset_joint_force_torque_observation():
 
 def dataset_phase_index(phase):
     text = str(phase).lower()
-    if "clearance_route_post" in text or "staged_unload" in text or "high_carry" in text:
+    if text == "loaded_transit" or "clearance_route_post" in text or "staged_unload" in text or "high_carry" in text:
         return 8
     if "unload_to_bin" in text or "unload_pre_dump_align" in text or "unload" in text or "dump" in text:
         return 9
@@ -11213,6 +11215,323 @@ def dataset_observation_state(q_real=None, bucket_load_metrics=None):
     else:
         state.extend([0.0, 0.0, 0.0])
     return state
+
+
+def deployment_observation_context_update(context=None, reset=False):
+    if reset:
+        STATE["deployment_observation_context"] = {}
+        STATE["deployment_initial_origin_xy"] = None
+        STATE["deployment_initial_heading_rad"] = None
+        STATE["deployment_bucket_load_previous"] = None
+        STATE["deployment_bucket_load_previous_time"] = None
+        STATE["deployment_joint_previous_q"] = None
+        STATE["deployment_joint_previous_time"] = None
+        STATE["deployment_joint_velocity_4d"] = None
+    if context is None:
+        return dict(STATE.get("deployment_observation_context", {}) or {})
+    if not isinstance(context, dict):
+        raise vla_observation_contract.ObservationContractError(
+            "observation_context must be a JSON object"
+        )
+    merged = dict(STATE.get("deployment_observation_context", {}) or {})
+    merged.update({str(key): value for key, value in context.items() if value is not None})
+    STATE["deployment_observation_context"] = merged
+    return dict(merged)
+
+
+def deployment_canonical_joint_velocity(q_real=None, sample_time=None):
+    """Match the dataset's sampled finite-difference joint velocity semantics."""
+    if q_real is None:
+        q_real = get_real_joint_positions()
+    q_real = np.asarray(q_real, dtype=np.float32).reshape(-1)[:4]
+    if q_real.shape != (4,) or not np.all(np.isfinite(q_real)):
+        raise vla_observation_contract.ObservationContractError(
+            f"canonical joint position is unavailable: {q_real.tolist()}"
+        )
+    if sample_time is None:
+        sample_time = dataset_simulation_time_seconds()
+    sample_time = float(sample_time)
+    if not math.isfinite(sample_time):
+        raise vla_observation_contract.ObservationContractError(
+            f"simulation sample time is not finite: {sample_time!r}"
+        )
+
+    previous_q = STATE.get("deployment_joint_previous_q")
+    previous_time = STATE.get("deployment_joint_previous_time")
+    cached_velocity = STATE.get("deployment_joint_velocity_4d")
+    if previous_time is not None and abs(sample_time - float(previous_time)) <= 1.0e-9:
+        if cached_velocity is not None:
+            return [float(value) for value in cached_velocity]
+
+    if previous_q is None or previous_time is None or sample_time <= float(previous_time):
+        velocity = [0.0, 0.0, 0.0, 0.0]
+    else:
+        velocity = vla_observation_contract.joint_velocity_from_samples(
+            q_real,
+            previous_q,
+            sample_time - float(previous_time),
+        )
+    STATE["deployment_joint_previous_q"] = q_real.copy()
+    STATE["deployment_joint_previous_time"] = float(sample_time)
+    STATE["deployment_joint_velocity_4d"] = list(velocity)
+    return [float(value) for value in velocity]
+
+
+def _deployment_plan_stage_name():
+    stage_index_raw = STATE.get("active_plan_stage_index", -1)
+    stage_index = -1 if stage_index_raw is None else int(stage_index_raw)
+    plan = STATE.get("current_dig_plan")
+    if not isinstance(plan, dict) or stage_index < 0:
+        return None
+    sequence = plan.get("sequence")
+    if isinstance(sequence, (list, tuple)) and stage_index < len(sequence):
+        row = sequence[stage_index]
+        if isinstance(row, (list, tuple)) and row:
+            return str(row[0])
+        if isinstance(row, dict):
+            return str(row.get("phase") or row.get("name") or "")
+    stages = plan.get("stages")
+    if isinstance(stages, (list, tuple)) and stage_index < len(stages):
+        row = stages[stage_index]
+        if isinstance(row, dict):
+            return str(row.get("phase") or row.get("name") or "")
+    return None
+
+
+def _deployment_scene_heading_deg():
+    scene_record = STATE.get("auto_scene_last_randomization")
+    if not isinstance(scene_record, dict):
+        return None
+    for section_name in ("applied", "candidate"):
+        section = scene_record.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        value = section.get("robot_body_yaw_deg")
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _deployment_scene_truck_yaw_deg():
+    scene_record = STATE.get("auto_scene_last_randomization")
+    if isinstance(scene_record, dict):
+        for section_name in ("applied", "candidate"):
+            section = scene_record.get(section_name)
+            if not isinstance(section, dict):
+                continue
+            value = section.get("truck_yaw_deg")
+            if value is not None:
+                return float(value)
+    try:
+        return float(get_prim_local_yaw_z_deg(AUTO_SCENE_TRUCK_ROOT_PATH, default=0.0))
+    except Exception:
+        return None
+
+
+def deployment_vla_observation_payload(context=None):
+    """Build the live 28D+4D model input from the same sources as collection."""
+    def first_non_none(*values):
+        for value in values:
+            if value is not None:
+                return value
+        return None
+
+    context = deployment_observation_context_update(context)
+    q_real = get_real_joint_positions()
+    sample_time = float(dataset_simulation_time_seconds())
+    joint_velocity = deployment_canonical_joint_velocity(
+        q_real=q_real,
+        sample_time=sample_time,
+    )
+
+    bucket_metrics = bucket_load_fast_current(force=False)
+    if not isinstance(bucket_metrics, dict) or not bool(bucket_metrics.get("available", False)):
+        reason = (bucket_metrics or {}).get("reason", "bucket_metrics_unavailable")
+        raise vla_observation_contract.ObservationContractError(
+            f"bucket load source unavailable: {reason}"
+        )
+    tip = bucket_tip_pos()
+    load = bucket_load_pos()
+    if tip is None or load is None:
+        raise vla_observation_contract.ObservationContractError(
+            "bucket tip/load transforms are unavailable"
+        )
+    base_state = dataset_observation_state(q_real=q_real, bucket_load_metrics=bucket_metrics)
+
+    effort_report = dataset_joint_effort_observation()
+    effort = effort_report.get("observation.effort") if isinstance(effort_report, dict) else None
+    if effort is None:
+        reason = (effort_report or {}).get("reason", "measured_effort_unavailable")
+        raise vla_observation_contract.ObservationContractError(
+            f"measured effort source unavailable: {reason}"
+        )
+
+    plan = STATE.get("current_dig_plan")
+    plan = plan if isinstance(plan, dict) else {}
+    dig_target = vla_observation_contract.optional_context_value(
+        context,
+        "dig_target_xyz",
+        "target_xyz",
+    )
+    dig_target_source = "observation_context"
+    if dig_target is None:
+        dig_target = first_non_none(
+            plan.get("chosen_dig_target"),
+            plan.get("target_xyz"),
+        )
+        dig_target_source = "current_dig_plan"
+    if dig_target is None and TARGET_PATH:
+        dig_target = get_target_pos()
+        dig_target_source = "runtime_target_prim"
+    if dig_target is None:
+        raise vla_observation_contract.ObservationContractError(
+            "dig target is unavailable; provide observation_context.dig_target_xyz"
+        )
+
+    unload_landing = vla_observation_contract.optional_context_value(
+        context,
+        "unload_landing_xyz",
+    )
+    unload_source = "observation_context"
+    if unload_landing is None:
+        unload_landing = first_non_none(
+            STATE.get("active_unload_landing_point"),
+            plan.get("chosen_unload_landing_point"),
+            plan.get("unload_landing_xyz"),
+        )
+        unload_source = "runtime_unload_plan"
+    if unload_landing is None:
+        unload_landing = unload_bin_landing_point()
+        unload_source = "selected_unload_mesh"
+    if unload_landing is None:
+        raise vla_observation_contract.ObservationContractError(
+            "unload landing is unavailable; provide observation_context.unload_landing_xyz"
+        )
+
+    phase = vla_observation_contract.optional_context_value(
+        context,
+        "phase_index",
+        "phase_name",
+        "phase",
+    )
+    phase_source = "observation_context"
+    if phase is None:
+        phase = _deployment_plan_stage_name()
+        phase_source = "active_expert_plan"
+    if phase is None:
+        raise vla_observation_contract.ObservationContractError(
+            "phase is unavailable; an end-to-end policy must provide a deployment "
+            "phase supervisor or be retrained without phase_index"
+        )
+
+    initial_origin = vla_observation_contract.optional_context_value(
+        context,
+        "initial_origin_xy",
+        "initial_base_xy",
+    )
+    if initial_origin is None:
+        initial_origin = STATE.get("deployment_initial_origin_xy")
+    if initial_origin is None:
+        initial_origin = [float(base_state[0]), float(base_state[1])]
+        STATE["deployment_initial_origin_xy"] = list(initial_origin)
+
+    initial_heading = vla_observation_contract.optional_context_value(
+        context,
+        "initial_heading_rad",
+    )
+    if initial_heading is None:
+        initial_heading = STATE.get("deployment_initial_heading_rad")
+    if initial_heading is None:
+        heading_deg = _deployment_scene_heading_deg()
+        if heading_deg is None:
+            initial_heading = float(base_state[2]) + float(base_state[3])
+        else:
+            initial_heading = math.radians(float(heading_deg))
+        STATE["deployment_initial_heading_rad"] = float(initial_heading)
+
+    truck_yaw = vla_observation_contract.optional_context_value(
+        context,
+        "truck_yaw_rad",
+    )
+    if truck_yaw is None:
+        truck_yaw_deg = vla_observation_contract.optional_context_value(
+            context,
+            "truck_yaw_deg",
+        )
+        if truck_yaw_deg is None:
+            truck_yaw_deg = _deployment_scene_truck_yaw_deg()
+        if truck_yaw_deg is None:
+            raise vla_observation_contract.ObservationContractError(
+                "truck heading is unavailable; provide observation_context.truck_yaw_rad"
+            )
+        truck_yaw = math.radians(float(truck_yaw_deg))
+
+    bucket_load = float(base_state[7])
+    previous_load = STATE.get("deployment_bucket_load_previous")
+    previous_time = STATE.get("deployment_bucket_load_previous_time")
+    if previous_load is None or previous_time is None or sample_time <= float(previous_time):
+        bucket_load_rate = 0.0
+    else:
+        bucket_load_rate = (bucket_load - float(previous_load)) / max(
+            1.0e-4,
+            sample_time - float(previous_time),
+        )
+    STATE["deployment_bucket_load_previous"] = float(bucket_load)
+    STATE["deployment_bucket_load_previous_time"] = float(sample_time)
+
+    state_28d = vla_observation_contract.build_state_28d(
+        base_state_14d=base_state,
+        joint_velocity_4d=joint_velocity,
+        phase=phase,
+        dig_target_world_xyz=dig_target,
+        unload_landing_world_xyz=unload_landing,
+        initial_origin_xy=initial_origin,
+        initial_heading_rad=float(initial_heading),
+        truck_yaw_rad=float(truck_yaw),
+        bucket_load_rate=float(bucket_load_rate),
+    )
+    task_text = str(
+        vla_observation_contract.optional_context_value(context, "task_text")
+        or STATE.get("dataset_task_text", "")
+        or ""
+    ).strip()
+    if not task_text:
+        raise vla_observation_contract.ObservationContractError(
+            "task text is unavailable; provide observation_context.task_text"
+        )
+    payload = {
+        "observation_state_28d": state_28d,
+        "observation_effort": [float(value) for value in effort],
+        "observation_contract": vla_observation_contract.schema_payload(),
+        "observation_sources": {
+            "base_state_14d": "runtime.dataset_observation_state",
+            "joint_velocity_4d": "robot.get_joint_velocities:name_mapped",
+            "measured_effort_4d": "robot.get_measured_joint_efforts:name_mapped",
+            "bucket_load_estimate": str(bucket_metrics.get("load_volume_source", "")),
+            "phase": phase_source,
+            "dig_target": dig_target_source,
+            "unload_landing": unload_source,
+            "truck_heading": "observation_context_or_selected_truck_prim",
+            "initial_heading": "episode_initial_working_heading",
+            "task_text": (
+                "observation_context"
+                if vla_observation_contract.optional_context_value(context, "task_text") is not None
+                else "runtime.dataset_task_text"
+            ),
+        },
+        "task_text": task_text,
+        "observation_context": {
+            "phase_index": int(vla_observation_contract.canonical_phase_index(phase)),
+            "dig_target_xyz": vec_list(dig_target, 3),
+            "unload_landing_xyz": vec_list(unload_landing, 3),
+            "initial_origin_xy": vec_list(initial_origin, 2),
+            "initial_heading_rad": float(initial_heading),
+            "truck_yaw_rad": float(truck_yaw),
+            "sample_time": float(sample_time),
+        },
+    }
+    vla_observation_contract.validate_payload(payload)
+    return payload
 
 
 @debug_profiled("dataset_record_sample", threshold_ms=2.0)

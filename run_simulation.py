@@ -142,13 +142,17 @@ from excavator_common.deployment_contract import (
     ACTION_NAMES_4D,
     CAMERA_KEYS,
     CANONICAL_DOF_NAMES,
+    EFFORT_NAMES_4D,
+    OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
     PHYSICS_HZ,
     PROTOCOL_VERSION,
+    STATE_NAMES_28D,
     PhysicsTickScheduler,
     canonical_values,
     resolve_canonical_dof_indices,
     validate_client_contract,
 )
+from excavator_common import vla_observation_contract
 
 print(
     "[INFO] Run simulation project root:",
@@ -417,17 +421,20 @@ def capture_rgb_from_persistent_viewports(
             except Exception:
                 pass
         if result["rgb"] is None:
-            print(
-                f"[WARN] persistent viewport capture failed [{camera_name}]: "
-                f"{result.get('error') or 'timeout'}",
-                flush=True,
+            raise RuntimeError(
+                f"Persistent viewport capture failed [{camera_name}]: "
+                f"{result.get('error') or 'timeout'}"
             )
-            raw_frames[camera_name] = np_module.zeros(
-                (MODEL_IMAGE_HEIGHT, MODEL_IMAGE_WIDTH, 3),
-                dtype=np_module.uint8,
+        rgb = np_module.asarray(result["rgb"], dtype=np_module.uint8)
+        if rgb.ndim != 3 or rgb.shape[2] < 3 or rgb.shape[0] < 2 or rgb.shape[1] < 2:
+            raise RuntimeError(
+                f"Persistent viewport [{camera_name}] returned invalid RGB shape {rgb.shape}"
             )
-        else:
-            raw_frames[camera_name] = result["rgb"]
+        if not np_module.any(rgb[:, :, :3]):
+            raise RuntimeError(
+                f"Persistent viewport [{camera_name}] returned an all-zero RGB frame"
+            )
+        raw_frames[camera_name] = rgb[:, :, :3]
 
     capture_done = time.perf_counter()
     futures = {
@@ -1225,8 +1232,12 @@ def main(args):
         else:
             print(f"[WARN] Camera prim not found: {camera_path}")
 
-    if not active_camera_paths:
-        print("[ERROR] No configured Camera_0/1/2 prims found. Viewport capture cannot run.")
+    missing_camera_names = sorted(set(CAMERA_PRIM_PATHS) - set(active_camera_paths))
+    if missing_camera_names:
+        print(
+            "[ERROR] Required Camera_0/1/2 prims are incomplete: "
+            f"missing={missing_camera_names}, available={sorted(active_camera_paths)}"
+        )
         simulation_app.close()
         return
 
@@ -1831,6 +1842,165 @@ def main(args):
     )
     bucket_load_y_min = -0.50
     bucket_load_y_max = 0.50
+    bucket_volume_mesh_path = (
+        "/World/URDF_real3/bucket_link/bucket_cut/node_/mesh_"
+    )
+
+    def mesh_faces_from_usd(mesh):
+        counts = list(mesh.GetFaceVertexCountsAttr().Get() or [])
+        indices = list(mesh.GetFaceVertexIndicesAttr().Get() or [])
+        faces = []
+        offset = 0
+        for count in counts:
+            count = int(count)
+            if count >= 3 and offset + count <= len(indices):
+                faces.append(
+                    [int(indices[offset + index]) for index in range(count)]
+                )
+            offset += max(0, count)
+        return faces
+
+    def triangulate_faces(faces):
+        triangles = []
+        for face in faces:
+            if len(face) < 3:
+                continue
+            for index in range(1, len(face) - 1):
+                triangles.append([face[0], face[index], face[index + 1]])
+        return np.asarray(triangles, dtype=np.int32).reshape(-1, 3)
+
+    def closed_mesh_boundary_edge_count(faces):
+        counts = {}
+        for face in faces:
+            for index, first in enumerate(face):
+                second = face[(index + 1) % len(face)]
+                key = tuple(sorted((int(first), int(second))))
+                counts[key] = int(counts.get(key, 0)) + 1
+        return sum(1 for count in counts.values() if count != 2)
+
+    def authored_bucket_volume_topology():
+        result = {
+            "available": False,
+            "source": "",
+            "vertices": np.zeros((0, 3), dtype=np.float32),
+            "triangles": np.zeros((0, 3), dtype=np.int32),
+            "local_min": None,
+            "local_max": None,
+            "reason": "",
+        }
+        try:
+            mesh_prim = stage.GetPrimAtPath(bucket_volume_mesh_path)
+            bucket_prim = stage.GetPrimAtPath("/World/URDF_real3/bucket_link")
+            if not mesh_prim.IsValid() or not mesh_prim.IsA(UsdGeom.Mesh):
+                result["reason"] = f"missing_mesh:{bucket_volume_mesh_path}"
+                return result
+            if not bucket_prim.IsValid():
+                result["reason"] = "missing_bucket_link"
+                return result
+            mesh = UsdGeom.Mesh(mesh_prim)
+            raw_points = list(mesh.GetPointsAttr().Get() or [])
+            faces = mesh_faces_from_usd(mesh)
+            if len(raw_points) < 4 or not faces:
+                result["reason"] = (
+                    f"invalid_topology:vertices={len(raw_points)};faces={len(faces)}"
+                )
+                return result
+            boundary_edges = closed_mesh_boundary_edge_count(faces)
+            if boundary_edges:
+                result["reason"] = f"mesh_not_closed:boundary_edges={boundary_edges}"
+                return result
+            mesh_world = UsdGeom.Xformable(mesh_prim).ComputeLocalToWorldTransform(
+                Usd.TimeCode.Default()
+            )
+            bucket_world = UsdGeom.Xformable(bucket_prim).ComputeLocalToWorldTransform(
+                Usd.TimeCode.Default()
+            )
+            bucket_world_inverse = bucket_world.GetInverse()
+            vertices = []
+            for point in raw_points:
+                world_point = mesh_world.Transform(
+                    Gf.Vec3d(float(point[0]), float(point[1]), float(point[2]))
+                )
+                local_point = bucket_world_inverse.Transform(world_point)
+                vertices.append(
+                    [
+                        float(local_point[0]),
+                        float(local_point[1]),
+                        float(local_point[2]),
+                    ]
+                )
+            vertices = np.asarray(vertices, dtype=np.float32).reshape(-1, 3)
+            triangles = triangulate_faces(faces)
+            if len(triangles) == 0:
+                result["reason"] = "mesh_has_no_triangles"
+                return result
+            result.update(
+                {
+                    "available": True,
+                    "source": f"authored_closed_mesh:{bucket_volume_mesh_path}",
+                    "vertices": vertices,
+                    "triangles": triangles,
+                    "local_min": vertices.min(axis=0),
+                    "local_max": vertices.max(axis=0),
+                    "reason": "ok",
+                }
+            )
+            return result
+        except Exception as exc:
+            result["reason"] = f"{type(exc).__name__}:{exc}"
+            return result
+
+    bucket_volume_topology = authored_bucket_volume_topology()
+    print(
+        "[BRIDGE CONTRACT] bucket volume:",
+        f"available={bucket_volume_topology['available']}",
+        f"source={bucket_volume_topology['source']}",
+        f"reason={bucket_volume_topology['reason']}",
+        f"vertices={len(bucket_volume_topology['vertices'])}",
+        f"triangles={len(bucket_volume_topology['triangles'])}",
+        flush=True,
+    )
+
+    def points_in_closed_bucket_mesh(local_points):
+        points = np.asarray(local_points, dtype=np.float32).reshape(-1, 3)
+        vertices = np.asarray(
+            bucket_volume_topology["vertices"],
+            dtype=np.float32,
+        ).reshape(-1, 3)
+        triangles = np.asarray(
+            bucket_volume_topology["triangles"],
+            dtype=np.int32,
+        ).reshape(-1, 3)
+        if len(points) == 0 or len(vertices) < 4 or len(triangles) == 0:
+            return np.zeros(len(points), dtype=bool)
+        direction = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        counts = np.zeros(len(points), dtype=np.int32)
+        epsilon = 1.0e-6
+        for triangle in triangles:
+            v0 = vertices[int(triangle[0])]
+            edge1 = vertices[int(triangle[1])] - v0
+            edge2 = vertices[int(triangle[2])] - v0
+            h = np.cross(direction, edge2)
+            determinant = float(np.dot(edge1, h))
+            if abs(determinant) < epsilon:
+                continue
+            inverse = 1.0 / determinant
+            relative = points - v0.reshape(1, 3)
+            u = inverse * np.einsum("ij,j->i", relative, h)
+            candidate = (u >= -epsilon) & (u <= 1.0 + epsilon)
+            if not np.any(candidate):
+                continue
+            q = np.cross(relative, edge1.reshape(1, 3))
+            v = inverse * np.einsum("ij,j->i", q, direction)
+            distance = inverse * np.einsum("j,ij->i", edge2, q)
+            hit = (
+                candidate
+                & (v >= -epsilon)
+                & ((u + v) <= 1.0 + epsilon)
+                & (distance > epsilon)
+            )
+            counts[hit] += 1
+        return (counts % 2) == 1
 
     def points_in_polygon_2d(points_xz, polygon_xz):
         pts = np.asarray(points_xz, dtype=np.float32).reshape(-1, 2)
@@ -1854,7 +2024,13 @@ def main(args):
         start = time.perf_counter()
         result = {
             "count": 0,
-            "source": "closed_proxy_profile",
+            "source": (
+                bucket_volume_topology["source"]
+                if bucket_volume_topology["available"]
+                else "closed_proxy_profile"
+            ),
+            "authored_volume_available": bool(bucket_volume_topology["available"]),
+            "authored_volume_reason": str(bucket_volume_topology["reason"]),
             "candidate_count": 0,
             "particle_count": 0,
             "elapsed_ms": 0.0,
@@ -1879,14 +2055,32 @@ def main(args):
             )
             inverse_xf = world_xf.GetInverse()
 
-            local_min = np.asarray(
-                [bucket_load_profile_xz[:, 0].min(), bucket_load_y_min, bucket_load_profile_xz[:, 1].min()],
-                dtype=np.float32,
-            )
-            local_max = np.asarray(
-                [bucket_load_profile_xz[:, 0].max(), bucket_load_y_max, bucket_load_profile_xz[:, 1].max()],
-                dtype=np.float32,
-            )
+            if bucket_volume_topology["available"]:
+                local_min = np.asarray(
+                    bucket_volume_topology["local_min"],
+                    dtype=np.float32,
+                )
+                local_max = np.asarray(
+                    bucket_volume_topology["local_max"],
+                    dtype=np.float32,
+                )
+            else:
+                local_min = np.asarray(
+                    [
+                        bucket_load_profile_xz[:, 0].min(),
+                        bucket_load_y_min,
+                        bucket_load_profile_xz[:, 1].min(),
+                    ],
+                    dtype=np.float32,
+                )
+                local_max = np.asarray(
+                    [
+                        bucket_load_profile_xz[:, 0].max(),
+                        bucket_load_y_max,
+                        bucket_load_profile_xz[:, 1].max(),
+                    ],
+                    dtype=np.float32,
+                )
             world_corners = []
             for x_value in (local_min[0], local_max[0]):
                 for y_value in (local_min[1], local_max[1]):
@@ -1914,15 +2108,61 @@ def main(args):
                     float(transformed[1]),
                     float(transformed[2]),
                 ]
-            inside_y = (local[:, 1] >= bucket_load_y_min) & (local[:, 1] <= bucket_load_y_max)
-            inside_xz = points_in_polygon_2d(local[:, [0, 2]], bucket_load_profile_xz)
-            result["count"] = int(np.count_nonzero(inside_y & inside_xz))
+            if bucket_volume_topology["available"]:
+                inside = points_in_closed_bucket_mesh(local)
+            else:
+                inside_y = (
+                    (local[:, 1] >= bucket_load_y_min)
+                    & (local[:, 1] <= bucket_load_y_max)
+                )
+                inside_xz = points_in_polygon_2d(
+                    local[:, [0, 2]],
+                    bucket_load_profile_xz,
+                )
+                inside = inside_y & inside_xz
+            result["count"] = int(np.count_nonzero(inside))
             return result
         except Exception as exc:
             result["source"] = f"error:{type(exc).__name__}:{exc}"
             return result
         finally:
             result["elapsed_ms"] = (time.perf_counter() - start) * 1000.0
+
+    def quaternion_yaw_wxyz(orientation):
+        qw = float(orientation[0])
+        qx = float(orientation[1])
+        qy = float(orientation[2])
+        qz = float(orientation[3])
+        return math.atan2(
+            2.0 * (qw * qz + qx * qy),
+            1.0 - 2.0 * (qy * qy + qz * qz),
+        )
+
+    def read_robot_base_pose():
+        position, orientation = robot.get_world_pose()
+        return (
+            float(position[0]),
+            float(position[1]),
+            quaternion_yaw_wxyz(orientation),
+        )
+
+    def read_truck_yaw_rad():
+        truck_prim = stage.GetPrimAtPath("/World/DumpTruck")
+        if not truck_prim.IsValid():
+            raise RuntimeError("truck prim /World/DumpTruck is unavailable")
+        matrix = UsdGeom.Xformable(truck_prim).ComputeLocalToWorldTransform(
+            Usd.TimeCode.Default()
+        )
+        rotation = matrix.ExtractRotationQuat()
+        imaginary = rotation.GetImaginary()
+        return quaternion_yaw_wxyz(
+            [
+                float(rotation.GetReal()),
+                float(imaginary[0]),
+                float(imaginary[1]),
+                float(imaginary[2]),
+            ]
+        )
 
     # TCP Bridge Server functions.
     # No USD prims, references, or other scene objects may be
@@ -2032,6 +2272,10 @@ def main(args):
     active_contract = None
     active_connection_id = None
     tick_scheduler = None
+    active_observation_context = {}
+    deployment_previous_q = None
+    deployment_previous_load = None
+    deployment_elapsed_seconds = 0.0
     last_idle_ui_update = 0.0
     idle_ui_interval = 1.0 / max(0.1, float(args.idle_ui_hz))
     while simulation_app.is_running():
@@ -2043,12 +2287,44 @@ def main(args):
                     active_contract = validate_client_contract(cmd)
                     active_connection_id = int(cmd["_bridge_connection_id"])
                     tick_scheduler = PhysicsTickScheduler(active_contract["training_fps"])
+                    active_observation_context = dict(
+                        active_contract.get("observation_context") or {}
+                    )
+                    deployment_previous_q = None
+                    deployment_previous_load = None
+                    deployment_elapsed_seconds = 0.0
+                    if (
+                        active_contract["observation_schema"]
+                        == OBSERVATION_SCHEMA_28D_PLUS_EFFORT
+                    ):
+                        if not bucket_volume_topology["available"]:
+                            raise ValueError(
+                                "28D deployment requires the authored bucket_cut "
+                                f"closed mesh: {bucket_volume_topology['reason']}"
+                            )
+                        base_x, base_y, base_yaw = read_robot_base_pose()
+                        _, initial_q = read_canonical_joint_positions()
+                        active_observation_context.setdefault(
+                            "initial_origin_xy",
+                            [base_x, base_y],
+                        )
+                        active_observation_context.setdefault(
+                            "initial_heading_rad",
+                            float(base_yaw) + float(initial_q[0]),
+                        )
+                        active_observation_context.setdefault(
+                            "truck_yaw_rad",
+                            read_truck_yaw_rad(),
+                        )
                     reply = {
                         "type": "handshake_ack",
                         "ok": True,
                         "protocol_version": PROTOCOL_VERSION,
                         "physics_hz": PHYSICS_HZ,
                         "training_fps": active_contract["training_fps"],
+                        "observation_schema": active_contract["observation_schema"],
+                        "state_names": list(active_contract["state_names"]),
+                        "effort_names": list(active_contract.get("effort_names") or []),
                         "timing_mode": "deterministic_lockstep",
                         "raw_dof_names": raw_dof_names,
                         "canonical_dof_names": list(CANONICAL_DOF_NAMES),
@@ -2089,10 +2365,45 @@ def main(args):
                     "error": "ticks is not accepted in protocol v2; cadence comes from training_fps.",
                 })
                 continue
+            context_update = cmd.get("observation_context")
+            if context_update is not None:
+                if not isinstance(context_update, dict):
+                    response_queue.put({
+                        "type": "error",
+                        "error": "observation_context must be a JSON object.",
+                    })
+                    continue
+                immutable_change = None
+                for key, value in context_update.items():
+                    if key in ("phase_name", "phase_index") or value is None:
+                        continue
+                    if (
+                        key in active_observation_context
+                        and active_observation_context[key] != value
+                    ):
+                        immutable_change = key
+                        break
+                if immutable_change is not None:
+                    response_queue.put({
+                        "type": "error",
+                        "error": (
+                            "Episode observation context is immutable after handshake; "
+                            f"attempted change={immutable_change}"
+                        ),
+                    })
+                    continue
+                active_observation_context.update(
+                    {
+                        str(key): value
+                        for key, value in context_update.items()
+                        if value is not None
+                    }
+                )
 
             bridge_step_start = time.perf_counter()
             bridge_step_ticks = tick_scheduler.next_ticks()
             bridge_step_seconds = float(bridge_step_ticks) * PHYSICS_DT
+            deployment_elapsed_seconds += bridge_step_seconds
 
             if cmd.get("joint_velocities") is not None and cmd.get("joint_positions") is None:
                 _, q_target = read_canonical_joint_positions()
@@ -2177,14 +2488,7 @@ def main(args):
             # [base_x, base_y, base_yaw, swing, boom, arm, bucket,
             #  bucket_load_estimate, tip_x, tip_y, tip_z, load_x, load_y, load_z]
             try:
-                base_pos, base_ori = robot.get_world_pose()
-                base_x = float(base_pos[0])
-                base_y = float(base_pos[1])
-                qw = float(base_ori[3])
-                qx = float(base_ori[0])
-                qy = float(base_ori[1])
-                qz = float(base_ori[2])
-                base_yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+                base_x, base_y, base_yaw = read_robot_base_pose()
             except Exception:
                 base_x, base_y, base_yaw = 0.0, 0.0, 0.0
 
@@ -2210,7 +2514,7 @@ def main(args):
             observation_state = [
                 base_x,
                 base_y,
-                base_yaw,
+                0.0,
                 float(joint_positions[0]),
                 float(joint_positions[1]),
                 float(joint_positions[2]),
@@ -2223,6 +2527,31 @@ def main(args):
                 load_xyz[1],
                 load_xyz[2],
             ]
+            observation_effort = _read_bridge_measured_effort(
+                robot,
+                canonical_joint_indices,
+            ).tolist()
+
+            if deployment_previous_q is None:
+                deployment_joint_velocity = [0.0, 0.0, 0.0, 0.0]
+            else:
+                deployment_joint_velocity = (
+                    vla_observation_contract.joint_velocity_from_samples(
+                        joint_positions,
+                        deployment_previous_q,
+                        bridge_step_seconds,
+                    )
+                )
+            deployment_previous_q = joint_positions.copy()
+
+            current_bucket_load = float(bucket_load_metrics["count"])
+            if deployment_previous_load is None:
+                deployment_bucket_load_rate = 0.0
+            else:
+                deployment_bucket_load_rate = (
+                    current_bucket_load - float(deployment_previous_load)
+                ) / max(1.0e-6, bridge_step_seconds)
+            deployment_previous_load = current_bucket_load
 
             task_text = "Dig soil from the marked area and dump it into the target container."
             try:
@@ -2266,16 +2595,76 @@ def main(args):
             except Exception:
                 pass
 
+            observation_state_28d = None
+            observation_32d_ready = False
+            observation_32d_error = ""
+            if (
+                active_contract["observation_schema"]
+                == OBSERVATION_SCHEMA_28D_PLUS_EFFORT
+            ):
+                try:
+                    task_text = str(
+                        active_observation_context.get("task_text") or ""
+                    ).strip()
+                    if not task_text:
+                        raise vla_observation_contract.ObservationContractError(
+                            "observation_context.task_text is missing"
+                        )
+                    phase = (
+                        active_observation_context.get("phase_index")
+                        if active_observation_context.get("phase_index") is not None
+                        else active_observation_context.get("phase_name")
+                    )
+                    observation_state_28d = (
+                        vla_observation_contract.build_state_28d(
+                            base_state_14d=observation_state,
+                            joint_velocity_4d=deployment_joint_velocity,
+                            phase=phase,
+                            dig_target_world_xyz=active_observation_context.get(
+                                "dig_target_xyz"
+                            ),
+                            unload_landing_world_xyz=active_observation_context.get(
+                                "unload_landing_xyz"
+                            ),
+                            initial_origin_xy=active_observation_context.get(
+                                "initial_origin_xy"
+                            ),
+                            initial_heading_rad=active_observation_context.get(
+                                "initial_heading_rad"
+                            ),
+                            truck_yaw_rad=active_observation_context.get(
+                                "truck_yaw_rad"
+                            ),
+                            bucket_load_rate=deployment_bucket_load_rate,
+                        )
+                    )
+                    observation_32d_ready = True
+                except Exception as exc:
+                    observation_32d_error = f"{type(exc).__name__}: {exc}"
+
             reply = {
                 "joint_positions": q.tolist(),
                 "joint_velocities": qd.tolist(),
                 "raw_joint_positions": q_raw.tolist(),
                 "raw_joint_velocities": qd_raw.tolist(),
                 "observation_state": observation_state,
-                "observation_effort": _read_bridge_measured_effort(
-                    robot,
-                    canonical_joint_indices,
-                ).tolist(),
+                "observation_effort": observation_effort,
+                "observation_state_28d": observation_state_28d,
+                "observation_32d_ready": observation_32d_ready,
+                "observation_32d_error": observation_32d_error,
+                "observation_contract": (
+                    vla_observation_contract.schema_payload()
+                    if active_contract["observation_schema"]
+                    == OBSERVATION_SCHEMA_28D_PLUS_EFFORT
+                    else {
+                        "schema_version": "legacy_18d_state",
+                        "observation.state": {
+                            "shape": [18],
+                            "names": list(active_contract["state_names"]),
+                        },
+                    }
+                ),
+                "observation_context": dict(active_observation_context),
                 "bucket_load_metrics": bucket_load_metrics,
                 "task_text": task_text,
                 "primary_camera": primary_camera,

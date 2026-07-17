@@ -7,6 +7,8 @@ import json
 import math
 from pathlib import Path
 
+from excavator_common import vla_observation_contract
+
 
 PROTOCOL_VERSION = 2
 PHYSICS_HZ = 60.0
@@ -33,6 +35,10 @@ STATE_NAMES_18D = (
 )
 ACTION_NAMES_4D = tuple(f"{name}_cmd_velocity" for name in CANONICAL_DOF_NAMES)
 CAMERA_KEYS = tuple(f"observation.images.{index}" for index in range(3))
+OBSERVATION_SCHEMA_LEGACY_18D = "legacy_18d_state"
+OBSERVATION_SCHEMA_28D_PLUS_EFFORT = "state_28d_plus_effort_4d"
+STATE_NAMES_28D = tuple(vla_observation_contract.STATE_NAMES_28D)
+EFFORT_NAMES_4D = tuple(vla_observation_contract.EFFORT_NAMES_4D)
 
 
 def _name_tokens(value):
@@ -117,17 +123,35 @@ def sha256_files(paths):
     return digest.hexdigest() if found else ""
 
 
-def build_client_contract(training_fps, normalization_hash=""):
+def build_client_contract(
+    training_fps,
+    normalization_hash="",
+    observation_schema=OBSERVATION_SCHEMA_LEGACY_18D,
+    observation_context=None,
+):
+    schema = str(observation_schema or OBSERVATION_SCHEMA_LEGACY_18D)
+    if schema == OBSERVATION_SCHEMA_LEGACY_18D:
+        state_names = STATE_NAMES_18D
+        effort_names = ()
+    elif schema == OBSERVATION_SCHEMA_28D_PLUS_EFFORT:
+        state_names = STATE_NAMES_28D
+        effort_names = EFFORT_NAMES_4D
+    else:
+        raise ValueError(f"Unsupported observation schema: {schema!r}")
+    context = dict(observation_context or {})
     return {
         "type": "handshake",
         "protocol_version": PROTOCOL_VERSION,
         "training_fps": validate_training_fps(training_fps),
-        "state_names": list(STATE_NAMES_18D),
+        "observation_schema": schema,
+        "state_names": list(state_names),
+        "effort_names": list(effort_names),
         "action_names": list(ACTION_NAMES_4D),
         "action_units": "rad/s",
         "camera_keys": list(CAMERA_KEYS),
         "camera_shape": [1, 3, 256, 256],
         "normalization_hash": str(normalization_hash or ""),
+        "observation_context": context,
     }
 
 
@@ -139,8 +163,39 @@ def validate_client_contract(contract):
             f"Protocol mismatch: expected {PROTOCOL_VERSION}, "
             f"got {contract.get('protocol_version')!r}"
         )
-    if tuple(contract.get("state_names", ())) != STATE_NAMES_18D:
-        raise ValueError("Checkpoint/runtime state schema mismatch")
+    schema = str(contract.get("observation_schema") or "").strip()
+    state_names = tuple(contract.get("state_names", ()))
+    effort_names = tuple(contract.get("effort_names", ()))
+    if not schema:
+        schema = (
+            OBSERVATION_SCHEMA_LEGACY_18D
+            if state_names == STATE_NAMES_18D
+            else OBSERVATION_SCHEMA_28D_PLUS_EFFORT
+            if state_names == STATE_NAMES_28D
+            else ""
+        )
+    if schema == OBSERVATION_SCHEMA_LEGACY_18D:
+        if state_names != STATE_NAMES_18D or effort_names:
+            raise ValueError("Legacy checkpoint/runtime state schema mismatch")
+    elif schema == OBSERVATION_SCHEMA_28D_PLUS_EFFORT:
+        if state_names != STATE_NAMES_28D:
+            raise ValueError("28D checkpoint/runtime state schema mismatch")
+        if effort_names != EFFORT_NAMES_4D:
+            raise ValueError("4D effort checkpoint/runtime schema mismatch")
+        context = contract.get("observation_context")
+        if not isinstance(context, dict):
+            raise ValueError("28D deployment requires an observation_context object")
+        required = (
+            "phase_name",
+            "dig_target_xyz",
+            "unload_landing_xyz",
+            "task_text",
+        )
+        missing = [name for name in required if context.get(name) is None]
+        if missing:
+            raise ValueError(f"28D deployment context is missing: {missing}")
+    else:
+        raise ValueError(f"Unsupported observation schema: {schema!r}")
     if tuple(contract.get("action_names", ())) != ACTION_NAMES_4D:
         raise ValueError("Checkpoint/runtime action schema mismatch")
     if str(contract.get("action_units", "")) != "rad/s":
@@ -151,6 +206,8 @@ def validate_client_contract(contract):
     if camera_shape != [1, 3, 256, 256]:
         raise ValueError(f"Unexpected camera tensor shape: {camera_shape}")
     result = dict(contract)
+    result["observation_schema"] = schema
+    result["observation_context"] = dict(contract.get("observation_context") or {})
     result["training_fps"] = validate_training_fps(contract.get("training_fps"))
     return result
 

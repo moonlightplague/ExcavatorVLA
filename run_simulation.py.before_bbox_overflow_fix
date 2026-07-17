@@ -2012,16 +2012,8 @@ def main(args):
             return 0.0
 
     def prim_world_aligned_bbox(prim):
-        """
-        Return a finite, non-empty world-aligned BBox as float64.
-
-        USD BBoxCache may return an empty range whose endpoints are close to
-        +/-FLT_MAX. Those values are technically finite, but subtracting them
-        overflows float32. Reject such ranges before any extent calculation.
-        """
         if prim is None or not prim.IsValid():
             return None
-
         try:
             cache = UsdGeom.BBoxCache(
                 Usd.TimeCode.Default(),
@@ -2032,64 +2024,20 @@ def main(args):
                 ],
                 useExtentsHint=True,
             )
-            aligned_range = (
-                cache.ComputeWorldBound(prim)
-                .ComputeAlignedRange()
-            )
-
-            try:
-                if aligned_range.IsEmpty():
-                    return None
-            except Exception:
-                pass
-
-            minimum = aligned_range.GetMin()
-            maximum = aligned_range.GetMax()
-
-            bbox = np.asarray(
+            aligned = cache.ComputeWorldBound(prim).ComputeAlignedRange()
+            minimum = aligned.GetMin()
+            maximum = aligned.GetMax()
+            result = np.asarray(
                 [
-                    [
-                        float(minimum[0]),
-                        float(minimum[1]),
-                        float(minimum[2]),
-                    ],
-                    [
-                        float(maximum[0]),
-                        float(maximum[1]),
-                        float(maximum[2]),
-                    ],
+                    [float(minimum[0]), float(minimum[1]), float(minimum[2])],
+                    [float(maximum[0]), float(maximum[1]), float(maximum[2])],
                 ],
-                dtype=np.float64,
+                dtype=np.float32,
             )
-
-            if bbox.shape != (2, 3):
-                return None
-            if not np.all(np.isfinite(bbox)):
-                return None
-
-            # Reject FLT_MAX-style sentinel values and unreasonable bounds
-            # before any subtraction.
-            if np.max(np.abs(bbox)) > 1.0e6:
-                return None
-
-            extent = bbox[1] - bbox[0]
-            if not np.all(np.isfinite(extent)):
-                return None
-            if np.any(extent < 0.0):
-                return None
-            if float(np.max(extent)) <= 1.0e-6:
-                return None
-
-            return bbox
-
-        except Exception as exc:
-            print(
-                "[STATE27] Ignoring invalid BBox:",
-                str(prim.GetPath()) if prim is not None else None,
-                repr(exc),
-                flush=True,
-            )
+            return result if np.all(np.isfinite(result)) else None
+        except Exception:
             return None
+
     def resolve_truck_prim():
         for candidate_path in (
             "/World/truck", "/World/Truck",
@@ -2206,196 +2154,6 @@ def main(args):
         f"unload_source={unload_landing_source}",
         f"truck_prim={str(truck_prim_for_state.GetPath()) if truck_prim_for_state is not None and truck_prim_for_state.IsValid() else None}",
         f"truck_yaw={truck_yaw_world:.6f}",
-        flush=True,
-    )
-
-
-    # -----------------------------------------------------------------
-    # Deployment prompt must match one of the exact training tasks.
-    # Directions are measured relative to the INITIAL base pose.
-    # -----------------------------------------------------------------
-    TRAINING_TASK_BY_DIRECTIONS = {
-        ("left", "front-right"): (
-            0,
-            "Excavate one scoop of sand from the sand pile to the left of the excavator's initial base pose, then carry and dump the collected material into the truck bed at the front-right of the excavator's initial base pose.",
-        ),
-        ("behind", "front-left"): (
-            1,
-            "Excavate one scoop of sand from the sand pile behind the excavator's initial base pose, then carry and dump the collected material into the truck bed at the front-left of the excavator's initial base pose.",
-        ),
-        ("front", "right"): (
-            2,
-            "Excavate one scoop of sand from the sand pile in front of the excavator's initial base pose, then carry and dump the collected material into the truck bed to the right of the excavator's initial base pose.",
-        ),
-        ("front-left", "right"): (
-            3,
-            "Excavate one scoop of sand from the sand pile at the front-left of the excavator's initial base pose, then carry and dump the collected material into the truck bed to the right of the excavator's initial base pose.",
-        ),
-        ("front", "rear-right"): (
-            4,
-            "Excavate one scoop of sand from the sand pile in front of the excavator's initial base pose, then carry and dump the collected material into the truck bed at the rear-right of the excavator's initial base pose.",
-        ),
-        ("behind", "left"): (
-            5,
-            "Excavate one scoop of sand from the sand pile behind the excavator's initial base pose, then carry and dump the collected material into the truck bed to the left of the excavator's initial base pose.",
-        ),
-        ("right", "rear-left"): (
-            6,
-            "Excavate one scoop of sand from the sand pile to the right of the excavator's initial base pose, then carry and dump the collected material into the truck bed at the rear-left of the excavator's initial base pose.",
-        ),
-        ("rear-right", "left"): (
-            7,
-            "Excavate one scoop of sand from the sand pile at the rear-right of the excavator's initial base pose, then carry and dump the collected material into the truck bed to the left of the excavator's initial base pose.",
-        ),
-        ("front", "behind"): (
-            8,
-            "Excavate one scoop of sand from the sand pile in front of the excavator's initial base pose, then carry and dump the collected material into the truck bed behind the excavator's initial base pose.",
-        ),
-        ("front-right", "rear-right"): (
-            9,
-            "Excavate one scoop of sand from the sand pile at the front-right of the excavator's initial base pose, then carry and dump the collected material into the truck bed at the rear-right of the excavator's initial base pose.",
-        ),
-        ("rear-left", "front"): (
-            10,
-            "Excavate one scoop of sand from the sand pile at the rear-left of the excavator's initial base pose, then carry and dump the collected material into the truck bed in front of the excavator's initial base pose.",
-        ),
-        ("left", "front"): (
-            11,
-            "Excavate one scoop of sand from the sand pile to the left of the excavator's initial base pose, then carry and dump the collected material into the truck bed in front of the excavator's initial base pose.",
-        ),
-        ("front-left", "front-right"): (
-            12,
-            "Excavate one scoop of sand from the sand pile at the front-left of the excavator's initial base pose, then carry and dump the collected material into the truck bed at the front-right of the excavator's initial base pose.",
-        ),
-        ("front-right", "rear-left"): (
-            13,
-            "Excavate one scoop of sand from the sand pile at the front-right of the excavator's initial base pose, then carry and dump the collected material into the truck bed at the rear-left of the excavator's initial base pose.",
-        ),
-        ("front-left", "rear-right"): (
-            14,
-            "Excavate one scoop of sand from the sand pile at the front-left of the excavator's initial base pose, then carry and dump the collected material into the truck bed at the rear-right of the excavator's initial base pose.",
-        ),
-        ("right", "behind"): (
-            15,
-            "Excavate one scoop of sand from the sand pile to the right of the excavator's initial base pose, then carry and dump the collected material into the truck bed behind the excavator's initial base pose.",
-        ),
-        ("front-right", "behind"): (
-            16,
-            "Excavate one scoop of sand from the sand pile at the front-right of the excavator's initial base pose, then carry and dump the collected material into the truck bed behind the excavator's initial base pose.",
-        ),
-        ("rear-right", "rear-left"): (
-            17,
-            "Excavate one scoop of sand from the sand pile at the rear-right of the excavator's initial base pose, then carry and dump the collected material into the truck bed at the rear-left of the excavator's initial base pose.",
-        ),
-    }
-
-    def initial_base_direction_label(point_world):
-        point = np.asarray(point_world, dtype=np.float64).reshape(-1)
-        initial_position = np.asarray(
-            ROBOT_INITIAL_POS,
-            dtype=np.float64,
-        ).reshape(-1)
-
-        if point.size < 2 or initial_position.size < 2:
-            raise RuntimeError(
-                f"Invalid prompt target point: {point_world}"
-            )
-
-        initial_yaw = quaternion_wxyz_to_yaw(
-            ROBOT_INITIAL_ORI
-        )
-        dx = float(point[0] - initial_position[0])
-        dy = float(point[1] - initial_position[1])
-
-        if abs(dx) + abs(dy) < 1.0e-8:
-            raise RuntimeError(
-                "Prompt target is at the initial base origin; "
-                "no directional training task can represent it."
-            )
-
-        relative_angle = wrap_angle_radians(
-            math.atan2(dy, dx) - initial_yaw
-        )
-        sector = int(
-            math.floor(
-                (
-                    math.degrees(relative_angle)
-                    + 22.5
-                )
-                % 360.0
-                / 45.0
-            )
-        )
-
-        labels = (
-            "front",
-            "front-left",
-            "left",
-            "rear-left",
-            "behind",
-            "rear-right",
-            "right",
-            "front-right",
-        )
-        return labels[sector % len(labels)]
-
-    def select_exact_training_prompt(
-        dig_target_world,
-        unload_target_world,
-    ):
-        sand_direction = initial_base_direction_label(
-            dig_target_world
-        )
-        unload_direction = initial_base_direction_label(
-            unload_target_world
-        )
-        direction_pair = (
-            sand_direction,
-            unload_direction,
-        )
-
-        match = TRAINING_TASK_BY_DIRECTIONS.get(
-            direction_pair
-        )
-        if match is None:
-            raise RuntimeError(
-                "Current scene direction pair was not present in the "
-                "18 training tasks. Refusing to send an unseen prompt. "
-                f"current_pair={direction_pair}, "
-                f"dig_target_world={np.asarray(dig_target_world).tolist()}, "
-                f"unload_target_world={np.asarray(unload_target_world).tolist()}, "
-                f"initial_base_position={np.asarray(ROBOT_INITIAL_POS).tolist()}, "
-                f"available_pairs={sorted(TRAINING_TASK_BY_DIRECTIONS.keys())}"
-            )
-
-        task_index, task_text = match
-        return (
-            int(task_index),
-            str(task_text),
-            sand_direction,
-            unload_direction,
-        )
-
-    (
-        deployment_task_index,
-        deployment_task_text,
-        deployment_sand_direction,
-        deployment_unload_direction,
-    ) = select_exact_training_prompt(
-        dig_target_world,
-        unload_landing_world,
-    )
-
-    print(
-        "[PROMPT] Exact training task selected:",
-        f"task_index={deployment_task_index}",
-        f"sand_direction={deployment_sand_direction}",
-        f"unload_direction={deployment_unload_direction}",
-        flush=True,
-    )
-    print(
-        "[PROMPT] task_text:",
-        deployment_task_text,
         flush=True,
     )
 
@@ -2784,8 +2542,47 @@ def main(args):
                     f"State27 contains NaN/Inf: {observation_state}"
                 )
 
-            # Use one exact prompt from meta/tasks.parquet.
-            task_text = deployment_task_text
+            task_text = "Dig soil from the marked area and dump it into the target container."
+            try:
+                sand_x = float(getattr(sand_module, "SAND_CENTER_X", 0.0))
+                sand_y = float(getattr(sand_module, "SAND_CENTER_Y", 6.7))
+                sand_xy = (sand_x, sand_y)
+                truck_prim = stage.GetPrimAtPath("/World/DumpTruck")
+                if truck_prim.IsValid():
+                    truck_xf = UsdGeom.Xformable(truck_prim)
+                    truck_pos = truck_xf.ComputeLocalToWorldTransform(Usd.TimeCode.Default()).ExtractTranslation()
+                    unload_xy = (float(truck_pos[0]), float(truck_pos[1]))
+                else:
+                    unload_xy = None
+
+                robot_xy = (base_x, base_y)
+                robot_yaw = base_yaw
+
+                def _dir_label(point_xy, origin_xy):
+                    if point_xy is None or origin_xy is None:
+                        return "nearby"
+                    dx = point_xy[0] - origin_xy[0]
+                    dy = point_xy[1] - origin_xy[1]
+                    dist = abs(dx) + abs(dy)
+                    if dist < 1e-6:
+                        return "nearby"
+                    fwd = robot_yaw + math.pi * 0.5
+                    angle = math.atan2(dy, dx) - fwd
+                    labels = ["front", "front-left", "left", "rear-left",
+                              "rear", "rear-right", "right", "front-right"]
+                    idx = int(math.floor((math.degrees(angle) + 22.5) % 360.0 / 45.0))
+                    return labels[idx % len(labels)]
+
+                sand_dir = _dir_label(sand_xy, robot_xy)
+                unload_dir = _dir_label(unload_xy, robot_xy)
+                sand_s = f"({sand_x:.2f}, {sand_y:.2f})"
+                unload_s = f"({unload_xy[0]:.2f}, {unload_xy[1]:.2f})" if unload_xy else "the target container"
+                task_text = (
+                    f"Dig soil from the sand pile near {sand_s}, {sand_dir} of the excavator, "
+                    f"and dump it into the truck bed near {unload_s}, {unload_dir} of the excavator."
+                )
+            except Exception:
+                pass
 
             reply = {
                 "joint_positions": q.tolist(),

@@ -798,64 +798,46 @@ def main(args):
 
 
     def hide_sand_source_guides():
-        """Hide sand BBox/debug visuals while preserving particle physics."""
+        """Hide visual range/debug guides while preserving physical sand."""
         hidden = []
-        preserved = []
-        tokens = (
-            "bbox", "bounding_box", "boundingbox", "bounding",
-            "bounds", "aabb", "range", "guide", "selection", "debug",
-        )
-
-        def contains_particle_geometry(root_prim):
-            try:
-                for descendant in Usd.PrimRange(root_prim):
-                    if descendant == root_prim:
-                        continue
-                    if (
-                        str(descendant.GetTypeName()) == "PhysxParticleSystem"
-                        or descendant.IsA(UsdGeom.Points)
-                    ):
-                        return True
-            except Exception:
-                pass
-            return False
 
         for prim in stage.Traverse():
             path = str(prim.GetPath())
             lower_path = path.lower()
             type_name = str(prim.GetTypeName())
 
-            if "sand" not in lower_path:
+            is_visual_guide = (
+                "sand" in lower_path
+                and (
+                    "guide" in lower_path
+                    or "range" in lower_path
+                    or "selection" in lower_path
+                    or "debug" in lower_path
+                )
+            )
+
+            if not is_visual_guide:
                 continue
-            if not any(token in lower_path for token in tokens):
-                continue
-            if type_name == "PhysxParticleSystem" or prim.IsA(UsdGeom.Points):
-                preserved.append(path)
-                continue
-            if type_name == "Xform" and contains_particle_geometry(prim):
-                preserved.append(path)
+
+            if type_name not in (
+                "BasisCurves",
+                "Mesh",
+                "Points",
+                "Xform",
+            ):
                 continue
 
             try:
-                imageable = UsdGeom.Imageable(prim)
-                if imageable:
-                    imageable.MakeInvisible()
-                    hidden.append(path)
-            except Exception as exc:
-                print(
-                    "[SAND] Failed to hide visual helper:",
-                    path,
-                    repr(exc),
-                    flush=True,
-                )
+                UsdGeom.Imageable(prim).MakeInvisible()
+                hidden.append(path)
+            except Exception:
+                pass
 
-        print("[SAND] Hidden guide/BBox visuals:", hidden, flush=True)
-        if preserved:
-            print(
-                "[SAND] Preserved particle-related prims:",
-                preserved,
-                flush=True,
-            )
+        print(
+            "[SAND] Hidden visual guides:",
+            hidden,
+            flush=True,
+        )
         return hidden
 
     # Import bridge server components.
@@ -1833,9 +1815,6 @@ def main(args):
         )
 
 
-    # Hide sand BBox/range/debug visuals after particle settling.
-    hidden_sand_visuals = hide_sand_source_guides()
-
     # The standalone launcher intentionally does not import the full excavator
     # runtime.  This is the same closed proxy profile used by that runtime when
     # an authored bucket-volume mesh is unavailable.
@@ -1945,460 +1924,6 @@ def main(args):
         finally:
             result["elapsed_ms"] = (time.perf_counter() - start) * 1000.0
 
-
-    # -----------------------------------------------------------------
-    # State27 deployment features. phase_index was removed from the model
-    # input and is supervised separately.
-    # -----------------------------------------------------------------
-    STATE27_NAMES = [
-        "base_x", "base_y", "base_yaw",
-        "swing", "boom", "arm", "bucket",
-        "bucket_load_estimate",
-        "bucket_tip_x", "bucket_tip_y", "bucket_tip_z",
-        "bucket_load_x", "bucket_load_y", "bucket_load_z",
-        "swing_velocity", "boom_velocity", "arm_velocity", "bucket_velocity",
-        "dig_target_local_x", "dig_target_local_y", "dig_target_local_z",
-        "unload_landing_local_x", "unload_landing_local_y",
-        "unload_landing_local_z",
-        "truck_heading_relative_sin", "truck_heading_relative_cos",
-        "bucket_load_rate",
-    ]
-
-    def quaternion_wxyz_to_yaw(orientation):
-        quat = np.asarray(orientation, dtype=np.float64).reshape(-1)
-        if quat.size < 4 or not np.all(np.isfinite(quat[:4])):
-            return 0.0
-        w, x, y, z = [float(value) for value in quat[:4]]
-        return math.atan2(
-            2.0 * (w * z + x * y),
-            1.0 - 2.0 * (y * y + z * z),
-        )
-
-    def wrap_angle_radians(angle):
-        return math.atan2(math.sin(float(angle)), math.cos(float(angle)))
-
-    def world_point_to_robot_local_feature(point_world, base_world, base_yaw):
-        point = np.asarray(point_world, dtype=np.float32).reshape(-1)
-        base = np.asarray(base_world, dtype=np.float32).reshape(-1)
-        if point.size < 3 or base.size < 2:
-            raise RuntimeError(
-                f"Invalid target/base point: point={point}, base={base}"
-            )
-        dx = float(point[0] - base[0])
-        dy = float(point[1] - base[1])
-        c = math.cos(float(base_yaw))
-        s = math.sin(float(base_yaw))
-        return np.asarray(
-            [c * dx + s * dy, -s * dx + c * dy, float(point[2])],
-            dtype=np.float32,
-        )
-
-    def prim_world_yaw(prim):
-        if prim is None or not prim.IsValid():
-            return 0.0
-        try:
-            matrix = UsdGeom.Xformable(
-                prim
-            ).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
-            quat = matrix.ExtractRotationQuat()
-            imag = quat.GetImaginary()
-            w = float(quat.GetReal())
-            x, y, z = [float(imag[i]) for i in range(3)]
-            return math.atan2(
-                2.0 * (w * z + x * y),
-                1.0 - 2.0 * (y * y + z * z),
-            )
-        except Exception:
-            return 0.0
-
-    def prim_world_aligned_bbox(prim):
-        """
-        Return a finite, non-empty world-aligned BBox as float64.
-
-        USD BBoxCache may return an empty range whose endpoints are close to
-        +/-FLT_MAX. Those values are technically finite, but subtracting them
-        overflows float32. Reject such ranges before any extent calculation.
-        """
-        if prim is None or not prim.IsValid():
-            return None
-
-        try:
-            cache = UsdGeom.BBoxCache(
-                Usd.TimeCode.Default(),
-                [
-                    UsdGeom.Tokens.default_,
-                    UsdGeom.Tokens.render,
-                    UsdGeom.Tokens.proxy,
-                ],
-                useExtentsHint=True,
-            )
-            aligned_range = (
-                cache.ComputeWorldBound(prim)
-                .ComputeAlignedRange()
-            )
-
-            try:
-                if aligned_range.IsEmpty():
-                    return None
-            except Exception:
-                pass
-
-            minimum = aligned_range.GetMin()
-            maximum = aligned_range.GetMax()
-
-            bbox = np.asarray(
-                [
-                    [
-                        float(minimum[0]),
-                        float(minimum[1]),
-                        float(minimum[2]),
-                    ],
-                    [
-                        float(maximum[0]),
-                        float(maximum[1]),
-                        float(maximum[2]),
-                    ],
-                ],
-                dtype=np.float64,
-            )
-
-            if bbox.shape != (2, 3):
-                return None
-            if not np.all(np.isfinite(bbox)):
-                return None
-
-            # Reject FLT_MAX-style sentinel values and unreasonable bounds
-            # before any subtraction.
-            if np.max(np.abs(bbox)) > 1.0e6:
-                return None
-
-            extent = bbox[1] - bbox[0]
-            if not np.all(np.isfinite(extent)):
-                return None
-            if np.any(extent < 0.0):
-                return None
-            if float(np.max(extent)) <= 1.0e-6:
-                return None
-
-            return bbox
-
-        except Exception as exc:
-            print(
-                "[STATE27] Ignoring invalid BBox:",
-                str(prim.GetPath()) if prim is not None else None,
-                repr(exc),
-                flush=True,
-            )
-            return None
-    def resolve_truck_prim():
-        for candidate_path in (
-            "/World/truck", "/World/Truck",
-            "/World/DumpTruck", "/World/dump_truck",
-        ):
-            candidate = stage.GetPrimAtPath(candidate_path)
-            if candidate.IsValid():
-                return candidate
-
-        candidates = []
-        for prim in stage.Traverse():
-            path = str(prim.GetPath()).lower()
-            if "truck" in path and prim.GetTypeName() == "Xform":
-                candidates.append(prim)
-        candidates.sort(key=lambda prim: len(str(prim.GetPath())))
-        return candidates[0] if candidates else None
-
-    def resolve_unload_landing_world(truck_prim):
-        preferred = []
-        if truck_prim is not None and truck_prim.IsValid():
-            for prim in Usd.PrimRange(truck_prim):
-                lower_path = str(prim.GetPath()).lower()
-                if not any(
-                    token in lower_path
-                    for token in ("bed", "bin", "cargo", "container", "dump")
-                ):
-                    continue
-                bbox = prim_world_aligned_bbox(prim)
-                if bbox is None:
-                    continue
-                extent = bbox[1] - bbox[0]
-                area = max(0.0, float(extent[0] * extent[1]))
-                if area > 0.0:
-                    preferred.append((area, len(lower_path), prim, bbox))
-
-        if preferred:
-            preferred.sort(key=lambda item: (-item[0], item[1]))
-            _, _, selected_prim, bbox = preferred[0]
-            extent = bbox[1] - bbox[0]
-            point = 0.5 * (bbox[0] + bbox[1])
-            point[2] = bbox[0, 2] + 0.15 * max(0.0, float(extent[2]))
-            return point.astype(np.float32), str(selected_prim.GetPath())
-
-        bbox = prim_world_aligned_bbox(truck_prim)
-        if bbox is not None:
-            extent = bbox[1] - bbox[0]
-            point = 0.5 * (bbox[0] + bbox[1])
-            point[2] = bbox[0, 2] + 0.55 * max(0.0, float(extent[2]))
-            return point.astype(np.float32), "truck_bbox_fallback"
-
-        return (
-            np.asarray([4.14439, 6.72012, 4.222683], dtype=np.float32),
-            "configured_fallback",
-        )
-
-    def resolve_dig_target_world(sand_module, sand_api):
-        center_x = float(
-            getattr(sand_module, "SAND_CENTER_X", SAND_INITIAL_CENTER[0])
-        )
-        center_y = float(
-            getattr(sand_module, "SAND_CENTER_Y", SAND_INITIAL_CENTER[1])
-        )
-        target_z = 0.35
-        source = "configured_sand_center"
-
-        positions_fn = (
-            sand_api.get("particle_positions_fn")
-            if isinstance(sand_api, dict)
-            else None
-        )
-        if callable(positions_fn):
-            try:
-                points = np.asarray(
-                    positions_fn(),
-                    dtype=np.float32,
-                ).reshape(-1, 3)
-                if len(points) > 0:
-                    radius2 = (
-                        np.square(points[:, 0] - center_x)
-                        + np.square(points[:, 1] - center_y)
-                    )
-                    local_points = points[radius2 <= 1.0]
-                    if len(local_points) < 32:
-                        local_points = points
-                    target_z = float(np.percentile(local_points[:, 2], 65.0))
-                    source = "sand_particle_percentile65"
-            except Exception as exc:
-                print(
-                    "[STATE27] dig target particle lookup failed:",
-                    repr(exc),
-                    flush=True,
-                )
-
-        return (
-            np.asarray([center_x, center_y, target_z], dtype=np.float32),
-            source,
-        )
-
-    truck_prim_for_state = resolve_truck_prim()
-    unload_landing_world, unload_landing_source = (
-        resolve_unload_landing_world(truck_prim_for_state)
-    )
-    truck_yaw_world = prim_world_yaw(truck_prim_for_state)
-    dig_target_world, dig_target_source = resolve_dig_target_world(
-        sand_module,
-        sand_api,
-    )
-
-    print(
-        "[STATE27] fixed environment features:",
-        f"dig_target_world={dig_target_world.tolist()}",
-        f"dig_source={dig_target_source}",
-        f"unload_landing_world={unload_landing_world.tolist()}",
-        f"unload_source={unload_landing_source}",
-        f"truck_prim={str(truck_prim_for_state.GetPath()) if truck_prim_for_state is not None and truck_prim_for_state.IsValid() else None}",
-        f"truck_yaw={truck_yaw_world:.6f}",
-        flush=True,
-    )
-
-
-    # -----------------------------------------------------------------
-    # Deployment prompt must match one of the exact training tasks.
-    # Directions are measured relative to the INITIAL base pose.
-    # -----------------------------------------------------------------
-    TRAINING_TASK_BY_DIRECTIONS = {
-        ("left", "front-right"): (
-            0,
-            "Excavate one scoop of sand from the sand pile to the left of the excavator's initial base pose, then carry and dump the collected material into the truck bed at the front-right of the excavator's initial base pose.",
-        ),
-        ("behind", "front-left"): (
-            1,
-            "Excavate one scoop of sand from the sand pile behind the excavator's initial base pose, then carry and dump the collected material into the truck bed at the front-left of the excavator's initial base pose.",
-        ),
-        ("front", "right"): (
-            2,
-            "Excavate one scoop of sand from the sand pile in front of the excavator's initial base pose, then carry and dump the collected material into the truck bed to the right of the excavator's initial base pose.",
-        ),
-        ("front-left", "right"): (
-            3,
-            "Excavate one scoop of sand from the sand pile at the front-left of the excavator's initial base pose, then carry and dump the collected material into the truck bed to the right of the excavator's initial base pose.",
-        ),
-        ("front", "rear-right"): (
-            4,
-            "Excavate one scoop of sand from the sand pile in front of the excavator's initial base pose, then carry and dump the collected material into the truck bed at the rear-right of the excavator's initial base pose.",
-        ),
-        ("behind", "left"): (
-            5,
-            "Excavate one scoop of sand from the sand pile behind the excavator's initial base pose, then carry and dump the collected material into the truck bed to the left of the excavator's initial base pose.",
-        ),
-        ("right", "rear-left"): (
-            6,
-            "Excavate one scoop of sand from the sand pile to the right of the excavator's initial base pose, then carry and dump the collected material into the truck bed at the rear-left of the excavator's initial base pose.",
-        ),
-        ("rear-right", "left"): (
-            7,
-            "Excavate one scoop of sand from the sand pile at the rear-right of the excavator's initial base pose, then carry and dump the collected material into the truck bed to the left of the excavator's initial base pose.",
-        ),
-        ("front", "behind"): (
-            8,
-            "Excavate one scoop of sand from the sand pile in front of the excavator's initial base pose, then carry and dump the collected material into the truck bed behind the excavator's initial base pose.",
-        ),
-        ("front-right", "rear-right"): (
-            9,
-            "Excavate one scoop of sand from the sand pile at the front-right of the excavator's initial base pose, then carry and dump the collected material into the truck bed at the rear-right of the excavator's initial base pose.",
-        ),
-        ("rear-left", "front"): (
-            10,
-            "Excavate one scoop of sand from the sand pile at the rear-left of the excavator's initial base pose, then carry and dump the collected material into the truck bed in front of the excavator's initial base pose.",
-        ),
-        ("left", "front"): (
-            11,
-            "Excavate one scoop of sand from the sand pile to the left of the excavator's initial base pose, then carry and dump the collected material into the truck bed in front of the excavator's initial base pose.",
-        ),
-        ("front-left", "front-right"): (
-            12,
-            "Excavate one scoop of sand from the sand pile at the front-left of the excavator's initial base pose, then carry and dump the collected material into the truck bed at the front-right of the excavator's initial base pose.",
-        ),
-        ("front-right", "rear-left"): (
-            13,
-            "Excavate one scoop of sand from the sand pile at the front-right of the excavator's initial base pose, then carry and dump the collected material into the truck bed at the rear-left of the excavator's initial base pose.",
-        ),
-        ("front-left", "rear-right"): (
-            14,
-            "Excavate one scoop of sand from the sand pile at the front-left of the excavator's initial base pose, then carry and dump the collected material into the truck bed at the rear-right of the excavator's initial base pose.",
-        ),
-        ("right", "behind"): (
-            15,
-            "Excavate one scoop of sand from the sand pile to the right of the excavator's initial base pose, then carry and dump the collected material into the truck bed behind the excavator's initial base pose.",
-        ),
-        ("front-right", "behind"): (
-            16,
-            "Excavate one scoop of sand from the sand pile at the front-right of the excavator's initial base pose, then carry and dump the collected material into the truck bed behind the excavator's initial base pose.",
-        ),
-        ("rear-right", "rear-left"): (
-            17,
-            "Excavate one scoop of sand from the sand pile at the rear-right of the excavator's initial base pose, then carry and dump the collected material into the truck bed at the rear-left of the excavator's initial base pose.",
-        ),
-    }
-
-    def initial_base_direction_label(point_world):
-        point = np.asarray(point_world, dtype=np.float64).reshape(-1)
-        initial_position = np.asarray(
-            ROBOT_INITIAL_POS,
-            dtype=np.float64,
-        ).reshape(-1)
-
-        if point.size < 2 or initial_position.size < 2:
-            raise RuntimeError(
-                f"Invalid prompt target point: {point_world}"
-            )
-
-        initial_yaw = quaternion_wxyz_to_yaw(
-            ROBOT_INITIAL_ORI
-        )
-        dx = float(point[0] - initial_position[0])
-        dy = float(point[1] - initial_position[1])
-
-        if abs(dx) + abs(dy) < 1.0e-8:
-            raise RuntimeError(
-                "Prompt target is at the initial base origin; "
-                "no directional training task can represent it."
-            )
-
-        relative_angle = wrap_angle_radians(
-            math.atan2(dy, dx) - initial_yaw
-        )
-        sector = int(
-            math.floor(
-                (
-                    math.degrees(relative_angle)
-                    + 22.5
-                )
-                % 360.0
-                / 45.0
-            )
-        )
-
-        labels = (
-            "front",
-            "front-left",
-            "left",
-            "rear-left",
-            "behind",
-            "rear-right",
-            "right",
-            "front-right",
-        )
-        return labels[sector % len(labels)]
-
-    def select_exact_training_prompt(
-        dig_target_world,
-        unload_target_world,
-    ):
-        sand_direction = initial_base_direction_label(
-            dig_target_world
-        )
-        unload_direction = initial_base_direction_label(
-            unload_target_world
-        )
-        direction_pair = (
-            sand_direction,
-            unload_direction,
-        )
-
-        match = TRAINING_TASK_BY_DIRECTIONS.get(
-            direction_pair
-        )
-        if match is None:
-            raise RuntimeError(
-                "Current scene direction pair was not present in the "
-                "18 training tasks. Refusing to send an unseen prompt. "
-                f"current_pair={direction_pair}, "
-                f"dig_target_world={np.asarray(dig_target_world).tolist()}, "
-                f"unload_target_world={np.asarray(unload_target_world).tolist()}, "
-                f"initial_base_position={np.asarray(ROBOT_INITIAL_POS).tolist()}, "
-                f"available_pairs={sorted(TRAINING_TASK_BY_DIRECTIONS.keys())}"
-            )
-
-        task_index, task_text = match
-        return (
-            int(task_index),
-            str(task_text),
-            sand_direction,
-            unload_direction,
-        )
-
-    (
-        deployment_task_index,
-        deployment_task_text,
-        deployment_sand_direction,
-        deployment_unload_direction,
-    ) = select_exact_training_prompt(
-        dig_target_world,
-        unload_landing_world,
-    )
-
-    print(
-        "[PROMPT] Exact training task selected:",
-        f"task_index={deployment_task_index}",
-        f"sand_direction={deployment_sand_direction}",
-        f"unload_direction={deployment_unload_direction}",
-        flush=True,
-    )
-    print(
-        "[PROMPT] task_text:",
-        deployment_task_text,
-        flush=True,
-    )
-
     # TCP Bridge Server functions.
     # No USD prims, references, or other scene objects may be
     # created after the sand block above.
@@ -2490,10 +2015,6 @@ def main(args):
         "canonical_to_raw": list(canonical_to_raw),
         "camera_paths": dict(active_camera_paths),
         "camera_mode": "per_camera_persistent_viewport",
-        "observation_state_schema": "excavator_state27_no_phase_v1",
-        "observation_state_names": list(STATE27_NAMES),
-        "observation_state_dim": 27,
-        "sand_hidden_visuals": list(hidden_sand_visuals),
     }
 
     # From this point onward the bridge owns simulation time.  Keeping the
@@ -2511,7 +2032,6 @@ def main(args):
     active_contract = None
     active_connection_id = None
     tick_scheduler = None
-    previous_bucket_load_count = None
     last_idle_ui_update = 0.0
     idle_ui_interval = 1.0 / max(0.1, float(args.idle_ui_hz))
     while simulation_app.is_running():
@@ -2523,7 +2043,6 @@ def main(args):
                     active_contract = validate_client_contract(cmd)
                     active_connection_id = int(cmd["_bridge_connection_id"])
                     tick_scheduler = PhysicsTickScheduler(active_contract["training_fps"])
-                    previous_bucket_load_count = None
                     reply = {
                         "type": "handshake_ack",
                         "ok": True,
@@ -2654,94 +2173,39 @@ def main(args):
             )
             primary_rgb = encoded_cameras[primary_camera]
 
-            # Compute the exact 27D observation.state used by the final
-            # checkpoint. phase_index is not an input feature.
+            # Compute full 14D observation_state matching dataset schema:
+            # [base_x, base_y, base_yaw, swing, boom, arm, bucket,
+            #  bucket_load_estimate, tip_x, tip_y, tip_z, load_x, load_y, load_z]
             try:
                 base_pos, base_ori = robot.get_world_pose()
-                base_pos = np.asarray(base_pos, dtype=np.float32).reshape(-1)
                 base_x = float(base_pos[0])
                 base_y = float(base_pos[1])
-                base_yaw = quaternion_wxyz_to_yaw(base_ori)
-            except Exception as exc:
-                print(
-                    "[WARN] Failed to read robot base pose:",
-                    repr(exc),
-                    flush=True,
-                )
-                base_pos = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
-                base_x = base_y = base_yaw = 0.0
+                qw = float(base_ori[3])
+                qx = float(base_ori[0])
+                qy = float(base_ori[1])
+                qz = float(base_ori[2])
+                base_yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+            except Exception:
+                base_x, base_y, base_yaw = 0.0, 0.0, 0.0
 
-            joint_positions = np.asarray(q, dtype=np.float32).reshape(-1)
-            joint_velocities_state = np.asarray(
-                qd, dtype=np.float32
-            ).reshape(-1)
-            if joint_positions.size < 4:
-                raise RuntimeError(
-                    f"State27 requires four joint positions, got "
-                    f"{joint_positions.shape}"
-                )
-            if joint_velocities_state.size < 4:
-                raise RuntimeError(
-                    f"State27 requires four joint velocities, got "
-                    f"{joint_velocities_state.shape}"
-                )
-            joint_positions = joint_positions[:4]
-            joint_velocities_state = joint_velocities_state[:4]
-
+            joint_positions = np.asarray(q, dtype=np.float32).reshape(-1)[:4]
             bucket_load_metrics = estimate_bucket_load_particles()
-            bucket_load_count = float(bucket_load_metrics["count"])
-            if previous_bucket_load_count is None:
-                bucket_load_rate = 0.0
-            else:
-                bucket_load_rate = (
-                    bucket_load_count - float(previous_bucket_load_count)
-                ) / max(float(bridge_step_seconds), 1.0e-8)
-            previous_bucket_load_count = bucket_load_count
 
             tip_xyz = [0.0, 0.0, 0.0]
             load_xyz = [0.0, 0.0, 0.0]
             try:
-                bucket_prim = stage.GetPrimAtPath(
-                    "/World/URDF_real3/bucket_link"
-                )
+                bucket_prim = stage.GetPrimAtPath("/World/URDF_real3/bucket_link")
                 if bucket_prim.IsValid():
-                    world_xf = UsdGeom.Xformable(
-                        bucket_prim
-                    ).ComputeLocalToWorldTransform(
-                        Usd.TimeCode.Default()
-                    )
-                    tip_world = world_xf.Transform(
-                        Gf.Vec3d(0.75, 0.0, -0.18)
-                    )
-                    load_world = world_xf.Transform(
-                        Gf.Vec3d(0.35, 0.0, 0.08)
-                    )
-                    tip_xyz = [
-                        float(tip_world[0]),
-                        float(tip_world[1]),
-                        float(tip_world[2]),
-                    ]
-                    load_xyz = [
-                        float(load_world[0]),
-                        float(load_world[1]),
-                        float(load_world[2]),
-                    ]
-            except Exception as exc:
-                print(
-                    "[WARN] Failed to compute bucket points:",
-                    repr(exc),
-                    flush=True,
-                )
-
-            dig_target_local = world_point_to_robot_local_feature(
-                dig_target_world, base_pos, base_yaw
-            )
-            unload_landing_local = world_point_to_robot_local_feature(
-                unload_landing_world, base_pos, base_yaw
-            )
-            relative_heading = wrap_angle_radians(
-                float(truck_yaw_world) - float(base_yaw)
-            )
+                    xform = UsdGeom.Xformable(bucket_prim)
+                    world_xf = xform.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+                    tip_local = Gf.Vec3d(0.75, 0.0, -0.18)
+                    load_local = Gf.Vec3d(0.35, 0.0, 0.08)
+                    tip_world = world_xf.Transform(tip_local)
+                    load_world = world_xf.Transform(load_local)
+                    tip_xyz = [float(tip_world[0]), float(tip_world[1]), float(tip_world[2])]
+                    load_xyz = [float(load_world[0]), float(load_world[1]), float(load_world[2])]
+            except Exception:
+                pass
 
             observation_state = [
                 base_x,
@@ -2751,41 +2215,56 @@ def main(args):
                 float(joint_positions[1]),
                 float(joint_positions[2]),
                 float(joint_positions[3]),
-                bucket_load_count,
-                float(tip_xyz[0]),
-                float(tip_xyz[1]),
-                float(tip_xyz[2]),
-                float(load_xyz[0]),
-                float(load_xyz[1]),
-                float(load_xyz[2]),
-                float(joint_velocities_state[0]),
-                float(joint_velocities_state[1]),
-                float(joint_velocities_state[2]),
-                float(joint_velocities_state[3]),
-                float(dig_target_local[0]),
-                float(dig_target_local[1]),
-                float(dig_target_local[2]),
-                float(unload_landing_local[0]),
-                float(unload_landing_local[1]),
-                float(unload_landing_local[2]),
-                math.sin(relative_heading),
-                math.cos(relative_heading),
-                float(bucket_load_rate),
+                float(bucket_load_metrics["count"]),
+                tip_xyz[0],
+                tip_xyz[1],
+                tip_xyz[2],
+                load_xyz[0],
+                load_xyz[1],
+                load_xyz[2],
             ]
-            if len(observation_state) != 27:
-                raise RuntimeError(
-                    f"State27 construction produced "
-                    f"{len(observation_state)} values"
-                )
-            if not np.all(
-                np.isfinite(np.asarray(observation_state, dtype=np.float32))
-            ):
-                raise RuntimeError(
-                    f"State27 contains NaN/Inf: {observation_state}"
-                )
 
-            # Use one exact prompt from meta/tasks.parquet.
-            task_text = deployment_task_text
+            task_text = "Dig soil from the marked area and dump it into the target container."
+            try:
+                sand_x = float(getattr(sand_module, "SAND_CENTER_X", 0.0))
+                sand_y = float(getattr(sand_module, "SAND_CENTER_Y", 6.7))
+                sand_xy = (sand_x, sand_y)
+                truck_prim = stage.GetPrimAtPath("/World/DumpTruck")
+                if truck_prim.IsValid():
+                    truck_xf = UsdGeom.Xformable(truck_prim)
+                    truck_pos = truck_xf.ComputeLocalToWorldTransform(Usd.TimeCode.Default()).ExtractTranslation()
+                    unload_xy = (float(truck_pos[0]), float(truck_pos[1]))
+                else:
+                    unload_xy = None
+
+                robot_xy = (base_x, base_y)
+                robot_yaw = base_yaw
+
+                def _dir_label(point_xy, origin_xy):
+                    if point_xy is None or origin_xy is None:
+                        return "nearby"
+                    dx = point_xy[0] - origin_xy[0]
+                    dy = point_xy[1] - origin_xy[1]
+                    dist = abs(dx) + abs(dy)
+                    if dist < 1e-6:
+                        return "nearby"
+                    fwd = robot_yaw + math.pi * 0.5
+                    angle = math.atan2(dy, dx) - fwd
+                    labels = ["front", "front-left", "left", "rear-left",
+                              "rear", "rear-right", "right", "front-right"]
+                    idx = int(math.floor((math.degrees(angle) + 22.5) % 360.0 / 45.0))
+                    return labels[idx % len(labels)]
+
+                sand_dir = _dir_label(sand_xy, robot_xy)
+                unload_dir = _dir_label(unload_xy, robot_xy)
+                sand_s = f"({sand_x:.2f}, {sand_y:.2f})"
+                unload_s = f"({unload_xy[0]:.2f}, {unload_xy[1]:.2f})" if unload_xy else "the target container"
+                task_text = (
+                    f"Dig soil from the sand pile near {sand_s}, {sand_dir} of the excavator, "
+                    f"and dump it into the truck bed near {unload_s}, {unload_dir} of the excavator."
+                )
+            except Exception:
+                pass
 
             reply = {
                 "joint_positions": q.tolist(),
@@ -2793,9 +2272,6 @@ def main(args):
                 "raw_joint_positions": q_raw.tolist(),
                 "raw_joint_velocities": qd_raw.tolist(),
                 "observation_state": observation_state,
-                "observation_state_schema": "excavator_state27_no_phase_v1",
-                "observation_state_names": STATE27_NAMES,
-                "observation_state_dim": 27,
                 "observation_effort": _read_bridge_measured_effort(
                     robot,
                     canonical_joint_indices,

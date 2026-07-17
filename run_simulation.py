@@ -154,15 +154,6 @@ from excavator_common.deployment_contract import (
 )
 from excavator_common import vla_observation_contract
 
-STATE27_NAMES = tuple(
-    name for name in STATE_NAMES_28D if name != "phase_index"
-)
-if len(STATE27_NAMES) != 27:
-    raise RuntimeError(
-        "Expected the deployment observation schema to contain 27 state names "
-        f"after removing phase_index, got {len(STATE27_NAMES)}"
-    )
-
 print(
     "[INFO] Run simulation project root:",
     PROJECT_DIR,
@@ -2437,9 +2428,6 @@ def main(args):
         "canonical_to_raw": list(canonical_to_raw),
         "camera_paths": dict(active_camera_paths),
         "camera_mode": "per_camera_persistent_viewport",
-        "observation_state_schema": "excavator_state27_no_phase_v1",
-        "observation_state_names": list(STATE27_NAMES),
-        "observation_state_dim": 27,
         "sand_hidden_visuals": list(hidden_sand_visuals),
     }
 
@@ -2692,8 +2680,9 @@ def main(args):
             )
             primary_rgb = encoded_cameras[primary_camera]
 
-            # Compute the exact 27D observation.state used by the final
-            # checkpoint. phase_index is not an input feature.
+            # Compute the 14D base state. The negotiated deployment contract
+            # extends this to either the legacy 18D state (with effort) or the
+            # 28D state plus a separate 4D effort vector.
             try:
                 base_x, base_y, base_yaw = read_robot_base_pose()
             except Exception:
@@ -2743,16 +2732,6 @@ def main(args):
                     flush=True,
                 )
 
-            dig_target_local = world_point_to_robot_local_feature(
-                dig_target_world, base_pos, base_yaw
-            )
-            unload_landing_local = world_point_to_robot_local_feature(
-                unload_landing_world, base_pos, base_yaw
-            )
-            relative_heading = wrap_angle_radians(
-                float(truck_yaw_world) - float(base_yaw)
-            )
-
             observation_state = [
                 base_x,
                 base_y,
@@ -2761,26 +2740,13 @@ def main(args):
                 float(joint_positions[1]),
                 float(joint_positions[2]),
                 float(joint_positions[3]),
-                bucket_load_count,
+                float(bucket_load_metrics["count"]),
                 float(tip_xyz[0]),
                 float(tip_xyz[1]),
                 float(tip_xyz[2]),
                 float(load_xyz[0]),
                 float(load_xyz[1]),
                 float(load_xyz[2]),
-                float(joint_velocities_state[0]),
-                float(joint_velocities_state[1]),
-                float(joint_velocities_state[2]),
-                float(joint_velocities_state[3]),
-                float(dig_target_local[0]),
-                float(dig_target_local[1]),
-                float(dig_target_local[2]),
-                float(unload_landing_local[0]),
-                float(unload_landing_local[1]),
-                float(unload_landing_local[2]),
-                math.sin(relative_heading),
-                math.cos(relative_heading),
-                float(bucket_load_rate),
             ]
             observation_effort = _read_bridge_measured_effort(
                 robot,
@@ -2849,16 +2815,6 @@ def main(args):
                 )
             except Exception:
                 pass
-
-            if not np.all(
-                np.isfinite(np.asarray(observation_state, dtype=np.float32))
-            ):
-                raise RuntimeError(
-                    f"State27 contains NaN/Inf: {observation_state}"
-                )
-
-            # Use one exact prompt from meta/tasks.parquet.
-            task_text = deployment_task_text
 
             observation_state_28d = None
             observation_32d_ready = False

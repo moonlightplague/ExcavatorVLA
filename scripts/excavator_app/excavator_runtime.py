@@ -34483,6 +34483,212 @@ async def execute_pre_dig_route_continuous_group(seq, start_index, task_id=None)
     return True, int(next_index)
 
 
+def unload_route_continuous_group(seq, start_index):
+    try:
+        start_index = int(start_index)
+    except Exception:
+        return [], 0
+    if start_index < 0 or start_index >= len(seq or []):
+        return [], start_index
+    if not str(seq[start_index][0]).startswith("clearance_route_post"):
+        return [], start_index
+
+    group = []
+    i = start_index
+    while i < len(seq):
+        stage_name, q_goal, duration = seq[i]
+        if not str(stage_name).startswith("clearance_route_post"):
+            break
+        group.append(
+            (
+                i,
+                str(stage_name),
+                np.array(q_goal, dtype=np.float32).reshape(-1)[:4].copy(),
+                float(duration),
+            )
+        )
+        i += 1
+
+    if i >= len(seq):
+        return [], start_index
+    stage_name, q_goal, duration = seq[i]
+    if "unload" not in str(stage_name).lower():
+        return [], start_index
+    group.append(
+        (
+            i,
+            str(stage_name),
+            np.array(q_goal, dtype=np.float32).reshape(-1)[:4].copy(),
+            float(duration),
+        )
+    )
+    return group, i + 1
+
+
+async def execute_unload_route_continuous_group(seq, start_index, task_id=None):
+    group, next_index = unload_route_continuous_group(seq, start_index)
+    if not group:
+        return False, int(start_index)
+
+    try:
+        q_start = q_real_near_command(get_real_joint_positions(), CTRL.q_cmd)
+    except Exception:
+        q_start = np.array(CTRL.q_cmd, dtype=np.float32).reshape(-1)[:4].copy()
+
+    prepared = []
+    q_prev = q_start.copy()
+    for stage_index, stage_name, q_goal_raw, duration in group:
+        q_goal = clip_command_near(q_goal_raw, reference=q_prev)
+        q_goal = force_loaded_carry_bucket_q(q_goal, reference=q_prev, label=stage_name)
+        ok, kind, reason, sample, report = path_segment_check(
+            q_prev,
+            q_goal,
+            "unload_to_bin",
+            samples=PATH_CHECK_SAMPLES,
+        )
+        if not ok:
+            detail = path_block_report_text("unload_to_bin", kind, report, reason)
+            reason_text = (
+                f"execution_failed/path_precheck_failed:unload_continuous_route:"
+                f"{stage_name}:sample={sample}/{PATH_CHECK_SAMPLES}:{detail}"
+            )
+            set_execution_failure_reason(reason_text)
+            info_print(
+                "[UNLOAD ROUTE GROUP BLOCKED]",
+                f"stage={stage_name}",
+                f"sample={sample}/{PATH_CHECK_SAMPLES}",
+                detail,
+                force_log=True,
+            )
+            return False, int(start_index)
+        prepared.append(
+            {
+                "index": int(stage_index),
+                "name": str(stage_name),
+                "q_goal": q_goal.copy(),
+                "duration": float(duration),
+            }
+        )
+        q_prev = q_goal.copy()
+
+    route_waypoints = [stage["q_goal"] for stage in prepared[:-1]]
+    final_stage = prepared[-1]
+    height_floor = loaded_carry_height_floor(
+        q_start,
+        margin=LOADED_CARRY_ROUTE_HEIGHT_MARGIN_M,
+    )
+    height_ok, height_report = loaded_carry_route_height_check(
+        q_start,
+        route_waypoints,
+        final_stage["q_goal"],
+        height_floor,
+        samples=max(3, int(PATH_CHECK_SAMPLES)),
+    )
+    if not height_ok:
+        reason_text = f"execution_failed/unload_continuous_route_height:{height_report}"
+        set_execution_failure_reason(reason_text)
+        info_print(
+            "[UNLOAD ROUTE GROUP BLOCKED]",
+            "reason=loaded_carry_height_drop",
+            f"detail={height_report}",
+            force_log=True,
+        )
+        return False, int(start_index)
+
+    for stage in prepared:
+        record_stage_audit(
+            stage["name"],
+            stage["index"],
+            "start",
+            q_goal=stage["q_goal"],
+            duration=stage["duration"],
+            data={"continuous_unload_route": True},
+            include_sand=True,
+        )
+
+    def close_group(result, reason_text=""):
+        active = STATE.get("stage_timing_active")
+        active = active if isinstance(active, dict) else {}
+        for stage in prepared:
+            if stage_timing_key(stage["name"], stage["index"]) not in active:
+                continue
+            record_stage_audit(
+                stage["name"],
+                stage["index"],
+                result,
+                reason=str(reason_text),
+                q_goal=stage["q_goal"],
+                duration=stage["duration"],
+                data={"continuous_unload_route": True, "closed_by_group": True},
+                include_sand=True,
+            )
+
+    total_seconds = max(0.08, sum(float(stage["duration"]) for stage in prepared))
+    update_status(
+        f"[UNLOAD ROUTE] continuous path waypoints={len(route_waypoints)} "
+        f"target={final_stage['name']} duration={total_seconds:.2f}s",
+        force=True,
+    )
+    info_print(
+        "[UNLOAD ROUTE GROUP]",
+        f"stages={[stage['name'] for stage in prepared]}",
+        f"waypoints={len(route_waypoints)}",
+        f"duration={total_seconds:.2f}s",
+        "arrival_gate=unload_only",
+        "payload=live_physx",
+        force_log=debug_diagnostics_enabled(),
+    )
+
+    STATE["active_plan_stage_index"] = int(final_stage["index"])
+    success = await move_to_profile(
+        final_stage["q_goal"],
+        seconds=total_seconds,
+        label=final_stage["name"],
+        task_id=task_id,
+        mode="unload_to_bin",
+        path_waypoints=route_waypoints,
+    )
+    if not success or (task_id is not None and not task_alive(task_id)):
+        reason_text = str(
+            STATE.get("last_execution_failure_reason", "")
+            or "execution_failed/unload_continuous_route"
+        )
+        close_group("failed", reason_text)
+        return False, int(start_index)
+
+    if not verify_unload_arrival(final_stage["name"], final_stage["q_goal"]):
+        reason_text = str(
+            STATE.get("last_execution_failure_reason", "")
+            or "execution_failed/unload_arrival_failed"
+        )
+        close_group("failed", reason_text)
+        return False, int(start_index)
+
+    STATE["dig_plan_step_index"] = int(STATE.get("dig_plan_step_index", 0)) + len(prepared)
+    unload_detail = planned_unload_stage_detail(
+        stage_index=int(final_stage["index"]),
+        stage_name=final_stage["name"],
+    )
+    planned_q_dump = None if not unload_detail else unload_detail.get("q_dump")
+    planned_q_release_align = None if not unload_detail else unload_detail.get("q_release_align")
+    if not await dump_bucket_at_target(
+        final_stage["name"],
+        task_id=task_id,
+        planned_q_dump=planned_q_dump,
+        planned_q_release_align=planned_q_release_align,
+    ):
+        reason_text = str(
+            STATE.get("last_execution_failure_reason", "")
+            or "execution_failed/unload_dump_failed"
+        )
+        close_group("failed", reason_text)
+        return False, int(start_index)
+
+    log_phase_ground("[DIG GUARD AFTER]", final_stage["name"])
+    close_group("done")
+    return True, int(next_index)
+
+
 def loaded_route_continuous_group(seq, start_index):
     if not bool(LOADED_ROUTE_RUNTIME_FAST_EXEC):
         return [], int(start_index)
@@ -35349,6 +35555,20 @@ async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"
                 return False
             stage_index = int(pre_dig_route_next_index)
             continue
+
+        if not loaded_route_diag:
+            unload_route_group, unload_route_next_index = unload_route_continuous_group(seq, stage_index)
+            if unload_route_group:
+                success, unload_route_next_index = await execute_unload_route_continuous_group(
+                    seq,
+                    stage_index,
+                    task_id=task_id,
+                )
+                if not success or not task_alive(task_id):
+                    update_status(execution_failure_status_text(str(unload_route_group[-1][1])), force=True)
+                    return False
+                stage_index = int(unload_route_next_index)
+                continue
 
         if loaded_route_diag:
             route_group, route_next_index = loaded_route_continuous_group(seq, stage_index)

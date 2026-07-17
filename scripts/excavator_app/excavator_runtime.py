@@ -21624,7 +21624,15 @@ async def wait_for_motion_reached(q_goal, label="", mode="auto", seconds_eff=0.0
     return verify_motion_reached(q_goal, label=label, mode=mode, record_failure=record_failure)
 
 
-async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="auto", q_start_override=None):
+async def move_to_profile(
+    q_goal,
+    seconds=1.0,
+    label="",
+    task_id=None,
+    mode="auto",
+    q_start_override=None,
+    path_waypoints=None,
+):
     ready, reason, _detail = await wait_for_articulation_action_ready(
         f"{label}_stage_start",
         min_stable_frames=ACTION_READY_MIN_STABLE_FRAMES,
@@ -21662,6 +21670,51 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
     # coordinated close/lift recovery for a loaded bucket.
     if mode_requires_loaded_carry_bucket(mode, label):
         q1 = force_loaded_carry_bucket_q(q1, reference=q0, label=label or mode)
+    motion_path_points = None
+    motion_path_cumulative = None
+    motion_path_min_seconds = 0.0
+    if path_waypoints:
+        path_points = [q0.copy()]
+        q_path_ref = q0.copy()
+        for q_waypoint_raw in path_waypoints:
+            q_waypoint = clip_command_near(q_waypoint_raw, reference=q_path_ref)
+            if mode_requires_loaded_carry_bucket(mode, label):
+                q_waypoint = force_loaded_carry_bucket_q(
+                    q_waypoint,
+                    reference=q_path_ref,
+                    label=label or mode,
+                )
+            path_points.append(np.array(q_waypoint, dtype=np.float32).reshape(-1)[:4].copy())
+            q_path_ref = path_points[-1]
+        q1 = clip_command_near(q1, reference=q_path_ref)
+        if mode_requires_loaded_carry_bucket(mode, label):
+            q1 = force_loaded_carry_bucket_q(q1, reference=q_path_ref, label=label or mode)
+        path_points.append(q1.copy())
+
+        segment_weights = []
+        for q_path_start, q_path_goal in zip(path_points[:-1], path_points[1:]):
+            segment_seconds = 0.0
+            for joint_name, joint_idx in CTRL.name_to_idx.items():
+                if joint_name == "swing":
+                    joint_delta = abs(float(swing_delta(q_path_goal[joint_idx], q_path_start[joint_idx])))
+                else:
+                    joint_delta = abs(float(q_path_goal[joint_idx] - q_path_start[joint_idx]))
+                segment_seconds = max(
+                    segment_seconds,
+                    joint_delta / max(1.0e-6, float(DQ_MAX[joint_name]) * max(0.05, get_speed_multiplier())),
+                )
+            segment_seconds = max(1.0e-4, float(segment_seconds))
+            segment_weights.append(segment_seconds)
+            motion_path_min_seconds += segment_seconds
+        weight_total = max(1.0e-6, float(sum(segment_weights)))
+        motion_path_cumulative = np.concatenate(
+            [
+                np.array([0.0], dtype=np.float32),
+                np.cumsum(np.array(segment_weights, dtype=np.float32)) / weight_total,
+            ]
+        )
+        motion_path_cumulative[-1] = 1.0
+        motion_path_points = path_points
     q_final_cmd = q1.copy()
     q_stage_goal = q1.copy()
     contact_stage_name = str(label or mode)
@@ -21677,6 +21730,11 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
         requested_seconds=seconds,
         speed_multiplier=sm,
     )
+    if motion_path_points is not None:
+        seconds_eff = max(
+            float(seconds_eff),
+            float(motion_path_min_seconds) + float(MOVE_DURATION_MARGIN_SECONDS),
+        )
     if mode_requires_loaded_carry_bucket(mode, label):
         loaded_motion_text = f"{mode} {label}".lower()
         loaded_floor = (
@@ -21714,7 +21772,11 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
     if current_trace_mode() == 2 and not loaded_route_fast_motion:
         draw_trace(force=False)
 
-    update_status(f"[MOVE] {label} phase={mode} duration={seconds_eff:.2f}s speed={sm:.2f}", force=True)
+    route_text = "" if motion_path_points is None else f" waypoints={max(0, len(motion_path_points) - 2)}"
+    update_status(
+        f"[MOVE] {label} phase={mode} duration={seconds_eff:.2f}s speed={sm:.2f}{route_text}",
+        force=True,
+    )
     if bool(STATE.get("auto_collect_active", False)):
         try:
             progress_fn = globals().get("auto_collect_attempt_progress")
@@ -21728,7 +21790,7 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
         except Exception:
             pass
 
-    if fast_sampled_replay_enabled(label=label, mode=mode):
+    if motion_path_points is None and fast_sampled_replay_enabled(label=label, mode=mode):
         ok_fast, emitted_fast, fast_reason, safe_fallback = await move_to_profile_sampled_replay(
             q0,
             q1,
@@ -21806,7 +21868,22 @@ async def move_to_profile(q_goal, seconds=1.0, label="", task_id=None, mode="aut
 
         u = float(i + 1) / steps
         s = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u)
-        q = interpolate_q_motion(q0, q1, s, mode=mode, label=label)
+        if motion_path_points is None:
+            q = interpolate_q_motion(q0, q1, s, mode=mode, label=label)
+        else:
+            segment_idx = int(np.searchsorted(motion_path_cumulative, s, side="right") - 1)
+            segment_idx = max(0, min(segment_idx, len(motion_path_points) - 2))
+            segment_start = float(motion_path_cumulative[segment_idx])
+            segment_end = float(motion_path_cumulative[segment_idx + 1])
+            segment_u = 1.0 if segment_end <= segment_start else (float(s) - segment_start) / (segment_end - segment_start)
+            segment_u = min(1.0, max(0.0, float(segment_u)))
+            q = interpolate_q_motion(
+                motion_path_points[segment_idx],
+                motion_path_points[segment_idx + 1],
+                segment_u,
+                mode=mode,
+                label=label,
+            )
         if carry_bucket_world_rad is not None:
             carry_calc = bucket_joint_for_world_angle(q, carry_bucket_world_rad, end_effector="load")
             if carry_calc is not None:
@@ -27633,7 +27710,6 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
             return None, "planning budget exceeded"
         pre_dig_primary_route = str(label).lower() == "pre_dig"
         pre_dig_obstacle_context = False
-        pre_dig_corridor_report = None
         pre_dig_route_deadline = deadline
         if pre_dig_primary_route:
             try:
@@ -27643,13 +27719,6 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                 if p0 is not None and p1 is not None:
                     blockers = obstacle_bboxes_for_segment_xy(p0, p1)
                     pre_dig_obstacle_context = bool(blockers)
-                    if blockers:
-                        pre_dig_corridor_report = obstacle_corridor_report(
-                            p0,
-                            p1,
-                            obstacle=blockers[0],
-                            link_name=route_effector,
-                        )
             except Exception:
                 pre_dig_obstacle_context = False
         direct_phase_ok, direct_phase_reason, direct_phase_sample, direct_phase_report = path_phase_check(
@@ -27657,28 +27726,21 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
         )
         if planning_deadline_exceeded(deadline):
             return None, "planning budget exceeded"
-        if pre_dig_primary_route and pre_dig_obstacle_context:
-            direct_obstacle_ok = False
-            direct_obstacle_reason = "pre_dig corridor intersects rigid obstacle; route required before direct sweep"
-            direct_obstacle_sample = 0
-            direct_obstacle_report = pre_dig_corridor_report
-            if deadline is not None:
-                now = time.time()
-                remaining = max(0.0, float(deadline) - now)
-                pre_dig_route_deadline = child_planning_deadline(
-                    deadline,
-                    max(0.35, min(1.10, 0.45 * remaining)),
-                    min_seconds=0.12,
-                )
-        else:
-            direct_obstacle_ok, direct_obstacle_reason, direct_obstacle_sample, direct_obstacle_report = path_obstacle_check(
-                q_seed, q_goal, label, samples=DIG_PLAN_PATH_CHECK_SAMPLES, deadline=deadline
+        direct_obstacle_ok, direct_obstacle_reason, direct_obstacle_sample, direct_obstacle_report = path_obstacle_check(
+            q_seed, q_goal, label, samples=DIG_PLAN_PATH_CHECK_SAMPLES, deadline=deadline
+        )
+        if pre_dig_primary_route and pre_dig_obstacle_context and not direct_obstacle_ok and deadline is not None:
+            now = time.time()
+            remaining = max(0.0, float(deadline) - now)
+            pre_dig_route_deadline = child_planning_deadline(
+                deadline,
+                max(0.35, min(1.10, 0.45 * remaining)),
+                min_seconds=0.12,
             )
         route_required = not (direct_phase_ok and direct_obstacle_ok)
-        route_preferred = bool(pre_dig_primary_route and pre_dig_obstacle_context)
         route_waypoints = []
         route_reason = "direct_ok"
-        if route_required or route_preferred:
+        if route_required:
             route_waypoints, route_reason = find_clearance_route(
                 q_seed,
                 q_goal,
@@ -27688,22 +27750,18 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                 samples=PATH_ROUTE_PLANNING_SAMPLE_COUNT,
             )
             if route_waypoints is None:
-                if route_preferred and not route_required and direct_phase_ok and direct_obstacle_ok:
-                    route_waypoints = []
-                    route_reason = f"direct_ok; preferred pre_dig route unavailable: {route_reason}"
-                else:
-                    detail = []
-                    if not direct_phase_ok:
-                        detail.append(
-                            f"phase sample={direct_phase_sample}/{PATH_CHECK_SAMPLES} "
-                            + format_ground_report(label, direct_phase_report, direct_phase_reason)
-                        )
-                    if not direct_obstacle_ok:
-                        detail.append(
-                            f"obstacle sample={direct_obstacle_sample}/{PATH_CHECK_SAMPLES} "
-                            + format_obstacle_report(label, direct_obstacle_report, direct_obstacle_reason)
-                        )
-                    return None, f"{label}: no collision-free route: {route_reason}; " + "; ".join(detail)
+                detail = []
+                if not direct_phase_ok:
+                    detail.append(
+                        f"phase sample={direct_phase_sample}/{PATH_CHECK_SAMPLES} "
+                        + format_ground_report(label, direct_phase_report, direct_phase_reason)
+                    )
+                if not direct_obstacle_ok:
+                    detail.append(
+                        f"obstacle sample={direct_obstacle_sample}/{PATH_CHECK_SAMPLES} "
+                        + format_obstacle_report(label, direct_obstacle_report, direct_obstacle_reason)
+                    )
+                return None, f"{label}: no collision-free route: {route_reason}; " + "; ".join(detail)
             else:
                 route_required = True
                 route_reason = str(route_reason)
@@ -27715,7 +27773,7 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
         route_estimated_time = 0.0
         q_motion_seed = np.array(q_seed, dtype=np.float32).copy()
         route_end_effector = path_end_effector_for_mode(label)
-        path_eval_deadline = pre_dig_route_deadline if route_preferred else deadline
+        path_eval_deadline = pre_dig_route_deadline if route_required and pre_dig_obstacle_context else deadline
         route_prevalidated = bool(route_waypoints)
         for route_idx, q_route_raw in enumerate(route_waypoints or []):
             if planning_deadline_exceeded(path_eval_deadline):
@@ -34264,6 +34322,167 @@ async def dump_bucket_at_target(stage_name, task_id=None, planned_q_dump=None, p
     return True
 
 
+def pre_dig_route_continuous_group(seq, start_index):
+    try:
+        start_index = int(start_index)
+    except Exception:
+        return [], 0
+    if start_index < 0 or start_index >= len(seq or []):
+        return [], start_index
+
+    def is_pre_dig_clearance(name):
+        text = str(name)
+        return text.startswith("clearance_route_") and not text.startswith("clearance_route_post")
+
+    if not is_pre_dig_clearance(seq[start_index][0]):
+        return [], start_index
+
+    group = []
+    i = start_index
+    while i < len(seq):
+        stage_name, q_goal, duration = seq[i]
+        if not is_pre_dig_clearance(stage_name):
+            break
+        group.append(
+            (
+                i,
+                str(stage_name),
+                np.array(q_goal, dtype=np.float32).reshape(-1)[:4].copy(),
+                float(duration),
+            )
+        )
+        i += 1
+
+    if i >= len(seq):
+        return [], start_index
+    stage_name, q_goal, duration = seq[i]
+    if str(stage_name).lower() != "pre_dig":
+        return [], start_index
+    group.append(
+        (
+            i,
+            str(stage_name),
+            np.array(q_goal, dtype=np.float32).reshape(-1)[:4].copy(),
+            float(duration),
+        )
+    )
+    return group, i + 1
+
+
+async def execute_pre_dig_route_continuous_group(seq, start_index, task_id=None):
+    group, next_index = pre_dig_route_continuous_group(seq, start_index)
+    if not group:
+        return False, int(start_index)
+
+    try:
+        q_prev = q_real_near_command(get_real_joint_positions(), CTRL.q_cmd)
+    except Exception:
+        q_prev = np.array(CTRL.q_cmd, dtype=np.float32).reshape(-1)[:4].copy()
+
+    prepared = []
+    for stage_index, stage_name, q_goal_raw, duration in group:
+        q_goal = clip_command_near(q_goal_raw, reference=q_prev)
+        check_mode = "pre_dig" if stage_name == "pre_dig" else "clearance"
+        ok, kind, reason, sample, report = path_segment_check(
+            q_prev,
+            q_goal,
+            check_mode,
+            samples=PATH_CHECK_SAMPLES,
+        )
+        if not ok:
+            detail = path_block_report_text(check_mode, kind, report, reason)
+            reason_text = (
+                f"execution_failed/path_precheck_failed:pre_dig_continuous_route:"
+                f"{stage_name}:sample={sample}/{PATH_CHECK_SAMPLES}:{detail}"
+            )
+            set_execution_failure_reason(reason_text)
+            info_print(
+                "[PRE DIG ROUTE GROUP BLOCKED]",
+                f"stage={stage_name}",
+                f"sample={sample}/{PATH_CHECK_SAMPLES}",
+                detail,
+                force_log=True,
+            )
+            return False, int(start_index)
+        prepared.append(
+            {
+                "index": int(stage_index),
+                "name": str(stage_name),
+                "q_goal": q_goal.copy(),
+                "duration": float(duration),
+            }
+        )
+        q_prev = q_goal.copy()
+
+    for stage in prepared:
+        record_stage_audit(
+            stage["name"],
+            stage["index"],
+            "start",
+            q_goal=stage["q_goal"],
+            duration=stage["duration"],
+            data={"continuous_pre_dig_route": True},
+            include_sand=False,
+        )
+
+    def close_group(result, reason_text=""):
+        active = STATE.get("stage_timing_active")
+        active = active if isinstance(active, dict) else {}
+        for stage in prepared:
+            if stage_timing_key(stage["name"], stage["index"]) not in active:
+                continue
+            record_stage_audit(
+                stage["name"],
+                stage["index"],
+                result,
+                reason=str(reason_text),
+                q_goal=stage["q_goal"],
+                duration=stage["duration"],
+                data={"continuous_pre_dig_route": True, "closed_by_group": True},
+                include_sand=False,
+            )
+
+    route_waypoints = [stage["q_goal"] for stage in prepared[:-1]]
+    final_stage = prepared[-1]
+    total_seconds = max(0.08, sum(float(stage["duration"]) for stage in prepared))
+    update_status(
+        f"[PRE DIG ROUTE] continuous path waypoints={len(route_waypoints)} "
+        f"target=pre_dig duration={total_seconds:.2f}s",
+        force=True,
+    )
+    info_print(
+        "[PRE DIG ROUTE GROUP]",
+        f"stages={[stage['name'] for stage in prepared]}",
+        f"waypoints={len(route_waypoints)}",
+        f"duration={total_seconds:.2f}s",
+        "arrival_gate=pre_dig_only",
+        force_log=debug_diagnostics_enabled(),
+    )
+
+    STATE["active_plan_stage_index"] = int(final_stage["index"])
+    success = await move_to_profile(
+        final_stage["q_goal"],
+        seconds=total_seconds,
+        label="pre_dig",
+        task_id=task_id,
+        mode="pre_dig",
+        path_waypoints=route_waypoints,
+    )
+    if not success or (task_id is not None and not task_alive(task_id)):
+        reason_text = str(
+            STATE.get("last_execution_failure_reason", "")
+            or "execution_failed/pre_dig_continuous_route"
+        )
+        close_group("failed", reason_text)
+        return False, int(start_index)
+
+    STATE["dig_plan_step_index"] = int(STATE.get("dig_plan_step_index", 0)) + len(prepared)
+    notify_sand_site_step_done("pre_dig")
+    log_phase_ground("[DIG GUARD AFTER]", "pre_dig")
+    close_group("done")
+    return True, int(next_index)
+
+
 def loaded_route_continuous_group(seq, start_index):
     if not bool(LOADED_ROUTE_RUNTIME_FAST_EXEC):
         return [], int(start_index)
@@ -35117,6 +35336,19 @@ async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"
         STATE["active_plan_stage_index"] = int(stage_index)
         if not task_alive(task_id):
             return False
+
+        pre_dig_route_group, pre_dig_route_next_index = pre_dig_route_continuous_group(seq, stage_index)
+        if pre_dig_route_group:
+            success, pre_dig_route_next_index = await execute_pre_dig_route_continuous_group(
+                seq,
+                stage_index,
+                task_id=task_id,
+            )
+            if not success or not task_alive(task_id):
+                update_status(execution_failure_status_text("pre_dig"), force=True)
+                return False
+            stage_index = int(pre_dig_route_next_index)
+            continue
 
         if loaded_route_diag:
             route_group, route_next_index = loaded_route_continuous_group(seq, stage_index)

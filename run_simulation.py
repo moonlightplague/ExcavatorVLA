@@ -1601,12 +1601,51 @@ def main(args):
             )
 
         snapshots = []
+        collider_counts_by_link = {}
+        collider_counts_by_source = {}
         for prim in Usd.PrimRange(robot_prim):
             try:
-                if not prim.HasAPI(UsdPhysics.CollisionAPI):
+                path = str(prim.GetPath())
+                relative_path = path[len(ROBOT_PRIM_PATH):].lstrip("/")
+                link_name = (
+                    relative_path.split("/", 1)[0]
+                    if relative_path
+                    else "<robot_root>"
+                )
+                enabled_attr = prim.GetAttribute("physics:collisionEnabled")
+                has_enabled_attr = bool(enabled_attr.IsValid())
+                has_collision_api = bool(
+                    prim.HasAPI(UsdPhysics.CollisionAPI)
+                )
+                applied_schemas = [
+                    str(schema).lower()
+                    for schema in prim.GetAppliedSchemas()
+                ]
+                has_collision_schema = any(
+                    "collisionapi" in schema
+                    for schema in applied_schemas
+                )
+                path_parts = [
+                    part.lower()
+                    for part in relative_path.split("/")
+                    if part
+                ]
+                collision_named = any(
+                    part in ("collision", "collisions")
+                    or part.startswith("collision_")
+                    or part.endswith("_collision")
+                    for part in path_parts
+                )
+                is_collision_geometry = bool(
+                    collision_named and prim.IsA(UsdGeom.Gprim)
+                )
+                if not (
+                    has_collision_api
+                    or has_enabled_attr
+                    or has_collision_schema
+                    or is_collision_geometry
+                ):
                     continue
-                collision_api = UsdPhysics.CollisionAPI(prim)
-                enabled_attr = collision_api.GetCollisionEnabledAttr()
                 original_value = (
                     enabled_attr.Get() if enabled_attr.IsValid() else None
                 )
@@ -1614,10 +1653,29 @@ def main(args):
                     True if original_value is None else bool(original_value)
                 )
                 if not enabled_attr.IsValid():
-                    enabled_attr = collision_api.CreateCollisionEnabledAttr()
+                    enabled_attr = prim.CreateAttribute(
+                        "physics:collisionEnabled",
+                        Sdf.ValueTypeNames.Bool,
+                    )
                 enabled_attr.Set(False)
                 snapshots.append(
-                    (str(prim.GetPath()), originally_enabled)
+                    (path, originally_enabled)
+                )
+                source_names = []
+                if has_collision_api:
+                    source_names.append("CollisionAPI")
+                if has_enabled_attr:
+                    source_names.append("collisionEnabled")
+                if has_collision_schema:
+                    source_names.append("appliedSchema")
+                if is_collision_geometry:
+                    source_names.append("collisionNamedGprim")
+                source = "+".join(source_names)
+                collider_counts_by_link[link_name] = (
+                    collider_counts_by_link.get(link_name, 0) + 1
+                )
+                collider_counts_by_source[source] = (
+                    collider_counts_by_source.get(source, 0) + 1
                 )
             except Exception as exc:
                 raise RuntimeError(
@@ -1648,6 +1706,8 @@ def main(args):
         print(
             "[SAND INIT] Excavator collisions suspended:",
             f"colliders={len(snapshots)}",
+            f"by_link={collider_counts_by_link}",
+            f"by_source={collider_counts_by_source}",
             flush=True,
         )
         return snapshots
@@ -1657,17 +1717,16 @@ def main(args):
         failures = []
         for path, originally_enabled in snapshots:
             prim = stage.GetPrimAtPath(path)
-            if not prim.IsValid() or not prim.HasAPI(UsdPhysics.CollisionAPI):
-                failures.append(f"{path}:missing_or_no_collision_api")
+            if not prim.IsValid():
+                failures.append(f"{path}:missing")
                 continue
             try:
-                enabled_attr = UsdPhysics.CollisionAPI(
-                    prim
-                ).GetCollisionEnabledAttr()
+                enabled_attr = prim.GetAttribute("physics:collisionEnabled")
                 if not enabled_attr.IsValid():
-                    enabled_attr = UsdPhysics.CollisionAPI(
-                        prim
-                    ).CreateCollisionEnabledAttr()
+                    enabled_attr = prim.CreateAttribute(
+                        "physics:collisionEnabled",
+                        Sdf.ValueTypeNames.Bool,
+                    )
                 enabled_attr.Set(bool(originally_enabled))
             except Exception as exc:
                 failures.append(f"{path}:{type(exc).__name__}:{exc}")
@@ -1675,11 +1734,11 @@ def main(args):
         simulation_app.update()
         for path, originally_enabled in snapshots:
             prim = stage.GetPrimAtPath(path)
-            if not prim.IsValid() or not prim.HasAPI(UsdPhysics.CollisionAPI):
+            if not prim.IsValid():
                 continue
-            actual_value = UsdPhysics.CollisionAPI(
-                prim
-            ).GetCollisionEnabledAttr().Get()
+            actual_value = prim.GetAttribute(
+                "physics:collisionEnabled"
+            ).Get()
             if bool(actual_value) != bool(originally_enabled):
                 failures.append(
                     f"{path}:expected={originally_enabled}:actual={actual_value}"

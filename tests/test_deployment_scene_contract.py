@@ -79,6 +79,12 @@ class DeploymentSceneContractTests(unittest.TestCase):
             "pending_collision_restore = _ACTIVE_SAND_COLLISION_RESTORE",
             source,
         )
+        self.assertIn(
+            'prim.GetAttribute("physics:collisionEnabled")',
+            source,
+        )
+        self.assertIn("collisionNamedGprim", source)
+        self.assertIn("by_link={collider_counts_by_link}", source)
 
 
 if __name__ == "__main__":

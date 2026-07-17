@@ -154,6 +154,15 @@ from excavator_common.deployment_contract import (
 )
 from excavator_common import vla_observation_contract
 
+STATE27_NAMES = tuple(
+    name for name in STATE_NAMES_28D if name != "phase_index"
+)
+if len(STATE27_NAMES) != 27:
+    raise RuntimeError(
+        "Expected the deployment observation schema to contain 27 state names "
+        f"after removing phase_index, got {len(STATE27_NAMES)}"
+    )
+
 print(
     "[INFO] Run simulation project root:",
     PROJECT_DIR,

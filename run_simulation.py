@@ -173,7 +173,6 @@ SCENE_USD_PATH = os.path.join(PROJECT_DIR, "assets/usd/excavator_scene.usd")
 ROBOT_PRIM_PATH = "/World/URDF_real3"
 SAND_RUNTIME_PATH = os.path.join(PROJECT_DIR, "scripts", "excavator_app", "sand_site_runtime.py")
 
-SAND_AUTHORED_CENTER = deployment_scene_contract.AUTHORED_SAND_CENTER_XY
 TRUCK_ROOT_PATH = deployment_scene_contract.TRUCK_ROOT_PATH
 TRUCK_BED_COLLISION_PATH = (
     deployment_scene_contract.TRUCK_BED_COLLISION_PATH
@@ -746,10 +745,6 @@ def main(args):
         create_viewport_window,
     )
 
-    fixed_scene_profile = (
-        deployment_scene_contract.validate_fixed_scene_profile()
-    )
-
     def set_prim_translation_and_yaw(
         prim,
         translation_xyz,
@@ -908,7 +903,35 @@ def main(args):
             f"No supported local rotation op on truck prim {prim.GetPath()}"
         )
 
-    def apply_fixed_training_truck_pose():
+    def prim_world_bbox_min_max(prim):
+        bbox_cache = UsdGeom.BBoxCache(
+            Usd.TimeCode.Default(),
+            [
+                UsdGeom.Tokens.default_,
+                UsdGeom.Tokens.render,
+                UsdGeom.Tokens.proxy,
+            ],
+            useExtentsHint=True,
+        )
+        aligned_range = bbox_cache.ComputeWorldBound(
+            prim
+        ).ComputeAlignedRange()
+        if aligned_range.IsEmpty():
+            raise RuntimeError(f"World bound is empty: {prim.GetPath()}")
+        minimum_value = aligned_range.GetMin()
+        maximum_value = aligned_range.GetMax()
+        minimum = np.asarray(
+            [float(minimum_value[index]) for index in range(3)],
+            dtype=np.float64,
+        )
+        maximum = np.asarray(
+            [float(maximum_value[index]) for index in range(3)],
+            dtype=np.float64,
+        )
+        return minimum, maximum
+
+    def apply_randomized_dataset_scene():
+        """Sample and apply the sand/truck profile used by collection."""
         truck_prim = stage.GetPrimAtPath(TRUCK_ROOT_PATH)
         if not truck_prim.IsValid():
             raise RuntimeError(
@@ -920,38 +943,111 @@ def main(args):
                 "Training dump-bed collision mesh is unavailable: "
                 f"{TRUCK_BED_COLLISION_PATH}"
             )
+
+        truck_minimum, truck_maximum = prim_world_bbox_min_max(truck_prim)
+        bed_minimum, bed_maximum = prim_world_bbox_min_max(bed_prim)
+        truck_center = 0.5 * (truck_minimum + truck_maximum)
+        bed_center = 0.5 * (bed_minimum + bed_maximum)
+        baseline_translation = prim_world_position(truck_prim)
+        baseline_yaw_deg = prim_local_yaw_z_deg(truck_prim)
+        robot_position, _ = robot.get_world_pose()
+        scene_seed = (
+            int(args.scene_seed)
+            if args.scene_seed is not None
+            else int(
+                (time.time_ns() ^ (os.getpid() << 16))
+                & ((1 << 63) - 1)
+            )
+        )
+        profile = deployment_scene_contract.sample_random_scene_profile(
+            seed=scene_seed,
+            robot_xy=(float(robot_position[0]), float(robot_position[1])),
+            truck_center_xy=truck_center[:2],
+            truck_dump_center_xy=bed_center[:2],
+            truck_yaw_deg=baseline_yaw_deg,
+        )
+
         set_prim_translation_and_yaw(
             truck_prim,
-            fixed_scene_profile["truck_translation_xyz"],
-            fixed_scene_profile["truck_yaw_deg"],
+            baseline_translation,
+            profile["truck_yaw_deg"],
         )
+        simulation_app.update()
+        yawed_bed_minimum, yawed_bed_maximum = prim_world_bbox_min_max(
+            bed_prim
+        )
+        yawed_bed_center = 0.5 * (
+            yawed_bed_minimum + yawed_bed_maximum
+        )
+        target_translation = prim_world_position(truck_prim)
+        target_translation[:2] += (
+            np.asarray(profile["unload_xy"], dtype=np.float64)
+            - yawed_bed_center[:2]
+        )
+        set_prim_translation_and_yaw(
+            truck_prim,
+            target_translation,
+            profile["truck_yaw_deg"],
+        )
+        for _ in range(3):
+            simulation_app.update()
+
         actual_position = prim_world_position(truck_prim)
         actual_local_yaw_deg = prim_local_yaw_z_deg(truck_prim)
-        expected_position = np.asarray(
-            fixed_scene_profile["truck_translation_xyz"],
-            dtype=np.float64,
+        actual_bed_minimum, actual_bed_maximum = prim_world_bbox_min_max(
+            bed_prim
         )
-        position_error = float(np.linalg.norm(actual_position - expected_position))
+        actual_bed_center = 0.5 * (
+            actual_bed_minimum + actual_bed_maximum
+        )
         yaw_error_deg = deployment_scene_contract.wrapped_yaw_error_deg(
             actual_local_yaw_deg,
-            fixed_scene_profile["truck_yaw_deg"],
+            profile["truck_yaw_deg"],
         )
-        if position_error > 0.02 or yaw_error_deg > 0.25:
-            raise RuntimeError(
-                "Truck pose did not match the fixed training profile: "
-                f"position_error={position_error:.6f}, "
-                f"local_yaw_error_deg={yaw_error_deg:.6f}"
+        unload_xy_error = float(
+            np.linalg.norm(
+                actual_bed_center[:2]
+                - np.asarray(profile["unload_xy"], dtype=np.float64)
             )
+        )
+        if yaw_error_deg > 0.25 or unload_xy_error > 0.05:
+            raise RuntimeError(
+                "Random truck pose did not match the sampled profile: "
+                f"local_yaw_error_deg={yaw_error_deg:.6f}, "
+                f"unload_xy_error={unload_xy_error:.6f}"
+            )
+        unload_landing = np.asarray(
+            [
+                float(actual_bed_center[0]),
+                float(actual_bed_center[1]),
+                float(actual_bed_maximum[2]) + 0.05,
+            ],
+            dtype=np.float64,
+        )
+        profile.update(
+            {
+                "truck_translation_xyz": tuple(actual_position.tolist()),
+                "actual_truck_yaw_deg": float(actual_local_yaw_deg),
+                "actual_unload_center_xyz": tuple(
+                    actual_bed_center.tolist()
+                ),
+                "unload_landing_xyz": tuple(unload_landing.tolist()),
+            }
+        )
         print(
-            "[SCENE CONTRACT] Fixed training truck pose applied:",
+            "[SCENE RANDOMIZATION] Dataset-compatible scene sampled:",
+            f"seed={profile['seed']}",
+            f"sample_try={profile['sample_try']}",
+            f"sand_xy={list(profile['sand_xy'])}",
+            f"sand_amount={profile['sand_amount_multiplier']:.6f}",
             f"root={TRUCK_ROOT_PATH}",
             f"bed={TRUCK_BED_COLLISION_PATH}",
-            f"position={actual_position.tolist()}",
-            f"local_yaw_deg={actual_local_yaw_deg:.6f}",
-            f"unload_landing={list(fixed_scene_profile['unload_landing_xyz'])}",
+            f"truck_position={actual_position.tolist()}",
+            f"truck_yaw_deg={actual_local_yaw_deg:.6f}",
+            f"unload_landing={unload_landing.tolist()}",
             flush=True,
         )
-        return truck_prim, bed_prim
+        return profile
 
     def wait_for_stage_loading_complete(
         label,
@@ -1102,7 +1198,15 @@ def main(args):
     for camera_name, camera_path in CAMERA_PRIM_PATHS.items():
         print(f"  {camera_name}: {camera_path}")
     print(f"TCP Server: {HOST}:{PORT}")
-    print(f"Sand amount: {args.sand_amount} (0=disabled, 1-10=multiplier)")
+    print(
+        "Sand:",
+        "disabled" if args.sand_amount == 0 else "dataset-randomized",
+        f"enable_value={args.sand_amount}",
+    )
+    print(
+        "Scene seed:",
+        args.scene_seed if args.scene_seed is not None else "random-per-launch",
+    )
     print("=" * 60)
 
     # Get stage.
@@ -1586,7 +1690,7 @@ def main(args):
     if truck_pose_timeline_was_playing:
         timeline.pause()
         simulation_app.update()
-    apply_fixed_training_truck_pose()
+    random_scene_profile = apply_randomized_dataset_scene()
     for _ in range(3):
         simulation_app.update()
     if truck_pose_timeline_was_playing:
@@ -1838,47 +1942,6 @@ def main(args):
             "particle_system_path": particle_system_path,
         }
 
-
-    def synchronize_runtime_with_existing_sand(
-        sand_module,
-        existing_sand,
-    ):
-        """
-        Make sand_site_runtime status reflect the particle set loaded from USD.
-        This does not create, clear, or rebuild any prim.
-        """
-        state = getattr(sand_module, "STATE", None)
-
-        if isinstance(state, dict):
-            state["real_sand_enabled"] = True
-            state["real_sand_particle_count"] = int(
-                existing_sand["particle_count"]
-            )
-            state["real_sand_error"] = ""
-            state["real_sand_points_path"] = str(
-                existing_sand["points_path"]
-            )
-            state["particle_system_path"] = str(
-                existing_sand["particle_system_path"]
-            )
-
-        store_runtime_api = getattr(
-            sand_module,
-            "store_runtime_api",
-            None,
-        )
-        if callable(store_runtime_api):
-            store_runtime_api()
-
-        print(
-            "[SAND] Reusing USD-authored particle sand:",
-            f"points={existing_sand['points_path']}",
-            f"particles={existing_sand['particle_count']}",
-            f"system={existing_sand['particle_system_path']}",
-            flush=True,
-        )
-
-
     existing_sand_before_runtime = inspect_existing_particle_sand()
 
     print(
@@ -1893,7 +1956,12 @@ def main(args):
     # IMPORTANT: this is intentionally the final scene-creation stage.
     # Do not add or reference any USD scene objects after this block.
     # -----------------------------------------------------------------
-    sand_amount = int(args.sand_amount)
+    sand_enabled = int(args.sand_amount) > 0
+    sand_amount = (
+        float(random_scene_profile["sand_amount_multiplier"])
+        if sand_enabled
+        else 0.0
+    )
     excavator_pose_snapshot = None
 
     if not os.path.isfile(SAND_RUNTIME_PATH):
@@ -1912,7 +1980,7 @@ def main(args):
         simulation_app.update()
 
     builtins._SAND_SITE_STARTUP_CONFIG = {
-        "amount": sand_amount,
+        "amount": int(round(sand_amount)),
         "show_ui": False,
         "auto_create": False,
         "parameter_mode": "soft_dig",
@@ -1985,28 +2053,56 @@ def main(args):
         flush=True,
     )
 
+    apply_scene_parameters = sand_api.get("apply_auto_scene_parameters")
+    if not callable(apply_scene_parameters):
+        raise RuntimeError(
+            "Sand runtime does not expose apply_auto_scene_parameters"
+        )
+    sand_scene_result = apply_scene_parameters(
+        sand_center_xy=random_scene_profile["sand_xy"],
+        sand_amount_multiplier=(sand_amount if sand_enabled else None),
+        unload_center_xy=None,
+        rebuild=False,
+    )
+    sand_api = getattr(builtins, "_SAND_SITE", sand_api)
+
     actual_sand_center = (
         float(getattr(sand_module, "SAND_CENTER_X", float("nan"))),
         float(getattr(sand_module, "SAND_CENTER_Y", float("nan"))),
     )
     if not np.allclose(
         np.asarray(actual_sand_center, dtype=np.float64),
-        np.asarray(SAND_AUTHORED_CENTER, dtype=np.float64),
+        np.asarray(random_scene_profile["sand_xy"], dtype=np.float64),
         rtol=0.0,
         atol=1.0e-4,
     ):
         raise RuntimeError(
-            "Sand runtime center differs from the authored training center: "
-            f"actual={actual_sand_center}, expected={SAND_AUTHORED_CENTER}"
+            "Sand runtime center differs from the sampled training scene: "
+            f"actual={actual_sand_center}, "
+            f"expected={random_scene_profile['sand_xy']}"
+        )
+    actual_sand_amount = float(
+        getattr(sand_module, "SAND_AMOUNT_MULTIPLIER", float("nan"))
+    )
+    if sand_enabled and not math.isclose(
+        actual_sand_amount,
+        sand_amount,
+        rel_tol=0.0,
+        abs_tol=1.0e-4,
+    ):
+        raise RuntimeError(
+            "Sand runtime amount differs from the sampled training scene: "
+            f"actual={actual_sand_amount}, expected={sand_amount}"
         )
     print(
-        "[SCENE CONTRACT] Authored sand center retained:",
+        "[SCENE RANDOMIZATION] Sand parameters applied:",
         f"center={actual_sand_center}",
-        f"world_radius_m={fixed_scene_profile['sand_world_radius_m']:.6f}",
+        f"amount={actual_sand_amount:.6f}",
+        f"result={sand_scene_result}",
         flush=True,
     )
 
-    if sand_amount > 0:
+    if sand_enabled:
         excavator_pose_snapshot = elevate_excavator_for_sand_init(
             sand_floor_z=float(
                 getattr(sand_module, "SAND_FLOOR_Z", 0.0)
@@ -2024,9 +2120,27 @@ def main(args):
         )
 
         if existing_sand_after_runtime["exists"]:
-            synchronize_runtime_with_existing_sand(
-                sand_module,
-                existing_sand_after_runtime,
+            clear_existing_sand = sand_api.get(
+                "clear_real_particle_sand"
+            )
+            if not callable(clear_existing_sand):
+                raise RuntimeError(
+                    "Randomized scene requires clearing USD-authored sand, "
+                    "but clear_real_particle_sand is unavailable"
+                )
+            clear_existing_sand()
+            for _ in range(3):
+                simulation_app.update()
+            existing_sand_after_runtime = inspect_existing_particle_sand()
+            if existing_sand_after_runtime["exists"]:
+                raise RuntimeError(
+                    "USD-authored particle sand remained after clear: "
+                    f"{existing_sand_after_runtime}"
+                )
+            print(
+                "[SCENE RANDOMIZATION] Cleared USD-authored sand before "
+                "regeneration",
+                flush=True,
             )
 
         sand_api = getattr(
@@ -2225,7 +2339,7 @@ def main(args):
             flush=True,
         )
 
-    if sand_amount == 0:
+    if not sand_enabled:
         print(
             "[SAND] Disabled by --sand-amount=0",
             flush=True,
@@ -2749,10 +2863,18 @@ def main(args):
 
     def resolve_state27_dig_target():
         center_x = float(
-            getattr(sand_module, "SAND_CENTER_X", SAND_AUTHORED_CENTER[0])
+            getattr(
+                sand_module,
+                "SAND_CENTER_X",
+                random_scene_profile["sand_xy"][0],
+            )
         )
         center_y = float(
-            getattr(sand_module, "SAND_CENTER_Y", SAND_AUTHORED_CENTER[1])
+            getattr(
+                sand_module,
+                "SAND_CENTER_Y",
+                random_scene_profile["sand_xy"][1],
+            )
         )
         target_z = 0.35
         source = "configured_sand_center"
@@ -2825,7 +2947,7 @@ def main(args):
             dtype=np.float64,
         )
         landing = np.asarray(
-            fixed_scene_profile["unload_landing_xyz"],
+            random_scene_profile["unload_landing_xyz"],
             dtype=np.float64,
         )
         xy_inside = bool(
@@ -2835,13 +2957,13 @@ def main(args):
         z_above_bed = float(landing[2] - maximum[2])
         if not xy_inside or not (-0.05 <= z_above_bed <= 0.25):
             raise RuntimeError(
-                "Fixed unload landing does not match the transformed dump bed: "
+                "Randomized unload landing does not match the dump bed: "
                 f"landing={landing.tolist()}, min={minimum.tolist()}, "
                 f"max={maximum.tolist()}, z_above_bed={z_above_bed:.6f}"
             )
         return (
             landing.astype(np.float32),
-            "fixed_training_landing_validated_against_dump_bed",
+            "randomized_landing_validated_against_dump_bed",
         )
 
     state27_dig_target_world, state27_dig_target_source = (
@@ -2884,7 +3006,8 @@ def main(args):
         3.953 <= startup_unload_radius <= 10.518
     )
     print(
-        "[STATE27] Fixed environment features:",
+        "[STATE27] Randomized environment features:",
+        f"scene_seed={random_scene_profile['seed']}",
         f"dig_target={state27_dig_target_world.tolist()}",
         f"dig_source={state27_dig_target_source}",
         f"unload_target={state27_unload_target_world.tolist()}",
@@ -2900,8 +3023,8 @@ def main(args):
     )
     if not dig_local_in_training_range or not unload_local_in_training_range:
         print(
-            "[WARN] [SCENE CONTRACT] Fixed sand/truck world placement is "
-            "training-valid, but the unchanged robot pose makes a target "
+            "[WARN] [SCENE CONTRACT] Randomized sand/truck placement is "
+            "within the dataset world workspace, but the robot pose makes a target "
             "local radius fall outside the observed training range.",
             flush=True,
         )
@@ -3675,7 +3798,19 @@ if __name__ == "__main__":
         default=1,
         choices=range(0, 11),
         metavar="0-10",
-        help="0 disables sand; 1-10 controls the sand amount multiplier.",
+        help=(
+            "0 disables sand; any nonzero value enables dataset-compatible "
+            "random sand amount and placement."
+        ),
+    )
+    parser.add_argument(
+        "--scene-seed",
+        type=int,
+        default=None,
+        help=(
+            "Replay a randomized sand/truck scene. By default a new seed is "
+            "generated on each launch."
+        ),
     )
     parser.add_argument(
         "--sand-settle-frames",

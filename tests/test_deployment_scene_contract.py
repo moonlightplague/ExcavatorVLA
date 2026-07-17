@@ -48,6 +48,57 @@ class DeploymentSceneContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             scene_contract.wrapped_yaw_error_deg(float("nan"), 0.0)
 
+    def test_random_scene_sampler_matches_training_workspace(self):
+        profile = scene_contract.sample_random_scene_profile(
+            seed=1234,
+            robot_xy=(-9.2, 6.7),
+            truck_center_xy=(-5.0, -9.0),
+            truck_dump_center_xy=(-6.8, -7.5),
+            truck_yaw_deg=-93.0,
+        )
+        self.assertEqual(profile["seed"], 1234)
+        self.assertTrue(
+            scene_contract.TRAINING_SAND_RADIUS_RANGE_M[0]
+            <= profile["sand_radius_m"]
+            <= scene_contract.TRAINING_SAND_RADIUS_RANGE_M[1]
+        )
+        self.assertTrue(
+            scene_contract.TRAINING_UNLOAD_RADIUS_RANGE_M[0]
+            <= profile["unload_radius_m"]
+            <= scene_contract.TRAINING_UNLOAD_RADIUS_RANGE_M[1]
+        )
+        self.assertTrue(
+            scene_contract.TRAINING_SAND_AMOUNT_RANGE[0]
+            <= profile["sand_amount_multiplier"]
+            <= scene_contract.TRAINING_SAND_AMOUNT_RANGE[1]
+        )
+        self.assertGreaterEqual(
+            profile["sand_unload_distance_m"],
+            scene_contract.TRAINING_MIN_SAND_UNLOAD_DISTANCE_M,
+        )
+        self.assertGreaterEqual(
+            profile["robot_truck_distance_m"],
+            scene_contract.TRAINING_MIN_ROBOT_TRUCK_DISTANCE_M,
+        )
+
+    def test_random_scene_seed_is_replayable(self):
+        kwargs = {
+            "seed": 9876,
+            "robot_xy": (-9.2, 6.7),
+            "truck_center_xy": (-5.0, -9.0),
+            "truck_dump_center_xy": (-6.8, -7.5),
+            "truck_yaw_deg": -93.0,
+        }
+        self.assertEqual(
+            scene_contract.sample_random_scene_profile(**kwargs),
+            scene_contract.sample_random_scene_profile(**kwargs),
+        )
+        different = dict(kwargs, seed=9877)
+        self.assertNotEqual(
+            scene_contract.sample_random_scene_profile(**kwargs),
+            scene_contract.sample_random_scene_profile(**different),
+        )
+
     def test_run_simulation_has_no_obsolete_target_helper_or_truck_path(self):
         source = (
             Path(__file__).resolve().parents[1] / "run_simulation.py"
@@ -56,6 +107,9 @@ class DeploymentSceneContractTests(unittest.TestCase):
         self.assertNotIn('GetPrimAtPath("/World/DumpTruck")', source)
         self.assertNotIn("SAND_INITIAL_CENTER", source)
         self.assertIn("prim_local_yaw_z_deg(truck_prim)", source)
+        self.assertIn("apply_randomized_dataset_scene()", source)
+        self.assertIn("apply_auto_scene_parameters", source)
+        self.assertNotIn("apply_fixed_training_truck_pose", source)
 
     def test_sand_init_elevates_then_restores_excavator(self):
         source = (

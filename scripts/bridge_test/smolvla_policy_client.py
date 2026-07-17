@@ -54,6 +54,7 @@ from excavator_common.bridge_protocol import (  # noqa: E402
     write_json,
 )
 from excavator_common.deployment_contract import (  # noqa: E402
+    OBSERVATION_SCHEMA_27D_PLUS_EFFORT,
     build_client_contract,
     load_training_fps,
     sha256_files,
@@ -1262,6 +1263,7 @@ def main() -> None:
     handshake = build_client_contract(
         training_fps,
         normalization_hash=normalization_hash,
+        observation_schema=OBSERVATION_SCHEMA_27D_PLUS_EFFORT,
     )
     write_json(sock, handshake)
     handshake_reply = read_json(sock)

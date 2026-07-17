@@ -36,8 +36,12 @@ STATE_NAMES_18D = (
 ACTION_NAMES_4D = tuple(f"{name}_cmd_velocity" for name in CANONICAL_DOF_NAMES)
 CAMERA_KEYS = tuple(f"observation.images.{index}" for index in range(3))
 OBSERVATION_SCHEMA_LEGACY_18D = "legacy_18d_state"
+OBSERVATION_SCHEMA_27D_PLUS_EFFORT = "state_27d_plus_effort_4d"
 OBSERVATION_SCHEMA_28D_PLUS_EFFORT = "state_28d_plus_effort_4d"
 STATE_NAMES_28D = tuple(vla_observation_contract.STATE_NAMES_28D)
+STATE_NAMES_27D = tuple(
+    name for name in STATE_NAMES_28D if name != "phase_index"
+)
 EFFORT_NAMES_4D = tuple(vla_observation_contract.EFFORT_NAMES_4D)
 
 
@@ -133,6 +137,9 @@ def build_client_contract(
     if schema == OBSERVATION_SCHEMA_LEGACY_18D:
         state_names = STATE_NAMES_18D
         effort_names = ()
+    elif schema == OBSERVATION_SCHEMA_27D_PLUS_EFFORT:
+        state_names = STATE_NAMES_27D
+        effort_names = EFFORT_NAMES_4D
     elif schema == OBSERVATION_SCHEMA_28D_PLUS_EFFORT:
         state_names = STATE_NAMES_28D
         effort_names = EFFORT_NAMES_4D
@@ -180,6 +187,8 @@ def validate_client_contract(contract):
         schema = (
             OBSERVATION_SCHEMA_LEGACY_18D
             if state_names == STATE_NAMES_18D
+            else OBSERVATION_SCHEMA_27D_PLUS_EFFORT
+            if state_names == STATE_NAMES_27D
             else OBSERVATION_SCHEMA_28D_PLUS_EFFORT
             if state_names == STATE_NAMES_28D
             else ""
@@ -187,6 +196,11 @@ def validate_client_contract(contract):
     if schema == OBSERVATION_SCHEMA_LEGACY_18D:
         if state_names != STATE_NAMES_18D or effort_names:
             raise ValueError("Legacy checkpoint/runtime state schema mismatch")
+    elif schema == OBSERVATION_SCHEMA_27D_PLUS_EFFORT:
+        if state_names != STATE_NAMES_27D:
+            raise ValueError("27D checkpoint/runtime state schema mismatch")
+        if effort_names != EFFORT_NAMES_4D:
+            raise ValueError("4D effort checkpoint/runtime schema mismatch")
     elif schema == OBSERVATION_SCHEMA_28D_PLUS_EFFORT:
         if state_names != STATE_NAMES_28D:
             raise ValueError("28D checkpoint/runtime state schema mismatch")

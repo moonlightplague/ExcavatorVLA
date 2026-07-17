@@ -143,9 +143,11 @@ from excavator_common.deployment_contract import (
     CAMERA_KEYS,
     CANONICAL_DOF_NAMES,
     EFFORT_NAMES_4D,
+    OBSERVATION_SCHEMA_27D_PLUS_EFFORT,
     OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
     PHYSICS_HZ,
     PROTOCOL_VERSION,
+    STATE_NAMES_27D,
     STATE_NAMES_28D,
     PhysicsTickScheduler,
     canonical_values,
@@ -2337,6 +2339,154 @@ def main(args):
             ]
         )
 
+    def point_in_current_robot_frame(point_world, base_xy, base_yaw):
+        point = np.asarray(point_world, dtype=np.float32).reshape(-1)
+        base = np.asarray(base_xy, dtype=np.float32).reshape(-1)
+        if point.size < 3 or base.size < 2:
+            raise RuntimeError(
+                f"Invalid State27 target/base point: point={point}, base={base}"
+            )
+        dx = float(point[0] - base[0])
+        dy = float(point[1] - base[1])
+        cosine = math.cos(float(base_yaw))
+        sine = math.sin(float(base_yaw))
+        return [
+            cosine * dx + sine * dy,
+            -sine * dx + cosine * dy,
+            float(point[2]),
+        ]
+
+    def resolve_state27_dig_target():
+        center_x = float(
+            getattr(sand_module, "SAND_CENTER_X", SAND_INITIAL_CENTER[0])
+        )
+        center_y = float(
+            getattr(sand_module, "SAND_CENTER_Y", SAND_INITIAL_CENTER[1])
+        )
+        target_z = 0.35
+        source = "configured_sand_center"
+        positions_fn = (
+            sand_api.get("particle_positions_fn")
+            if isinstance(sand_api, dict)
+            else None
+        )
+        if callable(positions_fn):
+            try:
+                points = np.asarray(
+                    positions_fn(),
+                    dtype=np.float32,
+                ).reshape(-1, 3)
+                if len(points):
+                    radius_squared = (
+                        np.square(points[:, 0] - center_x)
+                        + np.square(points[:, 1] - center_y)
+                    )
+                    local_points = points[radius_squared <= 1.0]
+                    if len(local_points) < 32:
+                        local_points = points
+                    target_z = float(
+                        np.percentile(local_points[:, 2], 65.0)
+                    )
+                    source = "sand_particle_percentile65"
+            except Exception as exc:
+                print(
+                    "[STATE27] Dig target particle lookup failed:",
+                    repr(exc),
+                    flush=True,
+                )
+        return np.asarray(
+            [center_x, center_y, target_z],
+            dtype=np.float32,
+        ), source
+
+    def resolve_state27_unload_target():
+        truck_prim = stage.GetPrimAtPath("/World/DumpTruck")
+        if not truck_prim.IsValid():
+            return (
+                np.asarray(
+                    [4.14439, 6.72012, 4.222683],
+                    dtype=np.float32,
+                ),
+                "configured_fallback",
+            )
+        try:
+            bbox_cache = UsdGeom.BBoxCache(
+                Usd.TimeCode.Default(),
+                [
+                    UsdGeom.Tokens.default_,
+                    UsdGeom.Tokens.render,
+                    UsdGeom.Tokens.proxy,
+                ],
+                useExtentsHint=True,
+            )
+            aligned_range = (
+                bbox_cache.ComputeWorldBound(truck_prim)
+                .ComputeAlignedRange()
+            )
+            if not aligned_range.IsEmpty():
+                minimum_value = aligned_range.GetMin()
+                maximum_value = aligned_range.GetMax()
+                minimum = np.asarray(
+                    [
+                        float(minimum_value[0]),
+                        float(minimum_value[1]),
+                        float(minimum_value[2]),
+                    ],
+                    dtype=np.float64,
+                )
+                maximum = np.asarray(
+                    [
+                        float(maximum_value[0]),
+                        float(maximum_value[1]),
+                        float(maximum_value[2]),
+                    ],
+                    dtype=np.float64,
+                )
+                bounds = np.stack((minimum, maximum))
+                if (
+                    np.all(np.isfinite(bounds))
+                    and np.max(np.abs(bounds)) < 1.0e6
+                    and np.all(maximum >= minimum)
+                ):
+                    extent = maximum - minimum
+                    point = 0.5 * (minimum + maximum)
+                    point[2] = minimum[2] + 0.55 * max(
+                        0.0,
+                        float(extent[2]),
+                    )
+                    return point.astype(np.float32), "truck_bbox"
+        except Exception as exc:
+            print(
+                "[STATE27] Truck BBox lookup failed:",
+                repr(exc),
+                flush=True,
+            )
+        matrix = UsdGeom.Xformable(
+            truck_prim
+        ).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+        position = matrix.ExtractTranslation()
+        return np.asarray(
+            [float(position[0]), float(position[1]), float(position[2])],
+            dtype=np.float32,
+        ), "truck_origin"
+
+    state27_dig_target_world, state27_dig_target_source = (
+        resolve_state27_dig_target()
+    )
+    state27_unload_target_world, state27_unload_target_source = (
+        resolve_state27_unload_target()
+    )
+    state27_truck_yaw = read_truck_yaw_rad()
+    print(
+        "[STATE27] Fixed environment features:",
+        f"dig_target={state27_dig_target_world.tolist()}",
+        f"dig_source={state27_dig_target_source}",
+        f"unload_target={state27_unload_target_world.tolist()}",
+        f"unload_source={state27_unload_target_source}",
+        f"truck_yaw={state27_truck_yaw:.6f}",
+        flush=True,
+    )
+
     # TCP Bridge Server functions.
     # No USD prims, references, or other scene objects may be
     # created after the sand block above.
@@ -2428,6 +2578,9 @@ def main(args):
         "canonical_to_raw": list(canonical_to_raw),
         "camera_paths": dict(active_camera_paths),
         "camera_mode": "per_camera_persistent_viewport",
+        "observation_state_schema": OBSERVATION_SCHEMA_27D_PLUS_EFFORT,
+        "observation_state_names": list(STATE_NAMES_27D),
+        "observation_state_dim": len(STATE_NAMES_27D),
         "sand_hidden_visuals": list(hidden_sand_visuals),
     }
 
@@ -2732,10 +2885,10 @@ def main(args):
                     flush=True,
                 )
 
-            observation_state = [
+            base_state_14d = [
                 base_x,
                 base_y,
-                0.0,
+                base_yaw,
                 float(joint_positions[0]),
                 float(joint_positions[1]),
                 float(joint_positions[2]),
@@ -2773,6 +2926,59 @@ def main(args):
                     current_bucket_load - float(deployment_previous_load)
                 ) / max(1.0e-6, bridge_step_seconds)
             deployment_previous_load = current_bucket_load
+
+            if (
+                active_contract["observation_schema"]
+                == OBSERVATION_SCHEMA_27D_PLUS_EFFORT
+            ):
+                joint_velocities_state = np.asarray(
+                    qd,
+                    dtype=np.float32,
+                ).reshape(-1)
+                if joint_velocities_state.size < 4:
+                    raise RuntimeError(
+                        "State27 requires four joint velocities, got "
+                        f"{joint_velocities_state.shape}"
+                    )
+                dig_target_local = point_in_current_robot_frame(
+                    state27_dig_target_world,
+                    (base_x, base_y),
+                    base_yaw,
+                )
+                unload_target_local = point_in_current_robot_frame(
+                    state27_unload_target_world,
+                    (base_x, base_y),
+                    base_yaw,
+                )
+                relative_truck_yaw = (
+                    float(state27_truck_yaw) - float(base_yaw)
+                )
+                observation_state = (
+                    list(base_state_14d)
+                    + joint_velocities_state[:4].astype(float).tolist()
+                    + list(dig_target_local)
+                    + list(unload_target_local)
+                    + [
+                        math.sin(relative_truck_yaw),
+                        math.cos(relative_truck_yaw),
+                        float(deployment_bucket_load_rate),
+                    ]
+                )
+                if len(observation_state) != len(STATE_NAMES_27D):
+                    raise RuntimeError(
+                        "State27 construction produced "
+                        f"{len(observation_state)} values"
+                    )
+                if not np.all(
+                    np.isfinite(
+                        np.asarray(observation_state, dtype=np.float32)
+                    )
+                ):
+                    raise RuntimeError(
+                        f"State27 contains NaN/Inf: {observation_state}"
+                    )
+            else:
+                observation_state = list(base_state_14d)
 
             task_text = "Dig soil from the marked area and dump it into the target container."
             try:
@@ -2901,7 +3107,7 @@ def main(args):
                         )
                     observation_state_28d = (
                         vla_observation_contract.build_state_28d(
-                            base_state_14d=observation_state,
+                            base_state_14d=base_state_14d,
                             joint_velocity_4d=deployment_joint_velocity,
                             phase=phase,
                             dig_target_world_xyz=dig_target_xyz,
@@ -2943,6 +3149,13 @@ def main(args):
                 "raw_joint_positions": q_raw.tolist(),
                 "raw_joint_velocities": qd_raw.tolist(),
                 "observation_state": observation_state,
+                "observation_state_schema": active_contract[
+                    "observation_schema"
+                ],
+                "observation_state_names": list(
+                    active_contract["state_names"]
+                ),
+                "observation_state_dim": len(observation_state),
                 "observation_effort": observation_effort,
                 "observation_state_28d": observation_state_28d,
                 "observation_32d_ready": observation_32d_ready,
@@ -2952,10 +3165,20 @@ def main(args):
                     if active_contract["observation_schema"]
                     == OBSERVATION_SCHEMA_28D_PLUS_EFFORT
                     else {
-                        "schema_version": "legacy_18d_state",
+                        "schema_version": active_contract[
+                            "observation_schema"
+                        ],
                         "observation.state": {
-                            "shape": [18],
+                            "shape": [
+                                len(active_contract["state_names"])
+                            ],
                             "names": list(active_contract["state_names"]),
+                        },
+                        "observation.effort": {
+                            "shape": [
+                                len(active_contract["effort_names"])
+                            ],
+                            "names": list(active_contract["effort_names"]),
                         },
                     }
                 ),

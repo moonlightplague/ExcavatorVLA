@@ -52,6 +52,22 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertEqual(len(checked["state_names"]), 28)
         self.assertEqual(len(checked["effort_names"]), 4)
 
+    def test_27d_plus_effort_contract_round_trip(self):
+        payload = contract.build_client_contract(
+            10,
+            normalization_hash="state27",
+            observation_schema=contract.OBSERVATION_SCHEMA_27D_PLUS_EFFORT,
+        )
+        checked = contract.validate_client_contract(payload)
+        self.assertEqual(
+            checked["observation_schema"],
+            contract.OBSERVATION_SCHEMA_27D_PLUS_EFFORT,
+        )
+        self.assertEqual(tuple(checked["state_names"]), contract.STATE_NAMES_27D)
+        self.assertNotIn("phase_index", checked["state_names"])
+        self.assertEqual(len(checked["state_names"]), 27)
+        self.assertEqual(len(checked["effort_names"]), 4)
+
     def test_28d_contract_defaults_to_auto_phase_without_external_stage(self):
         payload = contract.build_client_contract(
             5,

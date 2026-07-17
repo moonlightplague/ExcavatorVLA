@@ -2838,6 +2838,9 @@ def main(args):
                     f"Dig soil from the sand pile near {sand_s}, {sand_dir} of the excavator, "
                     f"and dump it into the truck bed near {unload_s}, {unload_dir} of the excavator."
                 )
+            except Exception:
+                pass
+
             if not np.all(
                 np.isfinite(np.asarray(observation_state, dtype=np.float32))
             ):

@@ -34,6 +34,20 @@ class DeploymentSceneContractTests(unittest.TestCase):
         )
         self.assertTrue(all(math.isfinite(value) for value in values))
 
+    def test_wrapped_yaw_error_uses_shortest_difference(self):
+        self.assertAlmostEqual(
+            scene_contract.wrapped_yaw_error_deg(-179.0, 179.0),
+            2.0,
+        )
+        self.assertAlmostEqual(
+            scene_contract.wrapped_yaw_error_deg(266.625, -93.375),
+            0.0,
+        )
+
+    def test_non_finite_yaw_is_rejected(self):
+        with self.assertRaises(ValueError):
+            scene_contract.wrapped_yaw_error_deg(float("nan"), 0.0)
+
     def test_run_simulation_has_no_obsolete_target_helper_or_truck_path(self):
         source = (
             Path(__file__).resolve().parents[1] / "run_simulation.py"
@@ -41,6 +55,7 @@ class DeploymentSceneContractTests(unittest.TestCase):
         self.assertNotIn("world_point_to_robot_local_feature(", source)
         self.assertNotIn('GetPrimAtPath("/World/DumpTruck")', source)
         self.assertNotIn("SAND_INITIAL_CENTER", source)
+        self.assertIn("prim_local_yaw_z_deg(truck_prim)", source)
 
 
 if __name__ == "__main__":

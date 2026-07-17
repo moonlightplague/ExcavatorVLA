@@ -46,6 +46,15 @@ def planar_radius(xy: Sequence[float]) -> float:
     return math.hypot(x, y)
 
 
+def wrapped_yaw_error_deg(actual_deg: float, expected_deg: float) -> float:
+    """Return the smallest absolute difference between two yaw angles."""
+    actual = float(actual_deg)
+    expected = float(expected_deg)
+    if not math.isfinite(actual) or not math.isfinite(expected):
+        raise ValueError("yaw angles must be finite")
+    return abs((actual - expected + 180.0) % 360.0 - 180.0)
+
+
 def validate_fixed_scene_profile() -> dict:
     """Validate the fixed profile against the generator's world workspace."""
     sand_xy = _finite_vector(

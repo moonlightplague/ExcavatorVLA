@@ -859,32 +859,51 @@ def main(args):
                 normalized_order.append(op)
         xformable.SetXformOpOrder(normalized_order)
 
-    def prim_world_position_and_yaw(prim):
+    def prim_world_position(prim):
         matrix = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(
             Usd.TimeCode.Default()
         )
         position = matrix.ExtractTranslation()
-        rotation = matrix.ExtractRotationQuat()
-        imaginary = rotation.GetImaginary()
-        yaw = math.atan2(
-            2.0
-            * (
-                float(rotation.GetReal()) * float(imaginary[2])
-                + float(imaginary[0]) * float(imaginary[1])
-            ),
-            1.0
-            - 2.0
-            * (
-                float(imaginary[1]) * float(imaginary[1])
-                + float(imaginary[2]) * float(imaginary[2])
-            ),
+        return np.asarray(
+            [float(position[0]), float(position[1]), float(position[2])],
+            dtype=np.float64,
         )
-        return (
-            np.asarray(
-                [float(position[0]), float(position[1]), float(position[2])],
-                dtype=np.float64,
-            ),
-            yaw,
+
+    def prim_local_yaw_z_deg(prim):
+        """Read truck yaw with the same local-op semantics as collection."""
+        if prim is None or not prim.IsValid():
+            raise RuntimeError("Cannot read yaw from an invalid USD prim")
+        vector_rotate_types = {
+            UsdGeom.XformOp.TypeRotateXYZ,
+            UsdGeom.XformOp.TypeRotateXZY,
+            UsdGeom.XformOp.TypeRotateYXZ,
+            UsdGeom.XformOp.TypeRotateYZX,
+            UsdGeom.XformOp.TypeRotateZXY,
+            UsdGeom.XformOp.TypeRotateZYX,
+        }
+        for op in UsdGeom.Xformable(prim).GetOrderedXformOps():
+            op_type = op.GetOpType()
+            if op_type == UsdGeom.XformOp.TypeRotateZ:
+                return float(op.Get(Usd.TimeCode.Default()))
+            if op_type in vector_rotate_types:
+                value = op.Get(Usd.TimeCode.Default())
+                if value is None or len(value) < 3:
+                    break
+                return float(value[2])
+            if op_type == UsdGeom.XformOp.TypeOrient:
+                value = op.Get(Usd.TimeCode.Default())
+                if value is None:
+                    break
+                imaginary = value.GetImaginary()
+                return math.degrees(
+                    2.0
+                    * math.atan2(
+                        float(imaginary[2]),
+                        float(value.GetReal()),
+                    )
+                )
+        raise RuntimeError(
+            f"No supported local rotation op on truck prim {prim.GetPath()}"
         )
 
     def apply_fixed_training_truck_pose():
@@ -904,36 +923,29 @@ def main(args):
             fixed_scene_profile["truck_translation_xyz"],
             fixed_scene_profile["truck_yaw_deg"],
         )
-        actual_position, actual_yaw = prim_world_position_and_yaw(truck_prim)
+        actual_position = prim_world_position(truck_prim)
+        actual_local_yaw_deg = prim_local_yaw_z_deg(truck_prim)
         expected_position = np.asarray(
             fixed_scene_profile["truck_translation_xyz"],
             dtype=np.float64,
         )
         position_error = float(np.linalg.norm(actual_position - expected_position))
-        yaw_error = abs(
-            math.atan2(
-                math.sin(
-                    actual_yaw
-                    - math.radians(fixed_scene_profile["truck_yaw_deg"])
-                ),
-                math.cos(
-                    actual_yaw
-                    - math.radians(fixed_scene_profile["truck_yaw_deg"])
-                ),
-            )
+        yaw_error_deg = deployment_scene_contract.wrapped_yaw_error_deg(
+            actual_local_yaw_deg,
+            fixed_scene_profile["truck_yaw_deg"],
         )
-        if position_error > 0.02 or yaw_error > math.radians(0.25):
+        if position_error > 0.02 or yaw_error_deg > 0.25:
             raise RuntimeError(
                 "Truck pose did not match the fixed training profile: "
                 f"position_error={position_error:.6f}, "
-                f"yaw_error_deg={math.degrees(yaw_error):.6f}"
+                f"local_yaw_error_deg={yaw_error_deg:.6f}"
             )
         print(
             "[SCENE CONTRACT] Fixed training truck pose applied:",
             f"root={TRUCK_ROOT_PATH}",
             f"bed={TRUCK_BED_COLLISION_PATH}",
             f"position={actual_position.tolist()}",
-            f"yaw_deg={math.degrees(actual_yaw):.6f}",
+            f"local_yaw_deg={actual_local_yaw_deg:.6f}",
             f"unload_landing={list(fixed_scene_profile['unload_landing_xyz'])}",
             flush=True,
         )
@@ -2527,19 +2539,7 @@ def main(args):
             raise RuntimeError(
                 f"truck prim {TRUCK_ROOT_PATH} is unavailable"
             )
-        matrix = UsdGeom.Xformable(truck_prim).ComputeLocalToWorldTransform(
-            Usd.TimeCode.Default()
-        )
-        rotation = matrix.ExtractRotationQuat()
-        imaginary = rotation.GetImaginary()
-        return quaternion_yaw_wxyz(
-            [
-                float(rotation.GetReal()),
-                float(imaginary[0]),
-                float(imaginary[1]),
-                float(imaginary[2]),
-            ]
-        )
+        return math.radians(prim_local_yaw_z_deg(truck_prim))
 
     def resolve_state27_dig_target():
         center_x = float(

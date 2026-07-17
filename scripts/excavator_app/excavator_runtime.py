@@ -1030,6 +1030,8 @@ MOVE_REACH_WAIT_MIN_FRAMES = 12
 MOVE_REACH_WAIT_MAX_FRAMES = 180
 MOVE_REACH_EXTRA_TIME_RATIO = 0.35
 MOVE_DURATION_MARGIN_SECONDS = 0.25
+MOTION_CONTINUOUS_HANDOFF_MAX_ERR_DEG = 8.0
+MOTION_CONTINUOUS_HANDOFF_TTL_SECONDS = 10.0
 
 JOINT_DRIVE_GAINS = {
     "swing": {"stiffness": 1.8e7, "damping": 1.8e6, "max_force": 8.0e7},
@@ -1105,15 +1107,15 @@ UNLOAD_DROP_ROLL_OFFSET_PER_M = 0.10
 UNLOAD_DROP_TANGENTIAL_GAIN = 0.36
 UNLOAD_DROP_MAX_ROLL_OFFSET = 1.25
 UNLOAD_DROP_MAX_XY_CORRECTION = 1.35
-UNLOAD_DUMP_STEP_DEG = 10.0
-UNLOAD_DUMP_STEP_SECONDS = 0.12
+UNLOAD_DUMP_OPEN_RATE_DEG_S = 150.0
+UNLOAD_DUMP_MAX_OPEN_SECONDS = 2.60
 UNLOAD_DUMP_STOP_BUCKET_FRACTION = 0.15
 UNLOAD_DUMP_FLOW_CENTER_BUCKET_DEG = -25.0
 UNLOAD_DROP_IK_CORRECTION_ITERS = 5
 UNLOAD_PRE_DUMP_ALIGN_MIN_SECONDS = 0.35
 UNLOAD_PRE_DUMP_ALIGN_MAX_SECONDS = 1.80
 UNLOAD_PRE_DUMP_NON_BUCKET_TOL_DEG = 0.75
-UNLOAD_DUMP_METRIC_SAMPLE_STRIDE_LOADED = 3
+UNLOAD_DUMP_METRIC_SAMPLE_FRAMES = 8
 UNLOAD_ACTUAL_BUCKET_XY_MARGIN = 0.08
 UNLOAD_ACTUAL_LOAD_MARKER_XY_TOL = 0.42
 UNLOAD_ACTUAL_MIN_ABOVE_WALL_Z = 0.04
@@ -20957,6 +20959,22 @@ def sync_motion_start_q(label=""):
         return CTRL.q_cmd.copy()
 
 
+def set_motion_continuous_handoff(next_stage):
+    STATE["motion_continuous_handoff"] = {
+        "next_stage": str(next_stage),
+        "expires_at": time.time() + float(MOTION_CONTINUOUS_HANDOFF_TTL_SECONDS),
+    }
+
+
+def consume_motion_continuous_handoff(stage_name):
+    handoff = STATE.pop("motion_continuous_handoff", None)
+    if not isinstance(handoff, dict):
+        return False
+    if time.time() > float(handoff.get("expires_at", 0.0) or 0.0):
+        return False
+    return str(handoff.get("next_stage", "")) == str(stage_name)
+
+
 def estimate_stage_motion_seconds(q0, q1, requested_seconds=0.0, speed_multiplier=None):
     if speed_multiplier is None:
         sm = get_speed_multiplier()
@@ -21336,7 +21354,14 @@ async def move_to_profile_sampled_replay(
     return True, emitted, "ok", False
 
 
-async def wait_for_motion_reached(q_goal, label="", mode="auto", seconds_eff=0.0, record_failure=True):
+async def wait_for_motion_reached(
+    q_goal,
+    label="",
+    mode="auto",
+    seconds_eff=0.0,
+    record_failure=True,
+    min_frames_override=None,
+):
     try:
         q_goal = CTRL.clip_limits(np.array(q_goal, dtype=np.float32).reshape(-1)[:4].copy())
     except Exception:
@@ -21345,7 +21370,11 @@ async def wait_for_motion_reached(q_goal, label="", mode="auto", seconds_eff=0.0
         int(MOVE_REACH_WAIT_MAX_FRAMES),
         int(max(0.0, float(seconds_eff)) * CONTROL_HZ * MOVE_REACH_EXTRA_TIME_RATIO),
     )
-    min_frames = max(0, int(MOVE_REACH_WAIT_MIN_FRAMES))
+    min_frames = (
+        max(0, int(MOVE_REACH_WAIT_MIN_FRAMES))
+        if min_frames_override is None
+        else max(0, int(min_frames_override))
+    )
     last_detail = "not_checked"
     final_carry_recovery_count = 0
     final_carry_recovery_last_time = 0.0
@@ -21632,13 +21661,21 @@ async def move_to_profile(
     mode="auto",
     q_start_override=None,
     path_waypoints=None,
+    path_stage_names=None,
+    path_stage_indices=None,
+    continuous_handoff_in=False,
+    continuous_handoff_out=False,
 ):
-    ready, reason, _detail = await wait_for_articulation_action_ready(
-        f"{label}_stage_start",
-        min_stable_frames=ACTION_READY_MIN_STABLE_FRAMES,
-        max_frames=ACTION_READY_STAGE_MAX_WAIT_FRAMES,
-        record_failure=True,
-    )
+    _detail = articulation_action_ready_detail()
+    ready = bool(_detail.get("ready", False))
+    reason = "ok" if ready else f"action_channel_not_ready {format_action_ready_detail(_detail)}"
+    if not ready or q_start_override is None:
+        ready, reason, _detail = await wait_for_articulation_action_ready(
+            f"{label}_stage_start",
+            min_stable_frames=ACTION_READY_MIN_STABLE_FRAMES,
+            max_frames=ACTION_READY_STAGE_MAX_WAIT_FRAMES,
+            record_failure=True,
+        )
     if not ready:
         update_status(f"[DIG EXEC FAILED] {label}: action_channel_not_ready; {reason}", force=True)
         dataset_record_event("move_action_channel_not_ready", f"{label}:{mode}:{reason}")
@@ -21672,6 +21709,8 @@ async def move_to_profile(
         q1 = force_loaded_carry_bucket_q(q1, reference=q0, label=label or mode)
     motion_path_points = None
     motion_path_cumulative = None
+    motion_path_stage_names = None
+    motion_path_stage_indices = None
     motion_path_min_seconds = 0.0
     if path_waypoints:
         path_points = [q0.copy()]
@@ -21715,6 +21754,11 @@ async def move_to_profile(
         )
         motion_path_cumulative[-1] = 1.0
         motion_path_points = path_points
+        segment_count = len(path_points) - 1
+        if isinstance(path_stage_names, (list, tuple)) and len(path_stage_names) == segment_count:
+            motion_path_stage_names = [str(value) for value in path_stage_names]
+        if isinstance(path_stage_indices, (list, tuple)) and len(path_stage_indices) == segment_count:
+            motion_path_stage_indices = [int(value) for value in path_stage_indices]
     q_final_cmd = q1.copy()
     q_stage_goal = q1.copy()
     contact_stage_name = str(label or mode)
@@ -21867,7 +21911,16 @@ async def move_to_profile(
             return False
 
         u = float(i + 1) / steps
-        s = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u)
+        if continuous_handoff_in and continuous_handoff_out:
+            s = u
+        elif continuous_handoff_in:
+            s = u + u * u - u * u * u
+        elif continuous_handoff_out:
+            s = u * u * (2.0 - u)
+        else:
+            s = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u)
+        active_motion_mode = str(mode)
+        active_motion_label = str(label)
         if motion_path_points is None:
             q = interpolate_q_motion(q0, q1, s, mode=mode, label=label)
         else:
@@ -21884,6 +21937,11 @@ async def move_to_profile(
                 mode=mode,
                 label=label,
             )
+            if motion_path_stage_names is not None:
+                active_motion_mode = motion_path_stage_names[segment_idx]
+                active_motion_label = active_motion_mode
+            if motion_path_stage_indices is not None:
+                STATE["active_plan_stage_index"] = int(motion_path_stage_indices[segment_idx])
         if carry_bucket_world_rad is not None:
             carry_calc = bucket_joint_for_world_angle(q, carry_bucket_world_rad, end_effector="load")
             if carry_calc is not None:
@@ -21950,7 +22008,7 @@ async def move_to_profile(
 
         q_final_cmd = q.copy()
         apply_t = execution_stage_profile_now(exec_profile)
-        ok, reason = CTRL.apply_target_direct(q, mode=mode)
+        ok, reason = CTRL.apply_target_direct(q, mode=active_motion_mode)
         execution_stage_profile_add_elapsed(exec_profile, "apply_target_ms", apply_t, "cmd_steps", 1)
         if not ok:
             if "physics view not ready" in str(reason).lower() or "robot not ready" in str(reason).lower():
@@ -21994,14 +22052,18 @@ async def move_to_profile(
                         exec_profile["dataset_sample_skipped"] = int(exec_profile.get("dataset_sample_skipped", 0) or 0) + 1
                 else:
                     sample_t = execution_stage_profile_now(exec_profile)
-                    await dataset_record_sample_async(mode, q_cmd=CTRL.q_cmd.copy(), label=label)
+                    await dataset_record_sample_async(
+                        active_motion_mode,
+                        q_cmd=CTRL.q_cmd.copy(),
+                        label=active_motion_label,
+                    )
                     execution_stage_profile_add_elapsed(exec_profile, "dataset_sample_ms", sample_t, "dataset_sample_count", 1)
                     if isinstance(exec_profile, dict):
                         camera_ms = STATE.pop("dataset_last_camera_capture_ms", None)
                         if camera_ms is not None:
                             execution_stage_profile_add_ms(exec_profile, "camera_ms", float(camera_ms), "camera_count", 1)
                     execution_stage_profile_add_dataset_spans(exec_profile)
-            notify_sand_site_tool_sample(mode)
+            notify_sand_site_tool_sample(active_motion_mode)
         if is_sand_contact_phase(contact_stage_name) and bool(EXEC_AB_DISABLE_SAND_GATE):
             if isinstance(exec_profile, dict):
                 exec_profile["gate_skipped"] = int(exec_profile.get("gate_skipped", 0) or 0) + 1
@@ -22270,7 +22332,7 @@ async def move_to_profile(
                 break
         if not is_sand_contact_phase(contact_stage_name):
             freeze_t = execution_stage_profile_now(exec_profile)
-            check_freeze_state(f"move_profile:{mode}")
+            check_freeze_state(f"move_profile:{active_motion_mode}")
             execution_stage_profile_add_elapsed(exec_profile, "freeze_check_ms", freeze_t, "freeze_check_count", 1)
 
     if carry_bucket_world_rad is not None:
@@ -22306,7 +22368,19 @@ async def move_to_profile(
         finish_exec_profile("done", f"sand_contact_advance:{contact_advance_reason}")
         return True
 
-    if not await wait_for_motion_reached(q_final_cmd, label=label, mode=mode, seconds_eff=seconds_eff):
+    handoff_without_wait = False
+    if continuous_handoff_out:
+        try:
+            _ok, _detail, _blocked, _swing_err, _max_err, _q_real = motion_reach_report(q_final_cmd)
+            handoff_without_wait = float(_max_err) <= float(MOTION_CONTINUOUS_HANDOFF_MAX_ERR_DEG)
+        except Exception:
+            handoff_without_wait = False
+    if not handoff_without_wait and not await wait_for_motion_reached(
+        q_final_cmd,
+        label=label,
+        mode=mode,
+        seconds_eff=seconds_eff,
+    ):
         update_status(f"[DIG EXEC FAILED] {label}: path_deviation; real joints did not reach planned command", force=True)
         if bool(STATE.get("auto_collect_active", False)):
             try:
@@ -22515,17 +22589,13 @@ LOADED_ROUTE_ADAPTIVE_BUCKET_HARD_ERR_DEG = 42.0
 LOADED_ROUTE_ADAPTIVE_SWING_CRITICAL_ERR_DEG = 42.0
 LOADED_ROUTE_ADAPTIVE_SWING_CRITICAL_MIN_SCALE = 0.34
 LOADED_ROUTE_ADAPTIVE_CORNER_WINDOW_SECONDS = 0.75
-LOADED_ROUTE_ADAPTIVE_CORNER_MIN_SCALE = 0.42
+LOADED_ROUTE_ADAPTIVE_CORNER_MIN_SCALE = 1.00
 LOADED_ROUTE_ADAPTIVE_LOG_INTERVAL = 1.0
-LOADED_ROUTE_ADAPTIVE_MAX_WALL_MULTIPLIER = 5.0
-LOADED_ROUTE_ADAPTIVE_MAX_EXTRA_SECONDS = 20.0
 LOADED_ROUTE_ACCEL_LIMITING = True
-LOADED_ROUTE_ACCEL_MIN_STEP_SCALE = 0.80
+LOADED_ROUTE_ACCEL_MIN_STEP_SCALE = 0.75
 LOADED_ROUTE_ACCEL_BACKTRACK_ITERS = 2
-LOADED_ROUTE_MAX_LOAD_ACCEL_MPS2 = 80.0
-LOADED_ROUTE_MAX_SWING_ACCEL_DEG_S2 = 700.0
-LOADED_ROUTE_MAX_JOINT_ACCEL_DEG_S2 = 700.0
-LOADED_ROUTE_MAX_BUCKET_ACCEL_DEG_S2 = 2500.0
+LOADED_ROUTE_SWING_ACCEL_SCALE = 0.75
+LOADED_ROUTE_MAX_SWING_ACCEL_DEG_S2 = 700.0 * LOADED_ROUTE_SWING_ACCEL_SCALE
 LOADED_ROUTE_ACCEL_LOG_INTERVAL = 1.0
 LOADED_ROUTE_CARRY_SWING_MAX_DEG_PER_S = 16.0
 LOADED_ROUTE_CARRY_SWING_TIME_PAD_SECONDS = 0.45
@@ -33953,28 +34023,38 @@ async def wait_for_dump_settle(stage_name, task_id=None):
 
 
 async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
-    ready, reason, _detail = await wait_for_articulation_action_ready(
-        f"{stage_name}_bucket_dump_start",
-        min_stable_frames=ACTION_READY_MIN_STABLE_FRAMES,
-        max_frames=ACTION_READY_STAGE_MAX_WAIT_FRAMES,
-        record_failure=True,
-    )
-    if not ready:
-        update_status(f"[UNLOAD BLOCKED] {stage_name}: action_channel_not_ready; {reason}", force=True)
-        set_execution_failure_reason(f"execution_failed/unload_dump_action_not_ready:{stage_name}:{reason}")
-        return False
+    if not robot_articulation_action_ready():
+        ready, reason, _detail = await wait_for_articulation_action_ready(
+            f"{stage_name}_bucket_dump_start",
+            min_stable_frames=ACTION_READY_MIN_STABLE_FRAMES,
+            max_frames=ACTION_READY_STAGE_MAX_WAIT_FRAMES,
+            record_failure=True,
+        )
+        if not ready:
+            update_status(f"[UNLOAD BLOCKED] {stage_name}: action_channel_not_ready; {reason}", force=True)
+            set_execution_failure_reason(f"execution_failed/unload_dump_action_not_ready:{stage_name}:{reason}")
+            return False
 
     q0 = sync_motion_start_q(f"{stage_name}_bucket_dump")
     q1 = clip_unload_dump_command(q_dump, reference=q0)
     bucket_idx = CTRL.name_to_idx.get("bucket", 3)
+    start_bucket = float(q0[bucket_idx])
     target_bucket = float(q1[bucket_idx])
-    step_rad = deg_to_rad(max(2.0, float(UNLOAD_DUMP_STEP_DEG)))
-    max_steps = max(8, int(math.ceil(abs(target_bucket - float(q0[bucket_idx])) / max(1e-4, step_rad))) + 4)
-    wait_frames = max(3, int(float(UNLOAD_DUMP_STEP_SECONDS) * 60))
+    bucket_delta = float(target_bucket - start_bucket)
+    open_rate_rad_s = deg_to_rad(max(1.0, float(UNLOAD_DUMP_OPEN_RATE_DEG_S)))
+    profile_seconds = min(
+        float(UNLOAD_DUMP_MAX_OPEN_SECONDS),
+        max(float(CONTROL_DT), 1.5 * abs(bucket_delta) / max(1e-4, open_rate_rad_s)),
+    )
+    profile_frames = max(2, int(math.ceil(profile_seconds * float(CONTROL_HZ))))
+    max_frames = max(
+        profile_frames,
+        int(math.ceil(float(UNLOAD_DUMP_MAX_OPEN_SECONDS) * float(CONTROL_HZ))),
+    )
+    metric_frames = max(1, int(UNLOAD_DUMP_METRIC_SAMPLE_FRAMES))
+    opening_positive = bucket_delta >= 0.0
     loaded_route_dump = str(STATE.get("active_task_name", "")) == "loaded_unload_route_test"
-    metric_stride = max(1, int(UNLOAD_DUMP_METRIC_SAMPLE_STRIDE_LOADED if loaded_route_dump else 1))
     start_metrics = record_phase_metrics("before_dump_direct")
-    await record_unload_trajectory_sample_async(stage_name, "before_dump_direct", q_cmd=q0)
     start_bucket_count = int(start_metrics.get("bucket_from_pile_count", 0)) if isinstance(start_metrics, dict) else 0
     start_bin_count = int(start_metrics.get("bin_from_pile_count", 0)) if isinstance(start_metrics, dict) and "bin_from_pile_count" in start_metrics else None
     if loaded_route_dump and bool(LOADED_ROUTE_STAGE_PARTICLE_DIAGNOSTICS):
@@ -33982,33 +34062,37 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
     info_print(
         "[UNLOAD DUMP DIRECT START]",
         f"stage={stage_name}",
-        "policy=progressive_open_until_release",
-        f"steps={max_steps}",
-        f"step_deg={rad_to_deg(step_rad):.2f}",
-        f"bucket_start={rad_to_deg(float(q0[bucket_idx])):.2f}deg",
+        "policy=continuous_per_physics_frame_cubic_smoothstep",
+        f"profile_frames={profile_frames}",
+        f"max_frames={max_frames}",
+        f"peak_open_rate={float(UNLOAD_DUMP_OPEN_RATE_DEG_S):.1f}deg/s",
+        f"max_open_seconds={float(UNLOAD_DUMP_MAX_OPEN_SECONDS):.2f}",
+        f"bucket_start={rad_to_deg(start_bucket):.2f}deg",
         f"bucket_target={rad_to_deg(target_bucket):.2f}deg",
         f"bucket_start_particles={start_bucket_count}",
         f"bin_start_particles={'final_only' if start_bin_count is None else start_bin_count}",
-        f"metric_stride={metric_stride}",
+        f"metric_frames={metric_frames}",
         force_log=debug_diagnostics_enabled(),
     )
 
     q_final = q0.copy()
     last_metrics = start_metrics
-    for i in range(max_steps):
+    target_tolerance = deg_to_rad(1.5)
+    release_tolerance = deg_to_rad(2.0)
+    stop_bucket_count = max(0, int(start_bucket_count * float(UNLOAD_DUMP_STOP_BUCKET_FRACTION)))
+    release_stop_bucket = min(
+        target_bucket,
+        deg_to_rad(float(UNLOAD_DUMP_FLOW_CENTER_BUCKET_DEG)),
+    )
+    for frame in range(max_frames):
         if motion_cancel_requested(task_id):
             update_status(f"[MOVE STOPPED] {stage_name}_dump_pose", force=True)
             return False
-        try:
-            q_real = q_real_near_command(get_real_joint_positions(), CTRL.q_cmd)
-        except Exception:
-            q_real = CTRL.q_cmd.copy()
-        real_bucket = float(q_real[bucket_idx])
-        if real_bucket >= target_bucket - deg_to_rad(1.5):
-            q_final = q_real.copy()
-            break
-        q = q_real.copy()
-        q[bucket_idx] = min(target_bucket, real_bucket + step_rad)
+
+        u = min(1.0, float(frame + 1) / float(profile_frames))
+        smooth_u = u * u * (3.0 - 2.0 * u)
+        q = q0.copy()
+        q[bucket_idx] = start_bucket + bucket_delta * smooth_u
         q = clip_unload_dump_command(q, reference=CTRL.q_cmd)
         q_final = q.copy()
         ok, send_reason = CTRL.send_action(q, mode="unload_dump")
@@ -34016,9 +34100,25 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
             update_status(f"[UNLOAD BLOCKED] {stage_name}: bucket dump action failed; {send_reason}", force=True)
             set_execution_failure_reason(f"execution_failed/unload_dump_action_failed:{stage_name}:{send_reason}")
             return False
-        await step_updates(wait_frames)
-        await record_unload_trajectory_sample_async(stage_name, "during_dump_direct", q_cmd=q)
-        do_metric_sample = (i == 0) or ((i + 1) >= max_steps) or ((i + 1) % metric_stride == 0)
+        await step_updates(1)
+        if dataset_record_sample_due():
+            await record_unload_trajectory_sample_async(
+                stage_name,
+                "during_dump_direct",
+                q_cmd=q,
+                force=False,
+            )
+        try:
+            q_after = q_real_near_command(get_real_joint_positions(), q)
+        except Exception:
+            q_after = q.copy()
+        q_final = q_after.copy()
+        do_metric_sample = (
+            frame == 0
+            or (frame + 1) >= max_frames
+            or (frame + 1) == profile_frames
+            or (frame + 1) % metric_frames == 0
+        )
         if do_metric_sample:
             last_metrics = record_phase_metrics("during_dump_direct")
         bucket_now = int(last_metrics.get("bucket_from_pile_count", 0)) if isinstance(last_metrics, dict) else 0
@@ -34027,19 +34127,38 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
             info_print(
                 "[UNLOAD DUMP DIRECT SAMPLE]",
                 f"stage={stage_name}",
-                f"i={i + 1}/{max_steps}",
+                f"frame={frame + 1}/{max_frames}",
+                f"profile_u={u:.3f}",
                 f"bucket_cmd={rad_to_deg(float(q[bucket_idx])):.2f}deg",
-                f"bucket_real={rad_to_deg(real_bucket):.2f}deg",
+                f"bucket_real={rad_to_deg(float(q_after[bucket_idx])):.2f}deg",
                 f"bucket_delta={bucket_now - start_bucket_count}",
                 f"bin_delta={'final_only' if bin_now is None or start_bin_count is None else bin_now - start_bin_count}",
                 force_log=debug_diagnostics_enabled(),
             )
-        stop_bucket_count = max(0, int(start_bucket_count * float(UNLOAD_DUMP_STOP_BUCKET_FRACTION)))
         if (
-            bucket_now <= stop_bucket_count
-            and float(q[bucket_idx]) >= target_bucket - deg_to_rad(8.0)
+            do_metric_sample
+            and bucket_now <= stop_bucket_count
+            and float(q_after[bucket_idx]) >= release_stop_bucket - release_tolerance
         ):
-            q_final = q_real.copy()
+            q_final = q_after.copy()
+            info_print(
+                "[UNLOAD DUMP RELEASE COMPLETE]",
+                f"stage={stage_name}",
+                f"bucket_particles={bucket_now}/{start_bucket_count}",
+                f"stop_threshold={stop_bucket_count}",
+                f"bucket_real={rad_to_deg(float(q_after[bucket_idx])):.2f}deg",
+                "decision=stop_opening_and_settle",
+                force_log=debug_diagnostics_enabled(),
+            )
+            break
+        real_bucket = float(q_after[bucket_idx])
+        target_reached = (
+            real_bucket >= target_bucket - target_tolerance
+            if opening_positive
+            else real_bucket <= target_bucket + target_tolerance
+        )
+        if u >= 1.0 and target_reached:
+            q_final = q_after.copy()
             break
 
     STATE["dataset_current_q_goal"] = q_final.copy()
@@ -34049,7 +34168,7 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
         q_final = q_hold.copy()
     except Exception:
         pass
-    await step_updates(4)
+    await step_updates(1)
     try:
         q_real = q_real_near_command(get_real_joint_positions(), q_final)
         err_deg = abs(rad_to_deg(float(q_final[bucket_idx] - q_real[bucket_idx])))
@@ -34076,7 +34195,6 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
 
 async def dump_bucket_at_target(stage_name, task_id=None, planned_q_dump=None, planned_q_release_align=None):
     dump_deg = unload_dump_target_deg()
-    record_phase_metrics("before_dump")
 
     q_dump = None
     q_real = None
@@ -34444,6 +34562,10 @@ async def execute_pre_dig_route_continuous_group(seq, start_index, task_id=None)
 
     route_waypoints = [stage["q_goal"] for stage in prepared[:-1]]
     final_stage = prepared[-1]
+    next_stage_name = ""
+    if int(next_index) < len(seq):
+        next_stage_name = str(seq[int(next_index)][0])
+    continuous_handoff = next_stage_name == "approach_contact"
     total_seconds = max(0.08, sum(float(stage["duration"]) for stage in prepared))
     update_status(
         f"[PRE DIG ROUTE] continuous path waypoints={len(route_waypoints)} "
@@ -34467,6 +34589,9 @@ async def execute_pre_dig_route_continuous_group(seq, start_index, task_id=None)
         task_id=task_id,
         mode="pre_dig",
         path_waypoints=route_waypoints,
+        path_stage_names=[stage["name"] for stage in prepared],
+        path_stage_indices=[stage["index"] for stage in prepared],
+        continuous_handoff_out=continuous_handoff,
     )
     if not success or (task_id is not None and not task_alive(task_id)):
         reason_text = str(
@@ -34476,6 +34601,8 @@ async def execute_pre_dig_route_continuous_group(seq, start_index, task_id=None)
         close_group("failed", reason_text)
         return False, int(start_index)
 
+    if continuous_handoff:
+        set_motion_continuous_handoff(next_stage_name)
     STATE["dig_plan_step_index"] = int(STATE.get("dig_plan_step_index", 0)) + len(prepared)
     notify_sand_site_step_done("pre_dig")
     log_phase_ground("[DIG GUARD AFTER]", "pre_dig")
@@ -34490,11 +34617,24 @@ def unload_route_continuous_group(seq, start_index):
         return [], 0
     if start_index < 0 or start_index >= len(seq or []):
         return [], start_index
-    if not str(seq[start_index][0]).startswith("clearance_route_post"):
+    first_name = str(seq[start_index][0])
+    if first_name != "lift_carry" and not first_name.startswith("clearance_route_post"):
         return [], start_index
 
     group = []
     i = start_index
+    if first_name == "lift_carry":
+        stage_name, q_goal, duration = seq[i]
+        group.append(
+            (
+                i,
+                str(stage_name),
+                np.array(q_goal, dtype=np.float32).reshape(-1)[:4].copy(),
+                float(duration),
+            )
+        )
+        i += 1
+
     while i < len(seq):
         stage_name, q_goal, duration = seq[i]
         if not str(stage_name).startswith("clearance_route_post"):
@@ -34540,14 +34680,15 @@ async def execute_unload_route_continuous_group(seq, start_index, task_id=None):
     for stage_index, stage_name, q_goal_raw, duration in group:
         q_goal = clip_command_near(q_goal_raw, reference=q_prev)
         q_goal = force_loaded_carry_bucket_q(q_goal, reference=q_prev, label=stage_name)
+        check_mode = "lift_carry" if stage_name == "lift_carry" else "unload_to_bin"
         ok, kind, reason, sample, report = path_segment_check(
             q_prev,
             q_goal,
-            "unload_to_bin",
+            check_mode,
             samples=PATH_CHECK_SAMPLES,
         )
         if not ok:
-            detail = path_block_report_text("unload_to_bin", kind, report, reason)
+            detail = path_block_report_text(check_mode, kind, report, reason)
             reason_text = (
                 f"execution_failed/path_precheck_failed:unload_continuous_route:"
                 f"{stage_name}:sample={sample}/{PATH_CHECK_SAMPLES}:{detail}"
@@ -34647,6 +34788,8 @@ async def execute_unload_route_continuous_group(seq, start_index, task_id=None):
         task_id=task_id,
         mode="unload_to_bin",
         path_waypoints=route_waypoints,
+        path_stage_names=[stage["name"] for stage in prepared],
+        path_stage_indices=[stage["index"] for stage in prepared],
     )
     if not success or (task_id is not None and not task_alive(task_id)):
         reason_text = str(
@@ -34692,8 +34835,6 @@ async def execute_unload_route_continuous_group(seq, start_index, task_id=None):
 def loaded_route_continuous_group(seq, start_index):
     if not bool(LOADED_ROUTE_RUNTIME_FAST_EXEC):
         return [], int(start_index)
-    if str(STATE.get("active_task_name", "")) != "loaded_unload_route_test":
-        return [], int(start_index)
     try:
         start_index = int(start_index)
     except Exception:
@@ -34704,7 +34845,24 @@ def loaded_route_continuous_group(seq, start_index):
     first_name = str(seq[start_index][0])
     group = []
     i = start_index
-    if first_name.startswith("clearance_route_post"):
+    if first_name == "lift_carry":
+        name, q_goal, duration = seq[i]
+        group.append((i, str(name), np.array(q_goal, dtype=np.float32).reshape(-1)[:4].copy(), float(duration)))
+        i += 1
+        while i < len(seq):
+            name, q_goal, duration = seq[i]
+            name = str(name)
+            if not name.startswith("clearance_route_post"):
+                break
+            group.append((i, name, np.array(q_goal, dtype=np.float32).reshape(-1)[:4].copy(), float(duration)))
+            i += 1
+        if i < len(seq):
+            name, q_goal, duration = seq[i]
+            name = str(name)
+            if "unload_to_bin" in name or "unload" in name:
+                group.append((i, name, np.array(q_goal, dtype=np.float32).reshape(-1)[:4].copy(), float(duration)))
+                i += 1
+    elif first_name.startswith("clearance_route_post"):
         while i < len(seq):
             name, q_goal, duration = seq[i]
             name = str(name)
@@ -34851,7 +35009,7 @@ def loaded_route_sample_q_at_path_time(path_time, total_seconds, cumulative):
     return seg, q
 
 
-def loaded_route_accel_limit_scale(q_prev, q_candidate, joint_vel_prev, load_vel_prev, dt):
+def loaded_route_accel_limit_scale(q_prev, q_candidate, joint_vel_prev, dt):
     if not bool(LOADED_ROUTE_ACCEL_LIMITING):
         return 1.0, {}
     dt = max(1.0e-4, float(dt))
@@ -34865,61 +35023,16 @@ def loaded_route_accel_limit_scale(q_prev, q_candidate, joint_vel_prev, load_vel
         return 1.0, {"ok": False, "reason": "joint_accel_" + type(e).__name__}
 
     swing_idx = CTRL.name_to_idx.get("swing", 0)
-    bucket_idx = CTRL.name_to_idx.get("bucket", 3)
     swing_acc = float(joint_acc_deg[swing_idx])
-    bucket_acc = float(joint_acc_deg[bucket_idx]) if bucket_idx < len(joint_acc_deg) else 0.0
-    other_acc = max(
-        [
-            float(joint_acc_deg[idx])
-            for name, idx in CTRL.name_to_idx.items()
-            if name not in ("swing", "bucket") and idx < len(joint_acc_deg)
-        ]
-        or [0.0]
-    )
-
-    load_acc = 0.0
-    load_vel = np.array(load_vel_prev, dtype=np.float32).reshape(-1)[:3].copy()
-    try:
-        p0 = predicted_end_world_point(q_prev, end_effector="load", reference_q=q_prev)
-        p1 = predicted_end_world_point(q_candidate, end_effector="load", reference_q=q_candidate)
-        if p0 is not None and p1 is not None:
-            p0 = np.array(p0, dtype=np.float32).reshape(-1)[:3]
-            p1 = np.array(p1, dtype=np.float32).reshape(-1)[:3]
-            load_vel_new = (p1 - p0) / dt
-            load_acc = float(np.linalg.norm((load_vel_new - load_vel) / dt))
-            load_vel = load_vel_new
-    except Exception:
-        load_acc = 0.0
-
-    limits = [
-        (swing_acc, float(LOADED_ROUTE_MAX_SWING_ACCEL_DEG_S2)),
-        (other_acc, float(LOADED_ROUTE_MAX_JOINT_ACCEL_DEG_S2)),
-        (bucket_acc, float(LOADED_ROUTE_MAX_BUCKET_ACCEL_DEG_S2)),
-        (load_acc, float(LOADED_ROUTE_MAX_LOAD_ACCEL_MPS2)),
-    ]
+    limit = float(LOADED_ROUTE_MAX_SWING_ACCEL_DEG_S2)
     scale = 1.0
-    limiting = []
-    for value, limit in limits:
-        if limit <= 1.0e-6 or value <= limit:
-            continue
-        scale = min(scale, max(0.02, limit / max(value, 1.0e-6)))
-    if swing_acc > float(LOADED_ROUTE_MAX_SWING_ACCEL_DEG_S2):
-        limiting.append("swing")
-    if other_acc > float(LOADED_ROUTE_MAX_JOINT_ACCEL_DEG_S2):
-        limiting.append("boom_arm")
-    if bucket_acc > float(LOADED_ROUTE_MAX_BUCKET_ACCEL_DEG_S2):
-        limiting.append("bucket")
-    if load_acc > float(LOADED_ROUTE_MAX_LOAD_ACCEL_MPS2):
-        limiting.append("load_xyz")
+    if limit > 1.0e-6 and swing_acc > limit:
+        scale = max(0.02, limit / max(swing_acc, 1.0e-6))
     return max(0.02, min(1.0, float(scale))), {
         "ok": True,
         "swing_acc_deg_s2": swing_acc,
-        "joint_acc_deg_s2": other_acc,
-        "bucket_acc_deg_s2": bucket_acc,
-        "load_acc_mps2": load_acc,
-        "load_vel": load_vel,
         "joint_vel": joint_vel,
-        "limiting": limiting,
+        "limiting": ["swing"] if swing_acc > limit else [],
     }
 
 
@@ -34947,6 +35060,28 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
         q_goal = clip_command_near(q_goal_raw, reference=q_prev)
         if mode_requires_loaded_carry_bucket(stage_name, stage_name):
             q_goal = force_loaded_carry_bucket_q(q_goal, reference=q_prev, label=stage_name)
+        check_mode = "lift_carry" if stage_name == "lift_carry" else "unload_to_bin"
+        ok, kind, path_reason, sample, report = path_segment_check(
+            q_prev,
+            q_goal,
+            check_mode,
+            samples=PATH_CHECK_SAMPLES,
+        )
+        if not ok:
+            detail = path_block_report_text(check_mode, kind, report, path_reason)
+            reason_text = (
+                f"execution_failed/path_precheck_failed:loaded_route_group:"
+                f"{stage_name}:sample={sample}/{PATH_CHECK_SAMPLES}:{detail}"
+            )
+            set_execution_failure_reason(reason_text)
+            info_print(
+                "[LOADED ROUTE GROUP BLOCKED]",
+                f"stage={stage_name}",
+                f"sample={sample}/{PATH_CHECK_SAMPLES}",
+                detail,
+                force_log=True,
+            )
+            return False, int(start_index)
         seg_seconds = loaded_route_group_segment_seconds(q_prev, q_goal, duration, stage_name)
         segments.append({
             "index": int(idx),
@@ -34960,6 +35095,28 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
 
     if not segments or total_seconds <= 0.0:
         set_execution_failure_reason("execution_failed/loaded_route_group_empty")
+        return False, int(start_index)
+
+    height_floor = loaded_carry_height_floor(
+        q_start,
+        margin=LOADED_CARRY_ROUTE_HEIGHT_MARGIN_M,
+    )
+    height_ok, height_report = loaded_carry_route_height_check(
+        q_start,
+        [seg["q1"] for seg in segments[:-1]],
+        segments[-1]["q1"],
+        height_floor,
+        samples=max(3, int(PATH_CHECK_SAMPLES)),
+    )
+    if not height_ok:
+        reason_text = f"execution_failed/loaded_route_group_height:{height_report}"
+        set_execution_failure_reason(reason_text)
+        info_print(
+            "[LOADED ROUTE GROUP BLOCKED]",
+            "reason=loaded_carry_height_drop",
+            f"detail={height_report}",
+            force_log=True,
+        )
         return False, int(start_index)
 
     for seg in segments:
@@ -35004,7 +35161,10 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
             f"duration={total_seconds:.2f}s",
             f"q_start={q_deg_values(q_start, wrap_swing_for_display=True)}",
             f"q_final={q_deg_values(segments[-1]['q1'], wrap_swing_for_display=True)}",
-            "profile=global_smoothstep_piecewise_linear_adaptive",
+            "profile=global_smoothstep_piecewise_linear_swing_accel_limited",
+            f"corner_min_scale={float(LOADED_ROUTE_ADAPTIVE_CORNER_MIN_SCALE):.2f}",
+            f"swing_acc_scale={float(LOADED_ROUTE_SWING_ACCEL_SCALE):.2f}",
+            f"swing_acc_max={float(LOADED_ROUTE_MAX_SWING_ACCEL_DEG_S2):.1f}degps2",
         )
 
     cumulative = []
@@ -35047,15 +35207,19 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
     adaptive_scale = 1.0
     last_adaptive_log_time = 0.0
     last_accel_log_time = 0.0
-    wall_start = time.time()
-    max_wall_seconds = max(
-        float(total_seconds) + float(LOADED_ROUTE_ADAPTIVE_MAX_EXTRA_SECONDS),
-        float(total_seconds) * float(LOADED_ROUTE_ADAPTIVE_MAX_WALL_MULTIPLIER),
-    )
     frame_dt = float(step_frames) / 60.0
+    min_progress_scale = max(0.02, min(1.0, float(LOADED_ROUTE_ACCEL_MIN_STEP_SCALE)))
+    corner_progress_floor = max(
+        0.20,
+        min(min_progress_scale, float(LOADED_ROUTE_ADAPTIVE_CORNER_MIN_SCALE)),
+    )
+    guaranteed_progress_scale = min(min_progress_scale, corner_progress_floor)
+    max_control_steps = max(
+        4,
+        int(math.ceil(float(total_seconds) / max(1.0e-6, frame_dt * guaranteed_progress_scale))) + 4,
+    )
     q_sent_prev = q_start.copy()
     joint_vel_prev = np.zeros(4, dtype=np.float32)
-    load_vel_prev = np.zeros(3, dtype=np.float32)
 
     while profile_time < total_seconds - 1.0e-6:
         if motion_cancel_requested(task_id):
@@ -35063,13 +35227,14 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
             close_loaded_group_audits("cancelled", "motion_cancel_requested")
             finish_group_profile("cancelled", "motion_cancel_requested")
             return False, int(start_index)
-        if time.time() - wall_start > max_wall_seconds:
+        if frame >= max_control_steps:
             reason_text = (
-                "execution_failed/loaded_route_group_timeout:"
-                f"profile_time={profile_time:.2f}/{total_seconds:.2f}"
+                "execution_failed/loaded_route_group_progress_exhausted:"
+                f"profile_time={profile_time:.2f}/{total_seconds:.2f};"
+                f"frames={frame}/{max_control_steps}"
             )
             set_execution_failure_reason(reason_text)
-            update_status(f"[DIG EXEC FAILED] loaded_route_group: adaptive timeout", force=True)
+            update_status("[DIG EXEC FAILED] loaded_route_group: progress budget exhausted", force=True)
             close_loaded_group_audits("failed", reason_text)
             finish_group_profile("failed", reason_text)
             return False, int(start_index)
@@ -35107,7 +35272,6 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
                 q_sent_prev,
                 q,
                 joint_vel_prev,
-                load_vel_prev,
                 frame_dt,
             )
             if accel_scale >= 0.995 or attempt_scale <= step_floor + 1.0e-6:
@@ -35162,10 +35326,33 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
             close_loaded_group_audits("cancelled", "motion_cancel_requested")
             finish_group_profile("cancelled", "motion_cancel_requested")
             return False, int(start_index)
+        if dataset_record_sample_due():
+            if bool(EXEC_AB_DISABLE_DATASET_SAMPLE):
+                if isinstance(exec_profile, dict):
+                    exec_profile["dataset_sample_skipped"] = int(exec_profile.get("dataset_sample_skipped", 0) or 0) + 1
+            else:
+                sample_t = execution_stage_profile_now(exec_profile)
+                await dataset_record_sample_async(
+                    stage_name,
+                    q_cmd=CTRL.q_cmd.copy(),
+                    label=stage_name,
+                )
+                execution_stage_profile_add_elapsed(
+                    exec_profile,
+                    "dataset_sample_ms",
+                    sample_t,
+                    "dataset_sample_count",
+                    1,
+                )
+                if isinstance(exec_profile, dict):
+                    camera_ms = STATE.pop("dataset_last_camera_capture_ms", None)
+                    if camera_ms is not None:
+                        execution_stage_profile_add_ms(exec_profile, "camera_ms", float(camera_ms), "camera_count", 1)
+                execution_stage_profile_add_dataset_spans(exec_profile)
+        notify_sand_site_tool_sample(stage_name)
         if bool((accel_report or {}).get("ok", False)):
             try:
                 joint_vel_prev = np.array(accel_report.get("joint_vel"), dtype=np.float32).reshape(-1)[:4].copy()
-                load_vel_prev = np.array(accel_report.get("load_vel"), dtype=np.float32).reshape(-1)[:3].copy()
                 q_sent_prev = q_final_cmd.copy()
             except Exception:
                 joint_vel_prev = loaded_route_joint_velocity(q_sent_prev, q_final_cmd, frame_dt)
@@ -35188,10 +35375,7 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
                     f"base_scale={base_advance_scale:.2f}",
                     f"applied_scale={attempt_scale:.2f}",
                     f"profile_time={profile_time:.2f}/{total_seconds:.2f}",
-                    f"load_acc={float(accel_report.get('load_acc_mps2', 0.0)):.2f}mps2",
                     f"swing_acc={float(accel_report.get('swing_acc_deg_s2', 0.0)):.1f}deg/s2",
-                    f"joint_acc={float(accel_report.get('joint_acc_deg_s2', 0.0)):.1f}deg/s2",
-                    f"bucket_acc={float(accel_report.get('bucket_acc_deg_s2', 0.0)):.1f}deg/s2",
                     f"limiting={accel_report.get('limiting')}",
                 )
         adaptive_scale, lag_report = loaded_route_adaptive_scale(q_final_cmd)
@@ -35221,7 +35405,13 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
 
     final_seg = segments[-1]
     STATE["active_plan_stage_index"] = int(final_seg["index"])
-    if not await wait_for_motion_reached(q_final_cmd, label="loaded_route_group", mode=final_seg["name"], seconds_eff=0.0):
+    if not await wait_for_motion_reached(
+        q_final_cmd,
+        label="loaded_route_group",
+        mode=final_seg["name"],
+        seconds_eff=0.0,
+        min_frames_override=0,
+    ):
         record_stage_audit(
             final_seg["name"],
             int(final_seg["index"]),
@@ -35556,33 +35746,18 @@ async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"
             stage_index = int(pre_dig_route_next_index)
             continue
 
-        if not loaded_route_diag:
-            unload_route_group, unload_route_next_index = unload_route_continuous_group(seq, stage_index)
-            if unload_route_group:
-                success, unload_route_next_index = await execute_unload_route_continuous_group(
-                    seq,
-                    stage_index,
-                    task_id=task_id,
-                )
-                if not success or not task_alive(task_id):
-                    update_status(execution_failure_status_text(str(unload_route_group[-1][1])), force=True)
-                    return False
-                stage_index = int(unload_route_next_index)
-                continue
-
-        if loaded_route_diag:
-            route_group, route_next_index = loaded_route_continuous_group(seq, stage_index)
-            if route_group:
-                success, route_next_index = await execute_loaded_route_continuous_group(
-                    seq,
-                    stage_index,
-                    task_id=task_id,
-                )
-                if not success or not task_alive(task_id):
-                    update_status(execution_failure_status_text(str(route_group[-1][1])), force=True)
-                    return False
-                stage_index = int(route_next_index)
-                continue
+        route_group, route_next_index = loaded_route_continuous_group(seq, stage_index)
+        if route_group:
+            success, route_next_index = await execute_loaded_route_continuous_group(
+                seq,
+                stage_index,
+                task_id=task_id,
+            )
+            if not success or not task_alive(task_id):
+                update_status(execution_failure_status_text(str(route_group[-1][1])), force=True)
+                return False
+            stage_index = int(route_next_index)
+            continue
 
         record_stage_audit(
             stage_name,

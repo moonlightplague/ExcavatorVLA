@@ -1,15 +1,23 @@
 async def move_planned_stage(rt, stage_name, q_goal, duration, task_id=None):
-    ready, reason, _detail = await rt.wait_for_articulation_action_ready(
-        f"{stage_name}_trace_start",
-        min_stable_frames=rt.ACTION_READY_MIN_STABLE_FRAMES,
-        max_frames=rt.ACTION_READY_STAGE_MAX_WAIT_FRAMES,
-        record_failure=True,
-    )
+    continuous_handoff = bool(rt.consume_motion_continuous_handoff(stage_name))
+    _detail = rt.articulation_action_ready_detail()
+    ready = bool(_detail.get("ready", False))
+    reason = "ok" if ready else f"action_channel_not_ready {rt.format_action_ready_detail(_detail)}"
+    if not continuous_handoff or not ready:
+        ready, reason, _detail = await rt.wait_for_articulation_action_ready(
+            f"{stage_name}_trace_start",
+            min_stable_frames=rt.ACTION_READY_MIN_STABLE_FRAMES,
+            max_frames=rt.ACTION_READY_STAGE_MAX_WAIT_FRAMES,
+            record_failure=True,
+        )
     if not ready:
         rt.update_status(f"[DIG EXEC FAILED] {stage_name}: action_channel_not_ready; {reason}", force=True)
         return False
 
-    q_start = rt.sync_motion_start_q(stage_name)
+    if continuous_handoff:
+        q_start = rt.CTRL.clip_limits(rt.np.array(rt.CTRL.q_cmd, dtype=rt.np.float32).reshape(-1)[:4].copy())
+    else:
+        q_start = rt.sync_motion_start_q(stage_name)
     q_goal = rt.clip_command_near(q_goal, reference=q_start)
     fast_loaded_route = False
     try:
@@ -127,6 +135,7 @@ async def move_planned_stage(rt, stage_name, q_goal, duration, task_id=None):
         task_id=task_id,
         mode=stage_name,
         q_start_override=q_start,
+        continuous_handoff_in=continuous_handoff,
     )
 
 

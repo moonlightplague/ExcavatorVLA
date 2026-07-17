@@ -2434,12 +2434,27 @@ def run_activity_snapshot(
 def summarize_run_activity(runs: Sequence[dict]) -> Dict[str, object]:
     active = [run for run in runs if isinstance(run.get("activity"), dict) and run["activity"].get("active")]
     recent = [run for run in runs if isinstance(run.get("activity"), dict) and run["activity"].get("state") == "recent"]
+    active_successes = sum(max(0, int(run.get("success", 0) or 0)) for run in active)
+    active_worker_wall_s = sum(
+        max(0.0, float(run.get("run_wall_s", 0.0) or 0.0))
+        for run in active
+        if int(run.get("success", 0) or 0) > 0
+    )
+    success_seconds_per_attempt = (
+        float(active_worker_wall_s) / float(active_successes)
+        if active_successes > 0 and active_worker_wall_s > 0.0
+        else None
+    )
     return {
         "active_count": len(active),
         "recent_count": len(recent),
         "idle_count": max(0, len(runs) - len(active) - len(recent)),
         "active_window_s": RUN_ACTIVITY_ACTIVE_SECONDS,
         "recent_window_s": RUN_ACTIVITY_RECENT_SECONDS,
+        "active_successes": int(active_successes),
+        "active_worker_wall_s": float(active_worker_wall_s),
+        "success_seconds_per_attempt": success_seconds_per_attempt,
+        "success_speed_source": "active_run_total_wall_divided_by_successes",
         "active_runs": [
             {
                 "name": run.get("name"),
@@ -2449,6 +2464,8 @@ def summarize_run_activity(runs: Sequence[dict]) -> Dict[str, object]:
                 "attempts": run.get("attempts"),
                 "success": run.get("success"),
                 "trainable": run.get("trainable"),
+                "run_wall_s": run.get("run_wall_s"),
+                "success_seconds_per_attempt": run.get("success_seconds_per_attempt"),
                 "size_human": run.get("size_human"),
             }
             for run in active[:8]
@@ -3638,16 +3655,9 @@ def dashboard_export_time_policy_path(run_dir: Union[str, os.PathLike]) -> str:
 
 
 def normalize_export_time_policy(policy: object) -> Dict[str, object]:
-    data = policy if isinstance(policy, dict) else {}
-    try:
-        speed_scale = float(data.get("speed_scale", 1.0))
-    except Exception:
-        speed_scale = 1.0
-    if not math.isfinite(speed_scale) or speed_scale <= 0:
-        speed_scale = 1.0
     return {
         "version": 1,
-        "speed_scale": float(speed_scale),
+        "speed_scale": 1.0,
         "time_mode": "uniform_fps",
         "base_fps": None,
     }
@@ -3686,8 +3696,7 @@ def save_dashboard_export_time_policy(run_dir: Union[str, os.PathLike], policy: 
     normalized = normalize_export_time_policy(policy)
     path = dashboard_export_time_policy_path(run_abs)
     existing = read_json(path, default={}) if os.path.isfile(path) else {}
-    existing_normalized = normalize_export_time_policy(existing)
-    if os.path.isfile(path) and existing_normalized == normalized:
+    if os.path.isfile(path) and existing == normalized:
         return {
             "ok": True,
             "path": path,
@@ -3717,7 +3726,7 @@ def dashboard_effective_export_fps(run_dir: Union[str, os.PathLike], policy: obj
         base = infer_export_fps(run_dir, explicit_fps)
         return float(_require_shared_dataset_tool("effective_export_fps")(base, normalized))
     except Exception:
-        return 10.0 * float(normalized.get("speed_scale") or 1.0)
+        return 10.0
 
 
 def dashboard_time_policy_for_run(run_dir: Union[str, os.PathLike]) -> Dict[str, object]:
@@ -4748,6 +4757,13 @@ def list_dashboard_runs(dataset_root: Union[str, os.PathLike], limit: int = 80) 
         raw_index_counts = {key: fast_jsonl_count(index_path(path, key)) for key in INDEX_FILES}
         effective_counts, catchup = success_index_catchup_counts(path, raw_index_counts)
         success_count = int(effective_counts.get("success", 0) or 0)
+        wall_breakdown = summary.get("wall_clock_breakdown", {}) if isinstance(summary, dict) else {}
+        run_wall_s = float(wall_breakdown.get("total_wall_s", 0.0) or 0.0) if isinstance(wall_breakdown, dict) else 0.0
+        success_seconds_per_attempt = (
+            float(run_wall_s) / float(success_count)
+            if success_count > 0 and run_wall_s > 0.0
+            else None
+        )
         # Bounded scans keep "Loading runs..." fast even when many episode
         # image/video/data folders contain tens of thousands of files.
         size_snapshot = directory_size_snapshot(
@@ -4766,6 +4782,8 @@ def list_dashboard_runs(dataset_root: Union[str, os.PathLike], limit: int = 80) 
                 "attempts": int(effective_counts.get("all", 0) or 0),
                 "success": success_count,
                 "trainable": int(effective_counts.get("trainable", 0) or 0),
+                "run_wall_s": float(run_wall_s),
+                "success_seconds_per_attempt": success_seconds_per_attempt,
                 "rejected": int(effective_counts.get("rejected", 0) or 0),
                 "failed": int(effective_counts.get("failed", 0) or 0),
                 "requested": summary.get("requested"),
@@ -6174,7 +6192,6 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
 
 .terminalPanel{margin-bottom:14px}.terminalPanel .panelHeader,.rawAttemptPanel .panelHeader{margin-bottom:8px}.terminalActions,.rawAttemptActions{display:flex;align-items:center;gap:8px}.terminalBox{max-height:180px;min-height:72px}.rawAttemptActions:after{content:"debug only";font-size:12px;color:#667085}
 .epCellInner{display:inline-flex;align-items:center;gap:6px}.exportReadyDot{width:8px;height:8px;border-radius:999px;display:inline-block;box-shadow:0 0 0 2px #fff,0 0 0 3px #d0d5dd;flex:0 0 auto}.exportReadyDot.ready{background:#12b76a;box-shadow:0 0 0 2px #fff,0 0 0 3px rgba(18,183,106,.35)}.exportReadyDot.notReady{background:#f04438;box-shadow:0 0 0 2px #fff,0 0 0 3px rgba(240,68,56,.32)}.exportReadyDot.stale{background:#f79009;box-shadow:0 0 0 2px #fff,0 0 0 3px rgba(247,144,9,.34)}.exportReadyDot.unknown{background:#98a2b3}
-.modalOverlay{position:fixed;inset:0;z-index:1000;background:rgba(15,23,42,.48);display:none;align-items:center;justify-content:center;padding:18px}.modalOverlay.open{display:flex}.modalOverlay.loading{cursor:wait}.modalCard{width:min(560px,calc(100vw - 36px));background:#fff;border:1px solid #d0d5dd;border-radius:14px;box-shadow:0 24px 72px rgba(16,24,40,.32);padding:16px;color:#101828}.modalOverlay.loading .modalCard{box-shadow:0 24px 72px rgba(16,24,40,.36),0 0 0 3px rgba(23,92,211,.14)}.modalCard h2{margin:0 0 4px}.modalIntro{font-size:12px;color:#667085;line-height:1.45;margin:0 0 12px}.modalGrid{display:grid;grid-template-columns:150px minmax(0,1fr);gap:9px 10px;align-items:center}.modalGrid input,.modalGrid select{width:100%}.modalNote{margin-top:10px;border:1px solid #eaecf0;border-radius:10px;background:#f8fafc;padding:9px 10px;font-size:12px;color:#475467;line-height:1.45}.modalActions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-top:14px}.modalActions .danger{background:#b42318;border-color:#b42318;color:#fff}body.dark .modalCard{background:#0f172a;border-color:#334155;color:#e5e7eb}body.dark .modalNote{background:#111827;border-color:#334155;color:#94a3b8}
 body main details>summary:after,.managerPanel>summary:after,.detailsPanel>summary:after{content:""!important;width:10px!important;height:10px!important;border:0!important;border-right:2px solid #667085!important;border-bottom:2px solid #667085!important;border-radius:0!important;padding:0!important;background:transparent!important;transform:rotate(-45deg);transition:transform .2s ease;flex:0 0 auto;margin-top:4px}body main details[open]>summary:after,.managerPanel[open]>summary:after,.detailsPanel[open]>summary:after{content:""!important;transform:rotate(45deg);margin-top:7px}
 
 </style>
@@ -6334,23 +6351,6 @@ body main details>summary:after,.managerPanel>summary:after,.detailsPanel>summar
     <pre id="rawBox" class="codeBox">{}</pre>
   </section>
 </main>
-<div id="exportTimeModal" class="modalOverlay" role="dialog" aria-modal="true" aria-labelledby="exportTimeTitle">
-  <div class="modalCard">
-    <h2 id="exportTimeTitle">VLA export time scale</h2>
-    <p class="modalIntro">Set the training-time playback speed before exporting. Preview applies the same timestamp/action/dq/ddq recomputation used by the exporter.</p>
-    <div class="modalGrid">
-      <label for="exportSpeedScaleInput">Speed scale</label>
-      <input id="exportSpeedScaleInput" type="number" min="0.01" step="0.1" value="1">
-    </div>
-    <div id="exportTimePolicyPreview" class="modalNote">1x export uses the original timeline.</div>
-    <div class="modalActions">
-      <button type="button" class="secondary" id="cancelExportTimeBtn">Cancel</button>
-      <button type="button" class="secondary" id="resetTimePolicyBtn">Reset 1x</button>
-      <button type="button" class="secondary" id="applyTimePreviewBtn">Apply preview</button>
-      <button type="button" id="exportTimeNowBtn">Export now</button>
-    </div>
-  </div>
-</div>
 <script>
 
 const jointNames = ["swing","boom","arm","bucket"];
@@ -6383,8 +6383,6 @@ const cameraFrameImageCacheOrder = [];
 const cameraFrameImageCacheLimit = 360;
 let darkModeEnabled = false;
 let timelineDragState = {active:false, svg:null, moved:false, suppressClick:false};
-let exportTimeModalOpen = false;
-let currentExportTimePolicy = {version:1, speed_scale:1.0, time_mode:"uniform_fps", base_fps:null};
 
 function $(id){return document.getElementById(id)}
 function esc(s){return String(s ?? "").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]))}
@@ -6402,89 +6400,10 @@ function setStatus(text, cls="muted"){const el=$("status"); if(el){el.className=
 async function api(path, params){const qs=new URLSearchParams(params||{}); const r=await fetch(path+"?"+qs.toString()); if(!r.ok) throw new Error(await r.text()); return await r.json()}
 async function postJSON(path, payload){let r; try{r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload||{})});}catch(err){throw new Error(`Failed to fetch ${path}: ${err.message||err}`);} if(!r.ok) throw new Error(await r.text()); return await r.json()}
 function normalizeExportTimePolicyJS(policy){
-  const p=policy&&typeof policy==="object"?policy:{};
-  let speed=Number(p.speed_scale);
-  if(!Number.isFinite(speed)||speed<=0) speed=1;
-  return {version:1, speed_scale:speed, time_mode:"uniform_fps", base_fps:null};
-}
-function currentRunTimePolicyInfo(){
-  const info=(((currentRun||{}).diagnosis||{}).success_export||{}).current_time_policy;
-  if(info&&typeof info==="object") return info;
-  return {policy:{version:1,speed_scale:1,time_mode:"uniform_fps",base_fps:null},hash:"",is_default:true};
-}
-function fillExportTimePolicyInputs(policy){
-  const p=normalizeExportTimePolicyJS(policy);
-  currentExportTimePolicy=p;
-  const speed=$("exportSpeedScaleInput");
-  if(speed) speed.value=String(p.speed_scale);
-  updateExportTimePolicyPreview();
-}
-function readExportTimePolicyInputs(){
-  return normalizeExportTimePolicyJS({
-    speed_scale:$("exportSpeedScaleInput")?.value,
-    base_fps:null
-  });
+  return {version:1, speed_scale:1.0, time_mode:"uniform_fps", base_fps:null};
 }
 function exportTimePolicyText(policy){
-  const p=normalizeExportTimePolicyJS(policy);
-  return `${fmt(p.speed_scale,3)}x, uniform export time`;
-}
-function updateExportTimePolicyPreview(extra){
-  const p=readExportTimePolicyInputs();
-  currentExportTimePolicy=p;
-  const el=$("exportTimePolicyPreview");
-  if(el){
-    el.textContent=(extra?`${extra} `:"")+`Preview/export policy: ${exportTimePolicyText(p)}. Timestamps use the exporter uniform timeline; joint velocity, acceleration and action are recomputed from that timeline.`;
-  }
-}
-function showExportTimeModal(){
-  syncSuccessPoolPath();
-  const info=currentRunTimePolicyInfo();
-  fillExportTimePolicyInputs((info&&info.policy)||currentExportTimePolicy);
-  const modal=$("exportTimeModal");
-  if(modal){modal.classList.add("open"); exportTimeModalOpen=true;}
-}
-function hideExportTimeModal(){
-  const modal=$("exportTimeModal");
-  if(modal){modal.classList.remove("open"); exportTimeModalOpen=false;}
-}
-function setExportModalBusy(busy, message){
-  const modal=$("exportTimeModal");
-  if(modal) modal.classList.toggle("loading",!!busy);
-  ["cancelExportTimeBtn","resetTimePolicyBtn","applyTimePreviewBtn","exportTimeNowBtn","exportSpeedScaleInput"].forEach(id=>{
-    const el=$(id); if(el) el.disabled=!!busy;
-  });
-  const apply=$("applyTimePreviewBtn");
-  if(apply) apply.textContent=busy?"Applying...":"Apply preview";
-  const exportNow=$("exportTimeNowBtn");
-  if(exportNow) exportNow.textContent=busy?"Working...":"Export now";
-  if(message) updateExportTimePolicyPreview(message);
-}
-async function saveExportTimePolicyForPreview(reset=false, reload=true){
-  syncSuccessPoolPath();
-  const policy=reset?{speed_scale:1,time_mode:"uniform_fps",base_fps:null}:readExportTimePolicyInputs();
-  const result=await postJSON("/api/manage/export_time_policy", {root:$("rootInput").value, reset:!!reset, time_policy:policy});
-  currentExportTimePolicy=normalizeExportTimePolicyJS(result.policy||policy);
-  fillExportTimePolicyInputs(currentExportTimePolicy);
-  updateExportTimePolicyPreview(`Saved.`);
-  if(!reload) return result;
-  $("runInput").value=result.pool_dir||successPoolPath();
-  await loadRun(false);
-  if(currentEpisodeIndex!==null && currentEpisodeIndex!==undefined){
-    await loadEpisode(currentEpisodeIndex);
-  }
-  return result;
-}
-async function applyTimePreviewAndClose(){
-  setExportModalBusy(true,"Applying preview...");
-  try{
-    await saveExportTimePolicyForPreview(false, true);
-    setExportModalBusy(false,"Preview applied.");
-    hideExportTimeModal();
-  }catch(err){
-    setExportModalBusy(false,"Preview failed.");
-    throw err;
-  }
+  return "1.000x, recorded physical speed";
 }
 function finite(v){return typeof v==="number" && Number.isFinite(v)}
 function number(v){const n=Number(v); return Number.isFinite(n)?n:null}
@@ -6762,15 +6681,14 @@ async function trashSelectedEpisode(){
   }
 }
 async function exportSuccessPool(){
-  showExportTimeModal();
+  return exportSuccessPoolWithPolicy();
 }
 async function exportSuccessPoolWithPolicy(){
   syncSuccessPoolPath();
   const root=$('rootInput').value;
   const pool=successPoolPath();
-  const policy=readExportTimePolicyInputs();
-  await saveExportTimePolicyForPreview(false, false);
-  hideExportTimeModal();
+  const policy=normalizeExportTimePolicyJS({});
+  await postJSON("/api/manage/export_time_policy", {root, reset:true, time_policy:policy});
   setStatus('Starting .dashboard_success VLA export...');
   setTransferProgress('starting VLA export', 0, true);
   const job=await postJSON('/api/manage/export_success_vla', {root, overwrite:true, require_vla:true, time_policy:policy});
@@ -6797,7 +6715,11 @@ function renderRunMonitor(data){
   const recentCount=Number(summary.recent_count || 0);
   const idleCount=Number(summary.idle_count || 0);
   const windowS=Number(summary.active_window_s || 180);
-  const title=`<span class="runMonitorTitle"><span class="activityDot ${activeCount?"active":"idle"}"></span> Active writers: ${activeCount}</span>`;
+  const successSeconds=Number(summary.success_seconds_per_attempt);
+  const successSpeed=Number.isFinite(successSeconds) && successSeconds>0
+    ? `${successSeconds<100?successSeconds.toFixed(1):Math.round(successSeconds)} s/attempt`
+    : "collecting...";
+  const title=`<span class="runMonitorTitle"><span class="activityDot ${activeCount?"active":"idle"}"></span> Active writers: ${activeCount} · Data success ≈ ${esc(successSpeed)}</span>`;
   const subtitle=`<span class="muted">green = updated within ${ageText(windowS)}; recent=${recentCount}; idle=${idleCount}</span>`;
   const badges=activeRuns.map(run=>{
     const latest=run.latest_file ? ` · ${shortText(run.latest_file,42)}` : "";
@@ -7100,7 +7022,7 @@ function renderEpisode(data){
   const ep=data.episode||{}; $("episodeTitle").textContent=`Attempt ${ep.episode_index} timeline`; $("episodeMeta").textContent=`${statusKey(ep.status)} · score=${fmt(ep.score,1)} · samples=${data.sample_count} · shown=${data.returned_points} · ${shortText(ep.dataset_skip_reason || ep.reason||ep.warning_reason||"",260)}`; $("rawBox").textContent=JSON.stringify({episode:ep,stage_spans:data.stage_spans,camera_preview:data.camera_preview},null,2);
   const tp=data.time_policy||ep.export_time_policy||{};
   const tpPolicy=normalizeExportTimePolicyJS(tp.policy||tp.time_policy||{});
-  const tpInfo=`speed=${fmt(tpPolicy.speed_scale,3)}x, uniform time`;
+  const tpInfo="recorded physical speed, uniform time";
   $("episodeMeta").textContent=`${statusKey(ep.status)} | score=${fmt(ep.score,1)} | samples=${data.sample_count} | shown=${data.returned_points} | ${tpInfo} | ${shortText(ep.dataset_skip_reason || ep.reason||ep.warning_reason||"",260)}`;
   $("rawBox").textContent=JSON.stringify({episode:ep,time_policy:data.time_policy,stage_spans:data.stage_spans,camera_preview:data.camera_preview},null,2);
   const promptEl=$("episodeTaskPrompt"); const promptText=String(ep.task_prompt||"").trim(); if(promptEl){promptEl.style.display=promptText?"block":"none"; promptEl.innerHTML=promptText?`<span class="taskPromptLabel">Task prompt</span>${esc(promptText)}`:"";}
@@ -7845,12 +7767,6 @@ bindStaticControl("deleteSelectedRunsBtn","click",()=>deleteSelectedZeroSuccessR
 bindStaticControl("copySuccessBtn","click",()=>transferSuccessRecords("copy", false).catch(e=>setStatus(e.message,"error")));
 bindStaticControl("moveSuccessBtn","click",()=>transferSuccessRecords("move", false).catch(e=>setStatus(e.message,"error")));
 bindStaticControl("trashEpisodeBtn","click",()=>trashSelectedEpisode().catch(e=>setStatus(e.message,"error")));
-bindStaticControl("cancelExportTimeBtn","click",()=>hideExportTimeModal());
-bindStaticControl("resetTimePolicyBtn","click",()=>saveExportTimePolicyForPreview(true, true).catch(e=>setStatus(e.message,"error")));
-bindStaticControl("applyTimePreviewBtn","click",()=>applyTimePreviewAndClose().catch(e=>setStatus(e.message,"error")));
-bindStaticControl("exportTimeNowBtn","click",()=>exportSuccessPoolWithPolicy().catch(e=>setStatus(e.message,"error")));
-["exportSpeedScaleInput"].forEach(id=>{const el=$(id); if(el) el.addEventListener("input",()=>updateExportTimePolicyPreview());});
-bindStaticControl("exportTimeModal","click", e=>{const modal=$("exportTimeModal"); if(e.target===modal && !modal.classList.contains("loading")) hideExportTimeModal();});
 bindStaticControl("darkModeToggle","click",()=>toggleDarkMode());
 initDarkMode();
 const episodeSortSelect=$("episodeSortSelect"); if(episodeSortSelect) episodeSortSelect.addEventListener("change",()=>refreshFilteredViews());

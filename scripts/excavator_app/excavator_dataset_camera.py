@@ -18,7 +18,7 @@ except Exception:
     Image = None
 
 
-CAMERA_MODULE_VERSION = "dataset_camera_viewport_capture_v25_nonblocking_sim_clock"
+CAMERA_MODULE_VERSION = "dataset_camera_viewport_capture_v26_presubmit_sample_barrier"
 SYNC_STEP_ERROR_TEXT = "Synchronous call to `step`"
 
 
@@ -3015,6 +3015,16 @@ def config_snapshot(rt):
         "frequency": int(rt.STATE.get("dataset_camera_frequency", 10) or 10),
         "sample_stride": max(1, int(rt.STATE.get("dataset_camera_sample_stride", 1) or 1)),
         "require_complete_samples": bool(rt.STATE.get("dataset_camera_require_complete_samples", True)),
+        "sample_wait": {
+            "enabled": bool(rt.STATE.get("dataset_strict_sample_wait", False)),
+            "timeout_s": float(rt.STATE.get("dataset_sample_wait_timeout_s", 0.0) or 0.0),
+            "wait_count": int(rt.STATE.get("dataset_sample_wait_count", 0) or 0),
+            "wait_total_wall_ms": float(rt.STATE.get("dataset_sample_wait_total_wall_ms", 0.0) or 0.0),
+            "timeouts": int(rt.STATE.get("dataset_sample_wait_timeouts", 0) or 0),
+            "pre_submissions": int(rt.STATE.get("dataset_camera_pre_submissions", 0) or 0),
+            "pre_submit_failures": int(rt.STATE.get("dataset_camera_pre_submit_failures", 0) or 0),
+            "policy": "pre_submit_before_due_update_then_wall_wait",
+        },
         "warmup_frames": int(rt.STATE.get("dataset_camera_warmup_frames", 3) or 3),
         "warmup_ready_frames": int(rt.STATE.get("dataset_camera_warmup_ready_frames", 2) or 2),
         "warmup_max_frames": int(rt.STATE.get("dataset_camera_warmup_max_frames", 12) or 12),

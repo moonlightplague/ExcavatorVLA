@@ -10,6 +10,7 @@ Headless auto collect:
 """
 
 import argparse
+import asyncio
 import importlib
 import os
 import platform
@@ -114,8 +115,20 @@ def parse_args():
     parser.add_argument(
         "--fast-replay-sample-hz",
         type=float,
-        default=5.0,
-        help="Planned-time sample rate for --fast-sampled-replay (default: 5 Hz).",
+        default=10.0,
+        help="Planned-time sample rate for --fast-sampled-replay (default: 10 Hz).",
+    )
+    parser.add_argument(
+        "--attempt-motion-speed",
+        type=float,
+        default=None,
+        help="Physical auto-attempt free-space motion scale. Default runtime policy is 2.0x with lower contact/carry caps.",
+    )
+    parser.add_argument(
+        "--dataset-hz",
+        type=float,
+        default=None,
+        help="State and camera target sampling frequency in simulation time. Default runtime policy is 10 Hz.",
     )
     parser.add_argument("--wait-runtime-seconds", type=float, default=180.0)
     export_group = parser.add_mutually_exclusive_group()
@@ -181,10 +194,14 @@ def wait_task_done(simulation_app, task, label):
     while simulation_app.is_running() and not task.done():
         profiled_simulation_update(simulation_app, None, f"wait_task:{label}")
     if task.done():
+        if hasattr(task, "cancelled") and task.cancelled():
+            print(f"[WARN] Task cancelled: {label}", flush=True)
+            return
         try:
             exc = task.exception()
-        except Exception:
-            exc = None
+        except asyncio.CancelledError:
+            print(f"[WARN] Task cancelled: {label}", flush=True)
+            return
         if exc is not None:
             raise RuntimeError(f"{label} failed: {type(exc).__name__}: {exc}")
 
@@ -607,6 +624,16 @@ def main():
     os.environ["EXCAVATOR_FAST_SAMPLED_REPLAY"] = "1" if bool(args.fast_sampled_replay) else "0"
     os.environ["EXCAVATOR_FAST_REPLAY_PRE_DIG"] = "1"
     os.environ["EXCAVATOR_FAST_REPLAY_SAMPLE_HZ"] = str(max(1.0, float(args.fast_replay_sample_hz)))
+    if args.attempt_motion_speed is not None:
+        env_set_if_value(
+            "EXCAVATOR_AUTO_ATTEMPT_MOTION_SPEED_SCALE",
+            max(0.1, float(args.attempt_motion_speed)),
+        )
+    if args.dataset_hz is not None:
+        dataset_hz = max(1.0, float(args.dataset_hz))
+        env_set_if_value("EXCAVATOR_DATASET_SAMPLE_INTERVAL", 1.0 / dataset_hz)
+        env_set_if_value("EXCAVATOR_DATASET_CAMERA_FREQUENCY", int(round(dataset_hz)))
+        env_set_if_value("EXCAVATOR_DATASET_CAMERA_BACKGROUND_INTERVAL_S", 1.0 / dataset_hz)
     env_set_if_value("EXCAVATOR_DATASET_CAMERA_CAPTURE_RESOLUTION", args.camera_capture_resolution)
 
     from isaacsim import SimulationApp

@@ -1313,16 +1313,11 @@ def infer_export_fps(run_dir: Union[str, os.PathLike], explicit_fps: Optional[fl
 
 
 def normalize_export_time_policy(policy: object) -> Dict[str, object]:
-    data = policy if isinstance(policy, dict) else {}
-    try:
-        speed_scale = float(data.get("speed_scale", 1.0))
-    except Exception:
-        speed_scale = 1.0
-    if not math.isfinite(speed_scale) or speed_scale <= 0:
-        speed_scale = 1.0
+    # Export preserves the physical collection speed. Attempt timing must be
+    # changed in Isaac, never by retiming recorded trajectories after the fact.
     return {
         "version": 1,
-        "speed_scale": float(speed_scale),
+        "speed_scale": 1.0,
         "time_mode": "uniform_fps",
         "base_fps": None,
     }
@@ -1364,7 +1359,7 @@ def effective_export_fps(base_fps: float, policy: object) -> float:
     base = float(normalized.get("base_fps") or base_fps or 10.0)
     if not math.isfinite(base) or base <= 0:
         base = 10.0
-    return max(0.001, base * float(normalized.get("speed_scale") or 1.0))
+    return max(0.001, base)
 
 
 def lerobot_export_config_for_run(
@@ -1626,6 +1621,29 @@ def apply_export_time_policy_to_trajectory(
         "time_mode": normalized.get("time_mode"),
         "raw_duration_s": float(raw_times[-1]) if raw_times else 0.0,
         "duration_s": float(new_times[-1]) if new_times else 0.0,
+    }
+
+
+def trajectory_sampling_report(trajectory: Sequence[dict]) -> Dict[str, object]:
+    times: List[float] = []
+    for sample in trajectory or []:
+        if not isinstance(sample, dict):
+            continue
+        value = safe_float_value(sample.get("t"), None)
+        if value is not None and math.isfinite(float(value)):
+            times.append(float(value))
+    deltas = [
+        float(times[index] - times[index - 1])
+        for index in range(1, len(times))
+        if float(times[index] - times[index - 1]) > 1.0e-6
+    ]
+    median_dt = float(median(deltas)) if deltas else 0.0
+    duration_s = max(0.0, float(times[-1] - times[0])) if len(times) >= 2 else 0.0
+    return {
+        "sample_count": len(times),
+        "duration_s": duration_s,
+        "median_dt_s": median_dt,
+        "median_hz": (1.0 / median_dt) if median_dt > 0.0 else 0.0,
     }
 
 
@@ -2537,6 +2555,7 @@ def collect_lerobot_rows(
     missing_camera_examples: List[dict] = []
     missing_vla_state_by_reason: Counter = Counter()
     missing_vla_state_examples: List[dict] = []
+    source_sampling_reports: List[dict] = []
     global_frame = 0
     for source_episode_index, episode in enumerate(episode_rows):
         episode_dir = episode_dir_from_row(episode, run_dir=run_dir)
@@ -2545,6 +2564,7 @@ def collect_lerobot_rows(
         meta = read_json(resolve_episode_file(episode_dir, row_path_value(episode, "meta")), default={}) or {}
         if not trajectory:
             continue
+        source_sampling = trajectory_sampling_report(trajectory)
         transformed = apply_export_time_policy_to_trajectory(
             trajectory,
             policy=time_policy,
@@ -2689,6 +2709,14 @@ def collect_lerobot_rows(
             }
         )
         episode_image_paths.append(current_episode_image_paths)
+        source_sampling_reports.append(
+            {
+                **source_sampling,
+                "source_episode_index": int(source_episode_index),
+                "raw_episode_index": episode.get("episode_index"),
+                "raw_episode_id": episode.get("episode_id", ""),
+            }
+        )
         episode_stats.append(
             {
                 "episode_index": export_episode_index,
@@ -2726,6 +2754,7 @@ def collect_lerobot_rows(
         "skipped_missing_camera_frames": skipped_missing_camera_frames,
         "missing_camera_by_key": dict(missing_camera_by_key),
         "missing_camera_examples": missing_camera_examples,
+        "source_sampling_reports": source_sampling_reports,
         "source_episode_count": len(episode_rows),
     }
 
@@ -2761,15 +2790,6 @@ def export_lerobot_dataset(
         reuse_dir = ""
     if reuse_dir and os.path.normcase(reuse_dir) == os.path.normcase(export_dir):
         reuse_dir = ""
-    progress(2.0, "preparing export directory")
-    if os.path.exists(export_dir):
-        if not overwrite:
-            raise FileExistsError(f"{export_dir} already exists; pass --export-overwrite to rebuild it")
-        if os.path.normcase(export_dir) == os.path.normcase(run_dir):
-            raise ValueError("refusing to overwrite run_dir as export_dir")
-        shutil.rmtree(export_dir)
-    ensure_dir(export_dir)
-
     try:
         import pandas as pd  # type: ignore
     except Exception as exc:
@@ -2794,6 +2814,38 @@ def export_lerobot_dataset(
     rows: List[dict] = list(collected["rows"])  # type: ignore[arg-type]
     if not rows:
         raise ValueError(f"no exportable frames found for split={split}")
+    source_sampling_reports = list(collected.get("source_sampling_reports", []) or [])
+    sampling_tolerance_hz = max(0.5, float(base_export_fps) * 0.20)
+    sampling_mismatches = [
+        report
+        for report in source_sampling_reports
+        if int(report.get("sample_count", 0) or 0) >= 2
+        and abs(float(report.get("median_hz", 0.0) or 0.0) - float(base_export_fps)) > sampling_tolerance_hz
+    ]
+    if sampling_mismatches:
+        examples = [
+            {
+                "episode": report.get("raw_episode_index"),
+                "episode_id": report.get("raw_episode_id"),
+                "source_hz": round(float(report.get("median_hz", 0.0) or 0.0), 4),
+                "export_hz": float(base_export_fps),
+            }
+            for report in sampling_mismatches[:8]
+        ]
+        raise ValueError(
+            "source_sampling_rate_mismatch: export preserves physical speed and will not retime episodes; "
+            f"expected={base_export_fps:.4f}Hz tolerance={sampling_tolerance_hz:.4f}Hz "
+            f"mismatches={examples}. Export legacy and new sampling rates as separate datasets."
+        )
+
+    progress(8.0, "preparing export directory")
+    if os.path.exists(export_dir):
+        if not overwrite:
+            raise FileExistsError(f"{export_dir} already exists; pass --export-overwrite to rebuild it")
+        if os.path.normcase(export_dir) == os.path.normcase(run_dir):
+            raise ValueError("refusing to overwrite run_dir as export_dir")
+        shutil.rmtree(export_dir)
+    ensure_dir(export_dir)
 
     meta_dir = ensure_dir(os.path.join(export_dir, "meta"))
     data_dir = ensure_dir(os.path.join(export_dir, "data", "chunk-000"))
@@ -4060,7 +4112,12 @@ if __name__ == "__main__":
     parser.add_argument("--export-lerobot-v3", action="store_true", help="Alias for --export-lerobot.")
     parser.add_argument("--export-dir", default=None, help="Output directory for --export-lerobot. Defaults to run_dir/lerobot_v3.")
     parser.add_argument("--export-split", default="trainable", help="Episode index split to export, default: trainable.")
-    parser.add_argument("--export-speed-scale", type=float, default=None, help="Speed multiplier for export timestamps and recomputed dq/ddq/action.")
+    parser.add_argument(
+        "--export-speed-scale",
+        type=float,
+        default=None,
+        help="Deprecated compatibility option. Only 1.0 is accepted; export never retimes recorded motion.",
+    )
     parser.add_argument("--export-limit", type=int, default=None, help="Limit exported episodes for smoke tests.")
     parser.add_argument("--export-overwrite", action="store_true", help="Delete and rebuild the export directory if it already exists.")
     parser.add_argument("--export-require-standard", action="store_true", help="Fail if parquet/mp4 standard export cannot be produced.")
@@ -4086,13 +4143,12 @@ if __name__ == "__main__":
         print_plots(run_dir, output_dir=args.plot_dir)
         did_action = True
     if args.export_lerobot or args.export_lerobot_v3:
-        export_time_policy = None
-        if args.export_speed_scale is not None:
-            export_time_policy = {
-                "speed_scale": args.export_speed_scale if args.export_speed_scale is not None else 1.0,
-                "time_mode": "uniform_fps",
-                "base_fps": None,
-            }
+        if args.export_speed_scale is not None and not math.isclose(float(args.export_speed_scale), 1.0):
+            raise SystemExit(
+                "--export-speed-scale no longer supports values other than 1.0. "
+                "Accelerate the physical Isaac attempt during collection instead."
+            )
+        export_time_policy = default_export_time_policy()
         print_lerobot_export(
             run_dir,
             output_dir=args.export_dir,

@@ -5,6 +5,16 @@ from excavator_common import vla_observation_contract as contract
 
 
 class VLAObservationContractTests(unittest.TestCase):
+    def test_point_transform_uses_initial_heading_frame(self):
+        point = contract.point_in_initial_heading_frame(
+            [2.0, 3.0, 0.5],
+            [1.0, 1.0],
+            math.pi / 2.0,
+        )
+        self.assertAlmostEqual(point[0], 2.0, places=6)
+        self.assertAlmostEqual(point[1], -1.0, places=6)
+        self.assertAlmostEqual(point[2], 0.5, places=6)
+
     def test_phase_mapping(self):
         self.assertEqual(contract.canonical_phase_index("pre_dig"), 0)
         self.assertEqual(contract.canonical_phase_index("curl_to_hold_material"), 4)

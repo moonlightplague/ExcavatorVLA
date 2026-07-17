@@ -155,6 +155,7 @@ from excavator_common.deployment_contract import (
     validate_client_contract,
 )
 from excavator_common import vla_observation_contract
+from excavator_common import deployment_scene_contract
 
 print(
     "[INFO] Run simulation project root:",
@@ -172,9 +173,11 @@ SCENE_USD_PATH = os.path.join(PROJECT_DIR, "assets/usd/excavator_scene.usd")
 ROBOT_PRIM_PATH = "/World/URDF_real3"
 SAND_RUNTIME_PATH = os.path.join(PROJECT_DIR, "scripts", "excavator_app", "sand_site_runtime.py")
 
-# The excavator starts with zero yaw and its arm facing world +X.
-# World +Y is therefore slightly left of the arm.
-SAND_INITIAL_CENTER = (-0.5, 9.2)
+SAND_AUTHORED_CENTER = deployment_scene_contract.AUTHORED_SAND_CENTER_XY
+TRUCK_ROOT_PATH = deployment_scene_contract.TRUCK_ROOT_PATH
+TRUCK_BED_COLLISION_PATH = (
+    deployment_scene_contract.TRUCK_BED_COLLISION_PATH
+)
 
 def _load_sand_runtime():
     """
@@ -741,6 +744,201 @@ def main(args):
         create_viewport_window,
     )
 
+    fixed_scene_profile = (
+        deployment_scene_contract.validate_fixed_scene_profile()
+    )
+
+    def set_prim_translation_and_yaw(
+        prim,
+        translation_xyz,
+        yaw_deg,
+    ):
+        """Set truck translation/yaw without discarding authored scale ops."""
+        if prim is None or not prim.IsValid():
+            raise RuntimeError("Cannot transform an invalid USD prim")
+        xformable = UsdGeom.Xformable(prim)
+        ordered_ops = list(xformable.GetOrderedXformOps())
+        translate_op = None
+        rotate_op = None
+        rotate_types = {
+            UsdGeom.XformOp.TypeRotateZ,
+            UsdGeom.XformOp.TypeRotateXYZ,
+            UsdGeom.XformOp.TypeRotateXZY,
+            UsdGeom.XformOp.TypeRotateYXZ,
+            UsdGeom.XformOp.TypeRotateYZX,
+            UsdGeom.XformOp.TypeRotateZXY,
+            UsdGeom.XformOp.TypeRotateZYX,
+            UsdGeom.XformOp.TypeOrient,
+        }
+        for op in ordered_ops:
+            op_type = op.GetOpType()
+            if (
+                translate_op is None
+                and op_type == UsdGeom.XformOp.TypeTranslate
+            ):
+                translate_op = op
+            if rotate_op is None and op_type in rotate_types:
+                rotate_op = op
+
+        if translate_op is None:
+            translate_op = xformable.AddTranslateOp()
+        translation = Gf.Vec3d(
+            float(translation_xyz[0]),
+            float(translation_xyz[1]),
+            float(translation_xyz[2]),
+        )
+        try:
+            translate_op.Set(translation)
+        except Exception:
+            translate_op.Set(Gf.Vec3f(*translation))
+
+        if rotate_op is None:
+            rotate_op = xformable.AddRotateXYZOp()
+        rotate_type = rotate_op.GetOpType()
+        yaw = float(yaw_deg)
+        if rotate_type == UsdGeom.XformOp.TypeRotateZ:
+            rotate_op.Set(yaw)
+        elif rotate_type == UsdGeom.XformOp.TypeOrient:
+            half_yaw = math.radians(yaw) * 0.5
+            try:
+                rotate_op.Set(
+                    Gf.Quatd(
+                        math.cos(half_yaw),
+                        Gf.Vec3d(0.0, 0.0, math.sin(half_yaw)),
+                    )
+                )
+            except Exception:
+                rotate_op.Set(
+                    Gf.Quatf(
+                        math.cos(half_yaw),
+                        Gf.Vec3f(0.0, 0.0, math.sin(half_yaw)),
+                    )
+                )
+        elif rotate_type in (
+            UsdGeom.XformOp.TypeRotateXYZ,
+            UsdGeom.XformOp.TypeRotateXZY,
+            UsdGeom.XformOp.TypeRotateYXZ,
+            UsdGeom.XformOp.TypeRotateYZX,
+            UsdGeom.XformOp.TypeRotateZXY,
+            UsdGeom.XformOp.TypeRotateZYX,
+        ):
+            current = rotate_op.Get(Usd.TimeCode.Default())
+            rotate_xyz = (
+                float(current[0]) if current is not None else 0.0,
+                float(current[1]) if current is not None else 0.0,
+                yaw,
+            )
+            try:
+                rotate_op.Set(Gf.Vec3d(*rotate_xyz))
+            except Exception:
+                rotate_op.Set(Gf.Vec3f(*rotate_xyz))
+        else:
+            raise RuntimeError(
+                "Unsupported truck rotation op: "
+                f"{rotate_type} on {prim.GetPath()}"
+            )
+
+        all_ops = list(xformable.GetOrderedXformOps())
+        normalized_order = []
+        for op in all_ops:
+            if (
+                op.GetOpType() == UsdGeom.XformOp.TypeTranslate
+                and op not in normalized_order
+            ):
+                normalized_order.append(op)
+        if rotate_op not in normalized_order:
+            normalized_order.append(rotate_op)
+        for op in all_ops:
+            if (
+                op.GetOpType() == UsdGeom.XformOp.TypeScale
+                and op not in normalized_order
+            ):
+                normalized_order.append(op)
+        for op in all_ops:
+            if op not in normalized_order:
+                normalized_order.append(op)
+        xformable.SetXformOpOrder(normalized_order)
+
+    def prim_world_position_and_yaw(prim):
+        matrix = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(
+            Usd.TimeCode.Default()
+        )
+        position = matrix.ExtractTranslation()
+        rotation = matrix.ExtractRotationQuat()
+        imaginary = rotation.GetImaginary()
+        yaw = math.atan2(
+            2.0
+            * (
+                float(rotation.GetReal()) * float(imaginary[2])
+                + float(imaginary[0]) * float(imaginary[1])
+            ),
+            1.0
+            - 2.0
+            * (
+                float(imaginary[1]) * float(imaginary[1])
+                + float(imaginary[2]) * float(imaginary[2])
+            ),
+        )
+        return (
+            np.asarray(
+                [float(position[0]), float(position[1]), float(position[2])],
+                dtype=np.float64,
+            ),
+            yaw,
+        )
+
+    def apply_fixed_training_truck_pose():
+        truck_prim = stage.GetPrimAtPath(TRUCK_ROOT_PATH)
+        if not truck_prim.IsValid():
+            raise RuntimeError(
+                f"Training truck root is unavailable: {TRUCK_ROOT_PATH}"
+            )
+        bed_prim = stage.GetPrimAtPath(TRUCK_BED_COLLISION_PATH)
+        if not bed_prim.IsValid():
+            raise RuntimeError(
+                "Training dump-bed collision mesh is unavailable: "
+                f"{TRUCK_BED_COLLISION_PATH}"
+            )
+        set_prim_translation_and_yaw(
+            truck_prim,
+            fixed_scene_profile["truck_translation_xyz"],
+            fixed_scene_profile["truck_yaw_deg"],
+        )
+        actual_position, actual_yaw = prim_world_position_and_yaw(truck_prim)
+        expected_position = np.asarray(
+            fixed_scene_profile["truck_translation_xyz"],
+            dtype=np.float64,
+        )
+        position_error = float(np.linalg.norm(actual_position - expected_position))
+        yaw_error = abs(
+            math.atan2(
+                math.sin(
+                    actual_yaw
+                    - math.radians(fixed_scene_profile["truck_yaw_deg"])
+                ),
+                math.cos(
+                    actual_yaw
+                    - math.radians(fixed_scene_profile["truck_yaw_deg"])
+                ),
+            )
+        )
+        if position_error > 0.02 or yaw_error > math.radians(0.25):
+            raise RuntimeError(
+                "Truck pose did not match the fixed training profile: "
+                f"position_error={position_error:.6f}, "
+                f"yaw_error_deg={math.degrees(yaw_error):.6f}"
+            )
+        print(
+            "[SCENE CONTRACT] Fixed training truck pose applied:",
+            f"root={TRUCK_ROOT_PATH}",
+            f"bed={TRUCK_BED_COLLISION_PATH}",
+            f"position={actual_position.tolist()}",
+            f"yaw_deg={math.degrees(actual_yaw):.6f}",
+            f"unload_landing={list(fixed_scene_profile['unload_landing_xyz'])}",
+            flush=True,
+        )
+        return truck_prim, bed_prim
+
     def wait_for_stage_loading_complete(
         label,
         timeout_updates=3600,
@@ -1178,7 +1376,6 @@ def main(args):
     except Exception as e:
         print("[ERROR] Failed to set robot pose:", repr(e), flush=True)
 
-
     print("[INFO] World initialized")
     _print_joint_limits_once(robot)
     print("[INFO] Robot joint positions:", robot.get_joint_positions())
@@ -1370,6 +1567,16 @@ def main(args):
         timeout_updates=3600,
         stable_updates=120,
     )
+
+    truck_pose_timeline_was_playing = timeline.is_playing()
+    if truck_pose_timeline_was_playing:
+        timeline.pause()
+        simulation_app.update()
+    apply_fixed_training_truck_pose()
+    for _ in range(3):
+        simulation_app.update()
+    if truck_pose_timeline_was_playing:
+        timeline.play()
 
     def inspect_existing_particle_sand():
         """
@@ -1578,31 +1785,24 @@ def main(args):
         flush=True,
     )
 
-    apply_auto_scene_parameters = (
-        sand_api.get("apply_auto_scene_parameters")
-        or getattr(
-            sand_module,
-            "apply_auto_scene_parameters",
-            None,
-        )
+    actual_sand_center = (
+        float(getattr(sand_module, "SAND_CENTER_X", float("nan"))),
+        float(getattr(sand_module, "SAND_CENTER_Y", float("nan"))),
     )
-
-    if not callable(apply_auto_scene_parameters):
+    if not np.allclose(
+        np.asarray(actual_sand_center, dtype=np.float64),
+        np.asarray(SAND_AUTHORED_CENTER, dtype=np.float64),
+        rtol=0.0,
+        atol=1.0e-4,
+    ):
         raise RuntimeError(
-            "Sand runtime does not expose apply_auto_scene_parameters"
+            "Sand runtime center differs from the authored training center: "
+            f"actual={actual_sand_center}, expected={SAND_AUTHORED_CENTER}"
         )
-
-    sand_position_result = apply_auto_scene_parameters(
-        sand_center_xy=SAND_INITIAL_CENTER,
-        rebuild=False,
-    )
-
-    sand_api = getattr(builtins, "_SAND_SITE", sand_api)
-
     print(
-        "[SAND] Initial center configured:",
-        SAND_INITIAL_CENTER,
-        sand_position_result,
+        "[SCENE CONTRACT] Authored sand center retained:",
+        f"center={actual_sand_center}",
+        f"world_radius_m={fixed_scene_profile['sand_world_radius_m']:.6f}",
         flush=True,
     )
 
@@ -2322,9 +2522,11 @@ def main(args):
         )
 
     def read_truck_yaw_rad():
-        truck_prim = stage.GetPrimAtPath("/World/DumpTruck")
+        truck_prim = stage.GetPrimAtPath(TRUCK_ROOT_PATH)
         if not truck_prim.IsValid():
-            raise RuntimeError("truck prim /World/DumpTruck is unavailable")
+            raise RuntimeError(
+                f"truck prim {TRUCK_ROOT_PATH} is unavailable"
+            )
         matrix = UsdGeom.Xformable(truck_prim).ComputeLocalToWorldTransform(
             Usd.TimeCode.Default()
         )
@@ -2339,29 +2541,12 @@ def main(args):
             ]
         )
 
-    def point_in_current_robot_frame(point_world, base_xy, base_yaw):
-        point = np.asarray(point_world, dtype=np.float32).reshape(-1)
-        base = np.asarray(base_xy, dtype=np.float32).reshape(-1)
-        if point.size < 3 or base.size < 2:
-            raise RuntimeError(
-                f"Invalid State27 target/base point: point={point}, base={base}"
-            )
-        dx = float(point[0] - base[0])
-        dy = float(point[1] - base[1])
-        cosine = math.cos(float(base_yaw))
-        sine = math.sin(float(base_yaw))
-        return [
-            cosine * dx + sine * dy,
-            -sine * dx + cosine * dy,
-            float(point[2]),
-        ]
-
     def resolve_state27_dig_target():
         center_x = float(
-            getattr(sand_module, "SAND_CENTER_X", SAND_INITIAL_CENTER[0])
+            getattr(sand_module, "SAND_CENTER_X", SAND_AUTHORED_CENTER[0])
         )
         center_y = float(
-            getattr(sand_module, "SAND_CENTER_Y", SAND_INITIAL_CENTER[1])
+            getattr(sand_module, "SAND_CENTER_Y", SAND_AUTHORED_CENTER[1])
         )
         target_z = 0.35
         source = "configured_sand_center"
@@ -2400,75 +2585,58 @@ def main(args):
         ), source
 
     def resolve_state27_unload_target():
-        truck_prim = stage.GetPrimAtPath("/World/DumpTruck")
-        if not truck_prim.IsValid():
-            return (
-                np.asarray(
-                    [4.14439, 6.72012, 4.222683],
-                    dtype=np.float32,
-                ),
-                "configured_fallback",
+        bed_prim = stage.GetPrimAtPath(TRUCK_BED_COLLISION_PATH)
+        if not bed_prim.IsValid():
+            raise RuntimeError(
+                "Training dump-bed collision mesh is unavailable: "
+                f"{TRUCK_BED_COLLISION_PATH}"
             )
-        try:
-            bbox_cache = UsdGeom.BBoxCache(
-                Usd.TimeCode.Default(),
-                [
-                    UsdGeom.Tokens.default_,
-                    UsdGeom.Tokens.render,
-                    UsdGeom.Tokens.proxy,
-                ],
-                useExtentsHint=True,
+        bbox_cache = UsdGeom.BBoxCache(
+            Usd.TimeCode.Default(),
+            [
+                UsdGeom.Tokens.default_,
+                UsdGeom.Tokens.render,
+                UsdGeom.Tokens.proxy,
+            ],
+            useExtentsHint=True,
+        )
+        aligned_range = bbox_cache.ComputeWorldBound(
+            bed_prim
+        ).ComputeAlignedRange()
+        if aligned_range.IsEmpty():
+            raise RuntimeError(
+                "Training dump-bed collision mesh has an empty world bound: "
+                f"{TRUCK_BED_COLLISION_PATH}"
             )
-            aligned_range = (
-                bbox_cache.ComputeWorldBound(truck_prim)
-                .ComputeAlignedRange()
+        minimum_value = aligned_range.GetMin()
+        maximum_value = aligned_range.GetMax()
+        minimum = np.asarray(
+            [float(minimum_value[i]) for i in range(3)],
+            dtype=np.float64,
+        )
+        maximum = np.asarray(
+            [float(maximum_value[i]) for i in range(3)],
+            dtype=np.float64,
+        )
+        landing = np.asarray(
+            fixed_scene_profile["unload_landing_xyz"],
+            dtype=np.float64,
+        )
+        xy_inside = bool(
+            np.all(landing[:2] >= minimum[:2] - 0.05)
+            and np.all(landing[:2] <= maximum[:2] + 0.05)
+        )
+        z_above_bed = float(landing[2] - maximum[2])
+        if not xy_inside or not (-0.05 <= z_above_bed <= 0.25):
+            raise RuntimeError(
+                "Fixed unload landing does not match the transformed dump bed: "
+                f"landing={landing.tolist()}, min={minimum.tolist()}, "
+                f"max={maximum.tolist()}, z_above_bed={z_above_bed:.6f}"
             )
-            if not aligned_range.IsEmpty():
-                minimum_value = aligned_range.GetMin()
-                maximum_value = aligned_range.GetMax()
-                minimum = np.asarray(
-                    [
-                        float(minimum_value[0]),
-                        float(minimum_value[1]),
-                        float(minimum_value[2]),
-                    ],
-                    dtype=np.float64,
-                )
-                maximum = np.asarray(
-                    [
-                        float(maximum_value[0]),
-                        float(maximum_value[1]),
-                        float(maximum_value[2]),
-                    ],
-                    dtype=np.float64,
-                )
-                bounds = np.stack((minimum, maximum))
-                if (
-                    np.all(np.isfinite(bounds))
-                    and np.max(np.abs(bounds)) < 1.0e6
-                    and np.all(maximum >= minimum)
-                ):
-                    extent = maximum - minimum
-                    point = 0.5 * (minimum + maximum)
-                    point[2] = minimum[2] + 0.55 * max(
-                        0.0,
-                        float(extent[2]),
-                    )
-                    return point.astype(np.float32), "truck_bbox"
-        except Exception as exc:
-            print(
-                "[STATE27] Truck BBox lookup failed:",
-                repr(exc),
-                flush=True,
-            )
-        matrix = UsdGeom.Xformable(
-            truck_prim
-        ).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
-        position = matrix.ExtractTranslation()
-        return np.asarray(
-            [float(position[0]), float(position[1]), float(position[2])],
-            dtype=np.float32,
-        ), "truck_origin"
+        return (
+            landing.astype(np.float32),
+            "fixed_training_landing_validated_against_dump_bed",
+        )
 
     state27_dig_target_world, state27_dig_target_source = (
         resolve_state27_dig_target()
@@ -2477,6 +2645,38 @@ def main(args):
         resolve_state27_unload_target()
     )
     state27_truck_yaw = read_truck_yaw_rad()
+    startup_base_x, startup_base_y, startup_base_yaw = (
+        read_robot_base_pose()
+    )
+    _, startup_q = read_canonical_joint_positions()
+    startup_heading = startup_base_yaw + float(startup_q[0])
+    startup_origin = (startup_base_x, startup_base_y)
+    startup_dig_local = (
+        vla_observation_contract.point_in_initial_heading_frame(
+            state27_dig_target_world,
+            startup_origin,
+            startup_heading,
+        )
+    )
+    startup_unload_local = (
+        vla_observation_contract.point_in_initial_heading_frame(
+            state27_unload_target_world,
+            startup_origin,
+            startup_heading,
+        )
+    )
+    startup_dig_radius = math.hypot(
+        float(startup_dig_local[0]),
+        float(startup_dig_local[1]),
+    )
+    startup_unload_radius = math.hypot(
+        float(startup_unload_local[0]),
+        float(startup_unload_local[1]),
+    )
+    dig_local_in_training_range = 7.313 <= startup_dig_radius <= 9.146
+    unload_local_in_training_range = (
+        3.953 <= startup_unload_radius <= 10.518
+    )
     print(
         "[STATE27] Fixed environment features:",
         f"dig_target={state27_dig_target_world.tolist()}",
@@ -2484,8 +2684,21 @@ def main(args):
         f"unload_target={state27_unload_target_world.tolist()}",
         f"unload_source={state27_unload_target_source}",
         f"truck_yaw={state27_truck_yaw:.6f}",
+        f"initial_origin={list(startup_origin)}",
+        f"initial_heading={startup_heading:.6f}",
+        f"dig_local_radius={startup_dig_radius:.6f}",
+        f"dig_local_in_training_range={dig_local_in_training_range}",
+        f"unload_local_radius={startup_unload_radius:.6f}",
+        f"unload_local_in_training_range={unload_local_in_training_range}",
         flush=True,
     )
+    if not dig_local_in_training_range or not unload_local_in_training_range:
+        print(
+            "[WARN] [SCENE CONTRACT] Fixed sand/truck world placement is "
+            "training-valid, but the unchanged robot pose makes a target "
+            "local radius fall outside the observed training range.",
+            flush=True,
+        )
 
     # TCP Bridge Server functions.
     # No USD prims, references, or other scene objects may be
@@ -2622,6 +2835,24 @@ def main(args):
                     deployment_previous_q = None
                     deployment_previous_load = None
                     deployment_elapsed_seconds = 0.0
+                    if active_contract["observation_schema"] in (
+                        OBSERVATION_SCHEMA_27D_PLUS_EFFORT,
+                        OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
+                    ):
+                        base_x, base_y, base_yaw = read_robot_base_pose()
+                        _, initial_q = read_canonical_joint_positions()
+                        active_observation_context.setdefault(
+                            "initial_origin_xy",
+                            [base_x, base_y],
+                        )
+                        active_observation_context.setdefault(
+                            "initial_heading_rad",
+                            float(base_yaw) + float(initial_q[0]),
+                        )
+                        active_observation_context.setdefault(
+                            "truck_yaw_rad",
+                            read_truck_yaw_rad(),
+                        )
                     if (
                         active_contract["observation_schema"]
                         == OBSERVATION_SCHEMA_28D_PLUS_EFFORT
@@ -2643,20 +2874,6 @@ def main(args):
                             )
                         active_phase_estimator = (
                             vla_observation_contract.DeploymentPhaseEstimator()
-                        )
-                        base_x, base_y, base_yaw = read_robot_base_pose()
-                        _, initial_q = read_canonical_joint_positions()
-                        active_observation_context.setdefault(
-                            "initial_origin_xy",
-                            [base_x, base_y],
-                        )
-                        active_observation_context.setdefault(
-                            "initial_heading_rad",
-                            float(base_yaw) + float(initial_q[0]),
-                        )
-                        active_observation_context.setdefault(
-                            "truck_yaw_rad",
-                            read_truck_yaw_rad(),
                         )
                     reply = {
                         "type": "handshake_ack",
@@ -2940,18 +3157,32 @@ def main(args):
                         "State27 requires four joint velocities, got "
                         f"{joint_velocities_state.shape}"
                     )
-                dig_target_local = point_in_current_robot_frame(
-                    state27_dig_target_world,
+                initial_origin_xy = active_observation_context.get(
+                    "initial_origin_xy",
                     (base_x, base_y),
-                    base_yaw,
                 )
-                unload_target_local = point_in_current_robot_frame(
-                    state27_unload_target_world,
-                    (base_x, base_y),
-                    base_yaw,
+                initial_heading_rad = float(
+                    active_observation_context.get(
+                        "initial_heading_rad",
+                        base_yaw,
+                    )
+                )
+                dig_target_local = (
+                    vla_observation_contract.point_in_initial_heading_frame(
+                        state27_dig_target_world,
+                        initial_origin_xy,
+                        initial_heading_rad,
+                    )
+                )
+                unload_target_local = (
+                    vla_observation_contract.point_in_initial_heading_frame(
+                        state27_unload_target_world,
+                        initial_origin_xy,
+                        initial_heading_rad,
+                    )
                 )
                 relative_truck_yaw = (
-                    float(state27_truck_yaw) - float(base_yaw)
+                    float(state27_truck_yaw) - initial_heading_rad
                 )
                 observation_state = (
                     list(base_state_14d)
@@ -2985,7 +3216,7 @@ def main(args):
                 sand_x = float(getattr(sand_module, "SAND_CENTER_X", 0.0))
                 sand_y = float(getattr(sand_module, "SAND_CENTER_Y", 6.7))
                 sand_xy = (sand_x, sand_y)
-                truck_prim = stage.GetPrimAtPath("/World/DumpTruck")
+                truck_prim = stage.GetPrimAtPath(TRUCK_ROOT_PATH)
                 if truck_prim.IsValid():
                     truck_xf = UsdGeom.Xformable(truck_prim)
                     truck_pos = truck_xf.ComputeLocalToWorldTransform(Usd.TimeCode.Default()).ExtractTranslation()

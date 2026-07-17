@@ -57,34 +57,30 @@ class DeploymentSceneContractTests(unittest.TestCase):
         self.assertNotIn("SAND_INITIAL_CENTER", source)
         self.assertIn("prim_local_yaw_z_deg(truck_prim)", source)
 
-    def test_sand_init_temporarily_suspends_excavator_collisions(self):
+    def test_sand_init_elevates_then_restores_excavator(self):
         source = (
             Path(__file__).resolve().parents[1] / "run_simulation.py"
         ).read_text(encoding="utf-8")
-        suspend_call = source.index(
-            "suspend_excavator_collisions_for_sand_init()",
-            source.index("sand_amount = int(args.sand_amount)"),
+        elevate_call = source.index(
+            "elevate_excavator_for_sand_init(",
+            source.index("actual_sand_center ="),
         )
         settle_loop = source.index(
             "range(max(1, int(args.sand_settle_frames)))",
-            suspend_call,
+            elevate_call,
         )
         restore_call = source.index(
-            "restore_excavator_collisions_after_sand_init(",
+            "restore_excavator_pose_after_sand_init(",
             settle_loop,
         )
-        self.assertLess(suspend_call, settle_loop)
+        self.assertLess(elevate_call, settle_loop)
         self.assertLess(settle_loop, restore_call)
         self.assertIn(
-            "pending_collision_restore = _ACTIVE_SAND_COLLISION_RESTORE",
+            "pending_pose_restore = _ACTIVE_SAND_POSE_RESTORE",
             source,
         )
-        self.assertIn(
-            'prim.GetAttribute("physics:collisionEnabled")',
-            source,
-        )
-        self.assertIn("collisionNamedGprim", source)
-        self.assertIn("by_link={collider_counts_by_link}", source)
+        self.assertNotIn("suspend_excavator_collisions_for_sand_init", source)
+        self.assertIn("target_min_z", source)
 
 
 if __name__ == "__main__":

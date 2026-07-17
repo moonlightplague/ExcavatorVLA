@@ -178,7 +178,7 @@ TRUCK_ROOT_PATH = deployment_scene_contract.TRUCK_ROOT_PATH
 TRUCK_BED_COLLISION_PATH = (
     deployment_scene_contract.TRUCK_BED_COLLISION_PATH
 )
-_ACTIVE_SAND_COLLISION_RESTORE = None
+_ACTIVE_SAND_POSE_RESTORE = None
 
 def _load_sand_runtime():
     """
@@ -713,7 +713,7 @@ def _print_joint_limits_once(
 
 def main(args):
     """Main entry point for standalone launch."""
-    global _ACTIVE_SAND_COLLISION_RESTORE
+    global _ACTIVE_SAND_POSE_RESTORE
 
     # Import Isaac Sim modules after Isaac Sim Python env is set up.
     from isaacsim import SimulationApp
@@ -1592,166 +1592,188 @@ def main(args):
     if truck_pose_timeline_was_playing:
         timeline.play()
 
-    def suspend_excavator_collisions_for_sand_init():
-        """Disable every excavator collider and retain its original state."""
+    def elevate_excavator_for_sand_init(sand_floor_z, sand_fill_height):
+        """Move the complete articulation above the sand initialization zone."""
         robot_prim = stage.GetPrimAtPath(ROBOT_PRIM_PATH)
         if not robot_prim.IsValid():
             raise RuntimeError(
-                f"Cannot suspend collisions; robot prim is missing: {ROBOT_PRIM_PATH}"
+                f"Cannot elevate robot; prim is missing: {ROBOT_PRIM_PATH}"
             )
+        original_position, original_orientation = robot.get_world_pose()
+        original_position = np.asarray(
+            original_position,
+            dtype=np.float32,
+        ).copy()
+        original_orientation = np.asarray(
+            original_orientation,
+            dtype=np.float32,
+        ).copy()
+        original_joint_positions = np.asarray(
+            robot.get_joint_positions(),
+            dtype=np.float32,
+        ).copy()
+        original_joint_velocities = np.asarray(
+            robot.get_joint_velocities(),
+            dtype=np.float32,
+        ).copy()
 
-        snapshots = []
-        collider_counts_by_link = {}
-        collider_counts_by_source = {}
-        for prim in Usd.PrimRange(robot_prim):
-            try:
-                path = str(prim.GetPath())
-                relative_path = path[len(ROBOT_PRIM_PATH):].lstrip("/")
-                link_name = (
-                    relative_path.split("/", 1)[0]
-                    if relative_path
-                    else "<robot_root>"
-                )
-                enabled_attr = prim.GetAttribute("physics:collisionEnabled")
-                has_enabled_attr = bool(enabled_attr.IsValid())
-                has_collision_api = bool(
-                    prim.HasAPI(UsdPhysics.CollisionAPI)
-                )
-                applied_schemas = [
-                    str(schema).lower()
-                    for schema in prim.GetAppliedSchemas()
-                ]
-                has_collision_schema = any(
-                    "collisionapi" in schema
-                    for schema in applied_schemas
-                )
-                path_parts = [
-                    part.lower()
-                    for part in relative_path.split("/")
-                    if part
-                ]
-                collision_named = any(
-                    part in ("collision", "collisions")
-                    or part.startswith("collision_")
-                    or part.endswith("_collision")
-                    for part in path_parts
-                )
-                is_collision_geometry = bool(
-                    collision_named and prim.IsA(UsdGeom.Gprim)
-                )
-                if not (
-                    has_collision_api
-                    or has_enabled_attr
-                    or has_collision_schema
-                    or is_collision_geometry
-                ):
-                    continue
-                original_value = (
-                    enabled_attr.Get() if enabled_attr.IsValid() else None
-                )
-                originally_enabled = (
-                    True if original_value is None else bool(original_value)
-                )
-                if not enabled_attr.IsValid():
-                    enabled_attr = prim.CreateAttribute(
-                        "physics:collisionEnabled",
-                        Sdf.ValueTypeNames.Bool,
-                    )
-                enabled_attr.Set(False)
-                snapshots.append(
-                    (path, originally_enabled)
-                )
-                source_names = []
-                if has_collision_api:
-                    source_names.append("CollisionAPI")
-                if has_enabled_attr:
-                    source_names.append("collisionEnabled")
-                if has_collision_schema:
-                    source_names.append("appliedSchema")
-                if is_collision_geometry:
-                    source_names.append("collisionNamedGprim")
-                source = "+".join(source_names)
-                collider_counts_by_link[link_name] = (
-                    collider_counts_by_link.get(link_name, 0) + 1
-                )
-                collider_counts_by_source[source] = (
-                    collider_counts_by_source.get(source, 0) + 1
-                )
-            except Exception as exc:
+        bbox_cache = UsdGeom.BBoxCache(
+            Usd.TimeCode.Default(),
+            [
+                UsdGeom.Tokens.default_,
+                UsdGeom.Tokens.render,
+                UsdGeom.Tokens.proxy,
+            ],
+            useExtentsHint=True,
+        )
+        robot_range = bbox_cache.ComputeWorldBound(
+            robot_prim
+        ).ComputeAlignedRange()
+        if robot_range.IsEmpty():
+            raise RuntimeError("Cannot elevate robot; world bound is empty")
+        original_min_z = float(robot_range.GetMin()[2])
+        target_min_z = (
+            float(sand_floor_z) + float(sand_fill_height) + 1.0
+        )
+        lift_z = max(2.0, target_min_z - original_min_z)
+        elevated_position = original_position.copy()
+        elevated_position[2] += float(lift_z)
+
+        try:
+            robot.set_world_pose(
+                position=elevated_position,
+                orientation=original_orientation,
+            )
+            robot.set_joint_velocities(
+                np.zeros_like(original_joint_velocities)
+            )
+            for _ in range(3):
+                simulation_app.update()
+
+            actual_position, _ = robot.get_world_pose()
+            actual_position = np.asarray(actual_position, dtype=np.float32)
+            position_error = float(
+                np.linalg.norm(actual_position - elevated_position)
+            )
+            elevated_bbox_cache = UsdGeom.BBoxCache(
+                Usd.TimeCode.Default(),
+                [
+                    UsdGeom.Tokens.default_,
+                    UsdGeom.Tokens.render,
+                    UsdGeom.Tokens.proxy,
+                ],
+                useExtentsHint=True,
+            )
+            elevated_range = elevated_bbox_cache.ComputeWorldBound(
+                robot_prim
+            ).ComputeAlignedRange()
+            elevated_min_z = float(elevated_range.GetMin()[2])
+            if (
+                position_error > 0.02
+                or elevated_min_z < target_min_z - 0.05
+            ):
                 raise RuntimeError(
-                    "Failed to suspend excavator collider "
-                    f"{prim.GetPath()}: {exc}"
-                ) from exc
-
-        if not snapshots:
-            raise RuntimeError(
-                f"No CollisionAPI prims found below {ROBOT_PRIM_PATH}"
+                    "Excavator elevation did not take effect: "
+                    f"position_error={position_error:.6f}, "
+                    f"elevated_min_z={elevated_min_z:.6f}, "
+                    f"target_min_z={target_min_z:.6f}"
+                )
+        except Exception:
+            robot.set_world_pose(
+                position=original_position,
+                orientation=original_orientation,
             )
-
-        simulation_app.update()
-        still_enabled = []
-        for path, _ in snapshots:
-            prim = stage.GetPrimAtPath(path)
-            value = UsdPhysics.CollisionAPI(
-                prim
-            ).GetCollisionEnabledAttr().Get()
-            if value is None or bool(value):
-                still_enabled.append(path)
-        if still_enabled:
-            raise RuntimeError(
-                "Excavator collision suspension did not take effect: "
-                f"{still_enabled}"
-            )
-
+            robot.set_joint_positions(original_joint_positions)
+            robot.set_joint_velocities(original_joint_velocities)
+            simulation_app.update()
+            raise
         print(
-            "[SAND INIT] Excavator collisions suspended:",
-            f"colliders={len(snapshots)}",
-            f"by_link={collider_counts_by_link}",
-            f"by_source={collider_counts_by_source}",
+            "[SAND INIT] Excavator elevated:",
+            f"original_position={original_position.tolist()}",
+            f"elevated_position={actual_position.tolist()}",
+            f"original_min_z={original_min_z:.6f}",
+            f"elevated_min_z={elevated_min_z:.6f}",
+            f"target_min_z={target_min_z:.6f}",
+            f"lift_z={lift_z:.6f}",
             flush=True,
         )
-        return snapshots
+        return {
+            "position": original_position,
+            "orientation": original_orientation,
+            "joint_positions": original_joint_positions,
+            "joint_velocities": original_joint_velocities,
+        }
 
-    def restore_excavator_collisions_after_sand_init(snapshots):
-        """Restore the per-collider enabled states saved before sand init."""
-        failures = []
-        for path, originally_enabled in snapshots:
-            prim = stage.GetPrimAtPath(path)
-            if not prim.IsValid():
-                failures.append(f"{path}:missing")
-                continue
-            try:
-                enabled_attr = prim.GetAttribute("physics:collisionEnabled")
-                if not enabled_attr.IsValid():
-                    enabled_attr = prim.CreateAttribute(
-                        "physics:collisionEnabled",
-                        Sdf.ValueTypeNames.Bool,
-                    )
-                enabled_attr.Set(bool(originally_enabled))
-            except Exception as exc:
-                failures.append(f"{path}:{type(exc).__name__}:{exc}")
+    def restore_excavator_pose_after_sand_init(snapshot):
+        """Restore the exact base and articulation state saved before lifting."""
+        robot.set_world_pose(
+            position=snapshot["position"],
+            orientation=snapshot["orientation"],
+        )
+        robot.set_joint_positions(snapshot["joint_positions"])
+        robot.set_joint_velocities(snapshot["joint_velocities"])
+        for _ in range(3):
+            simulation_app.update()
 
-        simulation_app.update()
-        for path, originally_enabled in snapshots:
-            prim = stage.GetPrimAtPath(path)
-            if not prim.IsValid():
-                continue
-            actual_value = prim.GetAttribute(
-                "physics:collisionEnabled"
-            ).Get()
-            if bool(actual_value) != bool(originally_enabled):
-                failures.append(
-                    f"{path}:expected={originally_enabled}:actual={actual_value}"
+        actual_position, actual_orientation = robot.get_world_pose()
+        actual_position = np.asarray(actual_position, dtype=np.float32)
+        actual_orientation = np.asarray(
+            actual_orientation,
+            dtype=np.float32,
+        )
+        position_error = float(
+            np.linalg.norm(actual_position - snapshot["position"])
+        )
+        actual_orientation /= max(
+            1.0e-12,
+            float(np.linalg.norm(actual_orientation)),
+        )
+        expected_orientation = np.asarray(
+            snapshot["orientation"],
+            dtype=np.float32,
+        )
+        expected_orientation /= max(
+            1.0e-12,
+            float(np.linalg.norm(expected_orientation)),
+        )
+        orientation_dot = float(
+            np.clip(
+                abs(np.dot(actual_orientation, expected_orientation)),
+                0.0,
+                1.0,
+            )
+        )
+        orientation_error_deg = math.degrees(
+            2.0 * math.acos(orientation_dot)
+        )
+        actual_joint_positions = np.asarray(
+            robot.get_joint_positions(),
+            dtype=np.float32,
+        )
+        joint_error = float(
+            np.max(
+                np.abs(
+                    actual_joint_positions - snapshot["joint_positions"]
                 )
-
-        if failures:
+            )
+        )
+        if (
+            position_error > 0.02
+            or orientation_error_deg > 0.1
+            or joint_error > 1.0e-3
+        ):
             raise RuntimeError(
-                "Failed to restore excavator collision state after sand init: "
-                f"{failures}"
+                "Failed to restore excavator after sand init: "
+                f"position_error={position_error:.6f}, "
+                f"orientation_error_deg={orientation_error_deg:.6f}, "
+                f"joint_error={joint_error:.6f}"
             )
         print(
-            "[SAND INIT] Excavator collisions restored:",
-            f"colliders={len(snapshots)}",
+            "[SAND INIT] Excavator pose restored:",
+            f"position={actual_position.tolist()}",
+            f"position_error={position_error:.6f}",
+            f"orientation_error_deg={orientation_error_deg:.6f}",
+            f"joint_error={joint_error:.6f}",
             flush=True,
         )
 
@@ -1872,7 +1894,7 @@ def main(args):
     # Do not add or reference any USD scene objects after this block.
     # -----------------------------------------------------------------
     sand_amount = int(args.sand_amount)
-    excavator_collision_snapshots = []
+    excavator_pose_snapshot = None
 
     if not os.path.isfile(SAND_RUNTIME_PATH):
         raise FileNotFoundError(
@@ -1883,14 +1905,6 @@ def main(args):
         f"[SAND] Loading runtime: {SAND_RUNTIME_PATH}",
         flush=True,
     )
-
-    if sand_amount > 0:
-        excavator_collision_snapshots = (
-            suspend_excavator_collisions_for_sand_init()
-        )
-        _ACTIVE_SAND_COLLISION_RESTORE = lambda snapshots=tuple(
-            excavator_collision_snapshots
-        ): restore_excavator_collisions_after_sand_init(snapshots)
 
     enable_gpu_particle_physics()
 
@@ -1993,6 +2007,18 @@ def main(args):
     )
 
     if sand_amount > 0:
+        excavator_pose_snapshot = elevate_excavator_for_sand_init(
+            sand_floor_z=float(
+                getattr(sand_module, "SAND_FLOOR_Z", 0.0)
+            ),
+            sand_fill_height=float(
+                getattr(sand_module, "SANDBOX_FILL_HEIGHT", 3.0)
+            ),
+        )
+        _ACTIVE_SAND_POSE_RESTORE = lambda snapshot=(
+            excavator_pose_snapshot
+        ): restore_excavator_pose_after_sand_init(snapshot)
+
         existing_sand_after_runtime = (
             inspect_existing_particle_sand()
         )
@@ -2231,11 +2257,11 @@ def main(args):
             flush=True,
         )
 
-        restore_excavator_collisions_after_sand_init(
-            excavator_collision_snapshots
+        restore_excavator_pose_after_sand_init(
+            excavator_pose_snapshot
         )
-        _ACTIVE_SAND_COLLISION_RESTORE = None
-        excavator_collision_snapshots = []
+        _ACTIVE_SAND_POSE_RESTORE = None
+        excavator_pose_snapshot = None
 
 
     # Hide sand BBox/range/debug visuals after particle settling.
@@ -3684,14 +3710,14 @@ if __name__ == "__main__":
     try:
         main(args)
     finally:
-        pending_collision_restore = _ACTIVE_SAND_COLLISION_RESTORE
-        _ACTIVE_SAND_COLLISION_RESTORE = None
-        if callable(pending_collision_restore):
+        pending_pose_restore = _ACTIVE_SAND_POSE_RESTORE
+        _ACTIVE_SAND_POSE_RESTORE = None
+        if callable(pending_pose_restore):
             try:
-                pending_collision_restore()
+                pending_pose_restore()
             except Exception as exc:
                 print(
-                    "[ERROR] Emergency excavator collision restoration failed:",
+                    "[ERROR] Emergency excavator pose restoration failed:",
                     repr(exc),
                     flush=True,
                 )

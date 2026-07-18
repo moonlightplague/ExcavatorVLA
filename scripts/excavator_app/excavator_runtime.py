@@ -775,6 +775,10 @@ AUTO_COLLECT_HOME_ONLY_IF_UNSAFE = True
 AUTO_COLLECT_UNSAFE_BUCKET_BELOW_GROUND_Z = 0.08
 AUTO_COLLECT_HOME_BUCKET_RELAXED_TOL_DEG = 28.0
 AUTO_COLLECT_HOME_NON_BUCKET_RELAXED_SCALE = 1.5
+AUTO_COLLECT_HOME_RAISED_BOOM_TOL_DEG = max(
+    0.0,
+    float(os.environ.get("EXCAVATOR_AUTO_HOME_RAISED_BOOM_TOL_DEG", "20.0") or 20.0),
+)
 DIRECT_INITIAL_POSE_SETTLE_FRAMES = 18
 DIRECT_PLAN_END_HOME_SETTLE_FRAMES = 8
 AUTO_SCENE_RANDOM_TRUCK_DEFAULT = env_bool("EXCAVATOR_RANDOM_TRUCK", True)
@@ -1070,6 +1074,10 @@ BUCKET_CARRY_WARNING_EXTRA_TOL_DEG = 14.0
 BUCKET_CARRY_WARNING_MIN_POUR_ABOVE_LOAD_Z = -0.35
 LIFT_CARRY_MIN_LOAD_RAISE_M = 0.25
 LOADED_CARRY_ROUTE_HEIGHT_MARGIN_M = 0.20
+LOADED_CARRY_ROUTE_HEIGHT_TOLERANCE_M = max(
+    0.0,
+    float(os.environ.get("EXCAVATOR_LOADED_CARRY_HEIGHT_TOLERANCE_M", "0.02") or 0.02),
+)
 BUCKET_CARRY_MAX_DUMP_BRANCH_DEG = 35.0
 BUCKET_CARRY_MAX_ADJUST_DEG = 65.0
 BUCKET_CARRY_SOFT_ADJUST_DEG = 42.0
@@ -10116,16 +10124,17 @@ def loaded_carry_height_report(q_pose, floor, reference_q=None):
         min_tip_z = float(floor.get("min_tip_z", -1.0e9))
         load_margin = float(load[2]) - min_load_z
         tip_margin = float(tip[2]) - min_tip_z
-        ok = bool(load_margin >= -1e-4 and tip_margin >= -1e-4)
+        classification = common_planning.height_floor_report(
+            load_margin,
+            tip_margin,
+            tolerance_m=LOADED_CARRY_ROUTE_HEIGHT_TOLERANCE_M,
+        )
         return {
-            "ok": ok,
-            "reason": "ok" if ok else "loaded_carry_height_drop",
+            **classification,
             "load_z": float(load[2]),
             "tip_z": float(tip[2]),
             "min_load_z": float(min_load_z),
             "min_tip_z": float(min_tip_z),
-            "load_margin": float(load_margin),
-            "tip_margin": float(tip_margin),
             "floor": floor,
         }
     except Exception as exc:
@@ -17418,13 +17427,31 @@ async def auto_collect_prepare_environment(initial_info=None, attempt_index=None
             settle_frames=DIRECT_INITIAL_POSE_SETTLE_FRAMES,
             task_id=task_id,
         )
+        initial_recovery = None
+        if not initial_ok:
+            initial_recovery = auto_collect_home_reach_detail(q_initial)
+            if bool(initial_recovery.get("relaxed_ok", False)):
+                initial_ok = accept_auto_collect_home_recovery(
+                    initial_recovery.get("q_real"),
+                    detail=initial_recovery,
+                    label=f"auto_collect_initial_pre_reset_{initial_info.get('id', '')}",
+                )
         record_gate(
             "initial_pose_pre_reset",
             bool(initial_ok),
-            "ok" if initial_ok else "prepare_failed/initial_pose_pre_reset_failed",
+            (
+                "ok_recovered"
+                if initial_ok and isinstance(initial_recovery, dict)
+                else ("ok" if initial_ok else "prepare_failed/initial_pose_pre_reset_failed")
+            ),
             detail={
                 "initial_pose_id": str(initial_info.get("id", "")),
                 "q_initial_deg": initial_info.get("q_deg", []),
+                "recovery": {
+                    key: value
+                    for key, value in (initial_recovery or {}).items()
+                    if key != "q_real"
+                },
             },
         )
         record_prepare_step(
@@ -25258,10 +25285,23 @@ def auto_collect_home_reach_detail(q_home):
     boom_err = float(err_by_name.get("boom", 0.0) or 0.0)
     arm_err = float(err_by_name.get("arm", 0.0) or 0.0)
     swing_err = float(err_by_name.get("swing", swing_err) or 0.0)
+    boom_goal_deg = rad_to_deg(float(q_goal[CTRL.name_to_idx["boom"]]))
+    boom_real_deg = (
+        rad_to_deg(float(q_real[CTRL.name_to_idx["boom"]]))
+        if q_real is not None
+        else boom_goal_deg
+    )
+    boom_is_safely_raised = (
+        boom_real_deg >= boom_goal_deg
+        and boom_err <= float(AUTO_COLLECT_HOME_RAISED_BOOM_TOL_DEG)
+    )
     non_bucket_scale = max(1.0, float(AUTO_COLLECT_HOME_NON_BUCKET_RELAXED_SCALE))
     non_bucket_ok = (
         swing_err <= float(MOVE_FINAL_SWING_TOL_DEG) * non_bucket_scale
-        and boom_err <= float(MOVE_FINAL_JOINT_TOL_DEG) * non_bucket_scale
+        and (
+            boom_err <= float(MOVE_FINAL_JOINT_TOL_DEG) * non_bucket_scale
+            or boom_is_safely_raised
+        )
         and arm_err <= float(MOVE_FINAL_JOINT_TOL_DEG) * non_bucket_scale
     )
     bucket_relaxed_ok = bucket_err <= float(AUTO_COLLECT_HOME_BUCKET_RELAXED_TOL_DEG)
@@ -25273,13 +25313,17 @@ def auto_collect_home_reach_detail(q_home):
         "blocked_joints": list(blocked or []),
         "err_deg": err_by_name,
         "max_err_deg": float(max_err),
+        "boom_is_safely_raised": bool(boom_is_safely_raised),
+        "boom_goal_deg": float(boom_goal_deg),
+        "boom_real_deg": float(boom_real_deg),
+        "raised_boom_tolerance_deg": float(AUTO_COLLECT_HOME_RAISED_BOOM_TOL_DEG),
         "q_goal_deg": q_deg_values(q_goal, wrap_swing_for_display=True),
         "q_real_deg": q_deg_values(q_real, wrap_swing_for_display=True) if q_real is not None else None,
         "q_real": q_real,
     }
 
 
-def accept_auto_collect_home_recovery(q_real, detail=None):
+def accept_auto_collect_home_recovery(q_real, detail=None, label="auto_collect_home"):
     if q_real is None:
         return False
     q_hold = CTRL.clip_limits(np.array(q_real, dtype=np.float32).reshape(-1)[: len(DOF_ORDER)].copy())
@@ -25290,7 +25334,7 @@ def accept_auto_collect_home_recovery(q_real, detail=None):
     STATE["manual_joint_target"] = None
     STATE["trace_active_motion"] = None
     try:
-        CTRL.send_action(q_hold, mode="auto_collect_home_recovered_hold")
+        CTRL.send_action(q_hold, mode=f"{str(label)}_recovered_hold")
     except Exception:
         pass
     try:
@@ -25299,13 +25343,15 @@ def accept_auto_collect_home_recovery(q_real, detail=None):
         pass
     err_detail = detail.get("err_deg", {}) if isinstance(detail, dict) else {}
     info_print(
-        "[AUTO HOME RECOVERY]",
+        "[AUTO DIRECT RECOVERY]",
+        f"label={label}",
         "decision=accept_relaxed_home",
         f"q_hold_deg={q_deg_values(q_hold, wrap_swing_for_display=True)}",
         f"err_deg={err_detail}",
     )
     debug_timeline_record(
         "AUTO_HOME_RECOVERY",
+        stage=str(label),
         result="accepted",
         reason="accept_relaxed_home",
         q_real=q_hold,
@@ -30635,14 +30681,19 @@ def staged_lift_candidates(q_start):
         real_material_hold = bool(real_loaded_secure_hold_allowed(carry_report, loaded_count=loaded_now))
         transitional_material_hold = bool(loaded_transitional_hold_allowed(carry_report, loaded_count=loaded_now))
         candidate_carry_score = carry_report_score(carry_report)
-        high_load_recovery_candidate = bool(
-            loaded_now >= int(LIFT_CARRY_HIGH_LOAD_RECOVERY_PARTICLES)
-            and transitional_material_hold
-            and bool((carry_report or {}).get("loaded_carry_joint_ok", False))
-            and not bool((carry_report or {}).get("dump_branch_for_carry", False))
-            and candidate_carry_score
-            >= float(start_carry_score) - float(LIFT_CARRY_RECOVERY_MAX_SCORE_DROP)
+        recovery_policy = common_planning.loaded_lift_recovery_report(
+            loaded_count=loaded_now,
+            minimum_loaded_count=LIFT_CARRY_HIGH_LOAD_RECOVERY_PARTICLES,
+            transitional_hold=transitional_material_hold,
+            loaded_carry_joint_ok=bool((carry_report or {}).get("loaded_carry_joint_ok", False)),
+            dump_branch=bool((carry_report or {}).get("dump_branch_for_carry", False)),
+            carry_score_before=start_carry_score,
+            carry_score_after=candidate_carry_score,
+            score_warning_threshold=LIFT_CARRY_RECOVERY_MAX_SCORE_DROP,
         )
+        high_load_recovery_candidate = bool(recovery_policy["allowed"])
+        carry_score_drop = float(recovery_policy["score_drop"])
+        carry_score_warning = bool(recovery_policy["score_warning"])
         if not (retains_material or real_material_hold or high_load_recovery_candidate):
             rows.append({
                 "ok": False,
@@ -30698,7 +30749,7 @@ def staged_lift_candidates(q_start):
             float(motion.get("cost", 0.0) or 0.0)
             + carry_spill_risk_penalty(carry_report)
             + (
-                float(LIFT_CARRY_RECOVERY_CANDIDATE_PENALTY)
+                float(LIFT_CARRY_RECOVERY_CANDIDATE_PENALTY) + float(carry_score_drop)
                 if high_load_recovery_candidate and not (retains_material or real_material_hold)
                 else 0.0
             )
@@ -30716,6 +30767,9 @@ def staged_lift_candidates(q_start):
             "high_load_recovery_candidate": bool(high_load_recovery_candidate),
             "carry_score_before": float(start_carry_score),
             "carry_score_after": float(candidate_carry_score),
+            "carry_score_drop": float(carry_score_drop),
+            "carry_score_warning": bool(carry_score_warning),
+            "carry_score_warning_threshold": float(LIFT_CARRY_RECOVERY_MAX_SCORE_DROP),
             "preserve_loaded_bucket": False,
             "loaded_now": int(loaded_now),
             "boom_lift_deg": float(boom_lift_deg),
@@ -31972,6 +32026,7 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
             f"arm_retract={float(lift.get('arm_retract_deg', 0.0)):.1f}deg",
             f"carry_score={float(lift.get('carry_score_before', 0.0) or 0.0):.2f}"
             f"->{float(lift.get('carry_score_after', 0.0) or 0.0):.2f}",
+            f"carry_score_warning={bool(lift.get('carry_score_warning', False))}",
             f"q_goal={q_deg_values(q_lift, wrap_swing_for_display=True)}",
         )
         lift_row = make_stage_row_from_q(
@@ -31994,6 +32049,12 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
                     "loaded_particles": int(lift.get("loaded_now", 0) or 0),
                     "carry_score_before": float(lift.get("carry_score_before", 0.0) or 0.0),
                     "carry_score_after": float(lift.get("carry_score_after", 0.0) or 0.0),
+                    "carry_score_drop": float(lift.get("carry_score_drop", 0.0) or 0.0),
+                    "carry_score_warning": bool(lift.get("carry_score_warning", False)),
+                    "carry_score_warning_threshold": float(
+                        lift.get("carry_score_warning_threshold", LIFT_CARRY_RECOVERY_MAX_SCORE_DROP)
+                        or LIFT_CARRY_RECOVERY_MAX_SCORE_DROP
+                    ),
                 },
             },
         )

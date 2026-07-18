@@ -7,6 +7,7 @@ from pathlib import Path
 
 import excavator_dataset_tools
 from excavator_common import bridge_protocol, geometry, paths, planning, scene_randomization, vla_observation_contract
+from scripts.excavator_app import auto_dataset_collect
 
 try:
     import numpy as np
@@ -111,6 +112,44 @@ class PlanningTests(unittest.TestCase):
         longer = planning.route_efficiency_score(3.0, 180.0, 2)
         self.assertLess(shorter, longer)
 
+    def test_height_floor_accepts_small_negative_margin_with_warning(self):
+        report = planning.height_floor_report(0.038, -0.0013, tolerance_m=0.02)
+        self.assertTrue(report["ok"])
+        self.assertTrue(report["within_tolerance"])
+        self.assertEqual(report["warning"], "loaded_carry_height_near_floor")
+
+    def test_height_floor_rejects_drop_beyond_tolerance(self):
+        report = planning.height_floor_report(0.038, -0.021, tolerance_m=0.02)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["reason"], "loaded_carry_height_drop")
+
+    def test_loaded_lift_recovery_treats_score_drop_as_warning(self):
+        report = planning.loaded_lift_recovery_report(
+            loaded_count=5397,
+            minimum_loaded_count=2000,
+            transitional_hold=True,
+            loaded_carry_joint_ok=True,
+            dump_branch=False,
+            carry_score_before=-33.22,
+            carry_score_after=-36.76,
+            score_warning_threshold=3.0,
+        )
+        self.assertTrue(report["allowed"])
+        self.assertTrue(report["score_warning"])
+        self.assertAlmostEqual(report["score_drop"], 3.54, places=6)
+
+    def test_loaded_lift_recovery_still_rejects_dump_branch(self):
+        report = planning.loaded_lift_recovery_report(
+            loaded_count=5397,
+            minimum_loaded_count=2000,
+            transitional_hold=True,
+            loaded_carry_joint_ok=True,
+            dump_branch=True,
+            carry_score_before=-33.22,
+            carry_score_after=-36.76,
+        )
+        self.assertFalse(report["allowed"])
+
 
 class SceneRandomizationTests(unittest.TestCase):
     def test_area_uniform_radius_is_uniform_in_squared_radius(self):
@@ -144,6 +183,28 @@ class SceneRandomizationTests(unittest.TestCase):
             seed,
             scene_randomization.stable_scene_seed("run-a", 2, worker_identity="worker-0"),
         )
+
+
+class AutoDatasetReliabilityTests(unittest.TestCase):
+    class Runtime:
+        def __init__(self, last_result):
+            self.STATE = {"auto_collect_last_result": last_result}
+
+    def test_transient_scene_overlap_does_not_stop_worker(self):
+        rt = self.Runtime("prepare_failed/initial_robot_truck_overlap")
+        self.assertEqual(auto_dataset_collect.update_prepare_failure_streak(rt, 2), 0)
+
+    def test_transient_pose_failure_does_not_stop_worker(self):
+        rt = self.Runtime("prepare_failed/home_direct_failed:bucket lag")
+        self.assertEqual(auto_dataset_collect.update_prepare_failure_streak(rt, 2), 0)
+
+    def test_persistent_runtime_failure_still_counts(self):
+        rt = self.Runtime("prepare_failed/action_channel_not_ready:physics_view=False")
+        self.assertEqual(auto_dataset_collect.update_prepare_failure_streak(rt, 2), 3)
+
+    def test_success_resets_prepare_failure_streak(self):
+        rt = self.Runtime("episode_trainable")
+        self.assertEqual(auto_dataset_collect.update_prepare_failure_streak(rt, 2), 0)
 
 
 class VLAObservationContractTests(unittest.TestCase):

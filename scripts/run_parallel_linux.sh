@@ -22,6 +22,9 @@ ATTEMPT_MOTION_SPEED="${ATTEMPT_MOTION_SPEED:-}"
 DATASET_HZ="${DATASET_HZ:-}"
 SHUTDOWN_ON_COMPLETE="${SHUTDOWN_ON_COMPLETE:-0}"
 SHUTDOWN_DELAY_MINUTES="${SHUTDOWN_DELAY_MINUTES:-1}"
+WORKER_RESTART_LIMIT="${WORKER_RESTART_LIMIT:-3}"
+WORKER_RESTART_DELAY_SECONDS="${WORKER_RESTART_DELAY_SECONDS:-10}"
+WORKER_START_STAGGER_SECONDS="${WORKER_START_STAGGER_SECONDS:-2}"
 
 if [[ ! -x "${ISAAC_PYTHON}" ]]; then
     echo "Isaac Python is not executable: ${ISAAC_PYTHON}" >&2
@@ -53,13 +56,19 @@ if [[ ! "${SHUTDOWN_DELAY_MINUTES}" =~ ^[1-9][0-9]*$ ]] || (( SHUTDOWN_DELAY_MIN
     echo "SHUTDOWN_DELAY_MINUTES must be between 1 and 60" >&2
     exit 2
 fi
+for value_name in WORKER_RESTART_LIMIT WORKER_RESTART_DELAY_SECONDS WORKER_START_STAGGER_SECONDS; do
+    value="${!value_name}"
+    if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+        echo "${value_name} must be a non-negative integer" >&2
+        exit 2
+    fi
+done
 
 LOG_DIR="${DATASET_BASE}/.parallel_logs/${BATCH_ID}"
 mkdir -p "${LOG_DIR}"
 
 declare -a PIDS=()
 declare -a LABELS=()
-declare -a RESULT_PATHS=()
 interrupted=0
 
 stop_workers() {
@@ -78,6 +87,132 @@ echo "Batch:   ${BATCH_ID}"
 echo "GPUs:    ${GPU_IDS}"
 echo "Dashboard --root must be: ${DATASET_BASE}"
 echo "Shutdown after verified completion: ${SHUTDOWN_ON_COMPLETE}"
+echo "Worker restart limit: ${WORKER_RESTART_LIMIT}"
+
+result_successes() {
+    local result_path="$1"
+    local value=""
+    if [[ -f "${result_path}" ]]; then
+        value="$(
+            sed -nE 's/^[[:space:]]*"successes"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' \
+                "${result_path}" | head -n 1
+        )"
+    fi
+    if [[ "${value}" =~ ^[0-9]+$ ]]; then
+        printf '%s' "${value}"
+    else
+        printf '0'
+    fi
+}
+
+result_exit_reason() {
+    local result_path="$1"
+    if [[ ! -f "${result_path}" ]]; then
+        printf 'result_missing'
+        return
+    fi
+    local value=""
+    value="$(
+        sed -nE 's/^[[:space:]]*"loop_exit_reason"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' \
+            "${result_path}" | head -n 1
+    )"
+    printf '%s' "${value:-unknown}"
+}
+
+run_worker_supervisor() {
+    local worker="$1"
+    local gpu="$2"
+    local worker_name="$3"
+    local log_path="$4"
+    local result_path="$5"
+    local aggregate_successes=0
+    local restart_index=0
+    local child_pid=0
+
+    stop_supervised_child() {
+        if (( child_pid > 0 )); then
+            kill "${child_pid}" 2>/dev/null || true
+            wait "${child_pid}" 2>/dev/null || true
+        fi
+        exit 143
+    }
+    trap stop_supervised_child INT TERM
+
+    while (( aggregate_successes < SUCCESS_COUNT )); do
+        local remaining=$((SUCCESS_COUNT - aggregate_successes))
+        local run_suffix="${BATCH_ID}_${worker_name}"
+        if (( restart_index > 0 )); then
+            run_suffix="${run_suffix}_retry_$(printf '%02d' "${restart_index}")"
+        fi
+        local -a cmd=(
+            "${ISAAC_PYTHON}"
+            "${PROJECT_ROOT}/run_vla_train_scene.py"
+            --headless
+            --auto-collect
+            --no-bridge
+            --success-count "${remaining}"
+            --max-attempts "${MAX_ATTEMPTS}"
+            --dataset-root "${DATASET_BASE}"
+            --log-mode "${LOG_MODE}"
+            --graphics-api vulkan
+            --active-gpu "${gpu}"
+            --physics-gpu "${gpu}"
+            --disable-export
+            --no-wait-export
+        )
+        if [[ "${FAST_SAMPLED_REPLAY}" == "1" ]]; then
+            cmd+=(--fast-sampled-replay)
+        fi
+        if [[ -n "${ATTEMPT_MOTION_SPEED}" ]]; then
+            cmd+=(--attempt-motion-speed "${ATTEMPT_MOTION_SPEED}")
+        fi
+        if [[ -n "${DATASET_HZ}" ]]; then
+            cmd+=(--dataset-hz "${DATASET_HZ}")
+        fi
+
+        rm -f -- "${result_path}"
+        echo "[${worker_name}] launch=$((restart_index + 1)) gpu=${gpu} remaining=${remaining} log=${log_path}"
+        {
+            echo
+            echo "===== launch $((restart_index + 1)) remaining=${remaining} suffix=${run_suffix} ====="
+        } >>"${log_path}"
+        EXCAVATOR_AUTO_RUN_ID_SUFFIX="${run_suffix}" \
+            EXCAVATOR_AUTO_COLLECT_RESULT_FILE="${result_path}" \
+            PYTHONUNBUFFERED=1 \
+            "${cmd[@]}" >>"${log_path}" 2>&1 &
+        child_pid=$!
+        wait "${child_pid}"
+        local status=$?
+        child_pid=0
+
+        local gained
+        gained="$(result_successes "${result_path}")"
+        aggregate_successes=$((aggregate_successes + gained))
+        if (( aggregate_successes > SUCCESS_COUNT )); then
+            aggregate_successes="${SUCCESS_COUNT}"
+        fi
+        local reason
+        reason="$(result_exit_reason "${result_path}")"
+        echo "[${worker_name}] exit=${status} reason=${reason} gained=${gained} aggregate=${aggregate_successes}/${SUCCESS_COUNT}"
+
+        if (( aggregate_successes >= SUCCESS_COUNT )); then
+            trap - INT TERM
+            return 0
+        fi
+        if (( restart_index >= WORKER_RESTART_LIMIT )); then
+            echo "[${worker_name}] restart limit reached before target" >&2
+            trap - INT TERM
+            return 1
+        fi
+
+        restart_index=$((restart_index + 1))
+        echo "[${worker_name}] restarting in ${WORKER_RESTART_DELAY_SECONDS}s"
+        sleep "${WORKER_RESTART_DELAY_SECONDS}"
+    done
+
+    trap - INT TERM
+    return 0
+}
 
 for (( worker = 0; worker < WORKERS; worker++ )); do
     gpu="${GPU_LIST[$((worker % ${#GPU_LIST[@]}))]}"
@@ -85,40 +220,17 @@ for (( worker = 0; worker < WORKERS; worker++ )); do
     log_path="${LOG_DIR}/${worker_name}.log"
     result_path="${LOG_DIR}/${worker_name}.result.json"
 
-    cmd=(
-        "${ISAAC_PYTHON}"
-        "${PROJECT_ROOT}/run_vla_train_scene.py"
-        --headless
-        --auto-collect
-        --no-bridge
-        --success-count "${SUCCESS_COUNT}"
-        --max-attempts "${MAX_ATTEMPTS}"
-        --dataset-root "${DATASET_BASE}"
-        --log-mode "${LOG_MODE}"
-        --graphics-api vulkan
-        --active-gpu "${gpu}"
-        --physics-gpu "${gpu}"
-        --disable-export
-        --no-wait-export
-    )
-    if [[ "${FAST_SAMPLED_REPLAY}" == "1" ]]; then
-        cmd+=(--fast-sampled-replay)
-    fi
-    if [[ -n "${ATTEMPT_MOTION_SPEED}" ]]; then
-        cmd+=(--attempt-motion-speed "${ATTEMPT_MOTION_SPEED}")
-    fi
-    if [[ -n "${DATASET_HZ}" ]]; then
-        cmd+=(--dataset-hz "${DATASET_HZ}")
-    fi
-
-    echo "[${worker_name}] gpu=${gpu} log=${log_path}"
-    EXCAVATOR_AUTO_RUN_ID_SUFFIX="${BATCH_ID}_${worker_name}" \
-        EXCAVATOR_AUTO_COLLECT_RESULT_FILE="${result_path}" \
-        PYTHONUNBUFFERED=1 \
-        "${cmd[@]}" >"${log_path}" 2>&1 &
+    run_worker_supervisor \
+        "${worker}" \
+        "${gpu}" \
+        "${worker_name}" \
+        "${log_path}" \
+        "${result_path}" &
     PIDS+=("$!")
     LABELS+=("${worker_name}")
-    RESULT_PATHS+=("${result_path}")
+    if (( WORKER_START_STAGGER_SECONDS > 0 && worker + 1 < WORKERS )); then
+        sleep "${WORKER_START_STAGGER_SECONDS}"
+    fi
 done
 
 failed=0
@@ -126,18 +238,12 @@ completed_workers=0
 for index in "${!PIDS[@]}"; do
     pid="${PIDS[$index]}"
     label="${LABELS[$index]}"
-    result_path="${RESULT_PATHS[$index]}"
     if wait "${pid}"; then
-        if [[ -f "${result_path}" ]] && grep -Eq '"completed"[[:space:]]*:[[:space:]]*true' "${result_path}"; then
-            echo "[${label}] target verified"
-            completed_workers=$((completed_workers + 1))
-        else
-            echo "[${label}] exited without reaching its success target; result=${result_path}" >&2
-            failed=1
-        fi
+        echo "[${label}] aggregate target verified"
+        completed_workers=$((completed_workers + 1))
     else
         status=$?
-        echo "[${label}] failed with exit code ${status}" >&2
+        echo "[${label}] supervisor failed with exit code ${status}" >&2
         failed=1
     fi
 done

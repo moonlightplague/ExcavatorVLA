@@ -20,6 +20,24 @@ PLAN_STATE_KEYS = [
     "dig_plan_last_build_ms",
 ]
 
+TRANSIENT_PREPARE_FAILURE_MARKERS = (
+    "prepare_failed/initial_robot_truck_overlap",
+    "prepare_failed/home_direct_failed",
+    "prepare_failed/initial_pose_pre_reset_failed",
+    "prepare_failed/sand_not_settled",
+)
+
+PERSISTENT_PREPARE_FAILURE_MARKERS = (
+    "prepare_failed/timeline_not_playing",
+    "prepare_failed/timeline_stopped",
+    "prepare_failed/action_channel_not_ready",
+    "prepare_failed/physics_view_missing",
+    "prepare_failed/ik_invalid",
+    "prepare_failed/task_state_desync",
+    "prepare_failed/sand_reset_exception",
+    "prepare_failed/auto_collect_inactive_after_prepare",
+)
+
 
 def _snapshot_plan_state(rt):
     return {key: copy.deepcopy(rt.STATE.get(key)) for key in PLAN_STATE_KEYS}
@@ -495,8 +513,21 @@ async def find_plan(rt, attempt_index):
     return target, None, plan_attempts
 
 
+def prepare_failure_streak_policy(last_result):
+    text = str(last_result or "")
+    if "prepare_failed" not in text:
+        return "reset"
+    if any(marker in text for marker in PERSISTENT_PREPARE_FAILURE_MARKERS):
+        return "count"
+    if any(marker in text for marker in TRANSIENT_PREPARE_FAILURE_MARKERS):
+        return "retry"
+    return "count"
+
+
 def update_prepare_failure_streak(rt, current_count):
-    last_result = str(rt.STATE.get("auto_collect_last_result", ""))
-    if "prepare_failed" in last_result:
+    policy = prepare_failure_streak_policy(
+        rt.STATE.get("auto_collect_last_result", "")
+    )
+    if policy == "count":
         return int(current_count) + 1
     return 0

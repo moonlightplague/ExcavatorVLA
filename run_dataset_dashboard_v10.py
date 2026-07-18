@@ -3,8 +3,10 @@ import io
 import math
 import os
 import re
+import signal
 import shutil
 import struct
+import subprocess
 import time
 import threading
 import hashlib
@@ -4632,6 +4634,260 @@ def dashboard_start_job(kind: str, title: str, worker) -> Dict[str, object]:
     return dashboard_job_snapshot(job_id)
 
 
+PARALLEL_COLLECT_STATE_FILENAME = ".parallel_launcher_state.json"
+PARALLEL_COLLECT_LOCK = threading.Lock()
+
+
+def parallel_collect_state_path(dataset_root: Union[str, os.PathLike]) -> str:
+    return os.path.join(
+        os.path.abspath(str(dataset_root or "excavator_auto_dataset")),
+        PARALLEL_COLLECT_STATE_FILENAME,
+    )
+
+
+def normalize_parallel_collect_config(config: object) -> Dict[str, object]:
+    raw = dict(config) if isinstance(config, dict) else {}
+    gpu_ids = str(raw.get("gpu_ids") or "0").strip().replace(" ", "")
+    if not re.fullmatch(r"[0-9]+(?:,[0-9]+)*", gpu_ids):
+        raise ValueError("gpu_ids must be comma-separated non-negative integers, e.g. 0 or 0,1")
+    gpu_values = [int(value) for value in gpu_ids.split(",")]
+    if any(value < 0 or value > 63 for value in gpu_values):
+        raise ValueError("gpu_ids values must be between 0 and 63")
+
+    def bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(raw.get(name, default))
+        except Exception as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+        if value < minimum or value > maximum:
+            raise ValueError(f"{name} must be between {minimum} and {maximum}")
+        return value
+
+    workers = bounded_int("workers", len(gpu_values), 1, 32)
+    success_count = bounded_int("success_count", 100, 1, 10000)
+    max_attempts = bounded_int("max_attempts", max(300, success_count), 1, 100000)
+    if max_attempts < success_count:
+        raise ValueError("max_attempts per worker must be >= success_count per worker")
+    log_mode = str(raw.get("log_mode") or "data").strip().lower()
+    if log_mode not in {"data", "debug", "profile"}:
+        raise ValueError("log_mode must be data, debug, or profile")
+    return {
+        "gpu_ids": ",".join(str(value) for value in gpu_values),
+        "workers": workers,
+        "success_count": success_count,
+        "max_attempts": max_attempts,
+        "log_mode": log_mode,
+        "fast_sampled_replay": bool(raw.get("fast_sampled_replay", False)),
+        "expected_total_successes": int(workers * success_count),
+    }
+
+
+def process_is_alive(pid: object) -> bool:
+    try:
+        pid_value = int(pid)
+    except Exception:
+        return False
+    if pid_value <= 0:
+        return False
+    try:
+        os.kill(pid_value, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def tail_text_file(path: Union[str, os.PathLike], max_lines: int = 24, max_bytes: int = 65536) -> List[str]:
+    text_path = os.path.abspath(str(path or ""))
+    if not text_path or not os.path.isfile(text_path):
+        return []
+    try:
+        with open(text_path, "rb") as handle:
+            size = int(os.path.getsize(text_path))
+            handle.seek(max(0, size - max(1024, int(max_bytes))))
+            raw = handle.read()
+        return raw.decode("utf-8", errors="replace").splitlines()[-max(1, int(max_lines)) :]
+    except Exception:
+        return []
+
+
+def parallel_collect_process_matches(pid: int, launcher_path: str) -> bool:
+    if os.name != "posix":
+        return False
+    proc_path = f"/proc/{int(pid)}/cmdline"
+    if not os.path.isfile(proc_path):
+        return process_is_alive(pid)
+    try:
+        with open(proc_path, "rb") as handle:
+            command = handle.read().replace(b"\x00", b" ").decode("utf-8", errors="replace")
+        return os.path.basename(launcher_path) in command
+    except Exception:
+        return False
+
+
+def dashboard_parallel_collect_status(dataset_root: Union[str, os.PathLike]) -> Dict[str, object]:
+    root = os.path.abspath(str(dataset_root or "excavator_auto_dataset"))
+    state_path = parallel_collect_state_path(root)
+    state = read_json(state_path, default={}) or {}
+    if not isinstance(state, dict) or not state:
+        return {
+            "ok": True,
+            "supported": os.name == "posix",
+            "running": False,
+            "dataset_root": root,
+            "state_path": state_path,
+            "reason": "not_started",
+        }
+    state = dict(state)
+    pid = int(state.get("pid") or 0)
+    launcher_path = str(state.get("launcher_path") or "")
+    alive = process_is_alive(pid)
+    running = bool(alive and parallel_collect_process_matches(pid, launcher_path))
+    state.update(
+        {
+            "ok": True,
+            "supported": os.name == "posix",
+            "running": running,
+            "process_alive": alive,
+            "dataset_root": root,
+            "state_path": state_path,
+            "launcher_log_tail": tail_text_file(state.get("launcher_log_path", "")),
+        }
+    )
+    batch_id = str(state.get("batch_id") or "")
+    worker_log_dir = os.path.join(root, ".parallel_logs", batch_id)
+    worker_logs = []
+    if batch_id and os.path.isdir(worker_log_dir):
+        for name in sorted(os.listdir(worker_log_dir)):
+            if not name.endswith(".log"):
+                continue
+            path = os.path.join(worker_log_dir, name)
+            worker_logs.append(
+                {
+                    "name": name,
+                    "path": path,
+                    "tail": tail_text_file(path, max_lines=8, max_bytes=32768),
+                }
+            )
+    state["worker_logs"] = worker_logs
+    if alive and not running:
+        state["reason"] = "pid_identity_mismatch"
+    elif not running and state.get("stop_requested_at"):
+        state["reason"] = "stopped"
+    elif not running:
+        state["reason"] = "completed_or_exited"
+    else:
+        state["reason"] = "running"
+    return state
+
+
+def dashboard_start_parallel_collect(
+    dataset_root: Union[str, os.PathLike],
+    config: object,
+) -> Dict[str, object]:
+    if os.name != "posix":
+        raise RuntimeError("parallel collection launcher is supported only on Linux/POSIX")
+    root = os.path.abspath(str(dataset_root or "excavator_auto_dataset"))
+    os.makedirs(root, exist_ok=True)
+    normalized = normalize_parallel_collect_config(config)
+    project_root = os.path.abspath(os.path.dirname(__file__))
+    launcher_path = os.path.join(project_root, "scripts", "run_parallel_linux.sh")
+    if not os.path.isfile(launcher_path):
+        raise FileNotFoundError(f"parallel launcher not found: {launcher_path}")
+    bash_path = shutil.which("bash")
+    if not bash_path:
+        raise RuntimeError("bash executable not found")
+
+    with PARALLEL_COLLECT_LOCK:
+        current = dashboard_parallel_collect_status(root)
+        if current.get("running"):
+            raise RuntimeError(
+                f"parallel collection already running: pid={current.get('pid')} batch={current.get('batch_id')}"
+            )
+        batch_id = f"dashboard_{time.strftime('%Y%m%d_%H%M%S', time.localtime())}"
+        launcher_log_dir = os.path.join(root, ".parallel_logs")
+        os.makedirs(launcher_log_dir, exist_ok=True)
+        launcher_log_path = os.path.join(launcher_log_dir, f"{batch_id}_launcher.log")
+        env = os.environ.copy()
+        env.update(
+            {
+                "PROJECT_ROOT": project_root,
+                "DATASET_BASE": root,
+                "BATCH_ID": batch_id,
+                "GPU_IDS": str(normalized["gpu_ids"]),
+                "WORKERS": str(normalized["workers"]),
+                "SUCCESS_COUNT": str(normalized["success_count"]),
+                "MAX_ATTEMPTS": str(normalized["max_attempts"]),
+                "LOG_MODE": str(normalized["log_mode"]),
+                "FAST_SAMPLED_REPLAY": "1" if normalized["fast_sampled_replay"] else "0",
+                "PYTHONUNBUFFERED": "1",
+            }
+        )
+        with open(launcher_log_path, "ab", buffering=0) as output:
+            process = subprocess.Popen(
+                [bash_path, launcher_path],
+                cwd=project_root,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+        state = {
+            "schema": "dashboard_parallel_collect_v1",
+            "pid": int(process.pid),
+            "batch_id": batch_id,
+            "started_at": time.time(),
+            "dataset_root": root,
+            "project_root": project_root,
+            "launcher_path": launcher_path,
+            "launcher_log_path": launcher_log_path,
+            "config": normalized,
+            "stop_requested_at": None,
+        }
+        write_json(parallel_collect_state_path(root), state)
+
+        def reap_launcher() -> None:
+            return_code = process.wait()
+            with PARALLEL_COLLECT_LOCK:
+                latest = read_json(parallel_collect_state_path(root), default={}) or {}
+                if isinstance(latest, dict) and int(latest.get("pid") or 0) == int(process.pid):
+                    latest["exited_at"] = time.time()
+                    latest["return_code"] = int(return_code)
+                    write_json(parallel_collect_state_path(root), latest)
+
+        threading.Thread(
+            target=reap_launcher,
+            name=f"parallel-launcher-{process.pid}",
+            daemon=True,
+        ).start()
+    time.sleep(0.05)
+    return dashboard_parallel_collect_status(root)
+
+
+def dashboard_stop_parallel_collect(dataset_root: Union[str, os.PathLike]) -> Dict[str, object]:
+    if os.name != "posix":
+        raise RuntimeError("parallel collection launcher is supported only on Linux/POSIX")
+    root = os.path.abspath(str(dataset_root or "excavator_auto_dataset"))
+    with PARALLEL_COLLECT_LOCK:
+        status = dashboard_parallel_collect_status(root)
+        if not status.get("running"):
+            return status
+        pid = int(status.get("pid") or 0)
+        launcher_path = str(status.get("launcher_path") or "")
+        if not parallel_collect_process_matches(pid, launcher_path):
+            raise RuntimeError(f"refusing to stop pid {pid}: launcher identity mismatch")
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        state = read_json(parallel_collect_state_path(root), default={}) or {}
+        if isinstance(state, dict):
+            state["stop_requested_at"] = time.time()
+            write_json(parallel_collect_state_path(root), state)
+    time.sleep(0.10)
+    return dashboard_parallel_collect_status(root)
+
+
 def dashboard_start_success_transfer_job(dataset_root: Union[str, os.PathLike], run_paths: Sequence[object], dest_dir: Union[str, os.PathLike], mode: str = "copy") -> Dict[str, object]:
     root = os.path.abspath(str(dataset_root or "excavator_auto_dataset"))
     paths = list(run_paths or [])
@@ -6211,7 +6467,7 @@ table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.table
 @media(max-width:720px){.triageGrid{grid-template-columns:1fr}.diagStats{grid-template-columns:1fr}}
 .transferProgress{margin:8px 0 10px;border:1px solid #dbe3ee;border-radius:10px;background:#f8fafc;padding:8px 10px}.transferProgressMeta{display:flex;justify-content:space-between;gap:10px;font-size:12px;color:#475467;margin-bottom:6px}.transferProgressTrack{height:8px;border-radius:999px;background:#e5e7eb;overflow:hidden}.transferProgressFill{height:100%;border-radius:999px;background:#12b76a;transition:width .22s ease}.transferProgressFill.busy{background:linear-gradient(90deg,#12b76a,#60a5fa,#12b76a);background-size:180% 100%;animation:progressSlide 1.1s linear infinite}@keyframes progressSlide{from{background-position:0 0}to{background-position:180% 0}}
 
-.terminalPanel{margin-bottom:14px}.terminalPanel .panelHeader,.rawAttemptPanel .panelHeader{margin-bottom:8px}.terminalActions,.rawAttemptActions{display:flex;align-items:center;gap:8px}.terminalBox{max-height:180px;min-height:72px}.rawAttemptActions:after{content:"debug only";font-size:12px;color:#667085}
+.terminalPanel{margin-bottom:14px}.terminalPanel .panelHeader,.rawAttemptPanel .panelHeader{margin-bottom:8px}.terminalActions,.rawAttemptActions{display:flex;align-items:center;gap:8px}.terminalBox{max-height:180px;min-height:72px}.rawAttemptActions:after{content:"debug only";font-size:12px;color:#667085}.parallelCollectBar{display:flex;align-items:end;gap:8px;flex-wrap:wrap;margin-bottom:9px;padding:9px;border:1px solid #e4e7ec;background:#f8fafc}.parallelCollectBar .danger{background:#b42318;border-color:#b42318;color:#fff}.parallelCollectField{display:grid;gap:3px;font-size:10px;color:#667085;text-transform:uppercase;font-weight:750}.parallelCollectField input,.parallelCollectField select{height:32px;min-width:72px;padding:4px 7px}.parallelCollectField.gpus input{width:108px}.parallelCollectField.number input{width:84px}.parallelCollectToggle{display:flex;align-items:center;gap:5px;min-height:32px;font-size:12px;color:#475467}.parallelCollectStatus{display:inline-flex;align-items:center;min-height:32px;padding:4px 8px;border-left:3px solid #98a2b3;background:#fff;color:#475467;font-size:12px;max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.parallelCollectStatus.running{border-left-color:#12b76a;color:#027a48}.parallelCollectStatus.error{border-left-color:#f04438;color:#b42318}
 .epCellInner{display:inline-flex;align-items:center;gap:6px}.exportReadyDot{width:8px;height:8px;border-radius:999px;display:inline-block;box-shadow:0 0 0 2px #fff,0 0 0 3px #d0d5dd;flex:0 0 auto}.exportReadyDot.ready{background:#12b76a;box-shadow:0 0 0 2px #fff,0 0 0 3px rgba(18,183,106,.35)}.exportReadyDot.notReady{background:#f04438;box-shadow:0 0 0 2px #fff,0 0 0 3px rgba(240,68,56,.32)}.exportReadyDot.stale{background:#f79009;box-shadow:0 0 0 2px #fff,0 0 0 3px rgba(247,144,9,.34)}.exportReadyDot.unknown{background:#98a2b3}
 body main details>summary:after,.managerPanel>summary:after,.detailsPanel>summary:after{content:""!important;width:10px!important;height:10px!important;border:0!important;border-right:2px solid #667085!important;border-bottom:2px solid #667085!important;border-radius:0!important;padding:0!important;background:transparent!important;transform:rotate(-45deg);transition:transform .2s ease;flex:0 0 auto;margin-top:4px}body main details[open]>summary:after,.managerPanel[open]>summary:after,.detailsPanel[open]>summary:after{content:""!important;transform:rotate(45deg);margin-top:7px}
 
@@ -6251,6 +6507,17 @@ body main details>summary:after,.managerPanel>summary:after,.detailsPanel>summar
       <div class="terminalActions">
         <button type="button" class="secondary" id="clearTerminalBtn">Clear</button>
       </div>
+    </div>
+    <div class="parallelCollectBar">
+      <label class="parallelCollectField gpus"><span>GPU IDs</span><input id="parallelGpuIds" value="0" inputmode="numeric"></label>
+      <label class="parallelCollectField number"><span>Workers</span><input id="parallelWorkers" type="number" min="1" max="32" value="2"></label>
+      <label class="parallelCollectField number"><span>Success / worker</span><input id="parallelSuccessCount" type="number" min="1" max="10000" value="60"></label>
+      <label class="parallelCollectField number"><span>Attempts / worker</span><input id="parallelMaxAttempts" type="number" min="1" max="100000" value="500"></label>
+      <label class="parallelCollectField"><span>Log mode</span><select id="parallelLogMode"><option value="data">data</option><option value="debug">debug</option><option value="profile">profile</option></select></label>
+      <label class="parallelCollectToggle"><input id="parallelFastReplay" type="checkbox">Fast pre-dig</label>
+      <button type="button" id="startParallelCollectBtn">Start parallel</button>
+      <button type="button" class="danger" id="stopParallelCollectBtn" disabled>Stop</button>
+      <span id="parallelCollectStatus" class="parallelCollectStatus">not started</span>
     </div>
     <pre id="terminalBox" class="codeBox terminalBox">Dashboard ready.</pre>
   </section>
@@ -6390,6 +6657,8 @@ let selectedEpisodeTrash = new Set();
 let episodeSort = {key:"episode_index", dir:1};
 let selectedStatuses = new Set();
 let runMonitorTimer = null;
+let parallelCollectTimer = null;
+let parallelCollectFingerprint = "";
 let availableStatuses = [];
 let runRecords = [];
 let selectedRunPaths = new Set();
@@ -6420,6 +6689,68 @@ function terminalWrite(text, cls="muted"){
 function setStatus(text, cls="muted"){const el=$("status"); if(el){el.className=cls; el.textContent=text} terminalWrite(text,cls)}
 async function api(path, params){const qs=new URLSearchParams(params||{}); const r=await fetch(path+"?"+qs.toString()); if(!r.ok) throw new Error(await r.text()); return await r.json()}
 async function postJSON(path, payload){let r; try{r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload||{})});}catch(err){throw new Error(`Failed to fetch ${path}: ${err.message||err}`);} if(!r.ok) throw new Error(await r.text()); return await r.json()}
+function parallelCollectConfig(){
+  return {
+    gpu_ids:String($("parallelGpuIds")?.value||"0").trim(),
+    workers:Number($("parallelWorkers")?.value||1),
+    success_count:Number($("parallelSuccessCount")?.value||1),
+    max_attempts:Number($("parallelMaxAttempts")?.value||1),
+    log_mode:String($("parallelLogMode")?.value||"data"),
+    fast_sampled_replay:!!$("parallelFastReplay")?.checked,
+  };
+}
+function renderParallelCollectStatus(state, announce=false){
+  const statusEl=$("parallelCollectStatus"), startBtn=$("startParallelCollectBtn"), stopBtn=$("stopParallelCollectBtn");
+  const running=!!state?.running, supported=state?.supported!==false;
+  if(startBtn) startBtn.disabled=!supported||running;
+  if(stopBtn) stopBtn.disabled=!supported||!running;
+  let text="not started", cls="parallelCollectStatus";
+  if(!supported){text="Linux/POSIX only"; cls+=" error";}
+  else if(running){
+    const config=state.config||{};
+    text=`running · pid ${state.pid} · ${config.workers||"?"} workers · total ${config.expected_total_successes||"?"}`;
+    cls+=" running";
+  }else if(state?.reason==="stopped"){text=`stopped · pid ${state.pid||"-"}`;}
+  else if(state?.reason==="completed_or_exited"){
+    text=`finished · exit ${state.return_code??"?"} · ${state.batch_id||""}`;
+  }else if(state?.reason==="pid_identity_mismatch"){
+    text=`PID mismatch · ${state.pid||"-"}`;
+    cls+=" error";
+  }
+  if(statusEl){statusEl.className=cls; statusEl.textContent=text; statusEl.title=String(state?.launcher_log_path||"");}
+  const launcherTail=Array.isArray(state?.launcher_log_tail)?state.launcher_log_tail:[];
+  const workerLogs=Array.isArray(state?.worker_logs)?state.worker_logs:[];
+  const lastLauncher=launcherTail.length?launcherTail[launcherTail.length-1]:"";
+  const lastWorker=workerLogs.map(item=>Array.isArray(item.tail)&&item.tail.length?`${item.name}: ${item.tail[item.tail.length-1]}`:"").filter(Boolean).slice(-1)[0]||"";
+  const fingerprint=JSON.stringify([running,state?.pid,state?.batch_id,state?.reason,state?.return_code,lastLauncher,lastWorker]);
+  if(announce || fingerprint!==parallelCollectFingerprint){
+    if(running) terminalWrite(`Parallel collect running: pid=${state.pid} batch=${state.batch_id} root=${state.dataset_root}`,"ok");
+    else if(state?.reason&&state.reason!=="not_started") terminalWrite(`Parallel collect ${state.reason}: pid=${state.pid||"-"} exit=${state.return_code??"-"}`,state?.reason==="pid_identity_mismatch"?"error":"muted");
+    if(lastLauncher) terminalWrite(lastLauncher,"muted");
+    if(lastWorker) terminalWrite(lastWorker,"muted");
+    parallelCollectFingerprint=fingerprint;
+  }
+}
+async function refreshParallelCollectStatus(announce=false){
+  const state=await api("/api/manage/parallel_collect_status",{root:$("rootInput").value,_:Date.now()});
+  renderParallelCollectStatus(state,announce);
+  return state;
+}
+async function startParallelCollect(){
+  const config=parallelCollectConfig();
+  const total=Number(config.workers||0)*Number(config.success_count||0);
+  terminalWrite(`Starting parallel collect: GPUs=${config.gpu_ids} workers=${config.workers} success/worker=${config.success_count} total=${total}`,"muted");
+  const state=await postJSON("/api/manage/parallel_collect_start",{root:$("rootInput").value,config});
+  renderParallelCollectStatus(state,true);
+  await loadRuns({silent:true});
+}
+async function stopParallelCollect(){
+  if(!window.confirm("Stop the launcher and all workers in this parallel batch? Completed episode data will be preserved.")) return;
+  terminalWrite("Stopping parallel collect...","muted");
+  const state=await postJSON("/api/manage/parallel_collect_stop",{root:$("rootInput").value});
+  renderParallelCollectStatus(state,true);
+  await loadRuns({silent:true});
+}
 function normalizeExportTimePolicyJS(policy){
   return {version:1, speed_scale:1.0, time_mode:"uniform_fps", base_fps:null};
 }
@@ -7773,6 +8104,8 @@ bindStaticControl("loadRunBtn","click",()=>loadRun(false).catch(e=>setStatus(e.m
 bindStaticControl("reloadBtn","click",()=>loadRun(true).catch(e=>setStatus(e.message,"error")));
 bindStaticControl("copyPathBtn","click",()=>navigator.clipboard&&navigator.clipboard.writeText($("runInput").value).then(()=>setStatus("Run path copied","ok")).catch(()=>setStatus("Copy failed","error")));
 bindStaticControl("clearTerminalBtn","click",()=>{const box=$("terminalBox"); if(box) box.textContent=""; terminalWrite("terminal cleared","muted");});
+bindStaticControl("startParallelCollectBtn","click",()=>startParallelCollect().catch(e=>setStatus(e.message,"error")));
+bindStaticControl("stopParallelCollectBtn","click",()=>stopParallelCollect().catch(e=>setStatus(e.message,"error")));
 bindStaticControl("copyRawAttemptBtn","click",()=>{
   const text=$("rawBox")?.textContent||"";
   if(!navigator.clipboard){setStatus("Clipboard unavailable","error");return;}
@@ -7791,7 +8124,7 @@ bindStaticControl("trashEpisodeBtn","click",()=>trashSelectedEpisode().catch(e=>
 bindStaticControl("darkModeToggle","click",()=>toggleDarkMode());
 initDarkMode();
 const episodeSortSelect=$("episodeSortSelect"); if(episodeSortSelect) episodeSortSelect.addEventListener("change",()=>refreshFilteredViews());
-$("rootInput").addEventListener("input", ()=>syncSuccessPoolPath());
+$("rootInput").addEventListener("input", ()=>{syncSuccessPoolPath(); parallelCollectFingerprint="";});
 $("rootInput").addEventListener("keydown", e=>{if(e.key==="Enter") loadRuns().then(()=>loadRun()).catch(err=>setStatus(err.message,"error"))});
 $("runInput").addEventListener("keydown", e=>{if(e.key==="Enter") loadRun().catch(err=>setStatus(err.message,"error"))});
 window.addEventListener("resize",()=>syncEpisodeInspectorHeight());
@@ -7800,6 +8133,9 @@ loadRuns().then(()=>{
   if(runMonitorTimer) clearInterval(runMonitorTimer);
   runMonitorTimer=setInterval(()=>loadRuns({silent:true}).catch(()=>{}), 30000);
 }).catch(e=>setStatus(e.message,"error"));
+refreshParallelCollectStatus().catch(e=>renderParallelCollectStatus({supported:false,reason:e.message}));
+if(parallelCollectTimer) clearInterval(parallelCollectTimer);
+parallelCollectTimer=setInterval(()=>refreshParallelCollectStatus().catch(()=>{}),3000);
 
 </script>
 </body>
@@ -7887,6 +8223,10 @@ def serve_dashboard(
                     job_id = params.get("job_id") or ""
                     self.send_json(dashboard_job_snapshot(job_id))
                     return
+                if parsed.path == "/api/manage/parallel_collect_status":
+                    root = normalize_dashboard_client_path(params.get("root") or default_root)
+                    self.send_json(dashboard_parallel_collect_status(root))
+                    return
                 if parsed.path == "/api/runs":
                     root = normalize_dashboard_client_path(params.get("root") or default_root)
                     runs = list_dashboard_runs(root)
@@ -7955,6 +8295,16 @@ def serve_dashboard(
             parsed = urlparse(self.path)
             try:
                 body = self.read_json_body()
+                if parsed.path == "/api/manage/parallel_collect_start":
+                    root = normalize_dashboard_client_path(body.get("root") or default_root)
+                    result = dashboard_start_parallel_collect(root, body.get("config") or {})
+                    self.send_json(result)
+                    return
+                if parsed.path == "/api/manage/parallel_collect_stop":
+                    root = normalize_dashboard_client_path(body.get("root") or default_root)
+                    result = dashboard_stop_parallel_collect(root)
+                    self.send_json(result)
+                    return
                 if parsed.path == "/api/manage/refresh_sizes":
                     root = normalize_dashboard_client_path(body.get("root") or default_root)
                     result = dashboard_refresh_folder_sizes(root, body.get("paths") or [])

@@ -115,6 +115,26 @@ class DashboardParallelLauncherTests(unittest.TestCase):
                 dashboard.launcher_worker_supervisor_pid(100, [201, 301]),
             )
 
+    def test_latest_attempt_folder_size_includes_nested_camera_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            older = os.path.join(tmp, "episode_000001")
+            latest = os.path.join(tmp, "episode_000002")
+            images = os.path.join(latest, "images", "0")
+            os.makedirs(older)
+            os.makedirs(images)
+            with open(os.path.join(older, "meta.json"), "wb") as handle:
+                handle.write(b"x" * 5)
+            with open(os.path.join(latest, "trajectory.jsonl"), "wb") as handle:
+                handle.write(b"y" * 7)
+            with open(os.path.join(images, "frame_000000.ppm"), "wb") as handle:
+                handle.write(b"z" * 11)
+
+            snapshot = dashboard.latest_attempt_folder_size_snapshot(tmp)
+
+            self.assertEqual(snapshot["name"], "episode_000002")
+            self.assertEqual(snapshot["size_bytes"], 18)
+            self.assertTrue(snapshot["complete"])
+
 
 if __name__ == "__main__":
     unittest.main()

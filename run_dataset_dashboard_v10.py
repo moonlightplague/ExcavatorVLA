@@ -2493,6 +2493,8 @@ def summarize_run_activity(runs: Sequence[dict]) -> Dict[str, object]:
                 "worker_seconds_per_success": run.get("success_seconds_per_attempt"),
                 "success_seconds_per_attempt": run.get("success_seconds_per_attempt"),
                 "size_human": run.get("size_human"),
+                "attempt_size_human": run.get("attempt_size_human"),
+                "attempt_folder_name": run.get("attempt_folder_name"),
                 "parallel_worker": run.get("parallel_worker"),
             }
             for run in active[:8]
@@ -2806,6 +2808,30 @@ def exact_directory_size_snapshot(path: Union[str, os.PathLike], dataset_root: O
     if dataset_root is not None:
         save_folder_size_cache(dataset_root)
     return result
+
+
+def latest_attempt_folder_size_snapshot(run_dir: Union[str, os.PathLike]) -> Optional[Dict[str, object]]:
+    root = os.path.abspath(str(run_dir))
+    candidates = []
+    try:
+        for entry in os.scandir(root):
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            if not entry.name.startswith(("episode_", "attempt_")):
+                continue
+            try:
+                mtime = float(entry.stat(follow_symlinks=False).st_mtime)
+            except Exception:
+                mtime = 0.0
+            candidates.append((mtime, entry.name, entry.path))
+    except Exception:
+        return None
+    if not candidates:
+        return None
+    _, name, path = max(candidates)
+    snapshot = exact_directory_size_snapshot(path)
+    snapshot["name"] = name
+    return snapshot
 
 
 def directory_size_snapshot(
@@ -5277,6 +5303,11 @@ def list_dashboard_runs(dataset_root: Union[str, os.PathLike], limit: int = 80) 
         summary = read_json(os.path.join(path, "summary.json"), default={}) or {}
         activity = run_activity_snapshot(path, now=now)
         latest_mtime = float(activity.get("latest_mtime") or 0.0)
+        attempt_size_snapshot = (
+            latest_attempt_folder_size_snapshot(path)
+            if activity.get("active")
+            else None
+        )
         raw_index_counts = {key: fast_jsonl_count(index_path(path, key)) for key in INDEX_FILES}
         effective_counts, catchup = success_index_catchup_counts(path, raw_index_counts)
         success_count = int(effective_counts.get("success", 0) or 0)
@@ -5320,6 +5351,16 @@ def list_dashboard_runs(dataset_root: Union[str, os.PathLike], limit: int = 80) 
                 "size_bytes": size_snapshot.get("size_bytes", 0),
                 "size_human": size_snapshot.get("size_human", "-"),
                 "size_truncated": size_snapshot.get("truncated", False),
+                "attempt_size_human": (
+                    attempt_size_snapshot.get("size_human")
+                    if isinstance(attempt_size_snapshot, dict)
+                    else "-"
+                ),
+                "attempt_folder_name": (
+                    attempt_size_snapshot.get("name")
+                    if isinstance(attempt_size_snapshot, dict)
+                    else ""
+                ),
                 "data_folders": data_sizes,
                 "data_size_human": ", ".join(f"{item.get('name')}={item.get('size_human')}" for item in data_sizes) if data_sizes else "-",
                 "activity": activity,
@@ -7424,7 +7465,7 @@ function renderRunMonitor(data){
     const runName=worker?` data-run-name="${esc(run.name||"")}"`:"";
     const kill=worker?`<span class="runBadgeKill" aria-hidden="true">×</span>`:"";
     const score=`<span class="runBadgeScore" title="success / attempts">${esc(run.success ?? 0)}/${esc(run.attempts ?? "-")}</span>`;
-    return `<button type="button" class="runBadge active" data-action="${action}" data-run-path="${esc(run.path||"")}"${runName} title="${esc(title)}"><span class="activityDot active"></span>${esc(run.name||"")} <span class="muted">${esc(ageText(run.age_s))} · ${score} size=${esc(run.size_human||"-")}${esc(latest)}</span>${kill}</button>`;
+    return `<button type="button" class="runBadge active" data-action="${action}" data-run-path="${esc(run.path||"")}"${runName} title="${esc(title)}"><span class="activityDot active"></span>${esc(run.name||"")} <span class="muted">${esc(ageText(run.age_s))} · ${score} size=${esc(run.attempt_size_human||"-")}${esc(latest)}</span>${kill}</button>`;
   }).join("");
   el.innerHTML=title + subtitle + (badges || `<span class="runBadge"><span class="activityDot idle"></span>no run folder updated recently</span>`);
 }

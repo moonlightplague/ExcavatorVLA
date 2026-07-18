@@ -430,6 +430,7 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_camera_rt_subframes": int(os.environ.get("EXCAVATOR_CAMERA_RT_SUBFRAMES", "1") or 1),
     "dataset_camera_background_enabled": str(os.environ.get("EXCAVATOR_DATASET_CAMERA_BACKGROUND_ENABLED", "1") or "1").strip().lower()
     in ("1", "true", "yes", "on"),
+    "dataset_camera_scheduler_mode": "sample_owned_strict" if DATASET_STRICT_SAMPLE_WAIT else "background_simulation_clock",
     "dataset_camera_opportunistic_capture_enabled": str(
         os.environ.get("EXCAVATOR_DATASET_CAMERA_OPPORTUNISTIC_CAPTURE", "0") or "0"
     ).strip().lower()
@@ -1955,6 +1956,38 @@ def ensure_timeline_playing(label=""):
         return True
 
 
+async def ensure_timeline_playing_async(label="", max_updates=3):
+    if not HAS_OMNI_TIMELINE:
+        return True
+    try:
+        timeline = omni.timeline.get_timeline_interface()
+    except Exception:
+        return True
+    if timeline is None:
+        return True
+    try:
+        if bool(timeline.is_playing()):
+            return True
+    except Exception:
+        return True
+
+    ensure_timeline_playing(label)
+    for update_index in range(max(0, int(max_updates))):
+        try:
+            if bool(timeline.is_playing()):
+                return True
+        except Exception:
+            return True
+        await step_updates(
+            1,
+            trace_label=f"timeline_recover:{label}:{int(update_index) + 1}",
+        )
+    try:
+        return bool(timeline.is_playing())
+    except Exception:
+        return True
+
+
 def timeline_allows_background_work():
     return bool(STATE.get("running", False)) and bool(simulation_timeline_is_playing())
 
@@ -2403,6 +2436,14 @@ def motion_cancel_requested(task_id=None):
     if bool(STATE.get("auto_collect_stop_requested", False)) and str(STATE.get("dig_plan_planning_source", "")) == "auto_collect":
         return True
     if bool(STATE.get("planning_cancel_requested", False)) and str(STATE.get("dig_plan_planning_source", "")) == "auto_collect":
+        return True
+    if (
+        bool(STATE.get("dataset_recording", False))
+        and bool(STATE.get("auto_collect_active", False))
+        and not internal_timeline_pause_active()
+        and not simulation_timeline_is_playing()
+    ):
+        STATE["last_execution_failure_reason"] = "execution_failed/timeline_not_playing:active_motion"
         return True
     return False
 
@@ -7301,8 +7342,6 @@ def dataset_camera_prepare_for_scheduled_update():
         return False
     if not bool(STATE.get("dataset_recording", False)):
         return False
-    if not bool(STATE.get("dataset_camera_background_running", False)):
-        return False
     if bool(STATE.get("dataset_camera_pose_sync_active", False)):
         return False
     if not bool(STATE.get("dataset_camera_enabled", True)):
@@ -7345,7 +7384,7 @@ def dataset_camera_prepare_for_scheduled_update():
 
 
 async def dataset_camera_wait_for_scheduled_capture(sample_index):
-    """Wait for a fresh triplet, advancing Kit only when submission was late."""
+    """Wait for a fresh triplet, advancing Kit once when submission was late."""
     if not bool(DATASET_STRICT_SAMPLE_WAIT):
         return False, "strict_sample_wait_disabled"
     if (
@@ -7360,23 +7399,17 @@ async def dataset_camera_wait_for_scheduled_capture(sample_index):
     last_used_seq = int(STATE.get("dataset_camera_last_payload_capture_seq", 0) or 0)
     last_reason = "fresh_capture_not_ready"
     late_render_update_used = False
-    timeline = None
-    resume_timeline = False
     previous_pose_sync = bool(STATE.get("dataset_camera_pose_sync_active", False))
 
     STATE["dataset_sample_wait_count"] = int(STATE.get("dataset_sample_wait_count", 0) or 0) + 1
     STATE["dataset_camera_pose_sync_active"] = True
     try:
-        if HAS_OMNI_TIMELINE:
-            timeline = omni.timeline.get_timeline_interface()
-            resume_timeline = bool(timeline is not None and timeline.is_playing())
-        if resume_timeline:
-            builtins._EXCAVATOR_INTERNAL_TIMELINE_PAUSE_DEPTH = int(
-                getattr(builtins, "_EXCAVATOR_INTERNAL_TIMELINE_PAUSE_DEPTH", 0) or 0
-            ) + 1
-            timeline.pause()
+        if not simulation_timeline_is_playing():
+            return False, f"timeline_not_playing_before_capture:sample={int(sample_index)}"
 
         while time.time() <= deadline:
+            if not simulation_timeline_is_playing():
+                return False, f"timeline_stopped_during_capture:sample={int(sample_index)}"
             latest_seq = int(STATE.get("dataset_camera_latest_seq", 0) or 0)
             if latest_seq > last_used_seq:
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -7399,16 +7432,14 @@ async def dataset_camera_wait_for_scheduled_capture(sample_index):
                     pending = STATE.get("dataset_camera_pending_capture")
                     pending_active = isinstance(pending, dict) and not bool(pending.get("done", False))
 
-            # A late request still needs one Kit render update. The timeline is
-            # paused here, so this drives viewport callbacks without advancing
-            # joint, particle, or dataset simulation time.
+            # Pre-submission normally makes the frame ready in the movement
+            # update. A genuinely late request gets one normal Kit update so
+            # viewport callbacks can complete. Capture metadata records the
+            # submit-time joint pose and simulation timestamp.
             if pending_active and not late_render_update_used:
-                pending_started_sim = float(pending.get("started_sim_time", 0.0) or 0.0)
-                sim_now = dataset_simulation_time_seconds()
-                if pending_started_sim >= sim_now - 1.0e-9:
-                    late_render_update_used = True
-                    await step_updates(1)
-                    continue
+                late_render_update_used = True
+                await step_updates(1)
+                continue
             await asyncio.sleep(float(DATASET_SAMPLE_WAIT_POLL_S))
 
         elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -7423,29 +7454,6 @@ async def dataset_camera_wait_for_scheduled_capture(sample_index):
         )
     finally:
         STATE["dataset_camera_pose_sync_active"] = bool(previous_pose_sync)
-        if resume_timeline and timeline is not None:
-            try:
-                if not bool(STATE.get("auto_collect_stop_requested", False)):
-                    timeline.play()
-                    # Keep the internal-pause guard raised until Kit reports the
-                    # resumed state. Otherwise the passive main loop can observe
-                    # a one-tick false stop and cancel the auto-collect task.
-                    for _ in range(3):
-                        if bool(timeline.is_playing()):
-                            break
-                        await step_updates(1)
-                    if not bool(timeline.is_playing()):
-                        info_print(
-                            "[WARN] [DATASET CAMERA]",
-                            "timeline_resume_not_confirmed",
-                            f"sample={int(sample_index)}",
-                            force_log=True,
-                        )
-            finally:
-                builtins._EXCAVATOR_INTERNAL_TIMELINE_PAUSE_DEPTH = max(
-                    0,
-                    int(getattr(builtins, "_EXCAVATOR_INTERNAL_TIMELINE_PAUSE_DEPTH", 1) or 1) - 1,
-                )
 
 
 async def dataset_camera_warmup_for_episode(label="episode"):
@@ -7529,17 +7537,6 @@ def dataset_camera_start_background(label="auto_collect"):
         return None
     if not bool(STATE.get("dataset_camera_require_complete_samples", True)):
         return None
-    if not bool(excavator_dataset_camera.background_capture_enabled(runtime_module())):
-        STATE["dataset_camera_background_running"] = False
-        STATE["dataset_camera_background_stop_reason"] = "disabled_throughput_mode"
-        info_print(
-            "[DATASET CAMERA BACKGROUND]",
-            "skipped",
-            "reason=disabled_throughput_mode",
-            "capture=opportunistic_sample_nonblocking",
-            f"interval_s={excavator_dataset_camera.background_interval_seconds(runtime_module()):.3f}",
-        )
-        return None
     STATE["dataset_camera_latest_capture"] = None
     STATE["dataset_camera_latest_capture_time"] = 0.0
     STATE["dataset_camera_latest_seq"] = 0
@@ -7553,6 +7550,30 @@ def dataset_camera_start_background(label="auto_collect"):
     STATE["dataset_camera_background_clock_source"] = str(STATE.get("dataset_camera_clock_source", "simulation"))
     STATE["dataset_camera_capture_backoff_until"] = 0.0
     STATE["dataset_camera_blocked_capture_consecutive"] = 0
+    if bool(DATASET_STRICT_SAMPLE_WAIT):
+        STATE["dataset_camera_scheduler_mode"] = "sample_owned_strict"
+        STATE["dataset_camera_background_running"] = False
+        STATE["dataset_camera_background_stop_reason"] = "sample_scheduler_owns_capture"
+        info_print(
+            "[DATASET CAMERA SCHEDULER]",
+            "mode=sample_owned_strict",
+            "background_submit=False",
+            "alignment=capture_pose_sim_time+capture_q",
+        )
+        return None
+    if not bool(excavator_dataset_camera.background_capture_enabled(runtime_module())):
+        STATE["dataset_camera_scheduler_mode"] = "opportunistic_sample_nonblocking"
+        STATE["dataset_camera_background_running"] = False
+        STATE["dataset_camera_background_stop_reason"] = "disabled_throughput_mode"
+        info_print(
+            "[DATASET CAMERA BACKGROUND]",
+            "skipped",
+            "reason=disabled_throughput_mode",
+            "capture=opportunistic_sample_nonblocking",
+            f"interval_s={excavator_dataset_camera.background_interval_seconds(runtime_module()):.3f}",
+        )
+        return None
+    STATE["dataset_camera_scheduler_mode"] = "background_simulation_clock"
     return register_async_task(
         "dataset_camera_capture",
         excavator_dataset_camera.background_capture_loop(runtime_module(), label=label),
@@ -36126,6 +36147,15 @@ async def execute_dig_plan_step(step_index=None):
 
 async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball", return_home=True):
     STATE["follow"] = False
+    timeline_ready = await ensure_timeline_playing_async(
+        f"{str(task_name)}_execution_start",
+        max_updates=3,
+    )
+    if not timeline_ready:
+        set_execution_failure_reason(
+            f"execution_failed/timeline_not_playing:{str(task_name)}:execution_start"
+        )
+        return False
     if rebuild_plan:
         seq = await build_dig_plan_from_current_target_task(force_status=True)
     else:
@@ -36146,6 +36176,12 @@ async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"
         stage_name, q_goal, duration = seq[stage_index]
         STATE["active_plan_stage_index"] = int(stage_index)
         if not task_alive(task_id):
+            return False
+        if not simulation_timeline_is_playing():
+            set_execution_failure_reason(
+                f"execution_failed/timeline_not_playing:{str(stage_name)}"
+            )
+            update_status(execution_failure_status_text(str(stage_name)), force=True)
             return False
 
         pre_dig_route_group, pre_dig_route_next_index = pre_dig_route_continuous_group(seq, stage_index)

@@ -18,7 +18,7 @@ except Exception:
     Image = None
 
 
-CAMERA_MODULE_VERSION = "dataset_camera_viewport_capture_v26_presubmit_sample_barrier"
+CAMERA_MODULE_VERSION = "dataset_camera_viewport_capture_v29_sample_owned_scheduler"
 SYNC_STEP_ERROR_TEXT = "Synchronous call to `step`"
 
 
@@ -105,7 +105,11 @@ def set_dataset_viewports_visible(rt, visible):
 
 
 def set_dataset_viewports_capture_active(rt, active):
-    visible = bool(active) or dataset_viewport_keep_visible(rt)
+    visible = (
+        bool(active)
+        or dataset_viewport_keep_visible(rt)
+        or bool(rt.STATE.get("dataset_camera_warmup_viewports_active", False))
+    )
     return set_dataset_viewports_visible(rt, visible)
 
 
@@ -573,6 +577,62 @@ def ensure_dataset_viewport(rt):
     first_name = str(rt.DATASET_CAMERA_NAMES[0])
     first = viewports[first_name]
     return first["viewport_api"], first.get("window")
+
+
+async def prime_dataset_viewports_async(rt, frame_count=2):
+    """Render newly-created capture viewports before their first readback."""
+    try:
+        from omni.kit.viewport.utility import next_viewport_frame_async
+    except Exception as exc:
+        return {
+            "ok": False,
+            "reason": f"next_viewport_frame_unavailable:{type(exc).__name__}:{exc}",
+            "frames": 0,
+        }
+
+    try:
+        viewports = ensure_dataset_viewports(rt)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "reason": f"dataset_viewport_unavailable:{type(exc).__name__}:{exc}",
+            "frames": 0,
+        }
+
+    apis = [
+        entry.get("viewport_api")
+        for entry in viewports.values()
+        if isinstance(entry, dict) and entry.get("viewport_api") is not None
+    ]
+    if not apis:
+        return {"ok": False, "reason": "dataset_viewport_api_unavailable", "frames": 0}
+
+    set_dataset_viewports_capture_active(rt, True)
+    rendered = 0
+    timeout_s = max(
+        5.0,
+        float(rt.STATE.get("dataset_camera_viewport_timeout_s", 2.0) or 2.0) * 3.0,
+    )
+    try:
+        for _ in range(max(1, int(frame_count))):
+            await asyncio.wait_for(
+                asyncio.gather(*(next_viewport_frame_async(api) for api in apis)),
+                timeout=timeout_s,
+            )
+            rendered += 1
+    except asyncio.TimeoutError:
+        return {
+            "ok": False,
+            "reason": f"viewport_prime_timeout:{timeout_s:.2f}s",
+            "frames": int(rendered),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "reason": f"viewport_prime_failed:{type(exc).__name__}:{exc}",
+            "frames": int(rendered),
+        }
+    return {"ok": True, "reason": "ok", "frames": int(rendered)}
 
 
 async def capture_viewport_rgb_async(rt, viewport_api, camera_path, wait_frames=0, timeout_s=2.0, update_camera=True):
@@ -2656,8 +2716,32 @@ async def background_capture_loop(rt, label="dataset_camera_background"):
             pending = rt.STATE.get("dataset_camera_pending_capture")
             pending_active = isinstance(pending, dict) and not bool(pending.get("done", False))
             pose_sync_active = bool(rt.STATE.get("dataset_camera_pose_sync_active", False))
+            internal_pause_active = False
+            internal_pause_fn = getattr(rt, "internal_timeline_pause_active", None)
+            if callable(internal_pause_fn):
+                try:
+                    internal_pause_active = bool(internal_pause_fn())
+                except Exception:
+                    internal_pause_active = False
+            timeline_playing = True
+            try:
+                timeline_playing = bool(rt.simulation_timeline_is_playing())
+            except Exception:
+                timeline_playing = True
+            if not timeline_playing and not pose_sync_active and not internal_pause_active:
+                failures += 1
+                rt.STATE["dataset_camera_background_failures"] = int(failures)
+                if failures <= 3 or failures % 50 == 0:
+                    rt.info_print(
+                        "[WARN] [DATASET CAMERA BACKGROUND]",
+                        f"capture_failed={failures}",
+                        "reason=timeline_not_playing",
+                    )
+                await asyncio.sleep(max(0.10, background_min_idle_seconds(rt)))
+                continue
             if (
                 (not pose_sync_active)
+                and (not internal_pause_active)
                 and (not pending_active)
                 and float(clock_now) + 1.0e-9 >= float(next_capture_time)
             ):
@@ -2727,59 +2811,86 @@ async def warmup_for_episode(rt, label="episode"):
         rt.STATE["dataset_camera_warmup_status"] = {"ok": True, "reason": "complete_samples_not_required", "label": str(label)}
         return True
     if backend(rt) == "viewport_capture":
-        max_frames = max(1, int(rt.STATE.get("dataset_camera_warmup_max_frames", 12) or 12))
-        min_frames = max(0, int(rt.STATE.get("dataset_camera_warmup_frames", 3) or 3))
-        ready_required = max(1, int(rt.STATE.get("dataset_camera_warmup_ready_frames", 2) or 2))
-        ready_streak = 0
-        last_reason = "not_checked"
-        last_views = {}
-        for frame in range(max_frames):
-            payload = await capture_observations_viewport_async(rt, sample_index=-1, write_files=False)
-            camera_info = payload.get("observation.camera", {}) if isinstance(payload, dict) else {}
-            last_reason = str(camera_info.get("reason", "") or "camera_payload_missing")
-            last_views = camera_info.get("views", {}) if isinstance(camera_info, dict) else {}
-            if bool(camera_info.get("available", False)):
-                ready_streak += 1
-            else:
-                ready_streak = 0
-            if frame + 1 >= min_frames and ready_streak >= ready_required:
+        previous_warmup_active = bool(rt.STATE.get("dataset_camera_warmup_viewports_active", False))
+        rt.STATE["dataset_camera_warmup_viewports_active"] = True
+        prime_status = {"ok": False, "reason": "not_started", "frames": 0}
+        try:
+            if not initialize(rt, force=False):
+                init_status = dict(rt.STATE.get("dataset_camera_last_status", {}) or {})
                 status = {
-                    "ok": True,
-                    "reason": "ok",
+                    "ok": False,
+                    "reason": str(init_status.get("reason", "camera_initialize_failed")),
                     "label": str(label),
-                    "frames": int(frame + 1),
-                    "ready_streak": int(ready_streak),
+                    "frames": 0,
+                    "ready_streak": 0,
                     "backend": "viewport_capture",
-                    "views": compact_camera_views(last_views),
-                    "active_viewport_unchanged": bool(camera_info.get("active_viewport_unchanged", True)),
+                    "viewport_prime": prime_status,
+                    "views": compact_camera_views(init_status.get("views", {})),
                 }
                 rt.STATE["dataset_camera_warmup_status"] = status
-                rt.info_print(
-                    "[DATASET CAMERA WARMUP OK]",
-                    "backend=viewport_capture",
-                    f"label={label}",
-                    f"frames={frame + 1}",
-                    f"ready_streak={ready_streak}",
-                    format_rgb_stats(last_views),
-                )
-                return True
-        status = {
-            "ok": False,
-            "reason": str(last_reason),
-            "label": str(label),
-            "frames": int(max_frames),
-            "ready_streak": int(ready_streak),
-            "backend": "viewport_capture",
-            "views": compact_camera_views(last_views),
-        }
-        rt.STATE["dataset_camera_warmup_status"] = status
-        rt.info_print(
-            "[WARN] [DATASET CAMERA WARMUP]",
-            "backend=viewport_capture",
-            f"reason={last_reason}",
-            format_rgb_stats(last_views),
-        )
-        return False
+                return False
+
+            prime_status = await prime_dataset_viewports_async(rt, frame_count=2)
+            max_frames = max(1, int(rt.STATE.get("dataset_camera_warmup_max_frames", 12) or 12))
+            min_frames = max(0, int(rt.STATE.get("dataset_camera_warmup_frames", 3) or 3))
+            ready_required = max(1, int(rt.STATE.get("dataset_camera_warmup_ready_frames", 2) or 2))
+            ready_streak = 0
+            last_reason = str(prime_status.get("reason", "not_checked"))
+            last_views = {}
+            for frame in range(max_frames):
+                payload = await capture_observations_viewport_async(rt, sample_index=-1, write_files=False)
+                camera_info = payload.get("observation.camera", {}) if isinstance(payload, dict) else {}
+                last_reason = str(camera_info.get("reason", "") or "camera_payload_missing")
+                last_views = camera_info.get("views", {}) if isinstance(camera_info, dict) else {}
+                if bool(camera_info.get("available", False)):
+                    ready_streak += 1
+                else:
+                    ready_streak = 0
+                if frame + 1 >= min_frames and ready_streak >= ready_required:
+                    status = {
+                        "ok": True,
+                        "reason": "ok",
+                        "label": str(label),
+                        "frames": int(frame + 1),
+                        "ready_streak": int(ready_streak),
+                        "backend": "viewport_capture",
+                        "viewport_prime": dict(prime_status),
+                        "views": compact_camera_views(last_views),
+                        "active_viewport_unchanged": bool(camera_info.get("active_viewport_unchanged", True)),
+                    }
+                    rt.STATE["dataset_camera_warmup_status"] = status
+                    rt.info_print(
+                        "[DATASET CAMERA WARMUP OK]",
+                        "backend=viewport_capture",
+                        f"label={label}",
+                        f"frames={frame + 1}",
+                        f"ready_streak={ready_streak}",
+                        f"prime={prime_status.get('reason', 'unknown')}:{prime_status.get('frames', 0)}",
+                        format_rgb_stats(last_views),
+                    )
+                    return True
+            status = {
+                "ok": False,
+                "reason": str(last_reason),
+                "label": str(label),
+                "frames": int(max_frames),
+                "ready_streak": int(ready_streak),
+                "backend": "viewport_capture",
+                "viewport_prime": dict(prime_status),
+                "views": compact_camera_views(last_views),
+            }
+            rt.STATE["dataset_camera_warmup_status"] = status
+            rt.info_print(
+                "[WARN] [DATASET CAMERA WARMUP]",
+                "backend=viewport_capture",
+                f"reason={last_reason}",
+                f"prime={prime_status.get('reason', 'unknown')}:{prime_status.get('frames', 0)}",
+                format_rgb_stats(last_views),
+            )
+            return False
+        finally:
+            rt.STATE["dataset_camera_warmup_viewports_active"] = bool(previous_warmup_active)
+            set_dataset_viewports_capture_active(rt, False)
     reset_replicator_tick_state(rt, reason=f"warmup_start:{label}")
     max_frames = max(0, int(rt.STATE.get("dataset_camera_warmup_max_frames", 12) or 12))
     min_frames = max(0, int(rt.STATE.get("dataset_camera_warmup_frames", 3) or 3))
@@ -3025,6 +3136,18 @@ def config_snapshot(rt):
             "pre_submit_failures": int(rt.STATE.get("dataset_camera_pre_submit_failures", 0) or 0),
             "policy": "pre_submit_before_due_update_then_wall_wait",
         },
+        "capture_scheduler": {
+            "mode": str(
+                rt.STATE.get(
+                    "dataset_camera_scheduler_mode",
+                    "sample_owned_strict"
+                    if bool(rt.STATE.get("dataset_strict_sample_wait", False))
+                    else "background_simulation_clock",
+                )
+            ),
+            "alignment": "capture_pose_sim_time+capture_q+capture_q_cmd",
+            "timeline_pause": False,
+        },
         "warmup_frames": int(rt.STATE.get("dataset_camera_warmup_frames", 3) or 3),
         "warmup_ready_frames": int(rt.STATE.get("dataset_camera_warmup_ready_frames", 2) or 2),
         "warmup_max_frames": int(rt.STATE.get("dataset_camera_warmup_max_frames", 12) or 12),
@@ -3036,7 +3159,10 @@ def config_snapshot(rt):
         "allow_frame_reuse": bool(camera_allow_frame_reuse(rt)),
         "last_payload_capture_seq": int(rt.STATE.get("dataset_camera_last_payload_capture_seq", 0) or 0),
         "background_capture": {
-            "enabled_for_auto_collect": bool(background_capture_enabled(rt)),
+            "enabled_for_auto_collect": bool(
+                background_capture_enabled(rt)
+                and not bool(rt.STATE.get("dataset_strict_sample_wait", False))
+            ),
             "interval_s": background_interval_seconds(rt),
             "min_idle_s": background_min_idle_seconds(rt),
             "clock_source": str(rt.STATE.get("dataset_camera_background_clock_source", rt.STATE.get("dataset_camera_clock_source", "simulation"))),
@@ -3047,7 +3173,10 @@ def config_snapshot(rt):
             "opportunistic_capture": bool(opportunistic_capture_enabled(rt)),
             "opportunistic_submissions": int(rt.STATE.get("dataset_camera_opportunistic_submissions", 0) or 0),
             "postprocess": "executor_lanczos_validate",
-            "note": "Background capture is scheduled by simulation time; capture viewports are visible only during GPU readback, and CPU resize/validation runs in an executor.",
+            "note": (
+                "Disabled in strict sample-owned mode; otherwise scheduled by simulation time. "
+                "Capture viewports are visible only during GPU readback, and CPU resize/validation runs in an executor."
+            ),
         },
         "capture_block_watchdog": {
             "threshold_ms": capture_block_watchdog_ms(rt),

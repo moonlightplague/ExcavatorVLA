@@ -4638,6 +4638,15 @@ PARALLEL_COLLECT_STATE_FILENAME = ".parallel_launcher_state.json"
 PARALLEL_COLLECT_LOCK = threading.Lock()
 
 
+def dashboard_parallel_shutdown_allowed() -> bool:
+    return str(os.environ.get("EXCAVATOR_DASHBOARD_ALLOW_SHUTDOWN", "0") or "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def parallel_collect_state_path(dataset_root: Union[str, os.PathLike]) -> str:
     return os.path.join(
         os.path.abspath(str(dataset_root or "excavator_auto_dataset")),
@@ -4678,6 +4687,7 @@ def normalize_parallel_collect_config(config: object) -> Dict[str, object]:
         "max_attempts": max_attempts,
         "log_mode": log_mode,
         "fast_sampled_replay": bool(raw.get("fast_sampled_replay", False)),
+        "shutdown_on_complete": bool(raw.get("shutdown_on_complete", False)),
         "expected_total_successes": int(workers * success_count),
     }
 
@@ -4735,6 +4745,7 @@ def dashboard_parallel_collect_status(dataset_root: Union[str, os.PathLike]) -> 
             "ok": True,
             "supported": os.name == "posix",
             "running": False,
+            "shutdown_allowed": dashboard_parallel_shutdown_allowed(),
             "dataset_root": root,
             "state_path": state_path,
             "reason": "not_started",
@@ -4749,6 +4760,7 @@ def dashboard_parallel_collect_status(dataset_root: Union[str, os.PathLike]) -> 
             "ok": True,
             "supported": os.name == "posix",
             "running": running,
+            "shutdown_allowed": dashboard_parallel_shutdown_allowed(),
             "process_alive": alive,
             "dataset_root": root,
             "state_path": state_path,
@@ -4791,6 +4803,11 @@ def dashboard_start_parallel_collect(
     root = os.path.abspath(str(dataset_root or "excavator_auto_dataset"))
     os.makedirs(root, exist_ok=True)
     normalized = normalize_parallel_collect_config(config)
+    if normalized["shutdown_on_complete"] and not dashboard_parallel_shutdown_allowed():
+        raise RuntimeError(
+            "shutdown is disabled for this dashboard; restart it with "
+            "EXCAVATOR_DASHBOARD_ALLOW_SHUTDOWN=1"
+        )
     project_root = os.path.abspath(os.path.dirname(__file__))
     launcher_path = os.path.join(project_root, "scripts", "run_parallel_linux.sh")
     if not os.path.isfile(launcher_path):
@@ -4821,6 +4838,8 @@ def dashboard_start_parallel_collect(
                 "MAX_ATTEMPTS": str(normalized["max_attempts"]),
                 "LOG_MODE": str(normalized["log_mode"]),
                 "FAST_SAMPLED_REPLAY": "1" if normalized["fast_sampled_replay"] else "0",
+                "SHUTDOWN_ON_COMPLETE": "1" if normalized["shutdown_on_complete"] else "0",
+                "SHUTDOWN_DELAY_MINUTES": "1",
                 "PYTHONUNBUFFERED": "1",
             }
         )
@@ -6515,6 +6534,7 @@ body main details>summary:after,.managerPanel>summary:after,.detailsPanel>summar
       <label class="parallelCollectField number"><span>Attempts / worker</span><input id="parallelMaxAttempts" type="number" min="1" max="100000" value="500"></label>
       <label class="parallelCollectField"><span>Log mode</span><select id="parallelLogMode"><option value="data">data</option><option value="debug">debug</option><option value="profile">profile</option></select></label>
       <label class="parallelCollectToggle"><input id="parallelFastReplay" type="checkbox">Fast pre-dig</label>
+      <label class="parallelCollectToggle" id="parallelShutdownLabel" title="Requires EXCAVATOR_DASHBOARD_ALLOW_SHUTDOWN=1"><input id="parallelShutdownOnComplete" type="checkbox" disabled>Shutdown when complete</label>
       <button type="button" id="startParallelCollectBtn">Start parallel</button>
       <button type="button" class="danger" id="stopParallelCollectBtn" disabled>Stop</button>
       <span id="parallelCollectStatus" class="parallelCollectStatus">not started</span>
@@ -6697,22 +6717,27 @@ function parallelCollectConfig(){
     max_attempts:Number($("parallelMaxAttempts")?.value||1),
     log_mode:String($("parallelLogMode")?.value||"data"),
     fast_sampled_replay:!!$("parallelFastReplay")?.checked,
+    shutdown_on_complete:!!$("parallelShutdownOnComplete")?.checked,
   };
 }
 function renderParallelCollectStatus(state, announce=false){
-  const statusEl=$("parallelCollectStatus"), startBtn=$("startParallelCollectBtn"), stopBtn=$("stopParallelCollectBtn");
+  const statusEl=$("parallelCollectStatus"), startBtn=$("startParallelCollectBtn"), stopBtn=$("stopParallelCollectBtn"), shutdownToggle=$("parallelShutdownOnComplete"), shutdownLabel=$("parallelShutdownLabel");
   const running=!!state?.running, supported=state?.supported!==false;
+  const shutdownAllowed=!!state?.shutdown_allowed;
   if(startBtn) startBtn.disabled=!supported||running;
   if(stopBtn) stopBtn.disabled=!supported||!running;
+  if(shutdownToggle) shutdownToggle.disabled=!supported||running||!shutdownAllowed;
+  if(shutdownLabel) shutdownLabel.title=shutdownAllowed?"Power off one minute after every worker reaches its target.":"Restart dashboard with EXCAVATOR_DASHBOARD_ALLOW_SHUTDOWN=1 to enable.";
   let text="not started", cls="parallelCollectStatus";
   if(!supported){text="Linux/POSIX only"; cls+=" error";}
   else if(running){
     const config=state.config||{};
-    text=`running · pid ${state.pid} · ${config.workers||"?"} workers · total ${config.expected_total_successes||"?"}`;
+    text=`running · pid ${state.pid} · ${config.workers||"?"} workers · total ${config.expected_total_successes||"?"}${config.shutdown_on_complete?" · shutdown armed":""}`;
     cls+=" running";
   }else if(state?.reason==="stopped"){text=`stopped · pid ${state.pid||"-"}`;}
   else if(state?.reason==="completed_or_exited"){
-    text=`finished · exit ${state.return_code??"?"} · ${state.batch_id||""}`;
+    const shutdownText=state?.config?.shutdown_on_complete&&Number(state.return_code)===0?" · shutdown scheduled":"";
+    text=`finished · exit ${state.return_code??"?"} · ${state.batch_id||""}${shutdownText}`;
   }else if(state?.reason==="pid_identity_mismatch"){
     text=`PID mismatch · ${state.pid||"-"}`;
     cls+=" error";
@@ -6738,8 +6763,9 @@ async function refreshParallelCollectStatus(announce=false){
 }
 async function startParallelCollect(){
   const config=parallelCollectConfig();
+  if(config.shutdown_on_complete&&!window.confirm("Power off this Linux host one minute after every worker reaches its success target? Manual Stop, worker failure, or incomplete targets will not shut it down.")) return;
   const total=Number(config.workers||0)*Number(config.success_count||0);
-  terminalWrite(`Starting parallel collect: GPUs=${config.gpu_ids} workers=${config.workers} success/worker=${config.success_count} total=${total}`,"muted");
+  terminalWrite(`Starting parallel collect: GPUs=${config.gpu_ids} workers=${config.workers} success/worker=${config.success_count} total=${total} shutdown=${config.shutdown_on_complete?"armed":"off"}`,"muted");
   const state=await postJSON("/api/manage/parallel_collect_start",{root:$("rootInput").value,config});
   renderParallelCollectStatus(state,true);
   await loadRuns({silent:true});

@@ -12,6 +12,7 @@ Headless auto collect:
 import argparse
 import asyncio
 import importlib
+import json
 import os
 import platform
 import runpy
@@ -590,6 +591,84 @@ def run_auto_collect(simulation_app, rt, success_count, max_attempts, wait_expor
         f"run_dir={rt.STATE.get('auto_collect_run_dir', '')}",
         flush=True,
     )
+    run_dir = str(rt.STATE.get("auto_collect_run_dir", "") or "")
+    summary = {}
+    summary_path = os.path.join(run_dir, "summary.json") if run_dir else ""
+    if summary_path and os.path.isfile(summary_path):
+        try:
+            with open(summary_path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                summary = loaded
+        except Exception as exc:
+            print(
+                "[WARN] Auto collect result could not read summary:",
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+    requested = max(
+        success_count,
+        int(summary.get("requested", 0) or 0),
+        int(rt.STATE.get("auto_collect_requested", 0) or 0),
+    )
+    successes = max(
+        int(summary.get("successes", 0) or 0),
+        int(rt.STATE.get("auto_collect_successes", 0) or 0),
+    )
+    exit_reason = str(
+        summary.get("loop_exit_reason")
+        or rt.STATE.get("auto_collect_loop_exit_reason", "")
+        or ""
+    )
+    cancelled = bool(
+        summary.get("loop_cancelled", False)
+        or rt.STATE.get("auto_collect_loop_cancelled", False)
+    )
+    result = {
+        "schema": "excavator_auto_collect_result_v1",
+        "completed": bool(
+            successes >= requested
+            and exit_reason == "target_successes_reached"
+            and not cancelled
+        ),
+        "requested": int(requested),
+        "successes": int(successes),
+        "attempts": int(
+            max(
+                int(summary.get("attempts", 0) or 0),
+                int(rt.STATE.get("auto_collect_attempts", 0) or 0),
+            )
+        ),
+        "loop_exit_reason": exit_reason,
+        "loop_cancelled": cancelled,
+        "run_dir": run_dir,
+        "summary_path": summary_path,
+        "finished_at": time.time(),
+    }
+    result_path = str(os.environ.get("EXCAVATOR_AUTO_COLLECT_RESULT_FILE", "") or "").strip()
+    if result_path:
+        result_path = os.path.abspath(os.path.expanduser(result_path))
+        try:
+            os.makedirs(os.path.dirname(result_path) or ".", exist_ok=True)
+            temporary_path = f"{result_path}.tmp.{os.getpid()}"
+            with open(temporary_path, "w", encoding="utf-8") as handle:
+                json.dump(result, handle, ensure_ascii=True, indent=2)
+                handle.write("\n")
+            os.replace(temporary_path, result_path)
+            print(
+                "[INFO] Auto collect result written:",
+                f"completed={result['completed']}",
+                f"path={result_path}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                "[ERROR] Auto collect result write failed:",
+                f"{type(exc).__name__}: {exc}",
+                f"path={result_path}",
+                flush=True,
+            )
+    return result
 
 
 def main():

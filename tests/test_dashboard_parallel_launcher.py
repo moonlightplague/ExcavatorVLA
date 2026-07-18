@@ -15,6 +15,7 @@ class DashboardParallelLauncherTests(unittest.TestCase):
                 "max_attempts": 500,
                 "log_mode": "data",
                 "fast_sampled_replay": True,
+                "shutdown_on_complete": True,
             }
         )
         self.assertEqual(config["gpu_ids"], "0,2")
@@ -22,6 +23,7 @@ class DashboardParallelLauncherTests(unittest.TestCase):
         self.assertEqual(config["success_count"], 60)
         self.assertEqual(config["expected_total_successes"], 300)
         self.assertTrue(config["fast_sampled_replay"])
+        self.assertTrue(config["shutdown_on_complete"])
 
     def test_rejects_shell_text_and_invalid_ranges(self):
         with self.assertRaisesRegex(ValueError, "gpu_ids"):
@@ -45,6 +47,21 @@ class DashboardParallelLauncherTests(unittest.TestCase):
             self.assertFalse(status["running"])
             self.assertEqual(status["reason"], "not_started")
             self.assertEqual(status["dataset_root"], os.path.abspath(tmp))
+
+    def test_shutdown_is_default_off_and_requires_explicit_dashboard_opt_in(self):
+        config = dashboard.normalize_parallel_collect_config({"gpu_ids": "0"})
+        self.assertFalse(config["shutdown_on_complete"])
+        previous = os.environ.get("EXCAVATOR_DASHBOARD_ALLOW_SHUTDOWN")
+        try:
+            os.environ["EXCAVATOR_DASHBOARD_ALLOW_SHUTDOWN"] = "1"
+            self.assertTrue(dashboard.dashboard_parallel_shutdown_allowed())
+            os.environ["EXCAVATOR_DASHBOARD_ALLOW_SHUTDOWN"] = "0"
+            self.assertFalse(dashboard.dashboard_parallel_shutdown_allowed())
+        finally:
+            if previous is None:
+                os.environ.pop("EXCAVATOR_DASHBOARD_ALLOW_SHUTDOWN", None)
+            else:
+                os.environ["EXCAVATOR_DASHBOARD_ALLOW_SHUTDOWN"] = previous
 
 
 if __name__ == "__main__":

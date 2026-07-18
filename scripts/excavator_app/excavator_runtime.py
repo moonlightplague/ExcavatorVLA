@@ -396,6 +396,9 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_last_action": None,
     "dataset_last_dq_real": None,
     "dataset_last_ddq_real": None,
+    "dataset_bucket_fill_previous_fraction": None,
+    "dataset_bucket_fill_previous_rate": None,
+    "dataset_bucket_fill_previous_time": None,
     "dataset_current_q_goal": None,
     "dataset_camera_enabled": env_bool("EXCAVATOR_DATASET_CAMERA_ENABLED", True) and not bool(EXEC_AB_DISABLE_CAMERA),
     "dataset_camera_backend": "viewport_capture",
@@ -6887,22 +6890,10 @@ def validate_dig_plan_contract(seq=None, points=None, stages=None, trace_points=
     }
 
 
-DATASET_STATE_NAMES = [
-    "base_x",
-    "base_y",
-    "base_yaw",
-    "swing",
-    "boom",
-    "arm",
-    "bucket",
-    "bucket_load_estimate",
-    "bucket_tip_x",
-    "bucket_tip_y",
-    "bucket_tip_z",
-    "bucket_load_x",
-    "bucket_load_y",
-    "bucket_load_z",
-]
+DATASET_STATE_NAMES = list(vla_observation_contract.STATE_NAMES_28D)
+DATASET_LEGACY_STATE_NAMES_14D = list(
+    vla_observation_contract.BASE_STATE_NAMES_14D
+)
 
 DATASET_ACTION_NAMES = [
     "swing_cmd_velocity",
@@ -6925,18 +6916,7 @@ DATASET_EFFORT_NAMES = [
     "bucket_measured_effort",
 ]
 
-DATASET_PHASE_NAMES = [
-    "pre_dig",
-    "approach_contact",
-    "insert_cut",
-    "pull_mid_cut",
-    "curl_to_hold_material",
-    "pull_exit_cut",
-    "secure_load",
-    "lift_carry",
-    "loaded_transit",
-    "unload_to_bin",
-]
+DATASET_PHASE_NAMES = list(vla_observation_contract.CANONICAL_PHASE_NAMES)
 
 
 def json_sanitize(value):
@@ -11431,6 +11411,7 @@ def dataset_constraint_flags(cost, contact, phase_features):
 
 
 def dataset_observation_state(q_real=None, bucket_load_metrics=None):
+    """Build the legacy 14D diagnostic state used to migrate older episodes."""
     if q_real is None:
         q_real = get_real_joint_positions()
     q_real = np.array(q_real, dtype=np.float32)
@@ -11459,6 +11440,102 @@ def dataset_observation_state(q_real=None, bucket_load_metrics=None):
     return state
 
 
+def dataset_current_unload_landing_point():
+    plan = STATE.get("current_dig_plan")
+    plan = plan if isinstance(plan, dict) else {}
+    value = None
+    for candidate in (
+        STATE.get("active_unload_landing_point"),
+        plan.get("chosen_unload_landing_point"),
+        plan.get("unload_landing_xyz"),
+    ):
+        if candidate is not None:
+            value = candidate
+            break
+    if value is None:
+        value = unload_bin_landing_point()
+    return None if value is None else np.asarray(value, dtype=np.float32).reshape(-1)[:3]
+
+
+def dataset_bucket_fill_features(bucket_load_particles, sample_time):
+    fill_fraction = vla_observation_contract.bucket_fill_fraction(
+        float(bucket_load_particles)
+    )
+    previous_fraction = STATE.get("dataset_bucket_fill_previous_fraction")
+    previous_rate = STATE.get("dataset_bucket_fill_previous_rate")
+    previous_time = STATE.get("dataset_bucket_fill_previous_time")
+    dt = (
+        0.0
+        if previous_time is None
+        else max(0.0, float(sample_time) - float(previous_time))
+    )
+    fill_rate = vla_observation_contract.causal_bucket_fill_rate(
+        fill_fraction,
+        previous_fraction,
+        previous_rate,
+        dt,
+    )
+    STATE["dataset_bucket_fill_previous_fraction"] = float(fill_fraction)
+    STATE["dataset_bucket_fill_previous_rate"] = float(fill_rate)
+    STATE["dataset_bucket_fill_previous_time"] = float(sample_time)
+    return float(fill_fraction), float(fill_rate)
+
+
+def dataset_vla_observation_state(
+    q_cmd,
+    q_real,
+    joint_velocity,
+    previous_action,
+    bucket_load_metrics,
+    target,
+    sample_time,
+):
+    q_cmd = np.asarray(q_cmd, dtype=np.float32).reshape(-1)[:4]
+    q_real = np.asarray(q_real, dtype=np.float32).reshape(-1)[:4]
+    tip = bucket_tip_pos()
+    load = bucket_load_pos()
+    pour = bucket_pour_pos()
+    unload_landing = dataset_current_unload_landing_point()
+    if (
+        tip is None
+        or load is None
+        or pour is None
+        or target is None
+        or unload_landing is None
+    ):
+        raise vla_observation_contract.ObservationContractError(
+            "bucket points, dig target, or unload landing are unavailable"
+        )
+    truck_yaw_deg = _deployment_scene_truck_yaw_deg()
+    if truck_yaw_deg is None:
+        raise vla_observation_contract.ObservationContractError(
+            "truck heading is unavailable"
+        )
+    bucket_load_particles = dataset_bucket_load_estimate(bucket_load_metrics)
+    fill_fraction, fill_rate = dataset_bucket_fill_features(
+        bucket_load_particles,
+        sample_time,
+    )
+    upper_heading = float(get_base_yaw_rad()) + float(
+        q_real[CTRL.name_to_idx["swing"]]
+    )
+    return vla_observation_contract.build_state_28d(
+        joint_positions_4d=q_real,
+        joint_velocity_4d=joint_velocity,
+        joint_tracking_error_4d=dataset_joint_error(q_cmd, q_real),
+        previous_action_4d=previous_action,
+        bucket_tip_world_xyz=tip,
+        bucket_load_world_xyz=load,
+        bucket_pour_world_xyz=pour,
+        dig_target_world_xyz=target,
+        unload_landing_world_xyz=unload_landing,
+        upper_heading_rad=upper_heading,
+        truck_yaw_rad=math.radians(float(truck_yaw_deg)),
+        bucket_fill_fraction_value=fill_fraction,
+        bucket_fill_rate_fraction_per_s=fill_rate,
+    )
+
+
 def deployment_observation_context_update(context=None, reset=False):
     if reset:
         STATE["deployment_observation_context"] = {}
@@ -11469,6 +11546,11 @@ def deployment_observation_context_update(context=None, reset=False):
         STATE["deployment_joint_previous_q"] = None
         STATE["deployment_joint_previous_time"] = None
         STATE["deployment_joint_velocity_4d"] = None
+        STATE["deployment_q_cmd_previous"] = None
+        STATE["deployment_q_cmd_previous_time"] = None
+        STATE["deployment_previous_action_4d"] = None
+        STATE["deployment_bucket_fill_previous_fraction"] = None
+        STATE["deployment_bucket_fill_previous_rate"] = None
     if context is None:
         return dict(STATE.get("deployment_observation_context", {}) or {})
     if not isinstance(context, dict):
@@ -11517,6 +11599,33 @@ def deployment_canonical_joint_velocity(q_real=None, sample_time=None):
     STATE["deployment_joint_previous_time"] = float(sample_time)
     STATE["deployment_joint_velocity_4d"] = list(velocity)
     return [float(value) for value in velocity]
+
+
+def deployment_canonical_previous_action(q_cmd=None, sample_time=None):
+    if q_cmd is None:
+        q_cmd = CTRL.q_cmd.copy()
+    q_cmd = np.asarray(q_cmd, dtype=np.float32).reshape(-1)[:4]
+    if sample_time is None:
+        sample_time = dataset_simulation_time_seconds()
+    sample_time = float(sample_time)
+    previous_q_cmd = STATE.get("deployment_q_cmd_previous")
+    previous_time = STATE.get("deployment_q_cmd_previous_time")
+    if (
+        previous_q_cmd is None
+        or previous_time is None
+        or sample_time <= float(previous_time)
+    ):
+        action = [0.0, 0.0, 0.0, 0.0]
+    else:
+        action = vla_observation_contract.joint_velocity_from_samples(
+            q_cmd,
+            previous_q_cmd,
+            sample_time - float(previous_time),
+        )
+    STATE["deployment_q_cmd_previous"] = q_cmd.copy()
+    STATE["deployment_q_cmd_previous_time"] = float(sample_time)
+    STATE["deployment_previous_action_4d"] = list(action)
+    return [float(value) for value in action]
 
 
 def _deployment_plan_stage_name():
@@ -11585,6 +11694,10 @@ def deployment_vla_observation_payload(context=None):
         q_real=q_real,
         sample_time=sample_time,
     )
+    previous_action = deployment_canonical_previous_action(
+        q_cmd=CTRL.q_cmd,
+        sample_time=sample_time,
+    )
 
     bucket_metrics = bucket_load_fast_current(force=False)
     if not isinstance(bucket_metrics, dict) or not bool(bucket_metrics.get("available", False)):
@@ -11594,9 +11707,10 @@ def deployment_vla_observation_payload(context=None):
         )
     tip = bucket_tip_pos()
     load = bucket_load_pos()
-    if tip is None or load is None:
+    pour = bucket_pour_pos()
+    if tip is None or load is None or pour is None:
         raise vla_observation_contract.ObservationContractError(
-            "bucket tip/load transforms are unavailable"
+            "bucket tip/load/pour transforms are unavailable"
         )
     base_state = dataset_observation_state(q_real=q_real, bucket_load_metrics=bucket_metrics)
 
@@ -11661,10 +11775,7 @@ def deployment_vla_observation_payload(context=None):
         phase = _deployment_plan_stage_name()
         phase_source = "active_expert_plan"
     if phase is None:
-        raise vla_observation_contract.ObservationContractError(
-            "phase is unavailable; an end-to-end policy must provide a deployment "
-            "phase supervisor or be retrained without phase_index"
-        )
+        phase_source = "unavailable_optional_telemetry"
 
     initial_origin = vla_observation_contract.optional_context_value(
         context,
@@ -11709,28 +11820,37 @@ def deployment_vla_observation_payload(context=None):
         truck_yaw = math.radians(float(truck_yaw_deg))
 
     bucket_load = float(base_state[7])
-    previous_load = STATE.get("deployment_bucket_load_previous")
+    fill_fraction = vla_observation_contract.bucket_fill_fraction(bucket_load)
+    previous_fraction = STATE.get("deployment_bucket_fill_previous_fraction")
+    previous_rate = STATE.get("deployment_bucket_fill_previous_rate")
     previous_time = STATE.get("deployment_bucket_load_previous_time")
-    if previous_load is None or previous_time is None or sample_time <= float(previous_time):
-        bucket_load_rate = 0.0
-    else:
-        bucket_load_rate = (bucket_load - float(previous_load)) / max(
-            1.0e-4,
-            sample_time - float(previous_time),
-        )
+    fill_rate = vla_observation_contract.causal_bucket_fill_rate(
+        fill_fraction,
+        previous_fraction,
+        previous_rate,
+        0.0
+        if previous_time is None
+        else max(0.0, sample_time - float(previous_time)),
+    )
     STATE["deployment_bucket_load_previous"] = float(bucket_load)
     STATE["deployment_bucket_load_previous_time"] = float(sample_time)
+    STATE["deployment_bucket_fill_previous_fraction"] = float(fill_fraction)
+    STATE["deployment_bucket_fill_previous_rate"] = float(fill_rate)
 
     state_28d = vla_observation_contract.build_state_28d(
-        base_state_14d=base_state,
+        joint_positions_4d=q_real,
         joint_velocity_4d=joint_velocity,
-        phase=phase,
+        joint_tracking_error_4d=dataset_joint_error(CTRL.q_cmd, q_real),
+        previous_action_4d=previous_action,
+        bucket_tip_world_xyz=tip,
+        bucket_load_world_xyz=load,
+        bucket_pour_world_xyz=pour,
         dig_target_world_xyz=dig_target,
         unload_landing_world_xyz=unload_landing,
-        initial_origin_xy=initial_origin,
-        initial_heading_rad=float(initial_heading),
+        upper_heading_rad=float(base_state[2]) + float(q_real[CTRL.name_to_idx["swing"]]),
         truck_yaw_rad=float(truck_yaw),
-        bucket_load_rate=float(bucket_load_rate),
+        bucket_fill_fraction_value=fill_fraction,
+        bucket_fill_rate_fraction_per_s=fill_rate,
     )
     task_text = str(
         vla_observation_contract.optional_context_value(context, "task_text")
@@ -11741,20 +11861,28 @@ def deployment_vla_observation_payload(context=None):
         raise vla_observation_contract.ObservationContractError(
             "task text is unavailable; provide observation_context.task_text"
         )
+    phase_index = (
+        None
+        if phase is None
+        else int(vla_observation_contract.canonical_phase_index(phase))
+    )
     payload = {
         "observation_state_28d": state_28d,
         "observation_effort": [float(value) for value in effort],
+        "observation_stage_current_id": phase_index,
         "observation_contract": vla_observation_contract.schema_payload(),
         "observation_sources": {
-            "base_state_14d": "runtime.dataset_observation_state",
-            "joint_velocity_4d": "robot.get_joint_velocities:name_mapped",
+            "joint_position_4d": "robot.get_joint_positions:name_mapped",
+            "joint_velocity_4d": "causal_simulation_time_difference",
+            "joint_tracking_error_4d": "controller_q_cmd_minus_measured_q",
+            "previous_action_4d": "causal_controller_command_velocity",
             "measured_effort_4d": "robot.get_measured_joint_efforts:name_mapped",
             "bucket_load_estimate": str(bucket_metrics.get("load_volume_source", "")),
             "phase": phase_source,
             "dig_target": dig_target_source,
             "unload_landing": unload_source,
             "truck_heading": "observation_context_or_selected_truck_prim",
-            "initial_heading": "episode_initial_working_heading",
+            "feature_frame": "current_upper_heading",
             "task_text": (
                 "observation_context"
                 if vla_observation_contract.optional_context_value(context, "task_text") is not None
@@ -11763,7 +11891,7 @@ def deployment_vla_observation_payload(context=None):
         },
         "task_text": task_text,
         "observation_context": {
-            "phase_index": int(vla_observation_contract.canonical_phase_index(phase)),
+            "phase_index": phase_index,
             "dig_target_xyz": vec_list(dig_target, 3),
             "unload_landing_xyz": vec_list(unload_landing, 3),
             "initial_origin_xy": vec_list(initial_origin, 2),
@@ -11942,7 +12070,28 @@ def dataset_record_sample(
             cost_summary = {}
             constraint_flags = []
         span_t = time.perf_counter()
-        obs_state = dataset_observation_state(q_real=q_real, bucket_load_metrics=bucket_metrics)
+        legacy_obs_state = dataset_observation_state(
+            q_real=q_real,
+            bucket_load_metrics=bucket_metrics,
+        )
+        try:
+            obs_state = dataset_vla_observation_state(
+                q_cmd=q_cmd,
+                q_real=q_real,
+                joint_velocity=joint_velocity,
+                previous_action=action,
+                bucket_load_metrics=bucket_metrics,
+                target=target,
+                sample_time=train_abs,
+            )
+        except Exception as exc:
+            info_print(
+                "[DATASET STATE DROP]",
+                f"episode={STATE.get('dataset_episode_uid', '')}",
+                f"sample_index={sample_index}",
+                f"reason={type(exc).__name__}:{exc}",
+            )
+            return False
         mark_span("dataset_record_sample.features.obs_state", span_t, threshold_ms=2.0)
         span_t = time.perf_counter()
         effort_obs = dataset_joint_effort_observation()
@@ -11986,6 +12135,7 @@ def dataset_record_sample(
             "task": str(STATE.get("dataset_task_text", "Dig soil from the marked area and dump it into the target container.")),
             "phase": str(phase),
             "phase.index": phase_features["index"],
+            "observation.stage_current_id": int(phase_features["index"]),
             "phase.one_hot": phase_features["one_hot"],
             "phase.context": phase_features["context"],
             "label": str(label),
@@ -11993,6 +12143,7 @@ def dataset_record_sample(
             "observation.effort": observation_effort,
             "observation.effort_meta": effort_obs,
             "obs.state": obs_state,
+            "obs.state_legacy_14d": legacy_obs_state,
             "obs.q": vec_list(q_real, 4),
             "obs.dq": joint_velocity,
             "obs.ddq": joint_acceleration,
@@ -12289,6 +12440,7 @@ def dataset_record_event(event, detail="", data=None):
             "detail": str(detail),
             "active_task": str(STATE.get("active_task_name", "idle")),
             "schema": AUTO_COLLECT_SCHEMA,
+            "state_schema_version": vla_observation_contract.SCHEMA_VERSION,
         }
         if data is not None:
             sample["data"] = data
@@ -12421,8 +12573,9 @@ def ensure_auto_collect_run_dir():
                 "observation.images.1": "relative image path in each trajectory row; original main swing-mounted view",
                 "observation.images.2": "relative image path in each trajectory row; swing-mounted overhead panorama view",
                 "observation.state": DATASET_STATE_NAMES,
-                "observation.state.bucket_load_estimate": "bucket_from_pile particle count from the per-sample bucket-fast metric",
+                "observation.state.bucket_fill_fraction": "source-tracked bucket particles normalized by the versioned 6400-particle capacity",
                 "observation.effort": DATASET_EFFORT_NAMES,
+                "observation.stage_current_id": "categorical 0..9 stage supervision; not part of the continuous 28D policy input",
                 "obs.joint_force_torque": "optional measured per-joint [Fx,Fy,Fz,Tx,Ty,Tz] diagnostics",
                 "action": DATASET_ACTION_NAMES,
                 "task": "episode-level and per-sample natural language task string",
@@ -12443,6 +12596,7 @@ def ensure_auto_collect_run_dir():
                     "views.{0,1,2}.pose",
                 ],
                 "obs.state": DATASET_STATE_NAMES,
+                "obs.state_legacy_14d": DATASET_LEGACY_STATE_NAMES_14D,
                 "obs.q": DOF_ORDER,
                 "obs.dq": DOF_ORDER,
                 "obs.ddq": DOF_ORDER,
@@ -14321,6 +14475,9 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
     STATE["dataset_last_action"] = None
     STATE["dataset_last_dq_real"] = None
     STATE["dataset_last_ddq_real"] = None
+    STATE["dataset_bucket_fill_previous_fraction"] = None
+    STATE["dataset_bucket_fill_previous_rate"] = None
+    STATE["dataset_bucket_fill_previous_time"] = None
     STATE["dataset_current_q_goal"] = None
     STATE["dataset_camera_frame_count"] = 0
     STATE["dataset_camera_dropped_incomplete_samples"] = 0
@@ -14434,6 +14591,7 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
         "created_at": STATE["dataset_episode_start_time"],
         "created_at_simulation": float(STATE["dataset_episode_start_sim_time"]),
         "schema": AUTO_COLLECT_SCHEMA,
+        "state_schema_version": vla_observation_contract.SCHEMA_VERSION,
         "planner_version": PLANNER_VERSION,
         "quality_gate_version": QUALITY_GATE_VERSION,
         "config_hash": config_hash,
@@ -14464,8 +14622,9 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
             "observation.images.1": "relative image path; original main swing-mounted view",
             "observation.images.2": "relative image path; swing-mounted overhead panorama view",
             "observation.state": DATASET_STATE_NAMES,
-            "observation.state.bucket_load_estimate": "bucket_from_pile particle count from the per-sample bucket-fast metric",
+            "observation.state.bucket_fill_fraction": "source-tracked bucket particles normalized by the versioned 6400-particle capacity",
             "observation.effort": DATASET_EFFORT_NAMES,
+            "observation.stage_current_id": "categorical 0..9 stage supervision; not part of the continuous 28D policy input",
             "obs.joint_force_torque": "optional measured per-joint [Fx,Fy,Fz,Tx,Ty,Tz] diagnostics",
             "action": DATASET_ACTION_NAMES,
         },

@@ -1,6 +1,6 @@
 # ExcavatorVLA Documentation Status
 
-Updated: 2026-07-15
+Updated: 2026-07-18
 
 This file is the current entry point for project documentation. Older reports
 under `docs/analysis/` remain useful as historical measurements, but they may
@@ -15,16 +15,17 @@ The data-generation branch currently exports:
 - a separate 4D `observation.effort`;
 - a 4D joint-command velocity `action` in canonical order
   `[swing, boom, arm, bucket]`;
-- an episode task prompt and canonical phase index;
+- an episode task prompt and separate categorical
+  `observation.stage_current_id`;
 - per-episode videos with a four-frame keyframe interval;
-- a uniform export time policy whose speed scaling also updates action and
-  derivative fields.
+- a uniform export time policy with causal observation derivatives and a
+  next-transition action target.
 
 The canonical export identifiers are:
 
 ```text
 task prompt:  excavator_relative_task_v3_heading_frame
-state schema: excavator_state_v3_28d_plus_4effort_phase_index10
+state schema: excavator_state_v4_28d_plus_4effort_categorical_phase10
 video layout: per_episode
 ```
 
@@ -38,15 +39,13 @@ configuration take precedence over older prose documents.
 - [Current runtime architecture](current_runtime_architecture.md): canonical
   auto-collect, planning, execution, clock, camera, and sampling call chain as
   audited against the 2026-07-15 working tree.
-- [32D collection code guide](vla_32d_collection_code_guide.md): source-level
-  data lineage from the raw 14D state and 4D effort through the exported 28D
-  state, action, cameras, phases, timestamps, and LeRobot rows.
-- [32D calculation audit](vla_32d_calculation_audit.md): verified calculations,
-  mixed-rate and temporal-alignment findings, measured data evidence, and the
-  recommended repair order.
+- [32D collection code guide](vla_32d_collection_code_guide.md): historical v3
+  source map retained for migration context.
+- [32D calculation audit](vla_32d_calculation_audit.md): historical v3 audit
+  retained as the evidence that motivated the v4 contract.
 - [32D deployment contract](vla_32d_deployment_contract.md): live simulator
-  sources, bridge payload, phase-supervisor requirement, and startup acceptance
-  checks for the 28D state plus 4D effort model input.
+  v4 state definitions, units, causal timing, bridge payload, compatibility,
+  and startup acceptance checks.
 - [18D SmolVLA deployment handoff](vla_18d_deployment_handoff.md): immediate
   guidance for the existing 14D state + 4D effort checkpoints, including the
   current simulator slowdown diagnosis and a later 32D migration path.

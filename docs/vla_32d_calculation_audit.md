@@ -2,6 +2,11 @@
 
 Audited: 2026-07-17
 
+> Historical v3 audit. Its findings motivated the v4 causal/local observation
+> contract implemented on 2026-07-18. Use
+> [vla_32d_deployment_contract.md](vla_32d_deployment_contract.md) for the
+> current schema and deployment requirements.
+
 Scope:
 
 ```text

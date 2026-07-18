@@ -34,7 +34,7 @@ CANONICAL_PHASE_NAMES = [
     "unload_to_bin",
 ]
 
-STATE_NAMES_28D = BASE_STATE_NAMES_14D + [
+LEGACY_STATE_NAMES_28D_V3 = BASE_STATE_NAMES_14D + [
     "swing_velocity",
     "boom_velocity",
     "arm_velocity",
@@ -51,6 +51,37 @@ STATE_NAMES_28D = BASE_STATE_NAMES_14D + [
     "bucket_load_rate",
 ]
 
+STATE_NAMES_28D = [
+    "swing_position",
+    "boom_position",
+    "arm_position",
+    "bucket_position",
+    "swing_velocity",
+    "boom_velocity",
+    "arm_velocity",
+    "bucket_velocity",
+    "swing_tracking_error",
+    "boom_tracking_error",
+    "arm_tracking_error",
+    "bucket_tracking_error",
+    "previous_swing_action",
+    "previous_boom_action",
+    "previous_arm_action",
+    "previous_bucket_action",
+    "bucket_pour_axis_forward",
+    "bucket_pour_axis_up",
+    "dig_target_from_tip_forward",
+    "dig_target_from_tip_left",
+    "dig_target_from_tip_up",
+    "unload_from_load_forward",
+    "unload_from_load_left",
+    "unload_from_load_up",
+    "truck_heading_relative_sin",
+    "truck_heading_relative_cos",
+    "bucket_fill_fraction",
+    "bucket_fill_rate_fraction_per_s",
+]
+
 EFFORT_NAMES_4D = [
     "swing_measured_effort",
     "boom_measured_effort",
@@ -65,7 +96,11 @@ ACTION_NAMES_4D = [
     "bucket_cmd_velocity",
 ]
 
-SCHEMA_VERSION = "excavator_state_v3_28d_plus_4effort_phase_index10"
+SCHEMA_VERSION = "excavator_state_v4_28d_plus_4effort_categorical_phase10"
+BUCKET_FILL_CAPACITY_PARTICLES = 6400.0
+BUCKET_FILL_RATE_TAU_SECONDS = 0.40
+BUCKET_FILL_FRACTION_MAX = 1.50
+BUCKET_FILL_RATE_ABS_MAX = 5.0
 
 
 class ObservationContractError(ValueError):
@@ -82,6 +117,24 @@ def _finite_vector(value: object, size: int, label: str) -> list:
     if not all(math.isfinite(item) for item in vector):
         raise ObservationContractError(f"{label} contains NaN or Inf: {vector}")
     return vector
+
+
+def wrap_angle_rad(value: float) -> float:
+    angle = float(value)
+    if not math.isfinite(angle):
+        raise ObservationContractError(f"angle is not finite: {value!r}")
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def joint_delta(
+    current_q: Sequence[float],
+    previous_q: Sequence[float],
+) -> list:
+    current = _finite_vector(current_q, 4, "current_q")
+    previous = _finite_vector(previous_q, 4, "previous_q")
+    delta = [current[index] - previous[index] for index in range(4)]
+    delta[0] = wrap_angle_rad(delta[0])
+    return delta
 
 
 def canonical_phase_index(phase: object) -> int:
@@ -122,18 +175,48 @@ def point_in_initial_heading_frame(
 ) -> list:
     point = _finite_vector(point_xyz, 3, "point_xyz")
     origin = _finite_vector(origin_xy, 2, "origin_xy")
+    return point_delta_in_heading_frame(
+        point,
+        [origin[0], origin[1], 0.0],
+        heading_rad,
+    )
+
+
+def point_delta_in_heading_frame(
+    point_xyz: Sequence[float],
+    reference_xyz: Sequence[float],
+    heading_rad: float,
+) -> list:
+    point = _finite_vector(point_xyz, 3, "point_xyz")
+    reference = _finite_vector(reference_xyz, 3, "reference_xyz")
     heading = float(heading_rad)
     if not math.isfinite(heading):
         raise ObservationContractError(f"heading_rad is not finite: {heading_rad!r}")
-    dx = point[0] - origin[0]
-    dy = point[1] - origin[1]
+    dx = point[0] - reference[0]
+    dy = point[1] - reference[1]
     c = math.cos(heading)
     s = math.sin(heading)
     return [
         c * dx + s * dy,
         -s * dx + c * dy,
-        point[2],
+        point[2] - reference[2],
     ]
+
+
+def bucket_pour_axis_in_heading_frame(
+    bucket_load_world_xyz: Sequence[float],
+    bucket_pour_world_xyz: Sequence[float],
+    heading_rad: float,
+) -> list:
+    axis = point_delta_in_heading_frame(
+        bucket_pour_world_xyz,
+        bucket_load_world_xyz,
+        heading_rad,
+    )
+    norm = math.hypot(float(axis[0]), float(axis[2]))
+    if norm <= 1.0e-8:
+        raise ObservationContractError("bucket load-to-pour axis is degenerate")
+    return [float(axis[0]) / norm, float(axis[2]) / norm]
 
 
 def joint_velocity_from_samples(
@@ -141,60 +224,102 @@ def joint_velocity_from_samples(
     previous_q: Sequence[float],
     dt: float,
 ) -> list:
-    current = _finite_vector(current_q, 4, "current_q")
-    previous = _finite_vector(previous_q, 4, "previous_q")
     delta_time = float(dt)
     if not math.isfinite(delta_time) or delta_time <= 0.0:
         raise ObservationContractError(f"joint velocity dt must be positive and finite: {dt!r}")
-    delta = [current[index] - previous[index] for index in range(4)]
-    delta[0] = math.atan2(math.sin(delta[0]), math.cos(delta[0]))
     return _finite_vector(
-        [value / delta_time for value in delta],
+        [value / delta_time for value in joint_delta(current_q, previous_q)],
         4,
         "joint_velocity_4d",
     )
 
 
+def bucket_fill_fraction(
+    bucket_load_particles: float,
+    capacity_particles: float = BUCKET_FILL_CAPACITY_PARTICLES,
+) -> float:
+    load = float(bucket_load_particles)
+    capacity = float(capacity_particles)
+    if not math.isfinite(load) or not math.isfinite(capacity) or capacity <= 0.0:
+        raise ObservationContractError(
+            f"invalid bucket fill values: load={bucket_load_particles!r} capacity={capacity_particles!r}"
+        )
+    return min(BUCKET_FILL_FRACTION_MAX, max(0.0, load / capacity))
+
+
+def causal_bucket_fill_rate(
+    current_fill_fraction: float,
+    previous_fill_fraction: Optional[float],
+    previous_smoothed_rate: Optional[float],
+    dt: float,
+    tau_seconds: float = BUCKET_FILL_RATE_TAU_SECONDS,
+) -> float:
+    current = float(current_fill_fraction)
+    if previous_fill_fraction is None:
+        return 0.0
+    delta_time = float(dt)
+    if not math.isfinite(delta_time) or delta_time <= 0.0:
+        return 0.0
+    raw_rate = (current - float(previous_fill_fraction)) / delta_time
+    previous_rate = 0.0 if previous_smoothed_rate is None else float(previous_smoothed_rate)
+    tau = max(1.0e-6, float(tau_seconds))
+    alpha = 1.0 - math.exp(-delta_time / tau)
+    smoothed = previous_rate + alpha * (raw_rate - previous_rate)
+    return min(BUCKET_FILL_RATE_ABS_MAX, max(-BUCKET_FILL_RATE_ABS_MAX, smoothed))
+
+
 def build_state_28d(
-    base_state_14d: Sequence[float],
+    joint_positions_4d: Sequence[float],
     joint_velocity_4d: Sequence[float],
-    phase: object,
+    joint_tracking_error_4d: Sequence[float],
+    previous_action_4d: Sequence[float],
+    bucket_tip_world_xyz: Sequence[float],
+    bucket_load_world_xyz: Sequence[float],
+    bucket_pour_world_xyz: Sequence[float],
     dig_target_world_xyz: Sequence[float],
     unload_landing_world_xyz: Sequence[float],
-    initial_origin_xy: Sequence[float],
-    initial_heading_rad: float,
+    upper_heading_rad: float,
     truck_yaw_rad: float,
-    bucket_load_rate: float,
+    bucket_fill_fraction_value: float,
+    bucket_fill_rate_fraction_per_s: float,
 ) -> list:
-    base_state = _finite_vector(base_state_14d, 14, "base_state_14d")
-    joint_velocity = _finite_vector(joint_velocity_4d, 4, "joint_velocity_4d")
-    phase_index = canonical_phase_index(phase)
-    dig_local = point_in_initial_heading_frame(
-        dig_target_world_xyz,
-        initial_origin_xy,
-        initial_heading_rad,
-    )
-    unload_local = point_in_initial_heading_frame(
-        unload_landing_world_xyz,
-        initial_origin_xy,
-        initial_heading_rad,
-    )
+    q = _finite_vector(joint_positions_4d, 4, "joint_positions_4d")
+    dq = _finite_vector(joint_velocity_4d, 4, "joint_velocity_4d")
+    q_error = _finite_vector(joint_tracking_error_4d, 4, "joint_tracking_error_4d")
+    q_error[0] = wrap_angle_rad(q_error[0])
+    previous_action = _finite_vector(previous_action_4d, 4, "previous_action_4d")
+    tip = _finite_vector(bucket_tip_world_xyz, 3, "bucket_tip_world_xyz")
+    load = _finite_vector(bucket_load_world_xyz, 3, "bucket_load_world_xyz")
+    pour = _finite_vector(bucket_pour_world_xyz, 3, "bucket_pour_world_xyz")
+    upper_heading = float(upper_heading_rad)
     truck_yaw = float(truck_yaw_rad)
-    load_rate = float(bucket_load_rate)
-    if not math.isfinite(truck_yaw):
-        raise ObservationContractError(f"truck_yaw_rad is not finite: {truck_yaw_rad!r}")
-    if not math.isfinite(load_rate):
-        raise ObservationContractError(f"bucket_load_rate is not finite: {bucket_load_rate!r}")
+    fill_fraction_value = float(bucket_fill_fraction_value)
+    fill_rate = float(bucket_fill_rate_fraction_per_s)
+    if not all(math.isfinite(value) for value in (upper_heading, truck_yaw, fill_fraction_value, fill_rate)):
+        raise ObservationContractError("heading or bucket fill feature is not finite")
 
-    relative_yaw = truck_yaw - float(initial_heading_rad)
+    pour_axis = bucket_pour_axis_in_heading_frame(load, pour, upper_heading)
+    dig_delta = point_delta_in_heading_frame(
+        dig_target_world_xyz,
+        tip,
+        upper_heading,
+    )
+    unload_delta = point_delta_in_heading_frame(
+        unload_landing_world_xyz,
+        load,
+        upper_heading,
+    )
+    relative_truck_yaw = wrap_angle_rad(truck_yaw - upper_heading)
     state = (
-        base_state
-        + joint_velocity
-        + [float(phase_index)]
-        + dig_local
-        + unload_local
-        + [math.sin(relative_yaw), math.cos(relative_yaw)]
-        + [load_rate]
+        q
+        + dq
+        + q_error
+        + previous_action
+        + pour_axis
+        + dig_delta
+        + unload_delta
+        + [math.sin(relative_truck_yaw), math.cos(relative_truck_yaw)]
+        + [fill_fraction_value, fill_rate]
     )
     return _finite_vector(state, len(STATE_NAMES_28D), "observation.state")
 
@@ -210,10 +335,18 @@ def schema_payload() -> dict:
             "shape": [len(EFFORT_NAMES_4D)],
             "names": list(EFFORT_NAMES_4D),
         },
+        "observation.stage_current_id": {
+            "dtype": "int64",
+            "shape": [1],
+            "names": ["stage_current_id"],
+            "class_names": list(CANONICAL_PHASE_NAMES),
+            "role": "categorical_supervision_not_policy_input",
+        },
         "action": {
             "shape": [len(ACTION_NAMES_4D)],
             "names": list(ACTION_NAMES_4D),
             "unit": "rad/s",
+            "semantics": "next_command_velocity",
         },
         "effective_robot_observation_dim": len(STATE_NAMES_28D) + len(EFFORT_NAMES_4D),
     }
@@ -224,9 +357,12 @@ def validate_payload(payload: Mapping[str, object]) -> dict:
         raise ObservationContractError("deployment observation payload must be a mapping")
     state = _finite_vector(payload.get("observation_state_28d"), len(STATE_NAMES_28D), "observation_state_28d")
     effort = _finite_vector(payload.get("observation_effort"), len(EFFORT_NAMES_4D), "observation_effort")
+    phase_raw = payload.get("observation_stage_current_id")
+    phase_index = None if phase_raw is None else canonical_phase_index(phase_raw)
     return {
         "observation_state_28d": state,
         "observation_effort": effort,
+        "observation_stage_current_id": phase_index,
     }
 
 

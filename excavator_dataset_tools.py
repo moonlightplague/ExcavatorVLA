@@ -10,6 +10,8 @@ from statistics import mean, median
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 from urllib.parse import parse_qs, unquote, urlparse
 
+from excavator_common import vla_observation_contract
+
 
 INDEX_FILES = {
     "all": "episodes.jsonl",
@@ -31,51 +33,10 @@ SEGMENT_FILES = {
 LEROBOT_EXPORT_SCHEMA = "excavator_lerobot_export_v3"
 LEROBOT_CODEBASE_VERSION = "v3.0"
 LEROBOT_TASK_PROMPT_VERSION = "excavator_relative_task_v3_heading_frame"
-LEROBOT_STATE_SCHEMA_VERSION = "excavator_state_v3_28d_plus_4effort_phase_index10"
-LEROBOT_CANONICAL_PHASE_NAMES = [
-    "pre_dig",
-    "approach_contact",
-    "insert_cut",
-    "pull_mid_cut",
-    "curl_to_hold_material",
-    "pull_exit_cut",
-    "secure_load",
-    "lift_carry",
-    "loaded_transit",
-    "unload_to_bin",
-]
-LEROBOT_BASE_STATE_NAMES_14D = [
-    "base_x",
-    "base_y",
-    "base_yaw",
-    "swing",
-    "boom",
-    "arm",
-    "bucket",
-    "bucket_load_estimate",
-    "bucket_tip_x",
-    "bucket_tip_y",
-    "bucket_tip_z",
-    "bucket_load_x",
-    "bucket_load_y",
-    "bucket_load_z",
-]
-LEROBOT_STATE_NAMES_28D = LEROBOT_BASE_STATE_NAMES_14D + [
-    "swing_velocity",
-    "boom_velocity",
-    "arm_velocity",
-    "bucket_velocity",
-    "phase_index",
-    "dig_target_local_x",
-    "dig_target_local_y",
-    "dig_target_local_z",
-    "unload_landing_local_x",
-    "unload_landing_local_y",
-    "unload_landing_local_z",
-    "truck_heading_relative_sin",
-    "truck_heading_relative_cos",
-    "bucket_load_rate",
-]
+LEROBOT_STATE_SCHEMA_VERSION = vla_observation_contract.SCHEMA_VERSION
+LEROBOT_CANONICAL_PHASE_NAMES = list(vla_observation_contract.CANONICAL_PHASE_NAMES)
+LEROBOT_BASE_STATE_NAMES_14D = list(vla_observation_contract.BASE_STATE_NAMES_14D)
+LEROBOT_STATE_NAMES_28D = list(vla_observation_contract.STATE_NAMES_28D)
 LEROBOT_DEFAULT_EXPORT_DIRNAME = "lerobot_v3"
 EXPORT_TIME_POLICY_FILENAME = "export_time_policy.json"
 LEROBOT_IMAGE_SHAPE = [256, 256, 3]
@@ -1478,6 +1439,63 @@ def _finite_difference_vectors(values: Sequence[Sequence[Optional[float]]], time
     return out
 
 
+def _causal_difference_vectors(
+    values: Sequence[Sequence[Optional[float]]],
+    timestamps: Sequence[float],
+    dim: int,
+) -> List[List[Optional[float]]]:
+    out: List[List[Optional[float]]] = []
+    for index, current_values in enumerate(values):
+        if index <= 0:
+            out.append([0.0] * int(dim))
+            continue
+        dt = float(timestamps[index]) - float(timestamps[index - 1])
+        if dt <= 1.0e-9:
+            out.append([0.0] * int(dim))
+            continue
+        previous_values = list(values[index - 1] or [])
+        current_values = list(current_values or [])
+        row: List[Optional[float]] = []
+        for axis in range(int(dim)):
+            try:
+                row.append(
+                    (float(current_values[axis]) - float(previous_values[axis])) / dt
+                )
+            except Exception:
+                row.append(None)
+        out.append(row)
+    return out
+
+
+def _forward_difference_vectors(
+    values: Sequence[Sequence[Optional[float]]],
+    timestamps: Sequence[float],
+    dim: int,
+) -> List[List[Optional[float]]]:
+    count = len(values)
+    out: List[List[Optional[float]]] = []
+    for index, current_values in enumerate(values):
+        if index >= count - 1:
+            out.append([0.0] * int(dim))
+            continue
+        dt = float(timestamps[index + 1]) - float(timestamps[index])
+        if dt <= 1.0e-9:
+            out.append([0.0] * int(dim))
+            continue
+        next_values = list(values[index + 1] or [])
+        current_values = list(current_values or [])
+        row: List[Optional[float]] = []
+        for axis in range(int(dim)):
+            try:
+                row.append(
+                    (float(next_values[axis]) - float(current_values[axis])) / dt
+                )
+            except Exception:
+                row.append(None)
+        out.append(row)
+    return out
+
+
 def _rewrap_angles(values: Sequence[Optional[float]]) -> List[Optional[float]]:
     out: List[Optional[float]] = []
     for value in values:
@@ -1566,12 +1584,21 @@ def apply_export_time_policy_to_trajectory(
     raw_action = [vector_or_none(sample.get("action"), dim) for sample in samples]
     q_unwrapped = _unwrap_angle_series(q_raw, dim)
     q_cmd_unwrapped = _unwrap_angle_series(q_cmd_raw, dim)
-    dq = _finite_difference_vectors(q_unwrapped, new_times, dim)
-    ddq = _finite_difference_vectors(dq, new_times, dim)
+    dq = _causal_difference_vectors(q_unwrapped, new_times, dim)
+    ddq = _causal_difference_vectors(dq, new_times, dim)
     if any(vec is not None for vec in q_cmd_raw):
-        action = _finite_difference_vectors(q_cmd_unwrapped, new_times, dim)
+        previous_action = _causal_difference_vectors(
+            q_cmd_unwrapped,
+            new_times,
+            dim,
+        )
+        action = _forward_difference_vectors(
+            q_cmd_unwrapped,
+            new_times,
+            dim,
+        )
     else:
-        action = []
+        previous_action = []
         for vec in raw_action:
             src = list(vec or [])
             row: List[Optional[float]] = []
@@ -1580,8 +1607,18 @@ def apply_export_time_policy_to_trajectory(
                     row.append(float(src[axis_i]) * speed_scale)
                 except Exception:
                     row.append(0.0)
-            action.append(row)
-    action_ddq = _finite_difference_vectors(action, new_times, dim)
+            previous_action.append(row)
+        action = [
+            list(previous_action[index + 1])
+            if index + 1 < len(previous_action)
+            else [0.0] * dim
+            for index in range(len(previous_action))
+        ]
+    action_ddq = _causal_difference_vectors(
+        previous_action,
+        new_times,
+        dim,
+    )
     state_names_list = list(state_names or [])
     transformed: List[dict] = []
     for index, sample in enumerate(samples):
@@ -1597,6 +1634,9 @@ def apply_export_time_policy_to_trajectory(
             out["obs.q_cmd"] = [float(value) for value in q_cmd_wrapped]  # type: ignore[arg-type]
         out["obs.dq"] = [float(value or 0.0) for value in dq[index]]
         out["obs.ddq"] = [float(value or 0.0) for value in ddq[index]]
+        out["obs.previous_action"] = [
+            float(value or 0.0) for value in previous_action[index]
+        ]
         out["action"] = [float(value or 0.0) for value in action[index]]
         out["action.ddq"] = [float(value or 0.0) for value in action_ddq[index]]
         state = vector_or_none(out.get("observation.state")) or vector_or_none(out.get("obs.state"))
@@ -1921,23 +1961,81 @@ def _point_in_initial_heading_frame(
     ]
 
 
+def _legacy_base_state_from_sample(
+    sample: dict,
+    raw_state_names: Sequence[str],
+) -> Optional[List[float]]:
+    legacy = vector_or_none(sample.get("obs.state_legacy_14d"), 14)
+    if legacy is not None:
+        return legacy
+    for key in ("observation.state", "obs.state"):
+        raw_state = vector_or_none(sample.get(key))
+        if raw_state is None:
+            continue
+        values = _state_values_by_name(
+            raw_state,
+            raw_state_names,
+            LEROBOT_BASE_STATE_NAMES_14D,
+        )
+        if values is not None:
+            return values
+    return None
+
+
+def _sample_bucket_load_particles(
+    sample: dict,
+    base_state_14d: Optional[Sequence[float]],
+) -> Optional[float]:
+    sand = sample.get("sand")
+    if isinstance(sand, dict):
+        for key in (
+            "bucket_from_pile",
+            "bucket_from_pile_count",
+            "bucket",
+            "count",
+        ):
+            value = safe_float_value(sand.get(key), None)
+            if value is not None:
+                return max(0.0, float(value))
+    if base_state_14d is not None and len(base_state_14d) >= 8:
+        value = safe_float_value(base_state_14d[7], None)
+        if value is not None:
+            return max(0.0, float(value))
+    return None
+
+
 def build_lerobot_state_28d(
     sample: dict,
     episode_meta: dict,
     episode_row: dict,
     raw_state_names: Sequence[str],
-    bucket_load_rate: float,
+    bucket_fill_fraction: float,
+    bucket_fill_rate_fraction_per_s: float,
 ) -> Tuple[Optional[List[float]], str]:
-    raw_state = vector_or_none(sample.get("observation.state")) or vector_or_none(sample.get("obs.state"))
-    if raw_state is None:
-        return None, "missing_raw_state"
-    base_state = _state_values_by_name(raw_state, raw_state_names, LEROBOT_BASE_STATE_NAMES_14D)
+    base_state = _legacy_base_state_from_sample(sample, raw_state_names)
     if base_state is None:
         return None, "raw_state_missing_named_14d_components"
 
+    joint_positions = vector_or_none(sample.get("obs.q"), 4)
+    if joint_positions is None:
+        joint_positions = [float(value) for value in base_state[3:7]]
     joint_velocity = vector_or_none(sample.get("obs.dq"), 4)
     if joint_velocity is None:
         return None, "missing_joint_velocity"
+    joint_tracking_error = vector_or_none(sample.get("obs.q_err"), 4)
+    if joint_tracking_error is None:
+        q_cmd = vector_or_none(sample.get("obs.q_cmd"), 4)
+        if q_cmd is None:
+            q_cmd = vector_or_none(sample.get("goal.q"), 4)
+        if q_cmd is None:
+            return None, "missing_joint_tracking_error"
+        joint_tracking_error = vla_observation_contract.joint_delta(
+            q_cmd,
+            joint_positions,
+        )
+    previous_action = vector_or_none(sample.get("obs.previous_action"), 4)
+    if previous_action is None:
+        return None, "missing_causal_previous_action"
     effort = vector_or_none(sample.get("observation.effort"), 4)
     if effort is None:
         return None, "missing_measured_effort"
@@ -1970,18 +2068,17 @@ def build_lerobot_state_28d(
     if unload_landing is None:
         return None, "missing_unload_landing_xyz"
 
-    base_x = float(base_state[0])
-    base_y = float(base_state[1])
-    robot_heading_deg = _first_float(
-        applied.get("robot_body_yaw_deg"),
-        candidate.get("robot_body_yaw_deg"),
+    bucket_tip = _first_vector_xyz(
+        sample.get("bucket.tip"),
+        base_state[8:11],
     )
-    if robot_heading_deg is None:
-        robot_heading_rad = float(base_state[2]) + float(base_state[3])
-    else:
-        robot_heading_rad = math.radians(float(robot_heading_deg))
-    dig_local = _point_in_initial_heading_frame(dig_target, [base_x, base_y], robot_heading_rad)
-    unload_local = _point_in_initial_heading_frame(unload_landing, [base_x, base_y], robot_heading_rad)
+    bucket_load = _first_vector_xyz(
+        sample.get("bucket.load"),
+        base_state[11:14],
+    )
+    bucket_pour = _first_vector_xyz(sample.get("bucket.pour"))
+    if bucket_tip is None or bucket_load is None or bucket_pour is None:
+        return None, "missing_bucket_tip_load_or_pour_xyz"
 
     truck_yaw_deg = _first_float(
         applied.get("truck_yaw_deg"),
@@ -1989,21 +2086,26 @@ def build_lerobot_state_28d(
     )
     if truck_yaw_deg is None:
         return None, "missing_truck_yaw_deg"
-    truck_relative_yaw = math.radians(float(truck_yaw_deg)) - float(robot_heading_rad)
+    upper_heading_rad = float(base_state[2]) + float(joint_positions[0])
 
-    state = (
-        [float(value) for value in base_state]
-        + [float(value) for value in joint_velocity]
-        + [float(phase_index)]
-        + [float(value) for value in dig_local]
-        + [float(value) for value in unload_local]
-        + [math.sin(truck_relative_yaw), math.cos(truck_relative_yaw)]
-        + [float(bucket_load_rate)]
-    )
-    if len(state) != len(LEROBOT_STATE_NAMES_28D):
-        return None, f"state_dimension_mismatch:{len(state)}"
-    if not all(math.isfinite(float(value)) for value in state):
-        return None, "state_contains_non_finite_value"
+    try:
+        state = vla_observation_contract.build_state_28d(
+            joint_positions_4d=joint_positions,
+            joint_velocity_4d=joint_velocity,
+            joint_tracking_error_4d=joint_tracking_error,
+            previous_action_4d=previous_action,
+            bucket_tip_world_xyz=bucket_tip,
+            bucket_load_world_xyz=bucket_load,
+            bucket_pour_world_xyz=bucket_pour,
+            dig_target_world_xyz=dig_target,
+            unload_landing_world_xyz=unload_landing,
+            upper_heading_rad=upper_heading_rad,
+            truck_yaw_rad=math.radians(float(truck_yaw_deg)),
+            bucket_fill_fraction_value=bucket_fill_fraction,
+            bucket_fill_rate_fraction_per_s=bucket_fill_rate_fraction_per_s,
+        )
+    except Exception as exc:
+        return None, f"state_contract_error:{type(exc).__name__}:{exc}"
     return state, "ok"
 
 
@@ -2581,14 +2683,16 @@ def collect_lerobot_rows(
         task_text = ""
         score = safe_float_value(episode.get("score"), None)
         current_episode_image_paths = {key: [] for key in LEROBOT_IMAGE_KEYS}
-        previous_bucket_load: Optional[float] = None
+        previous_bucket_fill_fraction: Optional[float] = None
+        previous_bucket_fill_rate: Optional[float] = None
         previous_sample_t: Optional[float] = None
         for sample in trajectory:
-            raw_state = vector_or_none(sample.get("observation.state"), len(raw_state_names))
-            if raw_state is None:
-                raw_state = vector_or_none(sample.get("obs.state"), len(raw_state_names))
+            raw_base_state = _legacy_base_state_from_sample(
+                sample,
+                raw_state_names,
+            )
             action = vector_or_none(sample.get("action"), len(action_names))
-            if raw_state is None or action is None:
+            if raw_base_state is None or action is None:
                 skipped_frames += 1
                 skipped_state_action_frames += 1
                 continue
@@ -2619,23 +2723,38 @@ def collect_lerobot_rows(
                 continue
             effort = vector_or_none(sample.get("observation.effort"), len(effort_names))
             sample_t = safe_float_value(sample.get("t"), first_t) or first_t
-            raw_base_state = _state_values_by_name(raw_state, raw_state_names, LEROBOT_BASE_STATE_NAMES_14D)
-            if raw_base_state is None:
+            bucket_load_particles = _sample_bucket_load_particles(
+                sample,
+                raw_base_state,
+            )
+            if bucket_load_particles is None:
                 state = None
-                state_reason = "raw_state_missing_named_14d_components"
+                state_reason = "missing_bucket_load_particles"
             else:
-                current_bucket_load = float(raw_base_state[7])
-                if previous_bucket_load is None or previous_sample_t is None:
-                    bucket_load_rate = 0.0
-                else:
-                    dt_sample = max(1.0e-6, float(sample_t) - float(previous_sample_t))
-                    bucket_load_rate = (current_bucket_load - float(previous_bucket_load)) / dt_sample
+                fill_fraction = vla_observation_contract.bucket_fill_fraction(
+                    bucket_load_particles
+                )
+                dt_sample = (
+                    0.0
+                    if previous_sample_t is None
+                    else max(
+                        1.0e-6,
+                        float(sample_t) - float(previous_sample_t),
+                    )
+                )
+                fill_rate = vla_observation_contract.causal_bucket_fill_rate(
+                    fill_fraction,
+                    previous_bucket_fill_fraction,
+                    previous_bucket_fill_rate,
+                    dt_sample,
+                )
                 state, state_reason = build_lerobot_state_28d(
                     sample,
                     meta,
                     episode,
                     raw_state_names,
-                    bucket_load_rate,
+                    fill_fraction,
+                    fill_rate,
                 )
             if state is None:
                 skipped_frames += 1
@@ -2656,6 +2775,13 @@ def collect_lerobot_rows(
             if task_text not in tasks_by_text:
                 tasks_by_text[task_text] = len(tasks_by_text)
             task_index = tasks_by_text[task_text]
+            phase_index = canonical_lerobot_phase_index(
+                sample.get("phase") or sample.get("label")
+            )
+            if phase_index is None:
+                skipped_frames += 1
+                missing_vla_state_by_reason["unknown_phase"] += 1
+                continue
             row = {
                 "index": global_frame,
                 "episode_index": export_episode_index,
@@ -2666,6 +2792,7 @@ def collect_lerobot_rows(
                 "observation.state": state,
                 "action": action,
                 "observation.effort": effort,
+                "observation.stage_current_id": int(phase_index),
                 "phase": str(sample.get("phase", "")),
                 "raw_episode_index": episode.get("episode_index"),
                 "raw_episode_id": episode.get("episode_id", sample.get("id", "")),
@@ -2678,7 +2805,8 @@ def collect_lerobot_rows(
                 row[key] = image_value
                 row[f"{key}.available"] = True
             rows.append(row)
-            previous_bucket_load = float(state[7])
+            previous_bucket_fill_fraction = float(state[26])
+            previous_bucket_fill_rate = float(state[27])
             previous_sample_t = float(sample_t)
             episode_length += 1
             global_frame += 1
@@ -3004,6 +3132,9 @@ def export_lerobot_dataset(
             "task_index": int(row["task_index"]),
             "observation.state": row["observation.state"],
             "action": row["action"],
+            "observation.stage_current_id": int(
+                row["observation.stage_current_id"]
+            ),
         }
         if effort_available:
             data_row["observation.effort"] = row["observation.effort"]
@@ -3067,6 +3198,12 @@ def export_lerobot_dataset(
         "episode_index": {"dtype": "int64", "shape": [1], "names": None},
         "index": {"dtype": "int64", "shape": [1], "names": None},
         "task_index": {"dtype": "int64", "shape": [1], "names": None},
+        "observation.stage_current_id": {
+            "dtype": "int64",
+            "shape": [1],
+            "names": ["stage_current_id"],
+            "class_names": list(LEROBOT_CANONICAL_PHASE_NAMES),
+        },
     }
     if effort_available:
         features["observation.effort"] = {
@@ -3089,6 +3226,8 @@ def export_lerobot_dataset(
         "effort_dim": effort_dim if effort_available else 0,
         "effective_robot_observation_dim": len(state_names) + (effort_dim if effort_available else 0),
         "canonical_phase_names": list(LEROBOT_CANONICAL_PHASE_NAMES),
+        "phase_feature": "observation.stage_current_id",
+        "phase_role": "categorical_supervision_not_policy_input",
         "total_episodes": len(episodes),
         "total_frames": len(data_rows),
         "total_tasks": len(tasks),

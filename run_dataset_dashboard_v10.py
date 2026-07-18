@@ -5871,6 +5871,9 @@ def dashboard_vla_observation_preview(
     episode_meta: dict,
 ) -> Dict[str, object]:
     state_builder = getattr(shared_dataset_tools, "build_lerobot_state_28d", None) if shared_dataset_tools is not None else None
+    base_state_builder = getattr(shared_dataset_tools, "_legacy_base_state_from_sample", None) if shared_dataset_tools is not None else None
+    bucket_load_reader = getattr(shared_dataset_tools, "_sample_bucket_load_particles", None) if shared_dataset_tools is not None else None
+    observation_contract = getattr(shared_dataset_tools, "vla_observation_contract", None) if shared_dataset_tools is not None else None
     state_names = list(getattr(shared_dataset_tools, "LEROBOT_STATE_NAMES_28D", []) or []) if shared_dataset_tools is not None else []
     effort_names = [
         "swing_measured_effort",
@@ -5878,7 +5881,13 @@ def dashboard_vla_observation_preview(
         "arm_measured_effort",
         "bucket_measured_effort",
     ]
-    if not callable(state_builder) or len(state_names) != 28:
+    if (
+        not callable(state_builder)
+        or not callable(base_state_builder)
+        or not callable(bucket_load_reader)
+        or observation_contract is None
+        or len(state_names) != 28
+    ):
         return {
             "available": False,
             "reason": "shared_32d_state_builder_unavailable",
@@ -5894,32 +5903,43 @@ def dashboard_vla_observation_preview(
         "bucket_load_estimate", "bucket_tip_x", "bucket_tip_y", "bucket_tip_z",
         "bucket_load_x", "bucket_load_y", "bucket_load_z",
     ])
-    raw_name_lookup = {str(name): index for index, name in enumerate(raw_state_names)}
-    bucket_load_index = raw_name_lookup.get("bucket_load_estimate")
     first_t = safe_float_value(trajectory[0].get("t"), 0.0) if trajectory else 0.0
     first_t = float(first_t or 0.0)
-    previous_bucket_load: Optional[float] = None
+    previous_fill_fraction: Optional[float] = None
+    previous_fill_rate: Optional[float] = None
     previous_t: Optional[float] = None
     rows: List[dict] = []
     valid_rows = 0
 
     for frame_index, sample in enumerate(trajectory or []):
         sample_t = float(safe_float_value(sample.get("t"), first_t) or first_t)
-        raw_state = vector_or_none(sample.get("observation.state")) or vector_or_none(sample.get("obs.state"))
-        current_bucket_load: Optional[float] = None
-        if raw_state is not None and bucket_load_index is not None and bucket_load_index < len(raw_state):
-            current_bucket_load = safe_float_value(raw_state[bucket_load_index], None)
-        if current_bucket_load is None or previous_bucket_load is None or previous_t is None:
-            bucket_load_rate = 0.0
-        else:
-            bucket_load_rate = (float(current_bucket_load) - float(previous_bucket_load)) / max(1.0e-6, sample_t - float(previous_t))
+        base_state = base_state_builder(sample, raw_state_names)
+        current_bucket_load = bucket_load_reader(sample, base_state)
+        fill_fraction = (
+            None
+            if current_bucket_load is None
+            else observation_contract.bucket_fill_fraction(current_bucket_load)
+        )
+        fill_rate = (
+            0.0
+            if fill_fraction is None
+            else observation_contract.causal_bucket_fill_rate(
+                fill_fraction,
+                previous_fill_fraction,
+                previous_fill_rate,
+                0.0
+                if previous_t is None
+                else max(1.0e-6, sample_t - float(previous_t)),
+            )
+        )
         try:
             state, reason = state_builder(
                 sample,
                 episode_meta,
                 episode_row,
                 raw_state_names,
-                bucket_load_rate,
+                fill_fraction,
+                fill_rate,
             )
         except Exception as exc:
             state = None
@@ -5941,8 +5961,9 @@ def dashboard_vla_observation_preview(
             "reason": str(reason or "unavailable"),
             "values": values,
         })
-        if current_bucket_load is not None:
-            previous_bucket_load = float(current_bucket_load)
+        if fill_fraction is not None:
+            previous_fill_fraction = float(fill_fraction)
+            previous_fill_rate = float(fill_rate)
             previous_t = float(sample_t)
 
     return {

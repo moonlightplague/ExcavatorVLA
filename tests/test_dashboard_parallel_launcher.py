@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import run_dataset_dashboard_v10 as dashboard
 
@@ -77,6 +78,42 @@ class DashboardParallelLauncherTests(unittest.TestCase):
                 os.environ.pop("EXCAVATOR_DASHBOARD_ALLOW_SHUTDOWN", None)
             else:
                 os.environ["EXCAVATOR_DASHBOARD_ALLOW_SHUTDOWN"] = previous
+
+    def test_parallel_run_worker_identity_matches_batch_worker_and_retry(self):
+        identity = dashboard.parallel_run_worker_identity(
+            "/tmp/data/run_20260718_155713_dashboard_20260718_155642_worker_07_retry_02",
+            "dashboard_20260718_155642",
+        )
+        self.assertEqual(identity["worker_name"], "worker_07")
+        self.assertEqual(identity["worker_index"], 7)
+        self.assertEqual(identity["retry_index"], 2)
+        self.assertEqual(
+            identity["run_suffix"],
+            "dashboard_20260718_155642_worker_07_retry_02",
+        )
+        self.assertIsNone(
+            dashboard.parallel_run_worker_identity(
+                "/tmp/data/run_20260718_155713_batch_20260718_155642_worker_07",
+                "dashboard_20260718_155642",
+            )
+        )
+
+    def test_launcher_worker_supervisor_resolves_one_launcher_child(self):
+        parents = {
+            200: 100,
+            201: 200,
+            202: 201,
+            300: 100,
+            301: 300,
+        }
+        with mock.patch.object(dashboard, "linux_process_parent_map", return_value=parents):
+            self.assertEqual(
+                dashboard.launcher_worker_supervisor_pid(100, [201, 202]),
+                200,
+            )
+            self.assertIsNone(
+                dashboard.launcher_worker_supervisor_pid(100, [201, 301]),
+            )
 
 
 if __name__ == "__main__":

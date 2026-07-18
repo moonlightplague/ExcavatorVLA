@@ -2493,6 +2493,7 @@ def summarize_run_activity(runs: Sequence[dict]) -> Dict[str, object]:
                 "worker_seconds_per_success": run.get("success_seconds_per_attempt"),
                 "success_seconds_per_attempt": run.get("success_seconds_per_attempt"),
                 "size_human": run.get("size_human"),
+                "parallel_worker": run.get("parallel_worker"),
             }
             for run in active[:8]
         ],
@@ -4790,6 +4791,121 @@ def parallel_collect_process_matches(pid: int, launcher_path: str) -> bool:
         return False
 
 
+def parallel_run_worker_identity(run_path: object, batch_id: object) -> Optional[Dict[str, object]]:
+    run_name = os.path.basename(os.path.normpath(str(run_path or "")))
+    batch_text = str(batch_id or "").strip()
+    if not run_name or not batch_text:
+        return None
+    match = re.search(
+        rf"(?P<suffix>{re.escape(batch_text)}_(?P<worker>worker_(?P<index>[0-9]+))(?:_retry_(?P<retry>[0-9]+))?)",
+        run_name,
+    )
+    if match is None:
+        return None
+    retry_text = match.group("retry")
+    return {
+        "batch_id": batch_text,
+        "worker_name": str(match.group("worker")),
+        "worker_index": int(match.group("index")),
+        "retry_index": int(retry_text) if retry_text is not None else 0,
+        "run_suffix": str(match.group("suffix")),
+    }
+
+
+def linux_process_parent_map() -> Dict[int, int]:
+    if os.name != "posix" or not os.path.isdir("/proc"):
+        return {}
+    parents: Dict[int, int] = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        try:
+            with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as handle:
+                stat_text = handle.read()
+            close_paren = stat_text.rfind(")")
+            fields = stat_text[close_paren + 2 :].split()
+            if len(fields) >= 2:
+                parents[pid] = int(fields[1])
+        except Exception:
+            continue
+    return parents
+
+
+def linux_processes_with_environment(name: str, value: str) -> List[int]:
+    if os.name != "posix" or not os.path.isdir("/proc"):
+        return []
+    needle = f"{str(name)}={str(value)}".encode("utf-8")
+    matches = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as handle:
+                values = handle.read().split(b"\x00")
+            if needle in values:
+                matches.append(pid)
+        except Exception:
+            continue
+    return matches
+
+
+def linux_descendant_environment_values(ancestor_pid: int, name: str) -> set:
+    ancestor_pid = int(ancestor_pid or 0)
+    if ancestor_pid <= 0 or os.name != "posix" or not os.path.isdir("/proc"):
+        return set()
+    parents = linux_process_parent_map()
+    prefix = f"{str(name)}=".encode("utf-8")
+    values = set()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        current = pid
+        seen = set()
+        is_descendant = False
+        while current > 0 and current not in seen:
+            seen.add(current)
+            parent = int(parents.get(current, 0) or 0)
+            if parent == ancestor_pid:
+                is_descendant = True
+                break
+            current = parent
+        if not is_descendant:
+            continue
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as handle:
+                environment = handle.read().split(b"\x00")
+            for item in environment:
+                if item.startswith(prefix):
+                    values.add(item[len(prefix) :].decode("utf-8", errors="replace"))
+        except Exception:
+            continue
+    return values
+
+
+def launcher_worker_supervisor_pid(launcher_pid: int, matching_pids: Sequence[int]) -> Optional[int]:
+    launcher_pid = int(launcher_pid or 0)
+    if launcher_pid <= 0:
+        return None
+    parents = linux_process_parent_map()
+    supervisors = set()
+    for matching_pid in matching_pids:
+        current = int(matching_pid or 0)
+        seen = set()
+        while current > 0 and current not in seen:
+            seen.add(current)
+            parent = int(parents.get(current, 0) or 0)
+            if parent == launcher_pid:
+                supervisors.add(current)
+                break
+            current = parent
+    if len(supervisors) != 1:
+        return None
+    return int(next(iter(supervisors)))
+
+
 def dashboard_parallel_collect_status(dataset_root: Union[str, os.PathLike]) -> Dict[str, object]:
     root = os.path.abspath(str(dataset_root or "excavator_auto_dataset"))
     state_path = parallel_collect_state_path(root)
@@ -4961,6 +5077,67 @@ def dashboard_stop_parallel_collect(dataset_root: Union[str, os.PathLike]) -> Di
     return dashboard_parallel_collect_status(root)
 
 
+def dashboard_stop_parallel_run(
+    dataset_root: Union[str, os.PathLike],
+    run_path: Union[str, os.PathLike],
+) -> Dict[str, object]:
+    if os.name != "posix":
+        raise RuntimeError("parallel run stop is supported only on Linux/POSIX")
+    root = os.path.abspath(str(dataset_root or "excavator_auto_dataset"))
+    selected_run = os.path.abspath(str(run_path or ""))
+    try:
+        if os.path.commonpath([root, selected_run]) != root:
+            raise RuntimeError("run path is outside the configured dataset root")
+    except ValueError:
+        raise RuntimeError("run path is outside the configured dataset root")
+
+    with PARALLEL_COLLECT_LOCK:
+        status = dashboard_parallel_collect_status(root)
+        if not status.get("running"):
+            raise RuntimeError("parallel launcher is not running")
+        launcher_pid = int(status.get("pid") or 0)
+        identity = parallel_run_worker_identity(selected_run, status.get("batch_id"))
+        if identity is None:
+            raise RuntimeError("selected run does not belong to the active dashboard batch")
+        matching_pids = linux_processes_with_environment(
+            "EXCAVATOR_AUTO_RUN_ID_SUFFIX",
+            str(identity["run_suffix"]),
+        )
+        supervisor_pid = launcher_worker_supervisor_pid(launcher_pid, matching_pids)
+        if supervisor_pid is None:
+            raise RuntimeError(
+                f"cannot uniquely resolve supervisor for {identity['worker_name']}"
+            )
+        if not process_is_alive(supervisor_pid):
+            raise RuntimeError(f"worker supervisor is no longer alive: pid={supervisor_pid}")
+        os.kill(supervisor_pid, signal.SIGTERM)
+        state = read_json(parallel_collect_state_path(root), default={}) or {}
+        if isinstance(state, dict):
+            stopped_workers = state.setdefault("stopped_workers", [])
+            if isinstance(stopped_workers, list):
+                stopped_workers.append(
+                    {
+                        "run_path": selected_run,
+                        "worker_name": identity["worker_name"],
+                        "run_suffix": identity["run_suffix"],
+                        "supervisor_pid": int(supervisor_pid),
+                        "stopped_at": time.time(),
+                    }
+                )
+                state["stopped_workers"] = stopped_workers[-64:]
+                write_json(parallel_collect_state_path(root), state)
+    time.sleep(0.10)
+    return {
+        "ok": True,
+        "run_path": selected_run,
+        "worker_name": identity["worker_name"],
+        "run_suffix": identity["run_suffix"],
+        "supervisor_pid": int(supervisor_pid),
+        "signal": "SIGTERM",
+        "parallel_status": dashboard_parallel_collect_status(root),
+    }
+
+
 def dashboard_start_success_transfer_job(dataset_root: Union[str, os.PathLike], run_paths: Sequence[object], dest_dir: Union[str, os.PathLike], mode: str = "copy") -> Dict[str, object]:
     root = os.path.abspath(str(dataset_root or "excavator_auto_dataset"))
     paths = list(run_paths or [])
@@ -5074,6 +5251,23 @@ def list_dashboard_runs(dataset_root: Union[str, os.PathLike], limit: int = 80) 
         return []
     runs = []
     now = time.time()
+    parallel_state = read_json(parallel_collect_state_path(root), default={}) or {}
+    parallel_batch_id = ""
+    parallel_launcher_running = False
+    parallel_active_run_suffixes = set()
+    if isinstance(parallel_state, dict):
+        parallel_batch_id = str(parallel_state.get("batch_id") or "")
+        parallel_launcher_pid = int(parallel_state.get("pid") or 0)
+        parallel_launcher_path = str(parallel_state.get("launcher_path") or "")
+        parallel_launcher_running = bool(
+            process_is_alive(parallel_launcher_pid)
+            and parallel_collect_process_matches(parallel_launcher_pid, parallel_launcher_path)
+        )
+        if parallel_launcher_running:
+            parallel_active_run_suffixes = linux_descendant_environment_values(
+                parallel_launcher_pid,
+                "EXCAVATOR_AUTO_RUN_ID_SUFFIX",
+            )
     for name in os.listdir(root):
         path = os.path.join(root, name)
         if not os.path.isdir(path):
@@ -5103,6 +5297,11 @@ def list_dashboard_runs(dataset_root: Union[str, os.PathLike], limit: int = 80) 
             path,
             dataset_root=root,
         )
+        parallel_worker = None
+        if parallel_launcher_running:
+            identity = parallel_run_worker_identity(path, parallel_batch_id)
+            if identity and identity.get("run_suffix") in parallel_active_run_suffixes:
+                parallel_worker = identity
         runs.append(
             {
                 "name": name,
@@ -5124,6 +5323,7 @@ def list_dashboard_runs(dataset_root: Union[str, os.PathLike], limit: int = 80) 
                 "data_folders": data_sizes,
                 "data_size_human": ", ".join(f"{item.get('name')}={item.get('size_human')}" for item in data_sizes) if data_sizes else "-",
                 "activity": activity,
+                "parallel_worker": parallel_worker,
             }
         )
     # Active writers stay visible at the top; within each state, sort by latest write time.
@@ -6504,7 +6704,7 @@ body{margin:0;background:linear-gradient(180deg,#eef3fb 0,#f6f8fb 220px,#f6f8fb 
 .darkModeToggle:hover{background:#f8fafc}
 body.dark{background:linear-gradient(180deg,#0b1220 0,#111827 240px,#111827 100%);color:#e5e7eb;--panel:#111827;--border:#334155;--muted:#94a3b8;--ink:#f8fafc}
 body.dark .topbar{background:rgba(15,23,42,.96);border-bottom-color:#334155;box-shadow:0 6px 18px rgba(0,0,0,.30)}
-body.dark h1,body.dark h2,body.dark h3,body.dark .cameraPreviewTitle,body.dark .cameraCardTitle,body.dark .diagCardValue,body.dark .runMonitorTitle,body.dark .managerTable .nameCell{color:#f8fafc}
+body.dark h1,body.dark h2,body.dark h3,body.dark .cameraPreviewTitle,body.dark .cameraCardTitle,body.dark .diagCardValue,body.dark .diagStatValue,body.dark .runMonitorTitle,body.dark .managerTable .nameCell{color:#f8fafc}
 body.dark .panel,body.dark .kpi,body.dark .diagCard,body.dark .subPanel,body.dark .managerPanel,body.dark .episodeSide,body.dark .vlaStatePanel,body.dark .timelinePaneHeader,body.dark .cameraPreview,body.dark .cameraCard,body.dark .miniChart,body.dark .finding,body.dark .action{background:#0f172a;border-color:#334155;color:#e5e7eb}
 body.dark input,body.dark select,body.dark button.secondary,body.dark .cameraPlayerBtn,body.dark .filterBtn,body.dark .runBadge,body.dark .unitLegend,body.dark .meshFrameBadge,body.dark .darkModeToggle{background:#111827;color:#e5e7eb;border-color:#475569}
 body.dark .chartSeriesToggleSvg rect,body.dark .chartUnitBadge{fill:#111827;stroke:#475569}body.dark .chartSeriesToggleSvg text,body.dark .chartUnitBadgeText{fill:#e5e7eb}
@@ -6521,6 +6721,15 @@ body.dark .chart{background:#0f172a;border-color:#334155}body.dark svg text{fill
 body.dark .empty,body.dark .reportHint,body.dark .taskPrompt,body.dark .diagStat,body.dark .transferProgress{background:#111827;border-color:#334155;color:#94a3b8}
 body.dark .barTrack,body.dark .scoreBar,body.dark .transferProgressTrack{background:#334155}
 body.dark .codeBox{background:#020617;color:#cbd5e1}
+body.dark .parallelCollectBar{background:#111827;border-color:#334155}
+body.dark .parallelCollectField,body.dark .parallelCollectToggle{color:#cbd5e1}
+body.dark .parallelCollectStatus{background:#0f172a;color:#cbd5e1}
+body.dark .parallelCollectStatus.running{background:#052e24;color:#6ee7b7}
+body.dark .parallelCollectStatus.error{background:#450a0a;color:#fca5a5}
+body.dark .runBadge.active{background:#052e24;border-color:#047857;color:#6ee7b7}
+body.dark .runBadge .muted{color:#cbd5e1}
+body.dark .runBadgeKill{border-left-color:#475569;color:#fca5a5}
+body.dark .runBadgeKill:hover{background:#450a0a;color:#fecaca}
 .shell{max-width:1720px;margin:0 auto;padding:16px 18px 28px}
 .topbar{position:sticky;top:0;z-index:20;background:rgba(255,255,255,.96);backdrop-filter:blur(8px);border-bottom:1px solid var(--border);box-shadow:0 6px 18px rgba(16,24,40,.06)}
 .topbar .shell{padding-top:12px;padding-bottom:12px}
@@ -6533,7 +6742,7 @@ input,select,button{min-height:34px;border:1px solid #cbd5e1;border-radius:8px;b
 input.path{width:100%}select{width:100%}
 button{background:#1f2937;color:#fff;border-color:#1f2937;cursor:pointer;font-weight:600}
 button.secondary{background:#fff;color:#111827;border-color:#cbd5e1}.linkBtn{border:0;background:transparent;color:#175cd3;padding:0;min-height:0;font-weight:800;text-align:left;cursor:pointer}.linkBtn:hover{text-decoration:underline}
-.statusLine{margin-top:8px;display:flex;gap:10px;align-items:center;min-height:18px}.runMonitor{margin-top:9px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;color:#475467}.runMonitorTitle{font-weight:800;color:#101828}.runBadge{display:inline-flex;align-items:center;gap:6px;border:1px solid #d0d5dd;border-radius:999px;background:#fff;color:#344054;padding:4px 9px;min-height:26px;font-size:12px;cursor:pointer}.runBadge.active{border-color:#12b76a;background:#ecfdf3;color:#027a48}.runBadge.recent{border-color:#fdb022;background:#fffaeb;color:#b54708}.activityDot{width:9px;height:9px;border-radius:999px;display:inline-block;background:#98a2b3;box-shadow:0 0 0 2px rgba(152,162,179,.14)}.activityDot.active{background:#12b76a;box-shadow:0 0 0 3px rgba(18,183,106,.18)}.activityDot.recent{background:#fdb022;box-shadow:0 0 0 3px rgba(253,176,34,.18)}.activityDot.idle{background:#f04438;box-shadow:0 0 0 3px rgba(240,68,56,.14)}.activityDot.missing,.activityDot.unknown{background:#98a2b3}.managerPanel{margin-bottom:14px;padding:0}.managerPanel>summary{cursor:pointer;list-style:none;padding:14px 16px;display:flex;align-items:flex-start;justify-content:space-between;gap:14px;border-bottom:1px solid #eaecf0;position:relative}.managerPanel>summary::-webkit-details-marker{display:none}.managerPanel>summary:after{content:"";width:10px;height:10px;border-right:2px solid #667085;border-bottom:2px solid #667085;transform:rotate(-45deg);transition:transform .2s ease;flex:0 0 auto;margin-top:4px}.managerPanel[open]>summary:after{transform:rotate(45deg);margin-top:7px}.managerPanel:not([open])>summary{border-bottom:0}.managerBody{padding:12px 14px 14px}.managerToolbar{display:flex;flex-wrap:nowrap;overflow-x:auto;gap:8px;align-items:center;margin-bottom:10px;padding-bottom:2px}.managerToolbar button{flex:0 0 auto}.managerToolbar input.path{flex:1 0 360px;min-width:260px}.managerToolbar .danger{background:#b42318;border-color:#b42318;color:#fff}.managerToolbar .warn{background:#b54708;border-color:#b54708;color:#fff}.managerSummary{font-size:12px;color:#475467;margin-bottom:8px;min-height:18px}.managerTableWrap{max-height:260px;overflow:auto;border:1px solid #eaecf0;border-radius:10px;background:#fff;scrollbar-width:none;-ms-overflow-style:none}.managerTableWrap::-webkit-scrollbar{display:none}.managerTable{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.managerTable th,.managerTable td{padding:7px 8px;border-bottom:1px solid #eef2f6;white-space:nowrap;vertical-align:middle}.managerTable th{position:sticky;top:0;background:#f8fafc;z-index:2;text-transform:uppercase;letter-spacing:.04em;font-size:10.5px;color:#475467}.managerTable .nameCell{font-weight:800;color:#101828}.managerTable .num{text-align:right;font-variant-numeric:tabular-nums}.managerTable .zeroSuccess{color:#b42318;font-weight:850}.managerTable .successRun{color:#067647;font-weight:850}.managerTable .dataSizeCell{max-width:280px;overflow:hidden;text-overflow:ellipsis}.ok{color:#047857}.error{color:#b91c1c}.muted{color:var(--muted);font-size:12px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.small{font-size:12px}.nowrap{white-space:nowrap}
+.statusLine{margin-top:8px;display:flex;gap:10px;align-items:center;min-height:18px}.runMonitor{margin-top:9px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;color:#475467}.runMonitorTitle{font-weight:800;color:#101828}.runBadge{display:inline-flex;align-items:center;gap:6px;border:1px solid #d0d5dd;border-radius:999px;background:#fff;color:#344054;padding:4px 7px 4px 9px;min-height:26px;font-size:12px;cursor:pointer}.runBadge.active{border-color:#12b76a;background:#ecfdf3;color:#027a48}.runBadge.recent{border-color:#fdb022;background:#fffaeb;color:#b54708}.runBadgeKill{display:inline-flex;align-items:center;justify-content:center;min-width:22px;height:18px;margin-left:2px;padding-left:7px;border-left:1px solid #d0d5dd;color:#b42318;font-size:15px;font-weight:900;line-height:1}.runBadgeKill:hover{background:#fef3f2;color:#912018}.activityDot{width:9px;height:9px;border-radius:999px;display:inline-block;background:#98a2b3;box-shadow:0 0 0 2px rgba(152,162,179,.14)}.activityDot.active{background:#12b76a;box-shadow:0 0 0 3px rgba(18,183,106,.18)}.activityDot.recent{background:#fdb022;box-shadow:0 0 0 3px rgba(253,176,34,.18)}.activityDot.idle{background:#f04438;box-shadow:0 0 0 3px rgba(240,68,56,.14)}.activityDot.missing,.activityDot.unknown{background:#98a2b3}.managerPanel{margin-bottom:14px;padding:0}.managerPanel>summary{cursor:pointer;list-style:none;padding:14px 16px;display:flex;align-items:flex-start;justify-content:space-between;gap:14px;border-bottom:1px solid #eaecf0;position:relative}.managerPanel>summary::-webkit-details-marker{display:none}.managerPanel>summary:after{content:"";width:10px;height:10px;border-right:2px solid #667085;border-bottom:2px solid #667085;transform:rotate(-45deg);transition:transform .2s ease;flex:0 0 auto;margin-top:4px}.managerPanel[open]>summary:after{transform:rotate(45deg);margin-top:7px}.managerPanel:not([open])>summary{border-bottom:0}.managerBody{padding:12px 14px 14px}.managerToolbar{display:flex;flex-wrap:nowrap;overflow-x:auto;gap:8px;align-items:center;margin-bottom:10px;padding-bottom:2px}.managerToolbar button{flex:0 0 auto}.managerToolbar input.path{flex:1 0 360px;min-width:260px}.managerToolbar .danger{background:#b42318;border-color:#b42318;color:#fff}.managerToolbar .warn{background:#b54708;border-color:#b54708;color:#fff}.managerSummary{font-size:12px;color:#475467;margin-bottom:8px;min-height:18px}.managerTableWrap{max-height:260px;overflow:auto;border:1px solid #eaecf0;border-radius:10px;background:#fff;scrollbar-width:none;-ms-overflow-style:none}.managerTableWrap::-webkit-scrollbar{display:none}.managerTable{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.managerTable th,.managerTable td{padding:7px 8px;border-bottom:1px solid #eef2f6;white-space:nowrap;vertical-align:middle}.managerTable th{position:sticky;top:0;background:#f8fafc;z-index:2;text-transform:uppercase;letter-spacing:.04em;font-size:10.5px;color:#475467}.managerTable .nameCell{font-weight:800;color:#101828}.managerTable .num{text-align:right;font-variant-numeric:tabular-nums}.managerTable .zeroSuccess{color:#b42318;font-weight:850}.managerTable .successRun{color:#067647;font-weight:850}.managerTable .dataSizeCell{max-width:280px;overflow:hidden;text-overflow:ellipsis}.ok{color:#047857}.error{color:#b91c1c}.muted{color:var(--muted);font-size:12px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.small{font-size:12px}.nowrap{white-space:nowrap}
 .grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:14px;align-items:start}
 .panel{background:var(--panel);border:1px solid var(--border);border-radius:14px;box-shadow:0 1px 2px rgba(16,24,40,.04);padding:14px;min-width:0;overflow:hidden}
 .panelHeader{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:10px}.panelHint{font-size:12px;color:#667085;line-height:1.35}
@@ -7208,9 +7417,23 @@ function renderRunMonitor(data){
   const subtitle=`<span class="muted">parallel estimate uses ${rateWorkers} writer${rateWorkers===1?"":"s"} with completed successes; green = updated within ${ageText(windowS)}; recent=${recentCount}; idle=${idleCount}</span>`;
   const badges=activeRuns.map(run=>{
     const latest=run.latest_file ? ` · ${shortText(run.latest_file,42)}` : "";
-    return `<button type="button" class="runBadge active" data-action="choose-run" data-run-path="${esc(run.path||"")}" title="${esc(run.path||"")}"><span class="activityDot active"></span>${esc(run.name||"")} <span class="muted">${esc(ageText(run.age_s))} · attempts=${esc(run.attempts ?? "-")} success=${esc(run.success ?? 0)} trainable=${esc(run.trainable ?? "-")} size=${esc(run.size_human||"-")}${esc(latest)}</span></button>`;
+    const worker=run.parallel_worker||null;
+    const action=worker?"kill-run":"choose-run";
+    const title=worker?`Stop ${worker.worker_name||"this worker"} only`:(run.path||"");
+    const runName=worker?` data-run-name="${esc(run.name||"")}"`:"";
+    const kill=worker?`<span class="runBadgeKill" aria-hidden="true">×</span>`:"";
+    return `<button type="button" class="runBadge active" data-action="${action}" data-run-path="${esc(run.path||"")}"${runName} title="${esc(title)}"><span class="activityDot active"></span>${esc(run.name||"")} <span class="muted">${esc(ageText(run.age_s))} · attempts=${esc(run.attempts ?? "-")} success=${esc(run.success ?? 0)} trainable=${esc(run.trainable ?? "-")} size=${esc(run.size_human||"-")}${esc(latest)}</span>${kill}</button>`;
   }).join("");
   el.innerHTML=title + subtitle + (badges || `<span class="runBadge"><span class="activityDot idle"></span>no run folder updated recently</span>`);
+}
+async function killRunWriter(path,name){
+  if(!path) return;
+  if(!window.confirm(`Stop only the worker writing ${name||path}? Other workers in this batch will continue.`)) return;
+  terminalWrite(`Stopping worker for ${name||path}...`,"muted");
+  const result=await postJSON("/api/manage/parallel_collect_stop_run",{root:$("rootInput").value,run_path:path});
+  terminalWrite(`Stopped ${result.worker_name||"worker"} pid=${result.supervisor_pid||"-"}; completed episode data is preserved.`,"ok");
+  await refreshParallelCollectStatus(true);
+  await loadRuns({silent:true});
 }
 function chooseRun(path){
   if(!path) return;
@@ -8185,6 +8408,13 @@ function syncEpisodeInspectorHeight(){
 document.addEventListener("click", evt=>{
   const target=evt.target;
   if(!target || !target.closest) return;
+  const killRunBtn=target.closest('[data-action="kill-run"]');
+  if(killRunBtn){
+    evt.preventDefault();
+    evt.stopPropagation();
+    killRunWriter(killRunBtn.dataset.runPath||"",killRunBtn.dataset.runName||"").catch(e=>setStatus(e.message,"error"));
+    return;
+  }
   const chooseRunBtn=target.closest('[data-action="choose-run"]');
   if(chooseRunBtn){
     evt.preventDefault();
@@ -8436,6 +8666,12 @@ def serve_dashboard(
                 if parsed.path == "/api/manage/parallel_collect_stop":
                     root = normalize_dashboard_client_path(body.get("root") or default_root)
                     result = dashboard_stop_parallel_collect(root)
+                    self.send_json(result)
+                    return
+                if parsed.path == "/api/manage/parallel_collect_stop_run":
+                    root = normalize_dashboard_client_path(body.get("root") or default_root)
+                    run_path = normalize_dashboard_client_path(body.get("run_path") or "")
+                    result = dashboard_stop_parallel_run(root, run_path)
                     self.send_json(result)
                     return
                 if parsed.path == "/api/manage/refresh_sizes":

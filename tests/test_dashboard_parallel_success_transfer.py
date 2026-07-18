@@ -100,6 +100,101 @@ class DashboardParallelSuccessTransferTests(unittest.TestCase):
         self.assertTrue(first.endswith("_ep000001"))
         self.assertTrue(second.endswith("_ep000001"))
 
+    def test_reconcile_enriches_existing_recovered_episode_row(self):
+        with tempfile.TemporaryDirectory() as root:
+            pool = os.path.join(root, dashboard.SUCCESS_POOL_DIRNAME)
+            episode_dir = os.path.join(pool, "episodes", "260718_190721_worker_ep000015")
+            os.makedirs(episode_dir, exist_ok=True)
+            self._write_jsonl(
+                os.path.join(episode_dir, "trajectory.jsonl"),
+                [{"t": 0.0, "observation.state": [0.0] * 28, "action": [0.0] * 4}],
+            )
+            with open(os.path.join(episode_dir, "meta.json"), "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "status": "trainable",
+                        "duration": 212.875,
+                        "scene_randomization": {
+                            "applied": {
+                                "robot_body_yaw_deg": 150.1377,
+                                "truck_yaw_deg": -92.0,
+                            }
+                        },
+                    },
+                    handle,
+                )
+            with open(os.path.join(episode_dir, "score.json"), "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "score": 52.8374,
+                        "counts": {
+                            "max_bucket_from_pile_particles": 1741,
+                            "lift_bucket_from_pile_particles": 1741,
+                            "final_bin_from_pile_particles": 447,
+                            "final_spill_from_pile_particles": 1294,
+                            "freeze_count": 0,
+                            "samples": 205,
+                        },
+                    },
+                    handle,
+                )
+            minimal = {
+                "episode_index": 284,
+                "episode_id": "dashboard_success_000284_existing",
+                "status": "trainable",
+                "trajectory": os.path.join(episode_dir, "trajectory.jsonl"),
+                "transferred_episode_dir": episode_dir,
+                "dashboard_recovered_from_episode_folder": True,
+            }
+            dashboard.write_success_pool_indexes(pool, [minimal])
+
+            result = dashboard.reconcile_success_pool_indexes(pool)
+            row = dashboard.load_index(pool, "trainable")[0]
+
+            self.assertTrue(result["changed"])
+            self.assertEqual(result["enriched_recovered_rows"], 1)
+            self.assertEqual(row["episode_index"], 284)
+            self.assertEqual(row["episode_id"], "dashboard_success_000284_existing")
+            self.assertAlmostEqual(row["duration_wall_s"], 212.875)
+            self.assertAlmostEqual(row["score"], 52.8374)
+            self.assertEqual(row["max_bucket_from_pile_particles"], 1741)
+            self.assertEqual(row["lift_bucket_from_pile_particles"], 1741)
+            self.assertEqual(row["final_bin_from_pile_particles"], 447)
+            self.assertEqual(row["final_spill_from_pile_particles"], 1294)
+            self.assertAlmostEqual(
+                row["scene_randomization"]["applied"]["robot_body_yaw_deg"],
+                150.1377,
+            )
+            self.assertEqual(row["dashboard_recovery_missing_fields"], [])
+
+            unchanged = dashboard.reconcile_success_pool_indexes(pool)
+            self.assertFalse(unchanged["changed"])
+            self.assertEqual(unchanged["enriched_recovered_rows"], 0)
+
+    def test_recovered_episode_does_not_invent_missing_score_counts(self):
+        with tempfile.TemporaryDirectory() as root:
+            pool = os.path.join(root, dashboard.SUCCESS_POOL_DIRNAME)
+            episode_dir = os.path.join(pool, "episodes", "260718_190721_worker_ep000030")
+            os.makedirs(episode_dir, exist_ok=True)
+            self._write_jsonl(
+                os.path.join(episode_dir, "trajectory.jsonl"),
+                [{"t": 0.0, "observation.state": [0.0] * 28, "action": [0.0] * 4}],
+            )
+            with open(os.path.join(episode_dir, "meta.json"), "w", encoding="utf-8") as handle:
+                json.dump({"status": "trainable", "duration": 161.984}, handle)
+
+            row = dashboard.recover_success_pool_row_from_episode_folder(pool, episode_dir, 300)
+
+            self.assertIsNotNone(row)
+            self.assertAlmostEqual(row["duration_wall_s"], 161.984)
+            self.assertNotIn("score", row)
+            self.assertNotIn("max_bucket_from_pile_particles", row)
+            self.assertIn("score", row["dashboard_recovery_missing_fields"])
+            self.assertIn(
+                "max_bucket_from_pile_particles",
+                row["dashboard_recovery_missing_fields"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

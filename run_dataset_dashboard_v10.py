@@ -2096,7 +2096,15 @@ def estimate_row_runtime_s(row: dict, trajectory: Optional[Sequence[dict]] = Non
     runtime = trajectory_runtime_s(trajectory or [])
     if runtime > 0:
         return runtime
-    for key in ["duration_s", "wall_duration_s", "elapsed_s", "runtime_s", "episode_duration_s"]:
+    for key in [
+        "duration_s",
+        "duration_wall_s",
+        "duration_simulation_s",
+        "wall_duration_s",
+        "elapsed_s",
+        "runtime_s",
+        "episode_duration_s",
+    ]:
         value = safe_float_value(row.get(key), None)
         if value is not None and value > 0:
             return float(value)
@@ -4171,6 +4179,146 @@ def parse_source_episode_index_from_pool_folder(folder_name: object) -> Optional
         return None
 
 
+SUCCESS_POOL_RECOVERY_METADATA_VERSION = 2
+SUCCESS_POOL_RECOVERY_COUNT_FIELDS = (
+    "max_bucket_from_pile_particles",
+    "lift_bucket_from_pile_particles",
+    "final_bucket_from_pile_particles",
+    "final_bin_from_pile_particles",
+    "final_spill_from_pile_particles",
+    "raw_region_spill_from_pile_particles",
+    "freeze_count",
+    "samples",
+)
+SUCCESS_POOL_RECOVERY_REQUIRED_SUMMARY_FIELDS = (
+    "duration_wall_s",
+    "score",
+    "max_bucket_from_pile_particles",
+    "lift_bucket_from_pile_particles",
+    "final_bin_from_pile_particles",
+    "final_spill_from_pile_particles",
+    "scene_randomization",
+)
+SUCCESS_POOL_RECOVERY_AUTHORITATIVE_FIELDS = {
+    "status",
+    "score",
+    "reason",
+    "warning_reason",
+    "quality_warnings",
+    "samples",
+    "freeze_count",
+    "duration",
+    "duration_s",
+    "duration_wall_s",
+    "duration_simulation_s",
+    "max_bucket_from_pile_particles",
+    "lift_bucket_from_pile_particles",
+    "final_bucket_from_pile_particles",
+    "final_bin_from_pile_particles",
+    "final_spill_from_pile_particles",
+    "raw_region_spill_from_pile_particles",
+    "initial_pose_id",
+    "chosen_plan_id",
+    "q_initial_deg",
+    "target_xyz",
+    "unload_landing_xyz",
+    "unload_point_xyz",
+    "scene_randomization",
+}
+
+
+def success_pool_recovery_file_paths(ep_dir: str) -> Tuple[str, str, str]:
+    meta_path = find_direct_episode_file(
+        ep_dir,
+        names=["meta.json", "episode_meta.json"],
+        contains=["meta"],
+        suffixes=[".json"],
+    )
+    score_path = find_direct_episode_file(
+        ep_dir,
+        names=["score.json", "episode_score.json"],
+        contains=["score"],
+        suffixes=[".json"],
+    )
+    events_path = find_direct_episode_file(
+        ep_dir,
+        names=["events.jsonl", "event_log.jsonl"],
+        contains=["event"],
+        suffixes=[".jsonl"],
+    )
+    return meta_path, score_path, events_path
+
+
+def success_pool_recovery_metadata_signature(ep_dir: str) -> Dict[str, object]:
+    meta_path, score_path, _events_path = success_pool_recovery_file_paths(ep_dir)
+    return {
+        "meta": file_update_signature(meta_path),
+        "score": file_update_signature(score_path),
+    }
+
+
+def recovered_value_missing(value: object) -> bool:
+    return value is None or value == "" or value == [] or value == {}
+
+
+def fill_recovered_value(row: dict, field: str, value: object) -> None:
+    if field not in row or recovered_value_missing(row.get(field)):
+        if not recovered_value_missing(value):
+            row[field] = value
+
+
+def hydrate_recovered_success_pool_summary(row: dict, meta: dict, score_data: dict) -> dict:
+    out = dict(row)
+    meta = meta if isinstance(meta, dict) else {}
+    score_data = score_data if isinstance(score_data, dict) else {}
+
+    direct_fields = [
+        "status",
+        "score",
+        "reason",
+        "warning_reason",
+        "quality_warnings",
+        "samples",
+        "freeze_count",
+        "initial_pose_id",
+        "chosen_plan_id",
+        "q_initial_deg",
+        "target_xyz",
+        "unload_landing_xyz",
+        "unload_point_xyz",
+        "scene_randomization",
+    ]
+    for source in [meta, score_data]:
+        for key in direct_fields:
+            fill_recovered_value(out, key, source.get(key))
+
+    fill_recovered_value(out, "reason", score_data.get("failure_reason"))
+    fill_recovered_value(out, "reason", meta.get("failure_reason"))
+    score_summary = meta.get("score_summary") if isinstance(meta.get("score_summary"), dict) else {}
+    fill_recovered_value(out, "score", score_summary.get("score"))
+
+    for counts in [
+        score_data.get("counts"),
+        meta.get("final_counts"),
+        score_summary.get("counts"),
+    ]:
+        if not isinstance(counts, dict):
+            continue
+        for key in SUCCESS_POOL_RECOVERY_COUNT_FIELDS:
+            fill_recovered_value(out, key, counts.get(key))
+
+    duration_wall = (
+        meta.get("duration_wall_s")
+        if meta.get("duration_wall_s") is not None
+        else meta.get("duration")
+    )
+    fill_recovered_value(out, "duration_wall_s", duration_wall)
+    fill_recovered_value(out, "duration_s", duration_wall)
+    fill_recovered_value(out, "duration", duration_wall)
+    fill_recovered_value(out, "duration_simulation_s", meta.get("duration_simulation_s"))
+    return out
+
+
 def recover_success_pool_row_from_episode_folder(pool_dir: str, ep_dir: str, next_ep_index: int) -> Optional[dict]:
     ep_dir = os.path.abspath(str(ep_dir))
     folder_name = os.path.basename(ep_dir)
@@ -4182,9 +4330,7 @@ def recover_success_pool_row_from_episode_folder(pool_dir: str, ep_dir: str, nex
             return None
     except Exception:
         return None
-    meta_path = find_direct_episode_file(ep_dir, names=["meta.json", "episode_meta.json"], contains=["meta"], suffixes=[".json"])
-    score_path = find_direct_episode_file(ep_dir, names=["score.json", "episode_score.json"], contains=["score"], suffixes=[".json"])
-    events_path = find_direct_episode_file(ep_dir, names=["events.jsonl", "event_log.jsonl"], contains=["event"], suffixes=[".jsonl"])
+    meta_path, score_path, events_path = success_pool_recovery_file_paths(ep_dir)
     meta = read_json(meta_path, default={}) or {}
     score_data = read_json(score_path, default={}) or {}
     sample_probe = read_jsonl_limited(trajectory_path, limit=1)
@@ -4205,35 +4351,22 @@ def recover_success_pool_row_from_episode_folder(pool_dir: str, ep_dir: str, nex
         row["events"] = events_path
     if source_ep is not None:
         row["source_episode_index"] = source_ep
-    for source in [meta, score_data]:
-        if not isinstance(source, dict):
-            continue
-        for key in [
-            "status",
-            "score",
-            "reason",
-            "warning_reason",
-            "samples",
-            "freeze_count",
-            "max_bucket_from_pile_particles",
-            "lift_bucket_from_pile_particles",
-            "final_bin_from_pile_particles",
-            "final_spill_from_pile_particles",
-            "initial_pose_id",
-            "chosen_plan_id",
-            "q_initial_deg",
-            "target_xyz",
-            "unload_landing_xyz",
-            "unload_point_xyz",
-            "scene_randomization",
-        ]:
-            if key not in row and key in source:
-                row[key] = source.get(key)
+    row = hydrate_recovered_success_pool_summary(row, meta, score_data)
     if "samples" not in row:
         try:
             row["samples"] = fast_jsonl_count(trajectory_path)
         except Exception:
             row["samples"] = len(sample_probe)
+    row["dashboard_recovery_metadata_version"] = SUCCESS_POOL_RECOVERY_METADATA_VERSION
+    row["dashboard_recovery_metadata_signature"] = {
+        "meta": file_update_signature(meta_path),
+        "score": file_update_signature(score_path),
+    }
+    row["dashboard_recovery_missing_fields"] = [
+        field
+        for field in SUCCESS_POOL_RECOVERY_REQUIRED_SUMMARY_FIELDS
+        if recovered_value_missing(row.get(field))
+    ]
     # Do not trust arbitrary recovered status values from meta/score.  The pool
     # itself is curated for trainable/success data; dataset_training_tag_for_row()
     # will still demote incomplete rows to skip after schema/camera checks.
@@ -4241,6 +4374,38 @@ def recover_success_pool_row_from_episode_folder(pool_dir: str, ep_dir: str, nex
     if row.get("status") not in {"trainable", "success"}:
         row["status"] = "trainable"
     return row
+
+
+def refresh_existing_recovered_success_pool_row(row: dict) -> Tuple[dict, bool]:
+    if not bool(row.get("dashboard_recovered_from_episode_folder")):
+        return row, False
+    ep_dir = episode_dir_from_row(row)
+    if not ep_dir or not os.path.isdir(ep_dir):
+        return row, False
+    signature = success_pool_recovery_metadata_signature(ep_dir)
+    if (
+        int(row.get("dashboard_recovery_metadata_version", 0) or 0)
+        >= SUCCESS_POOL_RECOVERY_METADATA_VERSION
+        and row.get("dashboard_recovery_metadata_signature") == signature
+    ):
+        return row, False
+    recovered = recover_success_pool_row_from_episode_folder(
+        os.path.dirname(os.path.dirname(ep_dir)),
+        ep_dir,
+        int(row.get("episode_index", 0) or 0),
+    )
+    if recovered is None:
+        return row, False
+    merged = dict(row)
+    for key, value in recovered.items():
+        if key in SUCCESS_POOL_RECOVERY_AUTHORITATIVE_FIELDS or key.startswith("dashboard_recovery_"):
+            merged[key] = value
+        elif key not in merged or recovered_value_missing(merged.get(key)):
+            merged[key] = value
+    # Pool identity belongs to the index, not the source episode folder.
+    merged["episode_index"] = row.get("episode_index")
+    merged["episode_id"] = row.get("episode_id")
+    return sanitize_success_pool_row(merged), merged != row
 
 
 def reconcile_success_pool_indexes(pool_dir: Union[str, os.PathLike], recover_orphan_folders: bool = True) -> Dict[str, object]:
@@ -4253,6 +4418,7 @@ def reconcile_success_pool_indexes(pool_dir: Union[str, os.PathLike], recover_or
     seen_ids = set()
     sanitized = 0
     duplicate_rows = 0
+    enriched_recovered_rows = 0
     raw_index_rows = {split: load_index(pool_dir, split) for split in ["trainable", "success", "all"]}
     initial_trainable_rows = len(raw_index_rows.get("trainable") or [])
     # Read all three pool indexes.  Some interrupted transfers wrote only one of
@@ -4268,6 +4434,9 @@ def reconcile_success_pool_indexes(pool_dir: Union[str, os.PathLike], recover_or
             if unique_key in seen_dirs or (row_id and row_id in seen_ids and not dir_key):
                 duplicate_rows += 1
                 continue
+            row, row_enriched = refresh_existing_recovered_success_pool_row(row)
+            if row_enriched:
+                enriched_recovered_rows += 1
             if dir_key:
                 seen_dirs.add(unique_key)
             if row_id:
@@ -4310,6 +4479,7 @@ def reconcile_success_pool_indexes(pool_dir: Union[str, os.PathLike], recover_or
     changed = bool(
         sanitized
         or recovered
+        or enriched_recovered_rows
         or hydrated_from_cache
         or len(aggregate) != initial_trainable_rows
         or (aggregate and not os.path.exists(index_path(pool_dir, "trainable")))
@@ -4323,6 +4493,7 @@ def reconcile_success_pool_indexes(pool_dir: Union[str, os.PathLike], recover_or
         "indexed_rows": len(aggregate),
         "scanned_episode_folders": scanned_folders,
         "recovered_orphan_folders": recovered,
+        "enriched_recovered_rows": enriched_recovered_rows,
         "incomplete_or_unreadable_folders": incomplete_folders,
         "sanitized_rows": sanitized,
         "hydrated_rows_from_transfer_cache": hydrated_from_cache,

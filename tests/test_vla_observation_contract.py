@@ -52,19 +52,38 @@ class VLAObservationContractTests(unittest.TestCase):
 
     def test_builds_exact_28d_shape(self):
         state = contract.build_state_28d(
-            base_state_14d=[0.0] * 14,
+            joint_positions_4d=[0.1, 0.2, 0.3, 0.4],
             joint_velocity_4d=[0.1, 0.2, 0.3, 0.4],
-            phase="loaded_transit",
-            dig_target_world_xyz=[1.0, 0.0, 0.5],
-            unload_landing_world_xyz=[0.0, 2.0, 4.0],
-            initial_origin_xy=[0.0, 0.0],
-            initial_heading_rad=math.pi / 2.0,
+            joint_tracking_error_4d=[0.01, 0.02, 0.03, 0.04],
+            previous_action_4d=[0.5, 0.6, 0.7, 0.8],
+            bucket_tip_world_xyz=[1.0, 1.0, 0.5],
+            bucket_load_world_xyz=[0.0, 0.0, 1.0],
+            bucket_pour_world_xyz=[1.0, 0.0, 2.0],
+            dig_target_world_xyz=[2.0, 1.0, 0.5],
+            unload_landing_world_xyz=[0.0, 3.0, 4.0],
+            upper_heading_rad=0.0,
             truck_yaw_rad=math.pi,
-            bucket_load_rate=12.0,
+            bucket_fill_fraction_value=0.5,
+            bucket_fill_rate_fraction_per_s=0.25,
         )
         self.assertEqual(len(state), 28)
-        self.assertEqual(state[18], 8.0)
-        self.assertEqual(state[27], 12.0)
+        self.assertAlmostEqual(state[16], math.sqrt(0.5), places=6)
+        self.assertEqual(state[18:21], [1.0, 0.0, 0.0])
+        self.assertEqual(state[21:24], [0.0, 3.0, 3.0])
+        self.assertEqual(state[26:], [0.5, 0.25])
+        self.assertNotIn("phase_index", contract.STATE_NAMES_28D)
+
+    def test_bucket_fill_features_are_normalized_and_causal(self):
+        fill = contract.bucket_fill_fraction(3200)
+        self.assertAlmostEqual(fill, 0.5)
+        rate = contract.causal_bucket_fill_rate(
+            current_fill_fraction=0.6,
+            previous_fill_fraction=0.5,
+            previous_smoothed_rate=0.0,
+            dt=0.2,
+        )
+        self.assertGreater(rate, 0.0)
+        self.assertLess(rate, 0.5)
 
     def test_auto_phase_estimator_uses_monotonic_dataset_stage_order(self):
         estimator = contract.DeploymentPhaseEstimator()

@@ -52,6 +52,30 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertEqual(len(checked["state_names"]), 28)
         self.assertEqual(len(checked["effort_names"]), 4)
 
+    def test_recommended_v4_28d_contract_round_trip(self):
+        payload = contract.build_client_contract(
+            5,
+            normalization_hash="v4",
+            observation_schema=contract.OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
+            observation_context={
+                "dig_target_xyz": [0.0, 6.5, 0.4],
+                "unload_landing_xyz": [-6.8, -7.8, 4.2],
+                "task_text": "Excavate one scoop and dump it into the truck bed.",
+            },
+        )
+        checked = contract.validate_client_contract(payload)
+        self.assertEqual(
+            checked["observation_schema"],
+            contract.OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
+        )
+        self.assertEqual(
+            tuple(checked["state_names"]),
+            contract.STATE_NAMES_28D,
+        )
+        self.assertNotIn("phase_index", checked["state_names"])
+        self.assertEqual(len(checked["state_names"]), 28)
+        self.assertEqual(len(checked["effort_names"]), 4)
+
     def test_27d_plus_effort_contract_round_trip(self):
         payload = contract.build_client_contract(
             10,

@@ -145,6 +145,7 @@ from excavator_common.deployment_contract import (
     EFFORT_NAMES_4D,
     OBSERVATION_SCHEMA_27D_PLUS_EFFORT,
     OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
+    OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
     PHYSICS_HZ,
     PROTOCOL_VERSION,
     STATE_NAMES_27D,
@@ -3145,6 +3146,8 @@ def main(args):
     active_phase_estimator = None
     deployment_previous_q = None
     deployment_previous_load = None
+    deployment_previous_fill_fraction = None
+    deployment_previous_fill_rate = None
     deployment_elapsed_seconds = 0.0
     last_idle_ui_update = 0.0
     idle_ui_interval = 1.0 / max(0.1, float(args.idle_ui_hz))
@@ -3163,10 +3166,13 @@ def main(args):
                     active_phase_estimator = None
                     deployment_previous_q = None
                     deployment_previous_load = None
+                    deployment_previous_fill_fraction = None
+                    deployment_previous_fill_rate = None
                     deployment_elapsed_seconds = 0.0
                     if active_contract["observation_schema"] in (
                         OBSERVATION_SCHEMA_27D_PLUS_EFFORT,
                         OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
+                        OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
                     ):
                         base_x, base_y, base_yaw = read_robot_base_pose()
                         _, initial_q = read_canonical_joint_positions()
@@ -3184,7 +3190,10 @@ def main(args):
                         )
                     if (
                         active_contract["observation_schema"]
-                        == OBSERVATION_SCHEMA_28D_PLUS_EFFORT
+                        in (
+                            OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
+                            OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
+                        )
                     ):
                         if not bucket_volume_topology["available"]:
                             raise ValueError(
@@ -3390,7 +3399,10 @@ def main(args):
             joint_positions = np.asarray(q, dtype=np.float32).reshape(-1)[:4]
             use_dataset_bucket_source_tracking = bool(
                 active_contract["observation_schema"]
-                == OBSERVATION_SCHEMA_28D_PLUS_EFFORT
+                in (
+                    OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
+                    OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
+                )
             )
             bucket_load_metrics = estimate_bucket_load_particles(
                 source_tracking_required=use_dataset_bucket_source_tracking,
@@ -3398,6 +3410,7 @@ def main(args):
 
             tip_xyz = [0.0, 0.0, 0.0]
             load_xyz = [0.0, 0.0, 0.0]
+            pour_xyz = [0.0, 0.0, 0.0]
             try:
                 bucket_prim = stage.GetPrimAtPath(
                     "/World/URDF_real3/bucket_link"
@@ -3414,6 +3427,9 @@ def main(args):
                     load_world = world_xf.Transform(
                         Gf.Vec3d(0.35, 0.0, 0.08)
                     )
+                    pour_world = world_xf.Transform(
+                        Gf.Vec3d(0.85, 0.0, 0.30)
+                    )
                     tip_xyz = [
                         float(tip_world[0]),
                         float(tip_world[1]),
@@ -3423,6 +3439,11 @@ def main(args):
                         float(load_world[0]),
                         float(load_world[1]),
                         float(load_world[2]),
+                    ]
+                    pour_xyz = [
+                        float(pour_world[0]),
+                        float(pour_world[1]),
+                        float(pour_world[2]),
                     ]
             except Exception as exc:
                 print(
@@ -3472,6 +3493,21 @@ def main(args):
                     current_bucket_load - float(deployment_previous_load)
                 ) / max(1.0e-6, bridge_step_seconds)
             deployment_previous_load = current_bucket_load
+            deployment_fill_fraction = (
+                vla_observation_contract.bucket_fill_fraction(
+                    current_bucket_load
+                )
+            )
+            deployment_fill_rate = (
+                vla_observation_contract.causal_bucket_fill_rate(
+                    deployment_fill_fraction,
+                    deployment_previous_fill_fraction,
+                    deployment_previous_fill_rate,
+                    bridge_step_seconds,
+                )
+            )
+            deployment_previous_fill_fraction = deployment_fill_fraction
+            deployment_previous_fill_rate = deployment_fill_rate
 
             if (
                 active_contract["observation_schema"]
@@ -3589,7 +3625,10 @@ def main(args):
             observation_phase_source = ""
             if (
                 active_contract["observation_schema"]
-                == OBSERVATION_SCHEMA_28D_PLUS_EFFORT
+                in (
+                    OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
+                    OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
+                )
             ):
                 try:
                     if not bool(
@@ -3665,28 +3704,63 @@ def main(args):
                         raise vla_observation_contract.ObservationContractError(
                             f"unsupported phase_mode: {phase_mode!r}"
                         )
-                    observation_state_28d = (
-                        vla_observation_contract.build_state_28d(
-                            base_state_14d=base_state_14d,
-                            joint_velocity_4d=deployment_joint_velocity,
-                            phase=phase,
-                            dig_target_world_xyz=dig_target_xyz,
-                            unload_landing_world_xyz=unload_landing_xyz,
-                            initial_origin_xy=active_observation_context.get(
-                                "initial_origin_xy"
-                            ),
-                            initial_heading_rad=active_observation_context.get(
-                                "initial_heading_rad"
-                            ),
-                            truck_yaw_rad=active_observation_context.get(
-                                "truck_yaw_rad"
-                            ),
-                            bucket_load_rate=deployment_bucket_load_rate,
+                    if (
+                        active_contract["observation_schema"]
+                        == OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT
+                    ):
+                        q_tracking_error = (
+                            np.asarray(q_target, dtype=np.float32)
+                            - joint_positions
                         )
-                    )
+                        q_tracking_error[0] = math.atan2(
+                            math.sin(float(q_tracking_error[0])),
+                            math.cos(float(q_tracking_error[0])),
+                        )
+                        observation_state_28d = (
+                            vla_observation_contract.build_state_28d(
+                                joint_positions_4d=joint_positions,
+                                joint_velocity_4d=deployment_joint_velocity,
+                                joint_tracking_error_4d=q_tracking_error,
+                                previous_action_4d=vel,
+                                bucket_tip_world_xyz=tip_xyz,
+                                bucket_load_world_xyz=load_xyz,
+                                bucket_pour_world_xyz=pour_xyz,
+                                dig_target_world_xyz=dig_target_xyz,
+                                unload_landing_world_xyz=unload_landing_xyz,
+                                upper_heading_rad=float(base_yaw)
+                                + float(joint_positions[0]),
+                                truck_yaw_rad=active_observation_context.get(
+                                    "truck_yaw_rad"
+                                ),
+                                bucket_fill_fraction_value=deployment_fill_fraction,
+                                bucket_fill_rate_fraction_per_s=deployment_fill_rate,
+                            )
+                        )
+                    else:
+                        observation_state_28d = (
+                            vla_observation_contract.build_legacy_state_28d_v3(
+                                base_state_14d=base_state_14d,
+                                joint_velocity_4d=deployment_joint_velocity,
+                                phase=phase,
+                                dig_target_world_xyz=dig_target_xyz,
+                                unload_landing_world_xyz=unload_landing_xyz,
+                                initial_origin_xy=active_observation_context.get(
+                                    "initial_origin_xy"
+                                ),
+                                initial_heading_rad=active_observation_context.get(
+                                    "initial_heading_rad"
+                                ),
+                                truck_yaw_rad=active_observation_context.get(
+                                    "truck_yaw_rad"
+                                ),
+                                bucket_load_rate=deployment_bucket_load_rate,
+                            )
+                        )
                     observation_32d_ready = True
                 except Exception as exc:
                     observation_32d_error = f"{type(exc).__name__}: {exc}"
+            if observation_state_28d is not None:
+                observation_state = list(observation_state_28d)
 
             reply_observation_context = dict(active_observation_context)
             if observation_phase_report:
@@ -3717,13 +3791,18 @@ def main(args):
                 ),
                 "observation_state_dim": len(observation_state),
                 "observation_effort": observation_effort,
+                "observation_stage_current_id": (
+                    int(observation_phase_report["phase_index"])
+                    if observation_phase_report
+                    else None
+                ),
                 "observation_state_28d": observation_state_28d,
                 "observation_32d_ready": observation_32d_ready,
                 "observation_32d_error": observation_32d_error,
                 "observation_contract": (
                     vla_observation_contract.schema_payload()
                     if active_contract["observation_schema"]
-                    == OBSERVATION_SCHEMA_28D_PLUS_EFFORT
+                    == OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT
                     else {
                         "schema_version": active_contract[
                             "observation_schema"

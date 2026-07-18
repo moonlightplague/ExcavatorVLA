@@ -38,9 +38,13 @@ CAMERA_KEYS = tuple(f"observation.images.{index}" for index in range(3))
 OBSERVATION_SCHEMA_LEGACY_18D = "legacy_18d_state"
 OBSERVATION_SCHEMA_27D_PLUS_EFFORT = "state_27d_plus_effort_4d"
 OBSERVATION_SCHEMA_28D_PLUS_EFFORT = "state_28d_plus_effort_4d"
+OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT = "state_28d_v4_plus_effort_4d"
 STATE_NAMES_28D = tuple(vla_observation_contract.STATE_NAMES_28D)
+STATE_NAMES_28D_V3 = tuple(
+    vla_observation_contract.LEGACY_STATE_NAMES_28D_V3
+)
 STATE_NAMES_27D = tuple(
-    name for name in STATE_NAMES_28D if name != "phase_index"
+    name for name in STATE_NAMES_28D_V3 if name != "phase_index"
 )
 EFFORT_NAMES_4D = tuple(vla_observation_contract.EFFORT_NAMES_4D)
 
@@ -141,12 +145,18 @@ def build_client_contract(
         state_names = STATE_NAMES_27D
         effort_names = EFFORT_NAMES_4D
     elif schema == OBSERVATION_SCHEMA_28D_PLUS_EFFORT:
+        state_names = STATE_NAMES_28D_V3
+        effort_names = EFFORT_NAMES_4D
+    elif schema == OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT:
         state_names = STATE_NAMES_28D
         effort_names = EFFORT_NAMES_4D
     else:
         raise ValueError(f"Unsupported observation schema: {schema!r}")
     context = dict(observation_context or {})
-    if schema == OBSERVATION_SCHEMA_28D_PLUS_EFFORT:
+    if schema in (
+        OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
+        OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
+    ):
         has_external_phase = (
             context.get("phase_index") is not None
             or context.get("phase_name") is not None
@@ -190,6 +200,8 @@ def validate_client_contract(contract):
             else OBSERVATION_SCHEMA_27D_PLUS_EFFORT
             if state_names == STATE_NAMES_27D
             else OBSERVATION_SCHEMA_28D_PLUS_EFFORT
+            if state_names == STATE_NAMES_28D_V3
+            else OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT
             if state_names == STATE_NAMES_28D
             else ""
         )
@@ -202,8 +214,8 @@ def validate_client_contract(contract):
         if effort_names != EFFORT_NAMES_4D:
             raise ValueError("4D effort checkpoint/runtime schema mismatch")
     elif schema == OBSERVATION_SCHEMA_28D_PLUS_EFFORT:
-        if state_names != STATE_NAMES_28D:
-            raise ValueError("28D checkpoint/runtime state schema mismatch")
+        if state_names != STATE_NAMES_28D_V3:
+            raise ValueError("Legacy v3 28D checkpoint/runtime state schema mismatch")
         if effort_names != EFFORT_NAMES_4D:
             raise ValueError("4D effort checkpoint/runtime schema mismatch")
         context = contract.get("observation_context")
@@ -230,6 +242,23 @@ def validate_client_contract(contract):
         if phase_mode == "external" and not has_external_phase:
             raise ValueError(
                 "28D external phase_mode requires phase_index or phase_name"
+            )
+    elif schema == OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT:
+        if state_names != STATE_NAMES_28D:
+            raise ValueError("Recommended v4 28D checkpoint/runtime state schema mismatch")
+        if effort_names != EFFORT_NAMES_4D:
+            raise ValueError("4D effort checkpoint/runtime schema mismatch")
+        context = contract.get("observation_context")
+        if not isinstance(context, dict):
+            raise ValueError("v4 28D deployment requires an observation_context object")
+        required = ("dig_target_xyz", "unload_landing_xyz", "task_text")
+        missing = [name for name in required if context.get(name) is None]
+        if missing:
+            raise ValueError(f"v4 28D deployment context is missing: {missing}")
+        phase_mode = str(context.get("phase_mode") or "auto").strip().lower()
+        if phase_mode not in ("auto", "external"):
+            raise ValueError(
+                "v4 28D deployment phase_mode must be 'auto' or 'external'"
             )
     else:
         raise ValueError(f"Unsupported observation schema: {schema!r}")

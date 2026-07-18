@@ -29,11 +29,10 @@ from excavator_common.bridge_protocol import (  # noqa: E402
     write_json,
 )
 from excavator_common.deployment_contract import (  # noqa: E402
-    OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
+    OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
     build_client_contract,
     load_training_fps,
     sha256_files,
-    validate_training_fps,
 )
 from excavator_common import vla_observation_contract  # noqa: E402
 
@@ -71,6 +70,26 @@ def validate_policy_contract(policy):
     if action_shape != (4,):
         raise RuntimeError(
             f"Checkpoint action must have shape (4,), got {action_shape}"
+        )
+
+
+def validate_dataset_metadata_schema(metadata_path):
+    path = Path(metadata_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    schema = str(payload.get("state_schema_version") or "")
+    if schema != vla_observation_contract.SCHEMA_VERSION:
+        raise RuntimeError(
+            "Dataset/checkpoint schema is not the recommended v4 28D contract: "
+            f"expected={vla_observation_contract.SCHEMA_VERSION!r} got={schema!r}"
+        )
+    features = payload.get("features")
+    features = features if isinstance(features, dict) else {}
+    state_feature = features.get("observation.state")
+    state_feature = state_feature if isinstance(state_feature, dict) else {}
+    names = state_feature.get("names")
+    if list(names or []) != list(vla_observation_contract.STATE_NAMES_28D):
+        raise RuntimeError(
+            "Dataset observation.state names do not match the v4 runtime contract"
         )
 
 
@@ -229,7 +248,6 @@ def main():
     parser.add_argument("--ckpt", default=os.environ.get("SMOLVLA_CKPT", ""))
     parser.add_argument("--vlm", default=os.environ.get("SMOLVLA_VLM", ""))
     parser.add_argument("--dataset-meta", default="")
-    parser.add_argument("--training-fps", type=float, default=0.0)
     parser.add_argument("--observation-context", required=True)
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument(
@@ -253,11 +271,13 @@ def main():
 
     if args.dataset_meta:
         training_fps, metadata_path = load_training_fps(args.dataset_meta)
+        validate_dataset_metadata_schema(metadata_path)
         print(f"[BRIDGE CONTRACT] training_fps={training_fps} source={metadata_path}")
-    elif args.training_fps > 0.0:
-        training_fps = validate_training_fps(args.training_fps)
     else:
-        raise RuntimeError("--dataset-meta or --training-fps is required")
+        raise RuntimeError(
+            "--dataset-meta is required for the v4 28D client so state names "
+            "and state_schema_version can be verified before motion"
+        )
 
     context = load_context(args.observation_context)
     normalization_hash = sha256_files(normalization_paths)
@@ -269,7 +289,7 @@ def main():
     handshake = build_client_contract(
         training_fps,
         normalization_hash=normalization_hash,
-        observation_schema=OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
+        observation_schema=OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
         observation_context=context,
     )
     write_json(sock, handshake)
@@ -354,7 +374,8 @@ def main():
                     f"phase={resolved_context.get('resolved_phase_name', context.get('phase_name'))} "
                     f"phase_source={reply.get('phase_source', '')} "
                     f"action_rad_s={velocity.round(5).tolist()} "
-                    f"bucket_load={state[7]:.1f}"
+                    f"bucket_fill={state[26]:.3f} "
+                    f"bucket_fill_rate={state[27]:.3f}/s"
                 )
     finally:
         try:

@@ -2,6 +2,11 @@
 
 Audited: 2026-07-17
 
+> Historical v3 source map. It describes the former 28D layout with
+> `phase_index` inside the continuous state. The authoritative v4 contract is
+> [vla_32d_deployment_contract.md](vla_32d_deployment_contract.md) and the
+> current names are in `excavator_common/vla_observation_contract.py`.
+
 ## 1. Important Data Contract
 
 The simulator does not directly collect one 32D vector. The exported model

@@ -1,175 +1,152 @@
 # 32D VLA Deployment Observation Contract
 
-Updated: 2026-07-17
+Updated: 2026-07-18
 
-## Scope
+## Contract
 
-The current dataset exports:
+The recommended policy input is:
 
 ```text
-observation.state   28D
-observation.effort   4D
+observation.state   28 float32 values
+observation.effort   4 float32 values
 ```
 
-They are two model features, not one raw 32-value articulation sensor. A
-deployment adapter must reproduce both keys with the same names, order, units,
-coordinate frames, and episode context used during export.
+The current stage is exported separately as
+`observation.stage_current_id` (`int64`, 0..9). It is supervision and
+telemetry, not part of the 32 continuous policy inputs.
 
-The shared schema and numeric builder live in:
+The authoritative implementation is:
 
 ```text
 excavator_common/vla_observation_contract.py
+schema: excavator_state_v4_28d_plus_4effort_categorical_phase10
 ```
 
-The full-runtime bridge obtains live values through:
+## State 28D
 
-```text
-excavator_runtime.deployment_vla_observation_payload()
-scripts/bridge_test/sand_site_tcp_bridge_server.py
-```
-
-## Source Matrix
-
-| Values | Deployment source | Availability |
+| Range | Values | Unit/source |
 | --- | --- | --- |
-| base_x/base_y | robot base prim world translation | direct simulator state |
-| base_yaw | fixed-base schema value, currently 0 | direct schema value |
-| swing/boom/arm/bucket | articulation DOFs resolved by name | direct simulator state |
-| joint velocity 4D | finite difference of canonical joint positions on simulation time, with shortest swing delta | derived online, matches dataset sampling |
-| measured effort 4D | `get_measured_joint_efforts()`, resolved by DOF name | direct simulator state |
-| bucket tip/load XYZ | training runtime `bucket_tip_pos()` / `bucket_load_pos()` | direct FK/world transform |
-| bucket load | initial-pile source particles inside the authored `bucket_cut` closed volume, including the dataset's 32-particle/0.60 source fallback | simulator oracle, same dataset semantics |
-| bucket load rate | finite difference of the live bucket count on simulation time | derived online |
-| dig target | episode task/target provider or active plan | required task context |
-| unload landing | selected unload mesh target or episode task provider | required task context |
-| truck relative heading | selected truck prim transform | simulator world model |
-| phase index | external supervisor, or the simulator's monotonic state/geometry FSM | derived semantic context, not a physical sensor |
-| task prompt | same episode task provider used for target context | required task context |
-| three RGB images | dataset camera prims 0/1/2 | direct simulator render |
+| 0..3 | swing, boom, arm, bucket position | rad, measured articulation |
+| 4..7 | joint velocity | rad/s, causal finite difference on dataset/simulation time |
+| 8..11 | command tracking error | rad, `q_cmd - q`; shortest swing delta |
+| 12..15 | previous issued action | rad/s, causal command velocity |
+| 16..17 | bucket load-to-pour axis forward/up | normalized in the current upper frame |
+| 18..20 | dig target minus bucket tip | m, current upper frame |
+| 21..23 | unload landing minus bucket load point | m, current upper frame |
+| 24..25 | truck heading relative to current upper heading | sin/cos |
+| 26 | source-tracked bucket fill fraction | count / 6400, clipped to 1.5 |
+| 27 | smoothed causal bucket fill-rate fraction | fraction/s |
 
-## Phase Handling
+The current upper heading is `base_yaw + measured_swing`. Position features
+are relative to the current bucket and current upper frame, so the policy does
+not need to learn arbitrary world origins.
 
-`phase_index` is an expert stage label. A pure end-to-end VLA cannot measure it
-directly from an articulation or camera API. Deployment therefore supports two
-explicit modes:
+`observation.effort` is the measured swing/boom/arm/bucket effort in canonical
+DOF order. It remains separate because it has different units and
+normalization statistics.
 
-1. `phase_mode=external`: a hierarchical controller owns the phase state and
-   sends `phase_name` or `phase_index`.
-2. `phase_mode=auto`: the simulator runs a monotonic 10-stage FSM using bucket
-   tip/load geometry, dig/unload target distance, bucket load/rate, and joint
-   motion. The reply reports `phase_source=simulator_auto_fsm` plus transition
-   diagnostics.
+## Action Timing
 
-Auto mode prevents a missing supervisor from becoming a constant zero phase.
-It is an estimator, not hidden ground truth. A checkpoint that learned a very
-strong dependence on exact expert stage boundaries should use external mode,
-or be retrained with the same inferred phase labels.
-
-## Episode Context
-
-At the beginning of an episode, send one bridge command with:
-
-```json
-{
-  "observation_context": {
-    "phase_mode": "auto",
-    "dig_target_xyz": [0.0, 6.5, 0.4],
-    "unload_landing_xyz": [-6.8, -7.8, 4.2],
-    "initial_origin_xy": [0.0, 0.0],
-    "initial_heading_rad": 1.57,
-    "truck_yaw_rad": -2.1,
-    "task_text": "Excavate one scoop from the pile in front of the excavator and dump it into the truck bed."
-  }
-}
-```
-
-An editable template is available at:
+At observation row `t`:
 
 ```text
-scripts/bridge_test/observation_context.example.json
+state[12:16] = command velocity that produced the current observation
+action          = command velocity for the next transition
 ```
 
-For external mode, set `"phase_mode": "external"` and include `phase_name` or
-`phase_index`; the supervisor may update those phase fields on later commands.
-Initial origin and heading remain fixed for the episode, matching export
-behavior.
+Joint velocity, previous action, and bucket fill rate use backward-only
+differences. The exporter never uses a centered difference for observation
+features, so no future action leaks into policy input.
 
-If target, landing, or truck heading is omitted, the full runtime may use its
-active target, selected unload mesh, and truck prim. Their resolved source is
-reported in `observation_sources`.
-
-## Bridge Reply
-
-A valid reply contains:
+## Stage Label
 
 ```text
-observation_state_28d    28 finite float values
-observation_effort        4 finite float values
-observation_32d_ready      true
-observation_contract       exact names/shapes/action unit
-observation_sources        provenance for every nontrivial group
-task_text                  episode language prompt
+0 pre_dig
+1 approach_contact
+2 insert_cut
+3 pull_mid_cut
+4 curl_to_hold_material
+5 pull_exit_cut
+6 secure_load
+7 lift_carry
+8 loaded_transit
+9 unload_to_bin
 ```
 
-The bridge also keeps `observation_state` as the legacy live 14D state. The
-policy client may form a legacy 18D checkpoint input only by explicitly
-concatenating that 14D vector with the measured 4D effort. A new checkpoint
-must read `observation_state_28d` and `observation_effort` as separate feature
-keys; it must not pad, truncate, or concatenate them based on a global guess.
-Read the checkpoint feature contract first.
+The simulator may report this label from its phase estimator, but
+`smolvla_policy_client_32d.py` does not feed it to the base policy.
 
-## Supported Simulator Paths
+## Bucket Semantics
 
-The full excavator runtime remains the reference source because it owns the
-authored bucket volume, particle source tracking, selected unload mesh, and
-canonical DOF mapping:
+Training and deployment both use the authored closed `bucket_cut` mesh and
+initial-pile particle source tracking. Deployment must not substitute the old
+hand-written box/profile proxy. Bucket tip/load/pour local points are:
 
 ```text
-run_vla_train_scene.py --bridge
+tip  = [0.75, 0.00, -0.18]
+load = [0.35, 0.00,  0.08]
+pour = [0.85, 0.00,  0.30]
 ```
 
-The current viewport bridge is GUI-only. `run_vla_train_scene.py` rejects
-`--headless --bridge`; a headless deployment needs a separately validated
-offscreen camera backend before it can satisfy the same three-image contract.
+## Export And Old Pool Upgrade
 
-The `vla-deploy-contract` worktree synced to `origin/smolvla` commit `c099da0`
-also supports the contract through its deterministic lockstep simulator:
+Re-exporting `.dashboard_success` automatically reconstructs v4 28D from the
+raw trajectory fields. Existing per-episode videos are reusable; only parquet,
+stats, info, and manifest need rebuilding when the schema changes.
+
+The exported `meta/info.json` must contain:
 
 ```text
-run_simulation.py
+state_schema_version = excavator_state_v4_28d_plus_4effort_categorical_phase10
+features.observation.state.names = the exact v4 28D names
+features.observation.stage_current_id = int64 scalar
+```
+
+## Deployment Pipeline
+
+The deployment repository supports four explicit protocols:
+
+```text
+legacy_18d_state
+state_27d_plus_effort_4d
+state_28d_plus_effort_4d              # legacy v3, phase inside state
+state_28d_v4_plus_effort_4d           # recommended
+```
+
+The strict v4 client is:
+
+```text
 scripts/bridge_test/smolvla_policy_client_32d.py
 ```
 
-That server keeps the legacy 18D handshake as the default and adds a separate
-`state_28d_plus_effort_4d` handshake. The new handshake is accepted only when
-the authored `/World/URDF_real3/bucket_link/bucket_cut/node_/mesh_` is a valid
-closed mesh, an initial-pile source-particle mask can be captured, and all
-three cameras are available. The client must supply target, unload landing,
-and task text. `phase_mode=auto` does not require a separate stage input.
+It requires `--dataset-meta <lerobot_v3/meta/info.json>` and verifies the v4
+schema and all 28 state names before sending any motion command. This prevents
+an old shape-compatible 28D checkpoint from being silently interpreted with
+new semantics.
 
-Example client command:
-
-```bash
-python scripts/bridge_test/smolvla_policy_client_32d.py \
-  --ckpt /path/to/checkpoint \
-  --vlm /path/to/local/SmolVLM \
-  --dataset-meta /path/to/lerobot_v3 \
-  --observation-context scripts/bridge_test/observation_context.example.json
-```
-
-## Acceptance Check
-
-Before enabling policy motion, verify:
+The simulator bridge reconstructs live v4 features from measured joints,
+current command, the selected truck/dig/unload context, three camera views,
+and the authored bucket volume. Its reply includes:
 
 ```text
-schema_version == excavator_state_v3_28d_plus_4effort_phase_index10
-state names exactly match all 28 exported names
-effort names exactly match [swing, boom, arm, bucket]
-all 32 values are finite
-bucket_load uses initial-pile particles inside bucket_cut, not a hand-written proxy
-phase source is external_supervisor or simulator_auto_fsm, never a constant fallback
-target/landing remain fixed in the initial heading frame for the episode
-truck sin/cos matches the current truck transform
-camera keys 0/1/2 are present and fresh
-action is four canonical rad/s values
+observation_state_28d
+observation_effort
+observation_stage_current_id
+observation_32d_ready
+observation_contract
+task_text
+```
+
+## Verified
+
+On 2026-07-18:
+
+```text
+old .dashboard_success: 45 episodes, 10445 rows, 0 skipped
+all state/effort/action values finite
+all stage IDs 0..9 represented
+one-episode strict LeRobot export: ready and validated
+Isaac profile/headless: 1/1 trainable, 207 samples
+camera 0/1/2: 207/207/207
+raw runtime state: 28D, measured q matches state[0:4]
 ```

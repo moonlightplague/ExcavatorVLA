@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import excavator_dataset_tools
 from excavator_common import bridge_protocol, geometry, paths, vla_observation_contract
 
 try:
@@ -133,6 +134,40 @@ class VLAObservationContractTests(unittest.TestCase):
                     "observation_effort": None,
                 }
             )
+
+
+class DatasetExportPerformanceTests(unittest.TestCase):
+    def test_video_parallel_config_honors_safe_overrides(self):
+        names = [
+            excavator_dataset_tools.LEROBOT_VIDEO_WORKERS_ENV,
+            excavator_dataset_tools.LEROBOT_VIDEO_ENCODER_THREADS_ENV,
+            excavator_dataset_tools.LEROBOT_VIDEO_PRESET_ENV,
+        ]
+        previous = {name: os.environ.get(name) for name in names}
+        try:
+            os.environ[excavator_dataset_tools.LEROBOT_VIDEO_WORKERS_ENV] = "3"
+            os.environ[excavator_dataset_tools.LEROBOT_VIDEO_ENCODER_THREADS_ENV] = "2"
+            os.environ[excavator_dataset_tools.LEROBOT_VIDEO_PRESET_ENV] = "veryfast"
+            config = excavator_dataset_tools.lerobot_video_parallel_config(total_jobs=10)
+            self.assertEqual(config["workers"], 3)
+            self.assertEqual(config["encoder_threads"], 2)
+            self.assertEqual(config["encoder_preset"], "veryfast")
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+    def test_safe_reuse_file_preserves_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.mp4"
+            target = Path(tmp) / "staging" / "target.mp4"
+            source.write_bytes(b"media")
+            ok, method = excavator_dataset_tools.safe_reuse_file(str(source), str(target))
+            self.assertTrue(ok)
+            self.assertIn(method, {"hardlink", "copy"})
+            self.assertEqual(target.read_bytes(), b"media")
 
 
 if __name__ == "__main__":

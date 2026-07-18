@@ -4,8 +4,10 @@ import math
 import os
 import re
 import shutil
+import threading
 import time
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from statistics import mean, median
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 from urllib.parse import parse_qs, unquote, urlparse
@@ -41,6 +43,20 @@ LEROBOT_DEFAULT_EXPORT_DIRNAME = "lerobot_v3"
 EXPORT_TIME_POLICY_FILENAME = "export_time_policy.json"
 LEROBOT_IMAGE_SHAPE = [256, 256, 3]
 LEROBOT_VIDEO_KEYFRAME_INTERVAL = 4
+LEROBOT_VIDEO_WORKERS_ENV = "EXCAVATOR_LEROBOT_VIDEO_WORKERS"
+LEROBOT_VIDEO_ENCODER_THREADS_ENV = "EXCAVATOR_LEROBOT_VIDEO_ENCODER_THREADS"
+LEROBOT_VIDEO_PRESET_ENV = "EXCAVATOR_LEROBOT_VIDEO_PRESET"
+LEROBOT_VIDEO_PRESETS = {
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+}
 SUCCESS_POOL_DIRNAME = ".dashboard_success"
 SUCCESS_TRANSFER_CACHE_FILENAME = "transfer_source_cache.json"
 LEROBOT_IMAGE_KEYS = [
@@ -1260,6 +1276,63 @@ def safe_copy_file(src: str, dst: str) -> bool:
     return True
 
 
+def safe_reuse_file(src: str, dst: str) -> Tuple[bool, str]:
+    """Reuse immutable media cheaply, falling back to a normal copy."""
+    if not src or not os.path.isfile(src):
+        return False, "missing"
+    ensure_dir(os.path.dirname(dst) or ".")
+    try:
+        os.link(src, dst)
+        return True, "hardlink"
+    except Exception:
+        try:
+            shutil.copy2(src, dst)
+            return True, "copy"
+        except Exception:
+            return False, "failed"
+
+
+def available_cpu_count() -> int:
+    try:
+        affinity = os.sched_getaffinity(0)
+        if affinity:
+            return max(1, len(affinity))
+    except (AttributeError, OSError):
+        pass
+    return max(1, int(os.cpu_count() or 1))
+
+
+def lerobot_video_parallel_config(total_jobs: int) -> Dict[str, object]:
+    total_jobs = max(1, int(total_jobs))
+    cpu_count = available_cpu_count()
+    default_workers = min(16, max(1, cpu_count // 4), total_jobs)
+    try:
+        workers = int(os.environ.get(LEROBOT_VIDEO_WORKERS_ENV, default_workers) or default_workers)
+    except Exception:
+        workers = default_workers
+    workers = max(1, min(64, total_jobs, workers))
+
+    default_encoder_threads = max(1, min(4, cpu_count // max(1, workers * 2)))
+    try:
+        encoder_threads = int(
+            os.environ.get(LEROBOT_VIDEO_ENCODER_THREADS_ENV, default_encoder_threads)
+            or default_encoder_threads
+        )
+    except Exception:
+        encoder_threads = default_encoder_threads
+    encoder_threads = max(1, min(16, encoder_threads))
+
+    preset = str(os.environ.get(LEROBOT_VIDEO_PRESET_ENV, "fast") or "fast").strip().lower()
+    if preset not in LEROBOT_VIDEO_PRESETS:
+        preset = "fast"
+    return {
+        "cpu_count": int(cpu_count),
+        "workers": int(workers),
+        "encoder_threads": int(encoder_threads),
+        "encoder_preset": preset,
+    }
+
+
 def infer_export_fps(run_dir: Union[str, os.PathLike], explicit_fps: Optional[float] = None) -> float:
     if explicit_fps is not None and float(explicit_fps) > 0:
         return float(explicit_fps)
@@ -2180,6 +2253,8 @@ def try_encode_mp4_imageio(
     target_size: Optional[Tuple[int, int]] = None,
     progress_callback=None,
     progress_label: str = "",
+    encoder_threads: int = 1,
+    encoder_preset: str = "fast",
 ) -> Tuple[bool, str]:
     try:
         import imageio.v2 as imageio  # type: ignore
@@ -2203,6 +2278,10 @@ def try_encode_mp4_imageio(
                 str(keyint),
                 "-sc_threshold",
                 "0",
+                "-threads",
+                str(max(1, int(encoder_threads))),
+                "-preset",
+                str(encoder_preset or "fast"),
             ],
         )
         try:
@@ -2217,7 +2296,10 @@ def try_encode_mp4_imageio(
                     )
         finally:
             writer.close()
-        return True, f"ok:keyframe_interval={keyint}"
+        return True, (
+            f"ok:keyframe_interval={keyint}:threads={max(1, int(encoder_threads))}:"
+            f"preset={str(encoder_preset or 'fast')}"
+        )
     except Exception as exc:
         return False, f"imageio_mp4_failed:{type(exc).__name__}:{exc}"
 
@@ -2277,6 +2359,8 @@ def encode_mp4(
     target_size: Optional[Tuple[int, int]] = None,
     progress_callback=None,
     progress_label: str = "",
+    encoder_threads: int = 1,
+    encoder_preset: str = "fast",
 ) -> Tuple[bool, str, str]:
     if not image_paths:
         return False, "none", "no_images"
@@ -2290,6 +2374,8 @@ def encode_mp4(
         target_size=target_size,
         progress_callback=progress_callback,
         progress_label=progress_label,
+        encoder_threads=encoder_threads,
+        encoder_preset=encoder_preset,
     )
     if ok:
         return True, "imageio", reason
@@ -3010,39 +3096,47 @@ def export_lerobot_dataset(
             "keyframe_interval": int(LEROBOT_VIDEO_KEYFRAME_INTERVAL),
             "episode_files": [],
         }
-    episode_video_manifest: List[dict] = []
+    episode_video_manifest: List[dict] = [
+        {"episode_index": int(episode_i), "videos": {}}
+        for episode_i in range(len(episode_image_paths))
+    ]
     total_video_jobs = max(1, len(episode_image_paths) * len(image_features))
     completed_video_jobs = 0
     reused_video_jobs = 0
+    reused_video_hardlink_jobs = 0
+    reused_video_copy_jobs = 0
     encoded_video_jobs = 0
     video_start_percent = 15.0
     video_end_percent = 75.0
+    encode_jobs: List[dict] = []
     for episode_i, episode_paths_by_key in enumerate(episode_image_paths):
         current_episode = episodes[episode_i] if 0 <= episode_i < len(episodes) else {"episode_index": episode_i, "length": 0}
-        episode_video = {
-            "episode_index": int(episode_i),
-            "videos": {},
-        }
+        episode_video = episode_video_manifest[episode_i]
         for key in image_features:
             paths = list(episode_paths_by_key.get(key, []) or [])
             episode_duration_s = float(current_episode.get("duration_s") or (float(len(paths)) / float(export_fps)))
-            job_start = video_start_percent + (video_end_percent - video_start_percent) * (completed_video_jobs / total_video_jobs)
-            job_end = video_start_percent + (video_end_percent - video_start_percent) * ((completed_video_jobs + 1) / total_video_jobs)
             if not paths or not any(paths):
                 entry = {"available": False, "reason": "no_images", "frames": 0, "chunk_index": 0, "file_index": int(episode_i)}
                 episode_video["videos"][key] = entry
                 video_results[key]["available"] = False
                 video_results[key].setdefault("failed_episodes", []).append(entry)
                 completed_video_jobs += 1
-                progress(job_end, f"{key} episode {episode_i}: no images", completed_video_jobs, total_video_jobs)
+                progress(
+                    video_start_percent,
+                    f"{key} episode {episode_i}: no images",
+                    completed_video_jobs,
+                    total_video_jobs,
+                )
                 continue
             video_path = os.path.join(export_dir, "videos", key, "chunk-000", f"file-{episode_i:03d}.mp4")
             rel_video_path = relpath_posix(video_path, export_dir)
             reused_src = reusable_episode_video(reuse_dir, reusable_episodes, current_episode, key, len(paths))
-            if reused_src and safe_copy_file(reused_src, video_path):
+            reused_ok, reuse_method = safe_reuse_file(reused_src, video_path) if reused_src else (False, "missing")
+            if reused_ok:
                 entry = {
                     "available": True,
                     "encoder": "reused",
+                    "reuse_method": reuse_method,
                     "path": rel_video_path,
                     "frames": len(paths),
                     "keyframe_interval": int(LEROBOT_VIDEO_KEYFRAME_INTERVAL),
@@ -3057,42 +3151,97 @@ def export_lerobot_dataset(
                 episode_video["videos"][key] = entry
                 completed_video_jobs += 1
                 reused_video_jobs += 1
-                progress(job_end, f"reused {key} episode {episode_i}: {len(paths)} frames", completed_video_jobs, total_video_jobs)
+                if reuse_method == "hardlink":
+                    reused_video_hardlink_jobs += 1
+                else:
+                    reused_video_copy_jobs += 1
+                progress(
+                    video_start_percent,
+                    f"reused {key} episode {episode_i} via {reuse_method}: {len(paths)} frames",
+                    completed_video_jobs,
+                    total_video_jobs,
+                )
                 continue
 
-            def camera_progress(done: int, total: int, message: str, _start=job_start, _end=job_end):
-                ratio = float(done) / float(max(1, total))
-                progress(_start + (_end - _start) * ratio, message, completed_video_jobs, total_video_jobs)
-
-            progress(job_start, f"encoding {key} episode {episode_i}: 0/{len(paths)}", completed_video_jobs, total_video_jobs)
-            ok, encoder, reason = encode_mp4(
-                paths,
-                video_path,
-                export_fps,
-                target_size=(LEROBOT_IMAGE_SHAPE[1], LEROBOT_IMAGE_SHAPE[0]),
-                progress_callback=camera_progress,
-                progress_label=f"{key} ep{episode_i}",
-            )
-            if ok:
-                entry = {
-                    "available": True,
-                    "encoder": encoder,
-                    "path": rel_video_path,
-                    "frames": len(paths),
-                    "keyframe_interval": int(LEROBOT_VIDEO_KEYFRAME_INTERVAL),
-                    "encode_reason": reason,
-                    "chunk_index": 0,
-                    "file_index": int(episode_i),
-                    "from_timestamp": 0.0,
-                    "to_timestamp": episode_duration_s,
+            encode_jobs.append(
+                {
+                    "job_id": len(encode_jobs),
+                    "episode_i": int(episode_i),
+                    "key": key,
+                    "paths": paths,
+                    "video_path": video_path,
+                    "rel_video_path": rel_video_path,
+                    "episode_duration_s": episode_duration_s,
                 }
-                video_results[key]["frames"] = int(video_results[key].get("frames", 0) or 0) + len(paths)
-                video_results[key]["episode_files"].append(entry)
-                episode_video["videos"][key] = entry
-                completed_video_jobs += 1
-                encoded_video_jobs += 1
-                progress(job_end, f"encoded {key} episode {episode_i}: {len(paths)} frames", completed_video_jobs, total_video_jobs)
-                continue
+            )
+
+    video_parallel_config = lerobot_video_parallel_config(len(encode_jobs) or 1)
+    progress_lock = threading.Lock()
+    job_progress = {int(job["job_id"]): 0.0 for job in encode_jobs}
+    base_completed_video_jobs = int(completed_video_jobs)
+
+    def camera_progress_for_job(job: dict):
+        job_id = int(job["job_id"])
+
+        def camera_progress(done: int, total: int, message: str) -> None:
+            ratio = max(0.0, min(1.0, float(done) / float(max(1, total))))
+            with progress_lock:
+                job_progress[job_id] = max(float(job_progress.get(job_id, 0.0)), ratio)
+                fractional_jobs = float(base_completed_video_jobs) + sum(job_progress.values())
+                percent = video_start_percent + (
+                    (video_end_percent - video_start_percent)
+                    * fractional_jobs
+                    / float(total_video_jobs)
+                )
+                progress(percent, message, int(fractional_jobs), total_video_jobs)
+
+        return camera_progress
+
+    def run_encode_job(job: dict) -> dict:
+        ok, encoder, reason = encode_mp4(
+            job["paths"],
+            job["video_path"],
+            export_fps,
+            target_size=(LEROBOT_IMAGE_SHAPE[1], LEROBOT_IMAGE_SHAPE[0]),
+            progress_callback=camera_progress_for_job(job),
+            progress_label=f"{job['key']} ep{job['episode_i']}",
+            encoder_threads=int(video_parallel_config["encoder_threads"]),
+            encoder_preset=str(video_parallel_config["encoder_preset"]),
+        )
+        result = dict(job)
+        result.update({"ok": bool(ok), "encoder": encoder, "reason": reason})
+        return result
+
+    def apply_encode_result(result: dict) -> None:
+        nonlocal completed_video_jobs, encoded_video_jobs
+        episode_i = int(result["episode_i"])
+        key = str(result["key"])
+        paths = list(result["paths"])
+        episode_video = episode_video_manifest[episode_i]
+        ok = bool(result.get("ok"))
+        encoder = str(result.get("encoder") or "none")
+        reason = str(result.get("reason") or "")
+        rel_video_path = str(result["rel_video_path"])
+        episode_duration_s = float(result["episode_duration_s"])
+        if ok:
+            entry = {
+                "available": True,
+                "encoder": encoder,
+                "path": rel_video_path,
+                "frames": len(paths),
+                "keyframe_interval": int(LEROBOT_VIDEO_KEYFRAME_INTERVAL),
+                "encode_reason": reason,
+                "encoder_threads": int(video_parallel_config["encoder_threads"]),
+                "encoder_preset": str(video_parallel_config["encoder_preset"]),
+                "chunk_index": 0,
+                "file_index": int(episode_i),
+                "from_timestamp": 0.0,
+                "to_timestamp": episode_duration_s,
+            }
+            video_results[key]["frames"] = int(video_results[key].get("frames", 0) or 0) + len(paths)
+            video_results[key]["episode_files"].append(entry)
+            episode_video["videos"][key] = entry
+        else:
             entry = {
                 "available": False,
                 "reason": reason,
@@ -3104,10 +3253,71 @@ def export_lerobot_dataset(
             episode_video["videos"][key] = entry
             video_results[key]["available"] = False
             video_results[key].setdefault("failed_episodes", []).append(entry)
-            completed_video_jobs += 1
-            encoded_video_jobs += 1
-            progress(job_end, f"{key} episode {episode_i}: video encode failed: {reason}", completed_video_jobs, total_video_jobs)
-        episode_video_manifest.append(episode_video)
+        completed_video_jobs += 1
+        encoded_video_jobs += 1
+        with progress_lock:
+            job_progress[int(result["job_id"])] = 1.0
+            fractional_jobs = float(base_completed_video_jobs) + sum(job_progress.values())
+            percent = video_start_percent + (
+                (video_end_percent - video_start_percent)
+                * fractional_jobs
+                / float(total_video_jobs)
+            )
+        message = (
+            f"encoded {key} episode {episode_i}: {len(paths)} frames"
+            if ok
+            else f"{key} episode {episode_i}: video encode failed: {reason}"
+        )
+        progress(percent, message, completed_video_jobs, total_video_jobs)
+
+    if encode_jobs:
+        workers = int(video_parallel_config["workers"])
+        progress(
+            video_start_percent,
+            (
+                f"encoding {len(encode_jobs)} video jobs with workers={workers} "
+                f"ffmpeg_threads={video_parallel_config['encoder_threads']} "
+                f"preset={video_parallel_config['encoder_preset']} "
+                f"available_cpus={video_parallel_config['cpu_count']}"
+            ),
+            completed_video_jobs,
+            total_video_jobs,
+        )
+        if workers <= 1:
+            for job in encode_jobs:
+                try:
+                    result = run_encode_job(job)
+                except Exception as exc:
+                    result = dict(job)
+                    result.update(
+                        {
+                            "ok": False,
+                            "encoder": "none",
+                            "reason": f"video_worker_failed:{type(exc).__name__}:{exc}",
+                        }
+                    )
+                apply_encode_result(result)
+        else:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lerobot-video") as executor:
+                futures = {executor.submit(run_encode_job, job): job for job in encode_jobs}
+                for future in as_completed(futures):
+                    job = futures[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        result = dict(job)
+                        result.update(
+                            {
+                                "ok": False,
+                                "encoder": "none",
+                                "reason": f"video_worker_failed:{type(exc).__name__}:{exc}",
+                            }
+                        )
+                    apply_encode_result(result)
+
+    for key in image_features:
+        video_results[key]["episode_files"].sort(key=lambda entry: int(entry.get("file_index", 0)))
+    progress(video_end_percent, "video encoding complete", completed_video_jobs, total_video_jobs)
 
     progress(78.0, "building parquet tables and metadata")
     state_names = list(collected["state_names"])  # type: ignore[arg-type]
@@ -3321,8 +3531,11 @@ def export_lerobot_dataset(
         "base_fps": float(base_export_fps),
         "effective_fps": float(export_fps),
         "video_keyframe_interval": int(LEROBOT_VIDEO_KEYFRAME_INTERVAL),
+        "video_parallel_config": dict(video_parallel_config),
         "reuse_from_dir": reuse_dir,
         "reused_video_jobs": int(reused_video_jobs),
+        "reused_video_hardlink_jobs": int(reused_video_hardlink_jobs),
+        "reused_video_copy_jobs": int(reused_video_copy_jobs),
         "encoded_video_jobs": int(encoded_video_jobs),
         "total_video_jobs": int(total_video_jobs),
         "standard_lerobot_ready": vla_training_ready,

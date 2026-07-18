@@ -6254,6 +6254,33 @@ def dashboard_vla_observation_preview(
     }
 
 
+def dashboard_sample_spatial_xyz(
+    sample: dict,
+    field_key: str,
+    state_names: Sequence[str],
+    component_names: Sequence[str],
+) -> Optional[List[float]]:
+    direct = vector_or_none(sample.get(field_key), 3)
+    if direct is not None:
+        return [float(value) for value in direct]
+
+    legacy_state = vector_or_none(sample.get("obs.state_legacy_14d"), 14)
+    if legacy_state is not None:
+        start = 8 if field_key == "bucket.tip" else 11
+        return [float(value) for value in legacy_state[start : start + 3]]
+
+    names = [str(name) for name in state_names or []]
+    if not names or any(name not in names for name in component_names):
+        return None
+    indices = [names.index(name) for name in component_names]
+    for state_key in ("observation.state", "obs.state"):
+        values = vector_or_none(sample.get(state_key))
+        if values is None or len(values) != len(names):
+            continue
+        return [float(values[index]) for index in indices]
+    return None
+
+
 def dashboard_episode_payload(
     run_dir: Union[str, os.PathLike],
     episode_index: Union[int, str],
@@ -6270,6 +6297,7 @@ def dashboard_episode_payload(
         episode = dashboard_episode_summary(selected, dataset_tag="skip", dataset_skip_reason="trajectory_empty", runtime_s=0.0)
         empty_series = {
             "t": [], "phase": [], "bucket_from_pile": [], "bucket_total": [], "bucket_mass": [],
+            "bucket_tip_xyz": [], "bucket_load_xyz": [],
             "q_deg": [], "dq_deg_s": [], "ddq_deg_s2": [], "cmd_q_deg": [], "q_err_deg": [],
             "action_deg_s": [], "action_accel_deg_s2": [], "effort": [],
         }
@@ -6293,6 +6321,8 @@ def dashboard_episode_payload(
         episode_meta = read_json(resolve_episode_file(episode_dir, row_path_value(selected, "meta")), default={}) or {}
     except Exception:
         episode_meta = {}
+    run_meta = read_json(os.path.join(run_dir, "run_meta.json"), default={}) or {}
+    spatial_state_names = list(run_meta.get("state_names") or [])
     episode_summary = dashboard_episode_summary(selected, runtime_s=trajectory_runtime_s(trajectory))
     if is_dashboard_success_pool_dir(run_dir):
         try:
@@ -6330,6 +6360,8 @@ def dashboard_episode_payload(
         "bucket_from_pile": [],
         "bucket_total": [],
         "bucket_mass": [],
+        "bucket_tip_xyz": [],
+        "bucket_load_xyz": [],
         "q_deg": [],
         "dq_deg_s": [],
         "ddq_deg_s2": [],
@@ -6349,6 +6381,22 @@ def dashboard_episode_payload(
         series["bucket_from_pile"].append(safe_float_value(sand.get("bucket_from_pile"), 0.0))
         series["bucket_total"].append(safe_float_value(sand.get("bucket"), 0.0))
         series["bucket_mass"].append(safe_float_value(sand.get("bucket_from_pile_mass"), 0.0))
+        series["bucket_tip_xyz"].append(
+            dashboard_sample_spatial_xyz(
+                sample,
+                "bucket.tip",
+                spatial_state_names,
+                ("bucket_tip_x", "bucket_tip_y", "bucket_tip_z"),
+            )
+        )
+        series["bucket_load_xyz"].append(
+            dashboard_sample_spatial_xyz(
+                sample,
+                "bucket.load",
+                spatial_state_names,
+                ("bucket_load_x", "bucket_load_y", "bucket_load_z"),
+            )
+        )
         series["q_deg"].append(radians_vector_to_degrees(sample.get("obs.q")))
         series["dq_deg_s"].append(radians_vector_to_degrees(sample.get("obs.dq")))
         series["ddq_deg_s2"].append(radians_vector_to_degrees(sample.get("obs.ddq")))
@@ -7409,7 +7457,7 @@ function renderEpisode(data){
   renderVlaObservationPreview(data);
   const s=data.series||{};
   drawLineChart("bucketChart","Bucket sand holding",s.t,[{name:"bucket_from_pile",values:s.bucket_from_pile},{name:"bucket_total",values:s.bucket_total}],data.stage_spans,"particles");
-  drawVlaSpatialCharts(data.vla_observation_preview||{},data.stage_spans||[]);
+  drawSpatialSeriesCharts(s,data.stage_spans||[]);
   drawVectorChart("qChart","Joint angles",s.t,s.q_deg,data.stage_spans,"deg");
   drawVectorChart("dqChart","Joint velocity",s.t,s.dq_deg_s,data.stage_spans,"deg/s");
   drawVectorChart("ddqChart","Joint acceleration",s.t,s.ddq_deg_s2,data.stage_spans,"deg/s²");
@@ -7958,17 +8006,17 @@ function drawLineChart(targetId,title,xs,lines,spans,unit){
   bindTimelineSvgInteractions(target);
 }
 function drawVectorChart(targetId,title,xs,vectors,spans,unit){drawLineChart(targetId,title,xs,jointNames.map((name,j)=>({name,values:(vectors||[]).map(row=>Array.isArray(row)?row[j]:null)})),spans,unit)}
-function drawVlaSpatialChart(targetId,title,preview,fieldNames,seriesNames,spans){
-  const names=Array.isArray(preview.names)?preview.names:[], rows=Array.isArray(preview.rows)?preview.rows:[];
-  const indices=fieldNames.map(name=>names.indexOf(name));
-  if(!rows.length||indices.some(index=>index<0)){const target=$(targetId); if(target) target.innerHTML='<div class="empty">Spatial XYZ unavailable.</div>'; return}
-  const xs=rows.map(row=>Number(row.t));
-  const lines=indices.map((valueIndex,index)=>({name:seriesNames[index],values:rows.map(row=>row.valid===true&&Array.isArray(row.values)?row.values[valueIndex]:null)}));
+function drawSpatialSeriesChart(targetId,title,xs,vectors,seriesNames,spans){
+  const rows=Array.isArray(vectors)?vectors:[];
+  const hasData=rows.some(row=>Array.isArray(row)&&row.slice(0,3).some(value=>finite(Number(value))));
+  if(!Array.isArray(xs)||!xs.length||!hasData){const target=$(targetId); if(target) target.innerHTML='<div class="empty">Spatial XYZ unavailable in this trajectory.</div>'; return}
+  const lines=seriesNames.map((name,index)=>({name,values:rows.map(row=>Array.isArray(row)&&finite(Number(row[index]))?Number(row[index]):null)}));
   drawLineChart(targetId,title,xs,lines,spans,"m");
 }
-function drawVlaSpatialCharts(preview,spans){
-  drawVlaSpatialChart("bucketTipXyzChart","Bucket tip XYZ · world",preview,["bucket_tip_x","bucket_tip_y","bucket_tip_z"],["X","Y","Z"],spans);
-  drawVlaSpatialChart("bucketLoadXyzChart","Bucket load point XYZ · world",preview,["bucket_load_x","bucket_load_y","bucket_load_z"],["X","Y","Z"],spans);
+function drawSpatialSeriesCharts(series,spans){
+  const s=series||{};
+  drawSpatialSeriesChart("bucketTipXyzChart","Bucket tip XYZ · world",s.t,s.bucket_tip_xyz,["X","Y","Z"],spans);
+  drawSpatialSeriesChart("bucketLoadXyzChart","Bucket load point XYZ · world",s.t,s.bucket_load_xyz,["X","Y","Z"],spans);
 }
 
 function cleanPolygon(poly){if(!Array.isArray(poly))return[]; const out=[]; for(const pt of poly){if(Array.isArray(pt)&&finite(Number(pt[0]))&&finite(Number(pt[1]))) out.push([Number(pt[0]),Number(pt[1])])} return out}

@@ -6,6 +6,21 @@ import run_dataset_dashboard_v10 as dashboard
 
 
 class DashboardParallelLauncherTests(unittest.TestCase):
+    def test_activity_summary_separates_worker_cost_from_parallel_output(self):
+        runs = [
+            {
+                "activity": {"active": True, "state": "active"},
+                "success": 2,
+                "run_wall_s": 282.0,
+            }
+            for _ in range(4)
+        ]
+        summary = dashboard.summarize_run_activity(runs)
+        self.assertEqual(summary["active_count"], 4)
+        self.assertEqual(summary["parallel_rate_worker_count"], 4)
+        self.assertAlmostEqual(summary["worker_seconds_per_success"], 141.0)
+        self.assertAlmostEqual(summary["parallel_seconds_per_success"], 35.25)
+
     def test_normalize_parallel_collect_config(self):
         config = dashboard.normalize_parallel_collect_config(
             {

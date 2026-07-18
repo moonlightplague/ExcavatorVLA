@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 import excavator_dataset_tools
-from excavator_common import bridge_protocol, geometry, paths, vla_observation_contract
+from excavator_common import bridge_protocol, geometry, paths, planning, scene_randomization, vla_observation_contract
 
 try:
     import numpy as np
@@ -79,6 +79,71 @@ class GeometryTests(unittest.TestCase):
         self.assertAlmostEqual(cy, 0.5)
         self.assertTrue(geometry.point_in_polygon_xy(0.5, 0.5, hull))
         self.assertFalse(geometry.point_in_polygon_xy(2.0, 2.0, hull))
+
+
+class PlanningTests(unittest.TestCase):
+    def test_prunes_redundant_clearance_waypoint(self):
+        valid_routes = {("high",)}
+        route, report = planning.greedy_prune_waypoints(
+            ["tuck", "high"],
+            lambda candidate: tuple(candidate) in valid_routes,
+            minimum_count=1,
+        )
+        self.assertEqual(route, ["high"])
+        self.assertEqual(report["removed_count"], 1)
+
+    def test_keeps_both_required_clearance_waypoints(self):
+        route, report = planning.greedy_prune_waypoints(
+            ["tuck", "swing"],
+            lambda _candidate: False,
+            minimum_count=1,
+        )
+        self.assertEqual(route, ["tuck", "swing"])
+        self.assertEqual(report["removed_count"], 0)
+
+    def test_route_efficiency_prefers_faster_coordinated_motion(self):
+        staged = planning.route_efficiency_score(4.2, 190.0, 2)
+        coordinated = planning.route_efficiency_score(2.8, 205.0, 1)
+        self.assertLess(coordinated, staged)
+
+    def test_route_efficiency_uses_angle_and_stops_as_secondary_costs(self):
+        shorter = planning.route_efficiency_score(3.0, 120.0, 1)
+        longer = planning.route_efficiency_score(3.0, 180.0, 2)
+        self.assertLess(shorter, longer)
+
+
+class SceneRandomizationTests(unittest.TestCase):
+    def test_area_uniform_radius_is_uniform_in_squared_radius(self):
+        radius_range = (5.0, 9.0)
+        self.assertAlmostEqual(
+            scene_randomization.area_uniform_radius(0.0, radius_range),
+            5.0,
+        )
+        midpoint = scene_randomization.area_uniform_radius(0.5, radius_range)
+        self.assertAlmostEqual(midpoint * midpoint, 0.5 * (5.0**2 + 9.0**2))
+        self.assertAlmostEqual(
+            scene_randomization.area_uniform_radius(1.0, radius_range),
+            9.0,
+        )
+
+    def test_scene_seed_varies_by_run_worker_and_attempt(self):
+        seed = scene_randomization.stable_scene_seed("run-a", 1, worker_identity="worker-0")
+        self.assertEqual(
+            seed,
+            scene_randomization.stable_scene_seed("run-a", 1, worker_identity="worker-0"),
+        )
+        self.assertNotEqual(
+            seed,
+            scene_randomization.stable_scene_seed("run-b", 1, worker_identity="worker-0"),
+        )
+        self.assertNotEqual(
+            seed,
+            scene_randomization.stable_scene_seed("run-a", 1, worker_identity="worker-1"),
+        )
+        self.assertNotEqual(
+            seed,
+            scene_randomization.stable_scene_seed("run-a", 2, worker_identity="worker-0"),
+        )
 
 
 class VLAObservationContractTests(unittest.TestCase):

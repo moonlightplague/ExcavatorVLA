@@ -2437,14 +2437,33 @@ def summarize_run_activity(runs: Sequence[dict]) -> Dict[str, object]:
     active = [run for run in runs if isinstance(run.get("activity"), dict) and run["activity"].get("active")]
     recent = [run for run in runs if isinstance(run.get("activity"), dict) and run["activity"].get("state") == "recent"]
     active_successes = sum(max(0, int(run.get("success", 0) or 0)) for run in active)
-    active_worker_wall_s = sum(
-        max(0.0, float(run.get("run_wall_s", 0.0) or 0.0))
+    throughput_runs = [
+        run
         for run in active
         if int(run.get("success", 0) or 0) > 0
+        and float(run.get("run_wall_s", 0.0) or 0.0) > 0.0
+    ]
+    active_worker_wall_s = sum(
+        max(0.0, float(run.get("run_wall_s", 0.0) or 0.0))
+        for run in throughput_runs
     )
-    success_seconds_per_attempt = (
-        float(active_worker_wall_s) / float(active_successes)
-        if active_successes > 0 and active_worker_wall_s > 0.0
+    throughput_successes = sum(
+        max(0, int(run.get("success", 0) or 0))
+        for run in throughput_runs
+    )
+    worker_seconds_per_success = (
+        float(active_worker_wall_s) / float(throughput_successes)
+        if throughput_successes > 0 and active_worker_wall_s > 0.0
+        else None
+    )
+    aggregate_success_rate = sum(
+        float(max(0, int(run.get("success", 0) or 0)))
+        / float(run.get("run_wall_s", 0.0) or 0.0)
+        for run in throughput_runs
+    )
+    parallel_seconds_per_success = (
+        1.0 / float(aggregate_success_rate)
+        if aggregate_success_rate > 0.0
         else None
     )
     return {
@@ -2455,8 +2474,12 @@ def summarize_run_activity(runs: Sequence[dict]) -> Dict[str, object]:
         "recent_window_s": RUN_ACTIVITY_RECENT_SECONDS,
         "active_successes": int(active_successes),
         "active_worker_wall_s": float(active_worker_wall_s),
-        "success_seconds_per_attempt": success_seconds_per_attempt,
-        "success_speed_source": "active_run_total_wall_divided_by_successes",
+        "worker_seconds_per_success": worker_seconds_per_success,
+        "parallel_seconds_per_success": parallel_seconds_per_success,
+        "parallel_rate_worker_count": len(throughput_runs),
+        # Compatibility alias for older dashboard clients.
+        "success_seconds_per_attempt": worker_seconds_per_success,
+        "success_speed_source": "sum_active_worker_success_rates",
         "active_runs": [
             {
                 "name": run.get("name"),
@@ -2467,6 +2490,7 @@ def summarize_run_activity(runs: Sequence[dict]) -> Dict[str, object]:
                 "success": run.get("success"),
                 "trainable": run.get("trainable"),
                 "run_wall_s": run.get("run_wall_s"),
+                "worker_seconds_per_success": run.get("success_seconds_per_attempt"),
                 "success_seconds_per_attempt": run.get("success_seconds_per_attempt"),
                 "size_human": run.get("size_human"),
             }
@@ -7171,12 +7195,17 @@ function renderRunMonitor(data){
   const recentCount=Number(summary.recent_count || 0);
   const idleCount=Number(summary.idle_count || 0);
   const windowS=Number(summary.active_window_s || 180);
-  const successSeconds=Number(summary.success_seconds_per_attempt);
-  const successSpeed=Number.isFinite(successSeconds) && successSeconds>0
-    ? `${successSeconds<100?successSeconds.toFixed(1):Math.round(successSeconds)} s/attempt`
+  const workerSeconds=Number(summary.worker_seconds_per_success ?? summary.success_seconds_per_attempt);
+  const parallelSeconds=Number(summary.parallel_seconds_per_success);
+  const rateWorkers=Number(summary.parallel_rate_worker_count || 0);
+  const workerSpeed=Number.isFinite(workerSeconds) && workerSeconds>0
+    ? `${workerSeconds<100?workerSeconds.toFixed(1):Math.round(workerSeconds)} s/success`
     : "collecting...";
-  const title=`<span class="runMonitorTitle"><span class="activityDot ${activeCount?"active":"idle"}"></span> Active writers: ${activeCount} · Data success ≈ ${esc(successSpeed)}</span>`;
-  const subtitle=`<span class="muted">green = updated within ${ageText(windowS)}; recent=${recentCount}; idle=${idleCount}</span>`;
+  const parallelSpeed=Number.isFinite(parallelSeconds) && parallelSeconds>0
+    ? `${parallelSeconds<100?parallelSeconds.toFixed(1):Math.round(parallelSeconds)} s/success`
+    : "collecting...";
+  const title=`<span class="runMonitorTitle"><span class="activityDot ${activeCount?"active":"idle"}"></span> Active writers: ${activeCount} · Worker cost ≈ ${esc(workerSpeed)} · Parallel output ≈ ${esc(parallelSpeed)}</span>`;
+  const subtitle=`<span class="muted">parallel estimate uses ${rateWorkers} writer${rateWorkers===1?"":"s"} with completed successes; green = updated within ${ageText(windowS)}; recent=${recentCount}; idle=${idleCount}</span>`;
   const badges=activeRuns.map(run=>{
     const latest=run.latest_file ? ` · ${shortText(run.latest_file,42)}` : "";
     return `<button type="button" class="runBadge active" data-action="choose-run" data-run-path="${esc(run.path||"")}" title="${esc(run.path||"")}"><span class="activityDot active"></span>${esc(run.name||"")} <span class="muted">${esc(ageText(run.age_s))} · attempts=${esc(run.attempts ?? "-")} success=${esc(run.success ?? 0)} trainable=${esc(run.trainable ?? "-")} size=${esc(run.size_human||"-")}${esc(latest)}</span></button>`;

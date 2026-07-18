@@ -43,6 +43,8 @@ from isaacsim.core.api.world import World
 from isaacsim.core.prims import SingleArticulation
 from isaacsim.core.utils.types import ArticulationAction
 
+from excavator_common import planning as common_planning
+from excavator_common import scene_randomization
 from excavator_common import vla_observation_contract
 
 from . import auto_dataset_collect
@@ -780,6 +782,10 @@ AUTO_SCENE_RANDOM_ROBOT_YAW_DEFAULT = env_bool("EXCAVATOR_RANDOM_ROBOT_YAW", Tru
 AUTO_SCENE_RANDOM_SAND_XY_DEFAULT = env_bool("EXCAVATOR_RANDOM_SAND_XY", True)
 AUTO_SCENE_RANDOM_SAND_AMOUNT_DEFAULT = env_bool("EXCAVATOR_RANDOM_SAND_AMOUNT", True)
 AUTO_SCENE_RANDOM_MAX_TRIES = 96
+AUTO_SCENE_RANDOM_BASE_SEED = env_int("EXCAVATOR_AUTO_SCENE_BASE_SEED", 410700)
+AUTO_SCENE_RANDOM_SEED_NAMESPACE = str(
+    os.environ.get("EXCAVATOR_AUTO_SCENE_SEED_NAMESPACE", "") or ""
+).strip()
 AUTO_SCENE_TRUCK_ROOT_PATH = "/World/truck"
 AUTO_SCENE_TRUCK_RANDOM_DX_RANGE = (-1.20, 1.20)
 AUTO_SCENE_TRUCK_RANDOM_DY_RANGE = (-1.20, 1.20)
@@ -6532,6 +6538,30 @@ def stage_constraint_summary(row):
     return out
 
 
+def compact_path_obstacle_report(report):
+    if not isinstance(report, dict):
+        return {}
+    out = {
+        "obstacle": str(report.get("obstacle", "")),
+        "source": str(report.get("obstacle_source", "")),
+        "proxy": str(report.get("obstacle_proxy", "")),
+        "link": str(report.get("link_name", "")),
+        "footprint_faces": int(report.get("obstacle_footprint_faces", 0) or 0),
+        "footprint_source_vertices": int(report.get("obstacle_footprint_source_vertices", 0) or 0),
+    }
+    for source_key, target_key in (
+        ("point", "point"),
+        ("bbox_min", "bbox_min"),
+        ("bbox_max", "bbox_max"),
+    ):
+        if report.get(source_key) is not None:
+            out[target_key] = vec_list(report.get(source_key), 3)
+    segment = report.get("segment")
+    if isinstance(segment, (list, tuple)) and len(segment) >= 2:
+        out["segment"] = [vec_list(segment[0], 3), vec_list(segment[1], 3)]
+    return out
+
+
 def compact_plan_stage(row):
     if not isinstance(row, dict):
         return {}
@@ -6574,6 +6604,11 @@ def compact_plan_stage(row):
                 "route_waypoints": int(path.get("route_waypoints", 0) or 0),
                 "route_reason": str(path.get("route_reason", "")),
             }
+            if path.get("direct_obstacle_sample") is not None:
+                out["path"]["direct_obstacle_sample"] = int(path.get("direct_obstacle_sample"))
+            direct_report = compact_path_obstacle_report(path.get("direct_obstacle_report"))
+            if direct_report:
+                out["path"]["direct_obstacle_report"] = direct_report
     constraints = stage_constraint_summary(row)
     if constraints:
         out["constraint_summary"] = constraints
@@ -7761,6 +7796,11 @@ def planner_config_snapshot():
         "path_rrt_smooth_alpha": PATH_RRT_SMOOTH_ALPHA,
         "path_rrt_smooth_bend_weight": PATH_RRT_SMOOTH_BEND_WEIGHT,
         "path_rrt_smooth_min_improvement": PATH_RRT_SMOOTH_MIN_IMPROVEMENT,
+        "path_route_angle_seconds_per_degree": PATH_ROUTE_ANGLE_SECONDS_PER_DEG,
+        "path_route_waypoint_stop_penalty_s": PATH_ROUTE_WAYPOINT_STOP_PENALTY_S,
+        "pre_dig_route_candidate_limit": PRE_DIG_ROUTE_CANDIDATE_LIMIT,
+        "pre_dig_route_arc_swing_fractions": list(PRE_DIG_ROUTE_ARC_SWING_FRACTIONS),
+        "pre_dig_route_rrt_time_ratio_trigger": PRE_DIG_ROUTE_RRT_TIME_RATIO_TRIGGER,
         "path_link_collision_segment_samples": PATH_LINK_COLLISION_SEGMENT_SAMPLES,
         "path_link_collision_radius_m": PATH_LINK_COLLISION_RADIUS_M,
         "collision_world_policy": "rigid_hard_avoid__sand_soft_contact",
@@ -7816,6 +7856,9 @@ def auto_dataset_config_snapshot():
         "sand_reset_policy": AUTO_COLLECT_SAND_RESET_POLICY,
         "preflight_min_particles": AUTO_PREFLIGHT_MIN_PARTICLES,
         "scene_randomization": {
+            "sampling_schema": "area_uniform_polar_v2",
+            "base_seed": int(AUTO_SCENE_RANDOM_BASE_SEED),
+            "seed_namespace_override": str(AUTO_SCENE_RANDOM_SEED_NAMESPACE),
             "random_truck": bool(STATE.get("auto_scene_random_truck_enabled", AUTO_SCENE_RANDOM_TRUCK_DEFAULT)),
             "random_truck_yaw": bool(STATE.get("auto_scene_random_truck_yaw_enabled", AUTO_SCENE_RANDOM_TRUCK_YAW_DEFAULT)),
             "random_robot_yaw": bool(STATE.get("auto_scene_random_robot_yaw_enabled", AUTO_SCENE_RANDOM_ROBOT_YAW_DEFAULT)),
@@ -15649,11 +15692,41 @@ def auto_scene_xy_angle_deg(xy):
 def auto_scene_sample_polar_xy(rng, radius_range, angle_deg_range):
     r0, r1 = float(radius_range[0]), float(radius_range[1])
     a0, a1 = float(angle_deg_range[0]), float(angle_deg_range[1])
-    radius = float(rng.uniform(min(r0, r1), max(r0, r1)))
+    radius = scene_randomization.area_uniform_radius(
+        float(rng.random()),
+        (r0, r1),
+    )
     angle_deg = float(rng.uniform(min(a0, a1), max(a0, a1)))
     angle = math.radians(angle_deg)
     xy = np.array([radius * math.cos(angle), radius * math.sin(angle)], dtype=np.float32)
     return xy, radius, angle_deg
+
+
+def auto_scene_seed_context(attempt_index):
+    run_id = str(STATE.get("auto_collect_run_id", "") or "").strip()
+    run_suffix = str(os.environ.get("EXCAVATOR_AUTO_RUN_ID_SUFFIX", "") or "").strip()
+    if AUTO_SCENE_RANDOM_SEED_NAMESPACE:
+        namespace = AUTO_SCENE_RANDOM_SEED_NAMESPACE
+        source = "env_namespace"
+    elif run_id:
+        namespace = run_id
+        source = "auto_collect_run_id"
+    else:
+        namespace = f"process-{os.getpid()}"
+        source = "process_fallback"
+    seed = scene_randomization.stable_scene_seed(
+        namespace,
+        int(attempt_index),
+        base_seed=AUTO_SCENE_RANDOM_BASE_SEED,
+        worker_identity=run_suffix,
+    )
+    return {
+        "scene_seed": int(seed),
+        "scene_seed_namespace": str(namespace),
+        "scene_seed_source": str(source),
+        "scene_seed_worker": str(run_suffix),
+        "scene_sampling_schema": "area_uniform_polar_v2",
+    }
 
 
 def auto_scene_unload_radius_window(random_truck=None, soft_margin=0.0):
@@ -16524,6 +16597,11 @@ def auto_scene_attempt_record(candidate=None, ok=False, reason="", cfg=None):
             "sand_radius_m": candidate.get("sand_radius_m"),
             "sand_angle_deg": candidate.get("sand_angle_deg"),
             "sand_amount_multiplier": candidate.get("sand_amount_multiplier"),
+            "scene_seed": candidate.get("scene_seed"),
+            "scene_seed_namespace": candidate.get("scene_seed_namespace"),
+            "scene_seed_source": candidate.get("scene_seed_source"),
+            "scene_seed_worker": candidate.get("scene_seed_worker"),
+            "scene_sampling_schema": candidate.get("scene_sampling_schema"),
             "truck_delta_xy": vec_list(candidate.get("truck_delta_xy"), 2),
             "applied_truck_delta_xy": vec_list(candidate.get("applied_truck_delta_xy"), 2),
             "truck_center_xy": vec_list(candidate.get("truck_center_xy"), 2) if candidate.get("truck_center_xy") is not None else None,
@@ -16563,15 +16641,17 @@ def auto_scene_sample_candidate(attempt_index):
     cfg = auto_scene_randomization_config()
     ctx = task_scene_context()
     workspace = auto_scene_random_workspace_bounds()
+    seed_context = auto_scene_seed_context(attempt_index)
     if not bool(workspace.get("valid", True)):
         return {
             "error": str(workspace.get("reason", "dynamic_reach_workspace_empty")),
             "attempt": int(attempt_index),
             "workspace": workspace,
+            **seed_context,
         }
     base_sand_xy = np.array(ctx.get("pile_center", [0.0, 6.7, 0.0]), dtype=np.float32).reshape(-1)[:2]
     base_unload_xy = np.array(ctx.get("unload_bin_center", [-10.0, -5.0, 0.0]), dtype=np.float32).reshape(-1)[:2]
-    rng = np.random.default_rng(410700 + int(max(1, attempt_index)) * 7919)
+    rng = np.random.default_rng(int(seed_context["scene_seed"]))
     truck_base = auto_scene_truck_baseline() if (cfg["random_truck"] or cfg["random_truck_yaw"]) else None
     last_reason = "not_sampled"
     for _try_index in range(max(1, int(AUTO_SCENE_RANDOM_MAX_TRIES))):
@@ -16651,6 +16731,7 @@ def auto_scene_sample_candidate(attempt_index):
         amount_for_estimate = amount if amount is not None else 1.0
         candidate = {
             "attempt": int(attempt_index),
+            **seed_context,
             "random_truck": bool(cfg["random_truck"]),
             "random_truck_yaw": bool(cfg["random_truck_yaw"]),
             "random_robot_yaw": bool(cfg["random_robot_yaw"]),
@@ -16679,7 +16760,11 @@ def auto_scene_sample_candidate(attempt_index):
             candidate["legal_reason"] = reason
             return candidate
         last_reason = reason
-    return {"error": last_reason, "attempt": int(attempt_index)}
+    return {
+        "error": last_reason,
+        "attempt": int(attempt_index),
+        **seed_context,
+    }
 
 
 def auto_scene_apply_candidate(candidate):
@@ -22732,6 +22817,23 @@ PATH_LINK_COLLISION_RADIUS_M = max(
     0.0,
     float(os.environ.get("EXCAVATOR_PATH_LINK_COLLISION_RADIUS_M", "0.06") or 0.06),
 )
+PATH_ROUTE_ANGLE_SECONDS_PER_DEG = max(
+    0.0,
+    env_float("EXCAVATOR_PATH_ROUTE_ANGLE_SECONDS_PER_DEG", 0.0025),
+)
+PATH_ROUTE_WAYPOINT_STOP_PENALTY_S = max(
+    0.0,
+    env_float("EXCAVATOR_PATH_ROUTE_WAYPOINT_STOP_PENALTY_S", 0.12),
+)
+PRE_DIG_ROUTE_CANDIDATE_LIMIT = max(
+    4,
+    env_int("EXCAVATOR_PRE_DIG_ROUTE_CANDIDATE_LIMIT", 8),
+)
+PRE_DIG_ROUTE_ARC_SWING_FRACTIONS = (0.50, 0.35, 0.65)
+PRE_DIG_ROUTE_RRT_TIME_RATIO_TRIGGER = max(
+    1.0,
+    env_float("EXCAVATOR_PRE_DIG_ROUTE_RRT_TIME_RATIO_TRIGGER", 1.25),
+)
 LOADED_ROUTE_TEST_PLAN_BUDGET_SECONDS = 30.0
 LOADED_ROUTE_MIN_STAGE_SECONDS = 1.80
 LOADED_ROUTE_FINAL_STAGE_SECONDS = 2.20
@@ -26854,19 +26956,62 @@ def route_segments_ok(q_start, route, q_goal, mode, samples=None, deadline=None)
     return True, "ok"
 
 
+def minimize_valid_clearance_waypoints(q_start, route, q_goal, mode, samples=None, deadline=None):
+    route = [np.array(q, dtype=np.float32).copy() for q in route or []]
+    if len(route) <= 1 or len(route) > 3:
+        return route, {
+            "original_count": len(route),
+            "final_count": len(route),
+            "removed_count": 0,
+            "validation_checks": 0,
+        }
+
+    def route_is_valid(candidate):
+        if planning_deadline_exceeded(deadline):
+            return False
+        ok, _reason = route_segments_ok(
+            q_start,
+            candidate,
+            q_goal,
+            mode,
+            samples=samples,
+            deadline=deadline,
+        )
+        return bool(ok)
+
+    # The caller already established that the direct route is blocked. Keep at
+    # least one waypoint and only remove points that pass the same full validator.
+    pruned, report = common_planning.greedy_prune_waypoints(
+        route,
+        route_is_valid,
+        minimum_count=1,
+    )
+    return [np.array(q, dtype=np.float32).copy() for q in pruned], report
+
+
 def clearance_route_cost(q_start, route, q_goal, duration=0.0, clearance_z=0.0, side_offset=0.0):
     q_prev = np.array(q_start, dtype=np.float32).copy()
     total = 0.0
     total_angle = 0.0
+    minimum_time = 0.0
     for q_next in list(route) + [q_goal]:
         motion = plan_joint_motion_metrics(q_next, q_prev, duration=duration)
+        minimum_motion = plan_joint_motion_metrics(q_next, q_prev, duration=0.0)
         total += float(motion.get("cost", 0.0))
         total_angle += float(motion.get("weighted_angle", 0.0))
+        minimum_time += float(minimum_motion.get("estimated_time", 0.0))
         q_prev = np.array(q_next, dtype=np.float32).copy()
     total += 0.16 * max(0.0, float(clearance_z) - GROUND_TOP_Z)
     total += 0.08 * abs(float(side_offset))
     total += 1.8 * max(0, len(route) - 1)
-    return float(total), float(total_angle)
+    efficiency_score = common_planning.route_efficiency_score(
+        minimum_time,
+        total_angle,
+        len(route),
+        angle_seconds_per_degree=PATH_ROUTE_ANGLE_SECONDS_PER_DEG,
+        waypoint_stop_penalty_s=PATH_ROUTE_WAYPOINT_STOP_PENALTY_S,
+    )
+    return float(total), float(total_angle), float(minimum_time), float(efficiency_score)
 
 
 def q_with_joint_degrees(reference_q, joint_degrees, swing_value=None):
@@ -27099,7 +27244,21 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
         if not ok_route:
             last_reason = route_reason
             return
-        cost, weighted_angle = clearance_route_cost(
+        if pre_dig_route:
+            route, prune_report = minimize_valid_clearance_waypoints(
+                q_start,
+                route,
+                q_goal,
+                mode,
+                samples=sample_count,
+                deadline=deadline,
+            )
+            if int(prune_report.get("removed_count", 0) or 0) > 0:
+                detail = (
+                    f"{detail} waypoint_prune="
+                    f"{int(prune_report['original_count'])}->{int(prune_report['final_count'])}"
+                )
+        cost, weighted_angle, estimated_time, efficiency_score = clearance_route_cost(
             q_start,
             route,
             q_goal,
@@ -27117,6 +27276,8 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
             "z": float(clearance_z),
             "cost": float(cost),
             "weighted_angle": float(weighted_angle),
+            "estimated_time": float(estimated_time),
+            "efficiency_score": float(efficiency_score),
             "detail": str(detail),
             "side_offset": float(side_offset),
         })
@@ -27124,7 +27285,25 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
     def choose_best_candidate():
         if not candidates:
             return None
-        return sorted(candidates, key=lambda row: (float(row["cost"]), float(row["weighted_angle"]), len(row["route"])))[0]
+        if not pre_dig_route:
+            return sorted(
+                candidates,
+                key=lambda row: (
+                    float(row["cost"]),
+                    float(row["weighted_angle"]),
+                    len(row["route"]),
+                ),
+            )[0]
+        return sorted(
+            candidates,
+            key=lambda row: (
+                float(row.get("efficiency_score", 1.0e9)),
+                float(row.get("estimated_time", 1.0e9)),
+                float(row["weighted_angle"]),
+                len(row["route"]),
+                float(row["cost"]),
+            ),
+        )[0]
 
     def try_joint_rrt_route():
         nonlocal last_reason
@@ -27201,7 +27380,7 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
         if deadline is None:
             candidate_limit = 999999
         elif pre_dig_route:
-            candidate_limit = 4
+            candidate_limit = int(PRE_DIG_ROUTE_CANDIDATE_LIMIT)
         else:
             candidate_limit = 8
 
@@ -27223,6 +27402,66 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
             (PATH_DETERMINISTIC_APPROACH_LIFTS_DEG[3], PATH_DETERMINISTIC_APPROACH_ARM_DELTAS_DEG[2]),
             (PATH_DETERMINISTIC_APPROACH_LIFTS_DEG[1], PATH_DETERMINISTIC_APPROACH_ARM_DELTAS_DEG[3]),
         ]
+        if pre_dig_route:
+            pose_rows = []
+            for pose_idx, pose in enumerate(PATH_DETERMINISTIC_ROUTE_POSES_DEG):
+                q_clear_start = q_with_joint_degrees(q_start_arr, pose)
+                q_clear_goal = q_with_swing_near(q_clear_start, goal_swing)
+                q_clear_start = clip_command_near(q_clear_start, reference=q_start_arr)
+                q_clear_goal = clip_command_near(q_clear_goal, reference=q_clear_start)
+                heuristic = (
+                    float(plan_joint_motion_metrics(q_clear_start, q_start_arr, duration=0.0).get("estimated_time", 0.0))
+                    + float(plan_joint_motion_metrics(q_goal_arr, q_clear_goal, duration=0.0).get("estimated_time", 0.0))
+                )
+                pose_rows.append((heuristic, pose_idx, q_clear_start, q_clear_goal))
+            pose_rows.sort(key=lambda row: (float(row[0]), int(row[1])))
+
+            total_swing = float(swing_delta(goal_swing, q_start_arr[swing_idx]))
+            primary_fraction = float(PRE_DIG_ROUTE_ARC_SWING_FRACTIONS[0])
+            for _heuristic, pose_idx, q_clear_start, q_clear_goal in pose_rows:
+                if budget_expired() or len(candidates) >= candidate_limit:
+                    break
+                q_arc = q_clear_start.copy()
+                q_arc[swing_idx] = float(q_start_arr[swing_idx]) + primary_fraction * total_swing
+                q_arc = clip_command_near(q_arc, reference=q_start_arr)
+                add_route(
+                    [q_arc],
+                    "joint_blended_arc",
+                    base_clearance_z,
+                    detail=f"pose={pose_idx} swing_fraction={primary_fraction:.2f} coordinated",
+                )
+                tried += 1
+                if budget_expired() or len(candidates) >= candidate_limit:
+                    break
+                add_route(
+                    [q_clear_start, q_clear_goal],
+                    "joint_tuck_swing",
+                    base_clearance_z,
+                    detail=f"pose={pose_idx} staged_safe_fallback",
+                )
+                tried += 1
+
+            for swing_fraction in PRE_DIG_ROUTE_ARC_SWING_FRACTIONS[1:]:
+                for _heuristic, pose_idx, q_clear_start, _q_clear_goal in pose_rows:
+                    if budget_expired() or len(candidates) >= candidate_limit:
+                        break
+                    q_arc = q_clear_start.copy()
+                    q_arc[swing_idx] = float(q_start_arr[swing_idx]) + float(swing_fraction) * total_swing
+                    q_arc = clip_command_near(q_arc, reference=q_start_arr)
+                    add_route(
+                        [q_arc],
+                        "joint_blended_arc",
+                        base_clearance_z,
+                        detail=f"pose={pose_idx} swing_fraction={float(swing_fraction):.2f} coordinated",
+                    )
+                    tried += 1
+                if budget_expired() or len(candidates) >= candidate_limit:
+                    break
+
+            if not candidates and tried > 0:
+                last_reason = f"pre_dig coordinated clearance tried={tried} last={last_reason}"
+            return
+
         for pose_idx, pose in enumerate(PATH_DETERMINISTIC_ROUTE_POSES_DEG):
             if budget_expired():
                 break
@@ -27238,8 +27477,6 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
                 detail=f"pose={pose_idx} direct_swing_clearance",
             )
             tried += 1
-            if pre_dig_route and candidates:
-                return
             if len(candidates) >= candidate_limit:
                 return
 
@@ -27263,8 +27500,6 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
                     side_offset=float(detour_deg) / 45.0,
                 )
                 tried += 1
-                if pre_dig_route and candidates:
-                    return
                 if len(candidates) >= candidate_limit:
                     return
 
@@ -27288,8 +27523,6 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
                     ),
                 )
                 tried += 1
-                if pre_dig_route and candidates:
-                    return
                 if len(candidates) >= candidate_limit:
                     return
 
@@ -27307,10 +27540,24 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
 
     add_deterministic_joint_routes()
     best = choose_best_candidate()
+    if pre_dig_route and best is not None and deadline is not None and not budget_expired():
+        direct_min_time = float(
+            plan_joint_motion_metrics(q_goal, q_start, duration=0.0).get("estimated_time", 0.0)
+        )
+        route_time = float(best.get("estimated_time", 0.0) or 0.0)
+        remaining = max(0.0, float(deadline) - time.time())
+        if (
+            direct_min_time > 1.0e-4
+            and route_time > direct_min_time * float(PRE_DIG_ROUTE_RRT_TIME_RATIO_TRIGGER)
+            and remaining >= 0.18
+        ):
+            try_joint_rrt_route()
+            best = choose_best_candidate()
     if best is not None:
         info_print(
             f"[PATH ROUTE SELECTED] {label}: end={end_effector} type={best['type']} "
             f"z={best['z']:.2f} cost={best['cost']:.2f} weighted_angle={best['weighted_angle']:.2f} "
+            f"estimated_time={best['estimated_time']:.2f}s efficiency={best['efficiency_score']:.3f} "
             f"waypoints={len(best['route'])} {best['detail']}"
         )
         return best["route"], str(best["type"])
@@ -27437,6 +27684,7 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
             info_print(
                 f"[PATH ROUTE SELECTED] {label}: end={end_effector} type={best['type']} "
                 f"z={best['z']:.2f} cost={best['cost']:.2f} weighted_angle={best['weighted_angle']:.2f} "
+                f"estimated_time={best['estimated_time']:.2f}s efficiency={best['efficiency_score']:.3f} "
                 f"waypoints={len(best['route'])} {best['detail']}"
             )
             return best["route"], str(best["type"])
@@ -27521,6 +27769,7 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
         info_print(
             f"[PATH ROUTE SELECTED] {label}: end={end_effector} type={best['type']} "
             f"z={best['z']:.2f} cost={best['cost']:.2f} weighted_angle={best['weighted_angle']:.2f} "
+            f"estimated_time={best['estimated_time']:.2f}s efficiency={best['efficiency_score']:.3f} "
             f"waypoints={len(best['route'])} {best['detail']}"
         )
         return best["route"], str(best["type"])
@@ -27531,6 +27780,7 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
         info_print(
             f"[PATH ROUTE SELECTED] {label}: end={end_effector} type={best['type']} "
             f"z={best['z']:.2f} cost={best['cost']:.2f} weighted_angle={best['weighted_angle']:.2f} "
+            f"estimated_time={best['estimated_time']:.2f}s efficiency={best['efficiency_score']:.3f} "
             f"waypoints={len(best['route'])} {best['detail']}"
         )
         return best["route"], str(best["type"])
@@ -28088,6 +28338,8 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                 "direct_phase_reason": str(direct_phase_reason),
                 "direct_obstacle_ok": bool(direct_obstacle_ok),
                 "direct_obstacle_reason": str(direct_obstacle_reason),
+                "direct_obstacle_sample": int(direct_obstacle_sample),
+                "direct_obstacle_report": compact_path_obstacle_report(direct_obstacle_report),
             }
         elif (
             not route_required
@@ -28118,6 +28370,8 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
             path_detail["direct_phase_reason"] = str(direct_phase_reason)
             path_detail["direct_obstacle_ok"] = bool(direct_obstacle_ok)
             path_detail["direct_obstacle_reason"] = str(direct_obstacle_reason)
+            path_detail["direct_obstacle_sample"] = int(direct_obstacle_sample)
+            path_detail["direct_obstacle_report"] = compact_path_obstacle_report(direct_obstacle_report)
         if not bool(path_detail.get("obstacle_ok", True)):
             return None, f"{label}: final segment still hits rigid obstacle: {path_detail.get('obstacle_reason')}"
         if strict_path_precheck_phase(label) and not bool(path_detail.get("phase_ok", True)):
@@ -28363,6 +28617,8 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                     path_detail["direct_phase_reason"] = str(direct_phase_reason)
                     path_detail["direct_obstacle_ok"] = bool(direct_obstacle_ok)
                     path_detail["direct_obstacle_reason"] = str(direct_obstacle_reason)
+                    path_detail["direct_obstacle_sample"] = int(direct_obstacle_sample)
+                    path_detail["direct_obstacle_report"] = compact_path_obstacle_report(direct_obstacle_report)
                 xy_err = float(drop.get("xy_err", 1.0) or 1.0)
                 overflow_xy = float(drop.get("bin_overflow_xy", xy_err) or 0.0)
                 effective_xy_err = overflow_xy if unload_drop_execution_ready(drop) else xy_err

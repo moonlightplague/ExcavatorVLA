@@ -5,7 +5,7 @@ set -o pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
 ISAAC_PYTHON="${ISAAC_PYTHON:-/isaac-sim/python.sh}"
-DATASET_BASE="${DATASET_BASE:-${PROJECT_ROOT}/excavator_auto_dataset_parallel}"
+DATASET_BASE="${DATASET_BASE:-${PROJECT_ROOT}/excavator_auto_dataset}"
 BATCH_ID="${BATCH_ID:-batch_$(date +%Y%m%d_%H%M%S)}"
 
 # GPU_IDS contains physical Isaac/Vulkan device indices. Workers cycle through
@@ -44,8 +44,7 @@ for gpu in "${GPU_LIST[@]}"; do
     fi
 done
 
-BATCH_ROOT="${DATASET_BASE}/${BATCH_ID}"
-LOG_DIR="${BATCH_ROOT}/logs"
+LOG_DIR="${DATASET_BASE}/.parallel_logs/${BATCH_ID}"
 mkdir -p "${LOG_DIR}"
 
 declare -a PIDS=()
@@ -61,15 +60,15 @@ trap stop_workers INT TERM
 
 echo "Starting ${WORKERS} Isaac Sim worker(s)"
 echo "Project: ${PROJECT_ROOT}"
-echo "Batch:   ${BATCH_ROOT}"
+echo "Dataset: ${DATASET_BASE}"
+echo "Batch:   ${BATCH_ID}"
 echo "GPUs:    ${GPU_IDS}"
+echo "Dashboard --root must be: ${DATASET_BASE}"
 
 for (( worker = 0; worker < WORKERS; worker++ )); do
     gpu="${GPU_LIST[$((worker % ${#GPU_LIST[@]}))]}"
     worker_name="worker_$(printf '%02d' "${worker}")"
-    worker_root="${BATCH_ROOT}/${worker_name}"
     log_path="${LOG_DIR}/${worker_name}.log"
-    mkdir -p "${worker_root}"
 
     cmd=(
         "${ISAAC_PYTHON}"
@@ -79,7 +78,7 @@ for (( worker = 0; worker < WORKERS; worker++ )); do
         --no-bridge
         --success-count "${SUCCESS_COUNT}"
         --max-attempts "${MAX_ATTEMPTS}"
-        --dataset-root "${worker_root}"
+        --dataset-root "${DATASET_BASE}"
         --log-mode "${LOG_MODE}"
         --graphics-api vulkan
         --active-gpu "${gpu}"
@@ -98,7 +97,9 @@ for (( worker = 0; worker < WORKERS; worker++ )); do
     fi
 
     echo "[${worker_name}] gpu=${gpu} log=${log_path}"
-    PYTHONUNBUFFERED=1 "${cmd[@]}" >"${log_path}" 2>&1 &
+    EXCAVATOR_AUTO_RUN_ID_SUFFIX="${BATCH_ID}_${worker_name}" \
+        PYTHONUNBUFFERED=1 \
+        "${cmd[@]}" >"${log_path}" 2>&1 &
     PIDS+=("$!")
     LABELS+=("${worker_name}")
 done
@@ -117,5 +118,5 @@ for index in "${!PIDS[@]}"; do
 done
 
 trap - INT TERM
-echo "Batch complete: ${BATCH_ROOT}"
+echo "Batch complete: ${DATASET_BASE} (${BATCH_ID})"
 exit "${failed}"

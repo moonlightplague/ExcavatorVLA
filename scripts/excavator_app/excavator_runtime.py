@@ -30092,8 +30092,11 @@ def force_loaded_carry_bucket_q(q_pose, reference=None, label=""):
             end_effector="load",
             max_bucket_adjust_deg=105.0,
         )
-        if bool((carry_report or {}).get("ok", False)) and bool(
-            (carry_report or {}).get("gravity_carry_closed_ok", False)
+        if (
+            bool((carry_report or {}).get("ok", False))
+            and bool((carry_report or {}).get("gravity_carry_closed_ok", False))
+            and bool((carry_report or {}).get("loaded_carry_joint_ok", False))
+            and not bool((carry_report or {}).get("dump_branch_for_carry", False))
         ):
             return q_adjusted.copy()
     except Exception:
@@ -30102,7 +30105,15 @@ def force_loaded_carry_bucket_q(q_pose, reference=None, label=""):
     # beyond -120deg and could leave a +dump-branch bucket untouched, which could
     # empty the bucket during secure_carry_safe before lift/unload.
     q = set_bucket_loaded_carry_joint(q, reference=q_ref)
-    return CTRL.clip_limits(q)
+    q = CTRL.clip_limits(q)
+    bucket_idx = CTRL.name_to_idx.get("bucket", 3)
+    bucket_deg = rad_to_deg(float(q[bucket_idx]))
+    if not bucket_joint_in_loaded_carry_state(bucket_deg):
+        # Loaded transit must never inherit an open dump branch. This final
+        # mechanical guard is independent of the FK carry diagnostics.
+        q[bucket_idx] = deg_to_rad(float(CURL_HOLD_TARGET_DEG))
+        q = CTRL.clip_limits(q)
+    return q
 
 
 def mode_requires_loaded_carry_bucket(mode, label=""):
@@ -32126,8 +32137,15 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
         q_pre = clip_command_near(q_pre, reference=q_reference)
         old_bucket_deg = rad_to_deg(float(q_pre[bucket_idx]))
         q_pre = force_loaded_carry_bucket_q(q_pre, reference=q_reference, label=compute_label)
+        if not bucket_joint_in_loaded_carry_state(rad_to_deg(float(q_pre[bucket_idx]))):
+            q_pre = set_bucket_loaded_carry_joint(q_pre, reference=q_reference)
+            q_pre = CTRL.clip_limits(q_pre)
         new_bucket_deg = rad_to_deg(float(q_pre[bucket_idx]))
         carry_report = carry_material_report_for_q(q_pre, end_effector="load")
+        carry_report["loaded_transit_bucket_closed"] = bool(
+            bucket_joint_in_loaded_carry_state(new_bucket_deg)
+        )
+        carry_report["dump_after_arrival_only"] = True
         if abs(new_bucket_deg - old_bucket_deg) > 0.25:
             info_print(
                 "[LOADED BUCKET CARRY]",
@@ -32140,6 +32158,7 @@ def append_staged_post_secure_load_plan(task_label="dig_target_ball"):
         return q_pre, carry_report
 
     q_pre_dump, pre_dump_carry_report = compute_pre_dump_carry_pose(q_release_align, q_lift, "staged_unload_to_bin")
+    candidate["pre_dump_carry_report"] = pre_dump_carry_report
 
     def exec_clearance_for(q_pose):
         return unload_pose_bucket_clearance_report(q_pose, reference_q=q_lift)
@@ -34874,13 +34893,6 @@ async def dump_bucket_at_target(stage_name, task_id=None, planned_q_dump=None, p
                 force=True,
             )
 
-    actual_gate = log_actual_unload_position("before_bucket_only_dump")
-    if not bool(actual_gate.get("ok", False)):
-        update_status(
-            f"[UNLOAD DIAG] {stage_name}: predicted landing left unload target before dump; executing and scoring actual particles",
-            force=True,
-        )
-
     if q_release_align is not None:
         log_unload_drop("planned_release_flow_landing", q=q_release_align, reference_q=q_real)
     log_unload_alignment("planned_dump_pour", q=q_dump, effector="pour", reference_q=q_real)
@@ -34890,14 +34902,30 @@ async def dump_bucket_at_target(stage_name, task_id=None, planned_q_dump=None, p
         if q_release_align is not None
         else drop
     )
-    if not unload_drop_execution_ready(readiness_drop):
+    actual_gate = log_actual_unload_position("before_bucket_only_dump")
+    if not bool(actual_gate.get("ok", False)) or not unload_drop_execution_ready(readiness_drop):
+        reason = (
+            "execution_failed/unload_gate_not_ready_before_dump:"
+            f"actual_gate={bool(actual_gate.get('ok', False))};"
+            f"inside_xy={readiness_drop.get('inside_xy')};"
+            f"above_wall={readiness_drop.get('above_wall')};"
+            f"release_centered={readiness_drop.get('release_centered_ok')};"
+            f"xy_err={fmt_optional(readiness_drop.get('xy_err'))}"
+        )
         update_status(
-            f"[UNLOAD DIAG] {stage_name}: release-flow opening center is not aligned; executing and scoring actual particles; "
-            f"release_xy_err={fmt_optional(readiness_drop.get('release_xy_err'))} "
-            f"xy_err={fmt_optional(readiness_drop.get('xy_err'))} close_xy={readiness_drop.get('close_xy')} "
-            f"scatter_xy_ok={readiness_drop.get('scatter_xy_ok')} acceptance={readiness_drop.get('landing_acceptance')}",
+            f"[UNLOAD BLOCKED] {stage_name}: bucket remains closed because the actual unload mesh gate is not ready",
             force=True,
         )
+        set_execution_failure_reason(reason)
+        dataset_record_event(
+            "unload_dump_blocked_before_open",
+            f"{stage_name}:{reason}",
+            data={
+                "actual_gate": actual_gate,
+                "readiness_drop": compact_unload_drop(readiness_drop),
+            },
+        )
+        return False
 
     info_print(
         f"[UNLOAD DUMP] {stage_name}: mode={dump_source} bucket_target={dump_deg:.1f}deg "
@@ -35501,8 +35529,14 @@ def loaded_route_sample_q_at_path_time(path_time, total_seconds, cumulative):
     local = min(1.0, max(0.0, float(local)))
     stage_name = seg["name"]
     q = interpolate_q_motion(seg["q0"], seg["q1"], local, mode=stage_name, label=stage_name)
-    if mode_requires_loaded_carry_bucket(stage_name, stage_name):
-        q = force_loaded_carry_bucket_q(q, reference=q, label=stage_name)
+    # Every point in this group carries live material, including lift_carry.
+    # Opening is only legal after verify_unload_arrival() hands control to the
+    # dedicated dump motion.
+    q = force_loaded_carry_bucket_q(q, reference=q, label=stage_name)
+    bucket_idx = CTRL.name_to_idx.get("bucket", 3)
+    if not bucket_joint_in_loaded_carry_state(rad_to_deg(float(q[bucket_idx]))):
+        q = set_bucket_loaded_carry_joint(q, reference=q)
+        q = CTRL.clip_limits(q)
     return seg, q
 
 
@@ -35555,8 +35589,11 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
     total_seconds = 0.0
     for idx, stage_name, q_goal_raw, duration in group:
         q_goal = clip_command_near(q_goal_raw, reference=q_prev)
-        if mode_requires_loaded_carry_bucket(stage_name, stage_name):
-            q_goal = force_loaded_carry_bucket_q(q_goal, reference=q_prev, label=stage_name)
+        q_goal = force_loaded_carry_bucket_q(q_goal, reference=q_prev, label=stage_name)
+        bucket_idx = CTRL.name_to_idx.get("bucket", 3)
+        if not bucket_joint_in_loaded_carry_state(rad_to_deg(float(q_goal[bucket_idx]))):
+            q_goal = set_bucket_loaded_carry_joint(q_goal, reference=q_prev)
+            q_goal = CTRL.clip_limits(q_goal)
         check_mode = "lift_carry" if stage_name == "lift_carry" else "unload_to_bin"
         ok, kind, path_reason, sample, report = path_segment_check(
             q_prev,
@@ -35791,6 +35828,16 @@ async def execute_loaded_route_continuous_group(seq, start_index, task_id=None):
         STATE["active_plan_stage_index"] = int(seg["index"])
 
         q_final_cmd = q.copy()
+        bucket_idx = CTRL.name_to_idx.get("bucket", 3)
+        if not bucket_joint_in_loaded_carry_state(rad_to_deg(float(q[bucket_idx]))):
+            reason_text = (
+                "execution_failed/loaded_route_bucket_open_before_arrival:"
+                f"stage={stage_name};bucket={rad_to_deg(float(q[bucket_idx])):.2f}deg"
+            )
+            set_execution_failure_reason(reason_text)
+            close_loaded_group_audits("failed", reason_text)
+            finish_group_profile("failed", reason_text)
+            return False, int(start_index)
         apply_t = execution_stage_profile_now(exec_profile)
         ok, send_reason = CTRL.apply_target_direct(q, mode=stage_name)
         execution_stage_profile_add_elapsed(exec_profile, "apply_target_ms", apply_t, "cmd_steps", 1)

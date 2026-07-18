@@ -3306,13 +3306,26 @@ def source_run_timestamp_token(run_name: str, row: dict, runtime_id: str = "") -
     return time.strftime("%y%m%d_%H%M%S")
 
 
+def source_run_identity_token(run_name: str, row: dict) -> str:
+    source_name = str(
+        run_name
+        or row.get("source_run_name")
+        or _basename_any_platform(row.get("source_run_dir"))
+        or _basename_any_platform(row.get("source_episode_dir"))
+        or "unknown_run"
+    )
+    normalized = source_name.replace("\\", "/").strip().lower()
+    return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:8]
+
+
 def success_pool_episode_folder_name(run_name: str, row: dict, runtime_id: str = "") -> str:
     token = source_run_timestamp_token(run_name, row, runtime_id)
+    source_token = source_run_identity_token(run_name, row)
     try:
         ep = int(row.get("source_episode_index", row.get("episode_index")))
     except Exception:
         ep = int(time.time()) % 1000000
-    return f"{token}_ep{ep:06d}"
+    return f"{token}_{source_token}_ep{ep:06d}"
 
 
 def normalize_existing_success_pool_rows(pool_dir: str, aggregate_rows: Sequence[dict]) -> Tuple[List[dict], Dict[str, int]]:
@@ -4273,7 +4286,7 @@ def maybe_reconcile_success_pool_for_dashboard(run_dir: Union[str, os.PathLike])
     return {"ok": True, "is_success_pool": False, "changed": False}
 
 def short_success_episode_folder_name(run_name: str, row: dict, runtime_id: str = "") -> str:
-    """Canonical success-pool folder name: YYMMDD_HHMMSS_epXXXXXX."""
+    """Canonical pool folder: YYMMDD_HHMMSS_RUNHASH_epXXXXXX."""
     return success_pool_episode_folder_name(run_name, row, runtime_id)
 
 def dashboard_cut_trash_root(dataset_root: Union[str, os.PathLike], runtime_id: str) -> str:
@@ -4384,6 +4397,7 @@ def dashboard_transfer_success_records(
     aggregate_rows = load_index(dest_root, "trainable")
     aggregate_rows, existing_pool_stats = normalize_existing_success_pool_rows(dest_root, aggregate_rows)
     existing_sources = build_existing_success_source_cache(dest_root, aggregate_rows)
+    existing_dest_sources = success_transfer_cache_by_dest(existing_sources)
     next_ep_index = max([int(row.get("episode_index", -1) or -1) for row in aggregate_rows], default=-1) + 1
     cached_skipped = 0
     updated_reprocessed = 0
@@ -4452,6 +4466,7 @@ def dashboard_transfer_success_records(
             existing_entry = existing_sources.get(source_key) if isinstance(existing_sources.get(source_key), dict) else {}
             existing_dest = str(existing_entry.get("transferred_episode_dir") or "")
             dst_dir = os.path.join(episodes_root, dst_name)
+            destination_collision_avoided = ""
             try:
                 if cache_reason == "source_updated" and existing_dest:
                     existing_abs = os.path.abspath(existing_dest)
@@ -4463,44 +4478,56 @@ def dashboard_transfer_success_records(
                     except Exception:
                         dst_dir = os.path.join(episodes_root, dst_name)
                 elif os.path.exists(dst_dir):
-                    # A canonical folder alone is not proof that the transfer is
-                    # complete. Verify the destination content using a rewritten
-                    # row; only then allow cache skip. If incomplete, remove the
-                    # partial destination and reprocess from the source episode.
-                    legacy_row = rewrite_row_paths_for_transfer(row, src_dir, dst_dir)
-                    legacy_entry = {"transferred_episode_dir": dst_dir, "pool_row": legacy_row}
-                    complete, complete_reason = success_pool_entry_content_complete(legacy_entry)
-                    if complete:
-                        item = {"episode_index": row.get("episode_index"), "reason": "canonical_folder_exists_complete", "source_key": source_key, "source_episode_dir": src_dir, "dest_episode_dir": dst_dir}
-                        if mode == "move":
-                            removed, remove_reason = safe_move_source_episode_dir_to_trash_for_cut(root, run_dir, src_dir, cut_trash_root)
-                            item["cut_source_trash_reason"] = remove_reason
-                            if removed:
-                                cut_source_episode_trashed += 1
-                                run_manifest["cut_source_episode_trashed"] += 1
+                    dest_key = norm_episode_dir_key(dst_dir)
+                    owner = existing_dest_sources.get(dest_key) or existing_dest_sources.get(
+                        os.path.normcase(os.path.basename(dst_dir))
+                    )
+                    owner_key = str(owner.get("source_key") or "") if isinstance(owner, dict) else ""
+                    if owner_key != source_key:
+                        destination_collision_avoided = (
+                            f"destination_owned_by_other_source:{owner_key or 'unknown'}"
+                        )
+                        dst_dir = unique_path(
+                            f"{dst_dir}_{str(source_signature.get('source_signature_hash') or '')[:8]}"
+                        )
+                    else:
+                        # Only a destination already owned by this exact source may
+                        # be treated as cache evidence. A same-named directory from
+                        # another parallel worker must never suppress this episode.
+                        legacy_row = rewrite_row_paths_for_transfer(row, src_dir, dst_dir)
+                        legacy_entry = {"transferred_episode_dir": dst_dir, "pool_row": legacy_row}
+                        complete, complete_reason = success_pool_entry_content_complete(legacy_entry)
+                        if complete:
+                            item = {"episode_index": row.get("episode_index"), "reason": "canonical_folder_exists_complete_same_source", "source_key": source_key, "source_episode_dir": src_dir, "dest_episode_dir": dst_dir}
+                            if mode == "move":
+                                removed, remove_reason = safe_move_source_episode_dir_to_trash_for_cut(root, run_dir, src_dir, cut_trash_root)
+                                item["cut_source_trash_reason"] = remove_reason
+                                if removed:
+                                    cut_source_episode_trashed += 1
+                                    run_manifest["cut_source_episode_trashed"] += 1
+                                else:
+                                    cut_source_episode_trash_failed += 1
+                                    run_manifest["cut_source_episode_trash_failed"] += 1
+                            skipped.append({"path": run_dir, **item})
+                            run_manifest["skipped"].append(item)
+                            cached_skipped += 1
+                            run_manifest["cached_skipped"] += 1
+                            done_records += 1
+                            progress(f"cached {run_name}: {done_records}/{max(1, total_records)}")
+                            continue
+                        try:
+                            existing_abs = os.path.abspath(dst_dir)
+                            if os.path.commonpath([episodes_root, existing_abs]) == episodes_root:
+                                shutil.rmtree(existing_abs)
                             else:
-                                cut_source_episode_trash_failed += 1
-                                run_manifest["cut_source_episode_trash_failed"] += 1
-                        skipped.append({"path": run_dir, **item})
-                        run_manifest["skipped"].append(item)
-                        cached_skipped += 1
-                        run_manifest["cached_skipped"] += 1
-                        done_records += 1
-                        progress(f"cached {run_name}: {done_records}/{max(1, total_records)}")
-                        continue
-                    try:
-                        existing_abs = os.path.abspath(dst_dir)
-                        if os.path.commonpath([episodes_root, existing_abs]) == episodes_root:
-                            shutil.rmtree(existing_abs)
-                        else:
-                            raise RuntimeError("canonical_dest_not_under_episodes_root")
-                    except Exception as exc:
-                        item = {"episode_index": row.get("episode_index"), "reason": f"partial_dest_remove_failed:{complete_reason}:{type(exc).__name__}:{exc}", "source_key": source_key, "source_episode_dir": src_dir, "dest_episode_dir": dst_dir}
-                        skipped.append({"path": run_dir, **item})
-                        run_manifest["skipped"].append(item)
-                        done_records += 1
-                        progress(f"skipped partial dest {run_name}: {done_records}/{max(1, total_records)}")
-                        continue
+                                raise RuntimeError("canonical_dest_not_under_episodes_root")
+                        except Exception as exc:
+                            item = {"episode_index": row.get("episode_index"), "reason": f"partial_dest_remove_failed:{complete_reason}:{type(exc).__name__}:{exc}", "source_key": source_key, "source_episode_dir": src_dir, "dest_episode_dir": dst_dir}
+                            skipped.append({"path": run_dir, **item})
+                            run_manifest["skipped"].append(item)
+                            done_records += 1
+                            progress(f"skipped partial dest {run_name}: {done_records}/{max(1, total_records)}")
+                            continue
                 if mode == "move":
                     shutil.move(src_dir, dst_dir)
                 else:
@@ -4530,6 +4557,7 @@ def dashboard_transfer_success_records(
                     "source_key": source_key,
                     "source_signature_hash": source_signature.get("source_signature_hash"),
                     "cache_reason": cache_reason,
+                    "destination_collision_avoided": destination_collision_avoided,
                 }
                 run_manifest["records"].append(record)
                 existing_sources[source_key] = {
@@ -4549,6 +4577,8 @@ def dashboard_transfer_success_records(
                     "updated_at": time.time(),
                     "mode": mode,
                 }
+                existing_dest_sources[norm_episode_dir_key(dst_dir)] = existing_sources[source_key]
+                existing_dest_sources[os.path.normcase(os.path.basename(dst_dir))] = existing_sources[source_key]
                 next_ep_index += 1
             except Exception as exc:
                 item = {"episode_index": row.get("episode_index"), "reason": f"{mode}_failed:{type(exc).__name__}:{exc}", "source_episode_dir": src_dir, "source_key": source_key}

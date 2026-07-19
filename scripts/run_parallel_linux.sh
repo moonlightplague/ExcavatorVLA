@@ -128,12 +128,33 @@ run_worker_supervisor() {
     local aggregate_successes=0
     local restart_index=0
     local child_pid=0
+    local child_owns_process_group=0
+
+    stop_supervised_processes() {
+        local attempt
+        if (( child_pid <= 0 )); then
+            return
+        fi
+        if (( child_owns_process_group != 0 )); then
+            kill -TERM -- "-${child_pid}" 2>/dev/null || true
+            for attempt in $(seq 1 10); do
+                if ! kill -0 -- "-${child_pid}" 2>/dev/null; then
+                    break
+                fi
+                sleep 0.5
+            done
+            kill -KILL -- "-${child_pid}" 2>/dev/null || true
+        else
+            pkill -TERM -P "${child_pid}" 2>/dev/null || true
+            kill -TERM "${child_pid}" 2>/dev/null || true
+        fi
+        wait "${child_pid}" 2>/dev/null || true
+        child_pid=0
+        child_owns_process_group=0
+    }
 
     stop_supervised_child() {
-        if (( child_pid > 0 )); then
-            kill "${child_pid}" 2>/dev/null || true
-            wait "${child_pid}" 2>/dev/null || true
-        fi
+        stop_supervised_processes
         exit 143
     }
     trap stop_supervised_child INT TERM
@@ -176,14 +197,24 @@ run_worker_supervisor() {
             echo
             echo "===== launch $((restart_index + 1)) remaining=${remaining} suffix=${run_suffix} ====="
         } >>"${log_path}"
-        EXCAVATOR_AUTO_RUN_ID_SUFFIX="${run_suffix}" \
-            EXCAVATOR_AUTO_COLLECT_RESULT_FILE="${result_path}" \
-            PYTHONUNBUFFERED=1 \
-            "${cmd[@]}" >>"${log_path}" 2>&1 &
+        if command -v setsid >/dev/null 2>&1; then
+            EXCAVATOR_AUTO_RUN_ID_SUFFIX="${run_suffix}" \
+                EXCAVATOR_AUTO_COLLECT_RESULT_FILE="${result_path}" \
+                PYTHONUNBUFFERED=1 \
+                setsid "${cmd[@]}" >>"${log_path}" 2>&1 &
+            child_owns_process_group=1
+        else
+            EXCAVATOR_AUTO_RUN_ID_SUFFIX="${run_suffix}" \
+                EXCAVATOR_AUTO_COLLECT_RESULT_FILE="${result_path}" \
+                PYTHONUNBUFFERED=1 \
+                "${cmd[@]}" >>"${log_path}" 2>&1 &
+            child_owns_process_group=0
+        fi
         child_pid=$!
         wait "${child_pid}"
         local status=$?
         child_pid=0
+        child_owns_process_group=0
 
         local gained
         gained="$(result_successes "${result_path}")"

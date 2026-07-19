@@ -30,13 +30,37 @@ def called_attribute_names(node):
 
 
 class CameraTimelineContractTests(unittest.TestCase):
-    def test_strict_sample_wait_never_pauses_timeline(self):
+    def test_strict_sample_wait_pauses_only_for_render_completion(self):
         node = function_node(RUNTIME_PATH, "dataset_camera_wait_for_scheduled_capture")
         calls = called_attribute_names(node)
-        self.assertNotIn("pause", calls)
+        self.assertIn("pause", calls)
+        self.assertIn("play", calls)
         self.assertIn("simulation_timeline_is_playing", calls)
         self.assertIn("submit_viewport_capture_triplet", calls)
         self.assertIn("step_updates", calls)
+        source = ast.unparse(node)
+        self.assertIn("_EXCAVATOR_INTERNAL_TIMELINE_PAUSE_DEPTH", source)
+        self.assertIn("raw_pending", source)
+
+    def test_sample_gate_uses_fixed_next_sim_deadline(self):
+        due_node = function_node(RUNTIME_PATH, "dataset_record_sample_due")
+        prepare_node = function_node(RUNTIME_PATH, "dataset_camera_prepare_for_scheduled_update")
+        due_source = ast.unparse(due_node)
+        prepare_source = ast.unparse(prepare_node)
+        self.assertIn("dataset_next_sim_sample_time", due_source)
+        self.assertIn("dataset_next_sim_sample_time", prepare_source)
+
+    def test_success_requires_original_uniform_10hz_source(self):
+        audit_node = function_node(RUNTIME_PATH, "dataset_episode_source_sampling_audit")
+        finish_node = function_node(RUNTIME_PATH, "auto_collect_finish_episode")
+        loop_node = function_node(RUNTIME_PATH, "auto_collect_loop")
+        audit_source = ast.unparse(audit_node)
+        finish_source = ast.unparse(finish_node)
+        loop_source = ast.unparse(loop_node)
+        self.assertIn("reused_camera_rows", audit_source)
+        self.assertIn("non_physical_timestamp_rows", audit_source)
+        self.assertIn("dataset_source_not_original_uniform_10hz", finish_source)
+        self.assertIn("dataset_source_rate_must_be_original_10hz", loop_source)
 
     def test_execution_has_start_recovery_and_stage_timeline_gate(self):
         node = function_node(RUNTIME_PATH, "execute_dig_target_ball")

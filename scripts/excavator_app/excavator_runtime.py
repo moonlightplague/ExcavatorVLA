@@ -85,6 +85,8 @@ NO_UI = env_bool("EXCAVATOR_NO_UI", False) or env_bool("EXCAVATOR_HEADLESS", Fal
 _INITIAL_LOG_MODE_RAW = str(os.environ.get("EXCAVATOR_LOG_MODE", "data") or "data").strip().lower()
 _INITIAL_DEBUG_VISUALS_VISIBLE = _INITIAL_LOG_MODE_RAW in ("debug", "profile", "trace")
 DATASET_SAMPLE_INTERVAL_DEFAULT = max(0.02, env_float("EXCAVATOR_DATASET_SAMPLE_INTERVAL", 0.10))
+AUTO_DATASET_REQUIRED_SOURCE_HZ = 10.0
+AUTO_DATASET_SOURCE_DT_TOLERANCE_S = 1.0e-4
 DATASET_CAMERA_FREQUENCY_DEFAULT = max(
     1,
     env_int("EXCAVATOR_DATASET_CAMERA_FREQUENCY", int(round(1.0 / DATASET_SAMPLE_INTERVAL_DEFAULT))),
@@ -382,6 +384,10 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_last_sample_time": 0.0,
     "dataset_last_wall_sample_time": 0.0,
     "dataset_last_sim_sample_time": 0.0,
+    "dataset_next_sim_sample_time": 0.0,
+    "dataset_sample_grid_origin_sim_time": 0.0,
+    "dataset_sample_cadence_max_error_s": 0.0,
+    "dataset_sample_cadence_violation_count": 0,
     "dataset_last_train_sample_time": 0.0,
     "dataset_last_derivative_time": 0.0,
     "dataset_train_time_cursor": 0.0,
@@ -393,6 +399,8 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_sample_wait_timeouts": 0,
     "dataset_camera_pre_submissions": 0,
     "dataset_camera_pre_submit_failures": 0,
+    "dataset_camera_paused_render_updates": 0,
+    "dataset_camera_timeline_resume_failures": 0,
     "dataset_last_q_cmd": None,
     "dataset_last_q_real": None,
     "dataset_last_action": None,
@@ -7331,7 +7339,12 @@ def dataset_record_sample_due(force=False):
         return False
     if not str(STATE.get("dataset_episode_dir", "") or ""):
         return False
-    if force:
+    strict_auto_grid = bool(
+        DATASET_USE_SIM_TIME
+        and STATE.get("auto_collect_active", False)
+        and STATE.get("dataset_recording", False)
+    )
+    if force and not strict_auto_grid:
         return True
     interval = float(STATE.get("dataset_sample_interval", 0.10))
     if DATASET_USE_SIM_TIME:
@@ -7339,8 +7352,12 @@ def dataset_record_sample_due(force=False):
         if rows <= 0:
             return True
         sim_now = dataset_simulation_time_seconds()
-        last_sim = float(STATE.get("dataset_last_sim_sample_time", sim_now))
-        return sim_now - last_sim >= interval
+        next_sim = float(STATE.get("dataset_next_sim_sample_time", 0.0) or 0.0)
+        if next_sim <= 0.0:
+            last_sim = float(STATE.get("dataset_last_sim_sample_time", sim_now))
+            next_sim = last_sim + interval
+            STATE["dataset_next_sim_sample_time"] = float(next_sim)
+        return sim_now + 1.0e-9 >= next_sim
     return time.time() - float(STATE.get("dataset_last_wall_sample_time", STATE.get("dataset_last_sample_time", 0.0)) or 0.0) >= interval
 
 
@@ -7370,11 +7387,15 @@ def dataset_camera_prepare_for_scheduled_update():
 
     rows = max(0, int(sample_index))
     sim_now = dataset_simulation_time_seconds()
-    interval = float(STATE.get("dataset_sample_interval", 0.10) or 0.10)
     if rows > 0:
-        last_sim = float(STATE.get("dataset_last_sim_sample_time", sim_now) or sim_now)
+        interval = float(STATE.get("dataset_sample_interval", 0.10) or 0.10)
+        next_sim = float(STATE.get("dataset_next_sim_sample_time", 0.0) or 0.0)
+        if next_sim <= 0.0:
+            last_sim = float(STATE.get("dataset_last_sim_sample_time", sim_now) or sim_now)
+            next_sim = last_sim + interval
+            STATE["dataset_next_sim_sample_time"] = float(next_sim)
         frame_dt = float(CONTROL_DT) / max(1.0, float(control_step_frames()))
-        if sim_now + frame_dt + 1.0e-9 < last_sim + interval:
+        if sim_now + frame_dt + 1.0e-9 < next_sim:
             return False
 
     submitted, reason = excavator_dataset_camera.submit_viewport_capture_triplet(
@@ -7392,7 +7413,7 @@ def dataset_camera_prepare_for_scheduled_update():
 
 
 async def dataset_camera_wait_for_scheduled_capture(sample_index):
-    """Wait for a fresh triplet, advancing Kit once when submission was late."""
+    """Finish a fresh render without advancing the simulation sample clock."""
     if not bool(DATASET_STRICT_SAMPLE_WAIT):
         return False, "strict_sample_wait_disabled"
     if (
@@ -7406,7 +7427,9 @@ async def dataset_camera_wait_for_scheduled_capture(sample_index):
     deadline = time.time() + float(DATASET_SAMPLE_WAIT_TIMEOUT_S)
     last_used_seq = int(STATE.get("dataset_camera_last_payload_capture_seq", 0) or 0)
     last_reason = "fresh_capture_not_ready"
-    late_render_update_used = False
+    paused_render_updates = 0
+    timeline = None
+    resume_timeline = False
     previous_pose_sync = bool(STATE.get("dataset_camera_pose_sync_active", False))
 
     STATE["dataset_sample_wait_count"] = int(STATE.get("dataset_sample_wait_count", 0) or 0) + 1
@@ -7414,10 +7437,16 @@ async def dataset_camera_wait_for_scheduled_capture(sample_index):
     try:
         if not simulation_timeline_is_playing():
             return False, f"timeline_not_playing_before_capture:sample={int(sample_index)}"
+        if HAS_OMNI_TIMELINE:
+            timeline = omni.timeline.get_timeline_interface()
+            resume_timeline = bool(timeline is not None and timeline.is_playing())
+        if resume_timeline:
+            builtins._EXCAVATOR_INTERNAL_TIMELINE_PAUSE_DEPTH = int(
+                getattr(builtins, "_EXCAVATOR_INTERNAL_TIMELINE_PAUSE_DEPTH", 0) or 0
+            ) + 1
+            timeline.pause()
 
         while time.time() <= deadline:
-            if not simulation_timeline_is_playing():
-                return False, f"timeline_stopped_during_capture:sample={int(sample_index)}"
             latest_seq = int(STATE.get("dataset_camera_latest_seq", 0) or 0)
             if latest_seq > last_used_seq:
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -7440,13 +7469,19 @@ async def dataset_camera_wait_for_scheduled_capture(sample_index):
                     pending = STATE.get("dataset_camera_pending_capture")
                     pending_active = isinstance(pending, dict) and not bool(pending.get("done", False))
 
-            # Pre-submission normally makes the frame ready in the movement
-            # update. A genuinely late request gets one normal Kit update so
-            # viewport callbacks can complete. Capture metadata records the
-            # submit-time joint pose and simulation timestamp.
-            if pending_active and not late_render_update_used:
-                late_render_update_used = True
-                await step_updates(1)
+            # A callback submitted before the due sample may still need a Kit
+            # render update. The timeline is paused, so these updates service
+            # viewport readback without advancing joints, particles, or sim time.
+            raw_pending = pending.get("raw_pending", []) if pending_active else []
+            if pending_active and raw_pending:
+                await step_updates(
+                    1,
+                    trace_label=f"dataset_camera_paused_render:{int(sample_index)}:{paused_render_updates + 1}",
+                )
+                paused_render_updates += 1
+                STATE["dataset_camera_paused_render_updates"] = int(
+                    STATE.get("dataset_camera_paused_render_updates", 0) or 0
+                ) + 1
                 continue
             await asyncio.sleep(float(DATASET_SAMPLE_WAIT_POLL_S))
 
@@ -7458,10 +7493,33 @@ async def dataset_camera_wait_for_scheduled_capture(sample_index):
         return False, (
             f"fresh_capture_timeout:sample={int(sample_index)};"
             f"last_used_seq={last_used_seq};latest_seq={int(STATE.get('dataset_camera_latest_seq', 0) or 0)};"
-            f"last_reason={last_reason};late_render_update={late_render_update_used}"
+            f"last_reason={last_reason};paused_render_updates={paused_render_updates}"
         )
     finally:
         STATE["dataset_camera_pose_sync_active"] = bool(previous_pose_sync)
+        if resume_timeline and timeline is not None:
+            try:
+                timeline.play()
+                for _ in range(3):
+                    if bool(timeline.is_playing()):
+                        break
+                    await asyncio.sleep(0)
+                    timeline.play()
+                if not bool(timeline.is_playing()):
+                    STATE["dataset_camera_timeline_resume_failures"] = int(
+                        STATE.get("dataset_camera_timeline_resume_failures", 0) or 0
+                    ) + 1
+                    info_print(
+                        "[WARN] [DATASET CAMERA]",
+                        "timeline_resume_not_confirmed",
+                        f"sample={int(sample_index)}",
+                        force_log=True,
+                    )
+            finally:
+                builtins._EXCAVATOR_INTERNAL_TIMELINE_PAUSE_DEPTH = max(
+                    0,
+                    int(getattr(builtins, "_EXCAVATOR_INTERNAL_TIMELINE_PAUSE_DEPTH", 1) or 1) - 1,
+                )
 
 
 async def dataset_camera_warmup_for_episode(label="episode"):
@@ -11987,6 +12045,7 @@ def dataset_record_sample(
     camera_payload=None,
     timestamp_override=None,
     timestamp_source="wall",
+    capture_sim_time_override=None,
     metrics_mode="auto",
     bucket_metrics_override=None,
 ):
@@ -12000,12 +12059,23 @@ def dataset_record_sample(
     wall_now = time.time()
     sim_now = dataset_simulation_time_seconds()
     interval = float(STATE.get("dataset_sample_interval", 0.10))
-    if not force:
+    strict_auto_grid = bool(
+        DATASET_USE_SIM_TIME
+        and STATE.get("auto_collect_active", False)
+        and STATE.get("dataset_recording", False)
+    )
+    if not force or strict_auto_grid:
         if DATASET_USE_SIM_TIME:
             rows = int(STATE.get("dataset_samples", 0) or 0) - int(STATE.get("dataset_episode_sample_start", 0) or 0)
-            last_sim_gate = float(STATE.get("dataset_last_sim_sample_time", sim_now))
-            if rows > 0 and sim_now - last_sim_gate < interval:
-                return False
+            if rows > 0:
+                next_sim_gate = float(STATE.get("dataset_next_sim_sample_time", 0.0) or 0.0)
+                if next_sim_gate > 0.0:
+                    if sim_now + 1.0e-9 < next_sim_gate:
+                        return False
+                else:
+                    last_sim_gate = float(STATE.get("dataset_last_sim_sample_time", sim_now))
+                    if sim_now - last_sim_gate + 1.0e-9 < interval:
+                        return False
         elif wall_now - float(STATE.get("dataset_last_wall_sample_time", STATE.get("dataset_last_sample_time", 0.0)) or 0.0) < interval:
             return False
 
@@ -12036,7 +12106,11 @@ def dataset_record_sample(
                 train_t = max(train_t, last_train_t + 1.0e-4)
             train_abs = episode_start + train_t
             timestamp_source_text = str(timestamp_source or "planned")
-        sample_sim_time = episode_start_sim + train_t
+        sample_sim_time = (
+            float(capture_sim_time_override)
+            if capture_sim_time_override is not None
+            else episode_start_sim + train_t
+        )
         sample_spans = {}
 
         def mark_span(span_label, started, threshold_ms=5.0, data=None):
@@ -12272,7 +12346,32 @@ def dataset_record_sample(
 
         STATE["dataset_last_sample_time"] = wall_now
         STATE["dataset_last_wall_sample_time"] = wall_now
-        STATE["dataset_last_sim_sample_time"] = float(sim_now)
+        STATE["dataset_last_sim_sample_time"] = float(sample_sim_time)
+        if DATASET_USE_SIM_TIME:
+            next_sim = float(STATE.get("dataset_next_sim_sample_time", 0.0) or 0.0)
+            if not has_episode_rows:
+                STATE["dataset_sample_grid_origin_sim_time"] = float(sample_sim_time)
+                next_sim = float(sample_sim_time) + interval
+            elif (
+                (bool(force) and not strict_auto_grid)
+                or str(timestamp_source_text).startswith("planned_")
+            ):
+                next_sim = float(sim_now) + interval
+            else:
+                if next_sim <= 0.0:
+                    next_sim = float(sample_sim_time) + interval
+                while next_sim <= float(sample_sim_time) + 1.0e-9:
+                    next_sim += interval
+                cadence_error = abs(float(sample_sim_time) - (next_sim - interval))
+                STATE["dataset_sample_cadence_max_error_s"] = max(
+                    float(STATE.get("dataset_sample_cadence_max_error_s", 0.0) or 0.0),
+                    float(cadence_error),
+                )
+                if cadence_error > max(1.0e-4, interval * 0.20):
+                    STATE["dataset_sample_cadence_violation_count"] = int(
+                        STATE.get("dataset_sample_cadence_violation_count", 0) or 0
+                    ) + 1
+            STATE["dataset_next_sim_sample_time"] = float(next_sim)
         STATE["dataset_last_train_sample_time"] = float(train_t)
         STATE["dataset_train_time_cursor"] = float(train_t)
         STATE["dataset_samples"] = int(STATE.get("dataset_samples", 0)) + 1
@@ -12301,6 +12400,7 @@ async def dataset_record_sample_async(
         return False
     sample_index = int(STATE.get("dataset_samples", 0)) - int(STATE.get("dataset_episode_sample_start", 0))
     camera_payload = None
+    capture_sim_time_override = None
     if dataset_camera_sample_requires_complete_images(sample_index):
         span_t = time.perf_counter()
         camera_payload = dataset_capture_camera_observations(sample_index)
@@ -12319,6 +12419,12 @@ async def dataset_record_sample_async(
                 STATE["dataset_last_camera_capture_ms"] = float(camera_ms)
                 camera_info = camera_payload.get("observation.camera", {}) if isinstance(camera_payload, dict) else {}
         if isinstance(camera_info, dict) and bool(camera_info.get("available", False)):
+            capture_sim_time = camera_info.get("capture_pose_sim_time")
+            if capture_sim_time is not None:
+                try:
+                    capture_sim_time_override = float(capture_sim_time)
+                except Exception:
+                    capture_sim_time_override = None
             capture_q = camera_info.get("capture_q")
             capture_q_cmd = camera_info.get("capture_q_cmd")
             if capture_q is not None:
@@ -12332,7 +12438,6 @@ async def dataset_record_sample_async(
                 except Exception:
                     pass
             if timestamp_override is None and DATASET_USE_SIM_TIME:
-                capture_sim_time = camera_info.get("capture_pose_sim_time")
                 if capture_sim_time is not None:
                     try:
                         episode_start_sim = float(STATE.get("dataset_episode_start_sim_time", capture_sim_time))
@@ -12349,6 +12454,7 @@ async def dataset_record_sample_async(
         camera_payload=camera_payload,
         timestamp_override=timestamp_override,
         timestamp_source=timestamp_source,
+        capture_sim_time_override=capture_sim_time_override,
         metrics_mode=metrics_mode,
         bucket_metrics_override=bucket_metrics_override,
     )
@@ -13374,6 +13480,102 @@ def auto_collect_episode_metrics():
         "effort_missing_samples": int(STATE.get("dataset_effort_missing_samples", 0) or 0),
         "max_abs_effort": float(STATE.get("dataset_max_abs_effort", 0.0)),
     }
+
+
+def dataset_episode_source_sampling_audit(path=None, expected_hz=AUTO_DATASET_REQUIRED_SOURCE_HZ):
+    trajectory_path = str(path or STATE.get("dataset_path", "") or "")
+    expected_hz = float(expected_hz)
+    expected_dt = 1.0 / max(1.0e-9, expected_hz)
+    result = {
+        "ok": False,
+        "expected_hz": expected_hz,
+        "expected_dt_s": expected_dt,
+        "sample_count": 0,
+        "min_dt_s": 0.0,
+        "max_dt_s": 0.0,
+        "median_dt_s": 0.0,
+        "missing_camera_rows": 0,
+        "reused_camera_rows": 0,
+        "non_physical_timestamp_rows": 0,
+        "reason": "",
+    }
+    if not trajectory_path or not os.path.isfile(trajectory_path):
+        result["reason"] = "trajectory_missing"
+        return result
+
+    times = []
+    previous_camera_paths = None
+    allowed_sources = {"simulation", "camera_simulation"}
+    try:
+        with open(trajectory_path, "r", encoding="utf-8") as handle:
+            for raw in handle:
+                text = raw.strip()
+                if not text:
+                    continue
+                row = json.loads(text)
+                sample_t = float(row.get("t"))
+                if not math.isfinite(sample_t):
+                    raise ValueError("non_finite_t")
+                times.append(sample_t)
+                camera_paths = tuple(
+                    str(row.get(f"observation.images.{camera_index}", "") or "")
+                    for camera_index in range(3)
+                )
+                if not all(camera_paths):
+                    result["missing_camera_rows"] += 1
+                if previous_camera_paths is not None and camera_paths == previous_camera_paths:
+                    result["reused_camera_rows"] += 1
+                previous_camera_paths = camera_paths
+                timestamp_source = str(row.get("timestamp.source", "") or "")
+                if timestamp_source not in allowed_sources:
+                    result["non_physical_timestamp_rows"] += 1
+    except Exception as exc:
+        result["reason"] = f"trajectory_read_failed:{type(exc).__name__}:{exc}"
+        return result
+
+    result["sample_count"] = len(times)
+    if len(times) < 2:
+        result["reason"] = "insufficient_samples"
+        return result
+    deltas = [times[index] - times[index - 1] for index in range(1, len(times))]
+    if any((not math.isfinite(value)) or value <= 0.0 for value in deltas):
+        result["reason"] = "non_monotonic_timeline"
+        return result
+    sorted_deltas = sorted(deltas)
+    middle = len(sorted_deltas) // 2
+    median_dt = (
+        sorted_deltas[middle]
+        if len(sorted_deltas) % 2
+        else 0.5 * (sorted_deltas[middle - 1] + sorted_deltas[middle])
+    )
+    result["min_dt_s"] = float(min(deltas))
+    result["max_dt_s"] = float(max(deltas))
+    result["median_dt_s"] = float(median_dt)
+    tolerance = float(AUTO_DATASET_SOURCE_DT_TOLERANCE_S)
+    cadence_ok = all(abs(float(value) - expected_dt) <= tolerance for value in deltas)
+    camera_ok = (
+        int(result["missing_camera_rows"]) == 0
+        and int(result["reused_camera_rows"]) == 0
+    )
+    source_ok = int(result["non_physical_timestamp_rows"]) == 0
+    result["ok"] = bool(cadence_ok and camera_ok and source_ok)
+    if not cadence_ok:
+        result["reason"] = (
+            f"cadence_not_uniform_{expected_hz:g}hz:"
+            f"median={median_dt:.6f};min={min(deltas):.6f};max={max(deltas):.6f}"
+        )
+    elif not camera_ok:
+        result["reason"] = (
+            f"camera_rows_invalid:missing={result['missing_camera_rows']};"
+            f"reused={result['reused_camera_rows']}"
+        )
+    elif not source_ok:
+        result["reason"] = (
+            f"non_physical_timestamp_rows:{result['non_physical_timestamp_rows']}"
+        )
+    else:
+        result["reason"] = "ok"
+    return result
 
 
 def current_episode_bucket_loaded_count():
@@ -14535,6 +14737,10 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
     STATE["dataset_last_sample_time"] = 0.0
     STATE["dataset_last_wall_sample_time"] = 0.0
     STATE["dataset_last_sim_sample_time"] = 0.0
+    STATE["dataset_next_sim_sample_time"] = float(STATE["dataset_episode_start_sim_time"])
+    STATE["dataset_sample_grid_origin_sim_time"] = 0.0
+    STATE["dataset_sample_cadence_max_error_s"] = 0.0
+    STATE["dataset_sample_cadence_violation_count"] = 0
     STATE["dataset_last_train_sample_time"] = 0.0
     STATE["dataset_last_derivative_time"] = 0.0
     STATE["dataset_train_time_cursor"] = 0.0
@@ -14543,6 +14749,8 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
     STATE["dataset_sample_wait_timeouts"] = 0
     STATE["dataset_camera_pre_submissions"] = 0
     STATE["dataset_camera_pre_submit_failures"] = 0
+    STATE["dataset_camera_paused_render_updates"] = 0
+    STATE["dataset_camera_timeline_resume_failures"] = 0
     STATE["dataset_last_q_cmd"] = None
     STATE["dataset_last_q_real"] = None
     STATE["dataset_last_action"] = None
@@ -14688,7 +14896,9 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
             "camera_target_hz": int(STATE.get("dataset_camera_frequency", DATASET_CAMERA_FREQUENCY_DEFAULT) or DATASET_CAMERA_FREQUENCY_DEFAULT),
             "strict_camera_wait": bool(DATASET_STRICT_SAMPLE_WAIT),
             "camera_wait_timeout_s": float(DATASET_SAMPLE_WAIT_TIMEOUT_S),
-            "camera_wait_policy": "pre_submit_before_due_update_then_wall_wait",
+            "camera_wait_policy": "fixed_sim_grid_pre_submit_then_paused_render_wait",
+            "camera_wait_advances_simulation": False,
+            "camera_state_alignment": "capture_pose_sim_time+capture_q+capture_q_cmd",
         },
         "lerobot_schema_notes": {
             "observation.images.0": "relative image path; arm-tip top-down view, export loader should read as torch.Tensor [3,H,W]",
@@ -14801,6 +15011,24 @@ def auto_collect_finish_episode(meta, success, reason):
     dataset_writer_flush("episode_finish")
     execution_success = bool(success)
     reason = str(reason)
+    source_sampling_audit = dataset_episode_source_sampling_audit()
+    meta["source_sampling_audit"] = source_sampling_audit
+    if execution_success and not bool(source_sampling_audit.get("ok", False)):
+        execution_success = False
+        success = False
+        reason = (
+            "quality_rejected/dataset_source_not_original_uniform_10hz:"
+            + str(source_sampling_audit.get("reason", "unknown"))
+        )
+        STATE["auto_collect_stop_requested"] = True
+        STATE["auto_collect_last_result"] = f"blocked={reason}"
+        info_print(
+            "[ERROR] [AUTO DATASET SAMPLING]",
+            f"episode={meta.get('episode_id', '')}",
+            f"reason={source_sampling_audit.get('reason', '')}",
+            "action=reject_and_stop_auto_collect",
+            force_log=True,
+        )
     score_report = compute_episode_quality_score(execution_success, reason)
     success = bool(score_report.get("success", False))
     execution_success = bool(score_report.get("execution_success", execution_success))
@@ -14852,6 +15080,8 @@ def auto_collect_finish_episode(meta, success, reason):
         "pre_submissions": int(STATE.get("dataset_camera_pre_submissions", 0) or 0),
         "pre_submit_failures": int(STATE.get("dataset_camera_pre_submit_failures", 0) or 0),
         "last_reason": str(STATE.get("dataset_last_camera_wait_reason", "") or ""),
+        "paused_render_updates": int(STATE.get("dataset_camera_paused_render_updates", 0) or 0),
+        "timeline_resume_failures": int(STATE.get("dataset_camera_timeline_resume_failures", 0) or 0),
     }
     meta["camera_episode_summary"] = dataset_camera_episode_summary(meta=meta)
     write_json_file(STATE.get("dataset_meta_path", ""), meta)
@@ -18226,6 +18456,27 @@ async def auto_collect_one_episode():
 async def auto_collect_loop(count, max_attempts=None):
     if bool(STATE.get("auto_collect_active", False)):
         update_status("[AUTO DATASET] already running", force=True)
+        return
+    configured_interval = float(
+        STATE.get("dataset_sample_interval", DATASET_SAMPLE_INTERVAL_DEFAULT) or 0.0
+    )
+    configured_hz = 1.0 / configured_interval if configured_interval > 0.0 else 0.0
+    configured_camera_hz = float(
+        STATE.get("dataset_camera_frequency", DATASET_CAMERA_FREQUENCY_DEFAULT) or 0.0
+    )
+    if (
+        abs(configured_hz - AUTO_DATASET_REQUIRED_SOURCE_HZ) > 1.0e-6
+        or abs(configured_camera_hz - AUTO_DATASET_REQUIRED_SOURCE_HZ) > 1.0e-6
+        or bool(FAST_SAMPLED_REPLAY)
+    ):
+        reason = (
+            "blocked=dataset_source_rate_must_be_original_10hz:"
+            f"state_hz={configured_hz:.6f};camera_hz={configured_camera_hz:.6f};"
+            f"fast_sampled_replay={bool(FAST_SAMPLED_REPLAY)}"
+        )
+        STATE["auto_collect_last_result"] = reason
+        update_status(f"[AUTO DATASET] {reason}", force=True)
+        info_print("[ERROR] [AUTO DATASET]", reason, force_log=True)
         return
 
     previous_dataset = {

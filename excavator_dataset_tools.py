@@ -40,6 +40,7 @@ LEROBOT_CANONICAL_PHASE_NAMES = list(vla_observation_contract.CANONICAL_PHASE_NA
 LEROBOT_BASE_STATE_NAMES_14D = list(vla_observation_contract.BASE_STATE_NAMES_14D)
 LEROBOT_STATE_NAMES_28D = list(vla_observation_contract.STATE_NAMES_28D)
 LEROBOT_DEFAULT_EXPORT_DIRNAME = "lerobot_v3"
+LEROBOT_SOURCE_SAMPLING_CONTRACT = "original_uniform_10hz_v1"
 EXPORT_TIME_POLICY_FILENAME = "export_time_policy.json"
 LEROBOT_IMAGE_SHAPE = [256, 256, 3]
 LEROBOT_VIDEO_KEYFRAME_INTERVAL = 4
@@ -1347,8 +1348,8 @@ def infer_export_fps(run_dir: Union[str, os.PathLike], explicit_fps: Optional[fl
 
 
 def normalize_export_time_policy(policy: object) -> Dict[str, object]:
-    # Export preserves the physical collection speed. Attempt timing must be
-    # changed in Isaac, never by retiming recorded trajectories after the fact.
+    # Export uses a uniform timeline, but normal export only accepts source
+    # episodes already collected on that timeline. Legacy migration is explicit.
     return {
         "version": 1,
         "speed_scale": 1.0,
@@ -1408,6 +1409,7 @@ def lerobot_export_config_for_run(
     export_config = {
         "video_layout": "per_episode",
         "fps": float(export_fps),
+        "source_sampling_contract": LEROBOT_SOURCE_SAMPLING_CONTRACT,
         "video_keyframe_interval": int(LEROBOT_VIDEO_KEYFRAME_INTERVAL),
         "task_prompt_version": LEROBOT_TASK_PROMPT_VERSION,
         "state_schema_version": LEROBOT_STATE_SCHEMA_VERSION,
@@ -1651,6 +1653,35 @@ def apply_export_time_policy_to_trajectory(
         raw_t = safe_float_value(sample.get("t"), raw_first_t) or raw_first_t
         raw_times.append(float(raw_t) - raw_first_t)
         new_times.append(float(index) / float(effective_fps_value))
+    raw_duration_s = float(raw_times[-1]) if raw_times else 0.0
+    duration_s = float(new_times[-1]) if new_times else 0.0
+    source_time_scale = (
+        raw_duration_s / duration_s
+        if raw_duration_s > 0.0 and duration_s > 0.0
+        else 1.0
+    )
+    timestamp_base = (
+        safe_float_value(samples[0].get("timestamp"), 0.0) or 0.0
+        if samples
+        else 0.0
+    )
+    observation_timestamp_base = (
+        safe_float_value(samples[0].get("observation.timestamp"), timestamp_base)
+        or timestamp_base
+        if samples
+        else timestamp_base
+    )
+    action_timestamp_base = (
+        safe_float_value(samples[0].get("action.timestamp"), timestamp_base)
+        or timestamp_base
+        if samples
+        else timestamp_base
+    )
+    simulation_timestamp_base = (
+        safe_float_value(samples[0].get("timestamp.simulation"), 0.0) or 0.0
+        if samples
+        else 0.0
+    )
     dim = 4
     q_raw = [_vector_with_fallback(sample.get("obs.q"), sample.get("goal.q"), dim) for sample in samples]
     q_cmd_raw = [_vector_with_fallback(sample.get("obs.q_cmd"), sample.get("goal.q"), dim) for sample in samples]
@@ -1677,7 +1708,7 @@ def apply_export_time_policy_to_trajectory(
             row: List[Optional[float]] = []
             for axis_i in range(dim):
                 try:
-                    row.append(float(src[axis_i]) * speed_scale)
+                    row.append(float(src[axis_i]) * source_time_scale * speed_scale)
                 except Exception:
                     row.append(0.0)
             previous_action.append(row)
@@ -1699,6 +1730,16 @@ def apply_export_time_policy_to_trajectory(
         out["t_raw"] = sample.get("t")
         out["t"] = float(new_times[index])
         out["export_time_policy"] = dict(normalized)
+        out["export_time_scale"] = float(source_time_scale)
+        out["timestamp.raw"] = sample.get("timestamp")
+        out["observation.timestamp.raw"] = sample.get("observation.timestamp")
+        out["action.timestamp.raw"] = sample.get("action.timestamp")
+        out["timestamp.simulation.raw"] = sample.get("timestamp.simulation")
+        out["timestamp"] = float(timestamp_base + new_times[index])
+        out["observation.timestamp"] = float(observation_timestamp_base + new_times[index])
+        out["action.timestamp"] = float(action_timestamp_base + new_times[index])
+        out["timestamp.simulation"] = float(simulation_timestamp_base + new_times[index])
+        out["timestamp.source"] = "export_uniform_fps"
         q_wrapped = _rewrap_angles(q_unwrapped[index])
         q_cmd_wrapped = _rewrap_angles(q_cmd_unwrapped[index])
         if all(value is not None for value in q_wrapped):
@@ -1731,9 +1772,15 @@ def apply_export_time_policy_to_trajectory(
         "base_fps": float(base_fps or 10.0),
         "effective_fps": float(effective_fps_value),
         "speed_scale": speed_scale,
+        "source_time_scale": float(source_time_scale),
         "time_mode": normalized.get("time_mode"),
-        "raw_duration_s": float(raw_times[-1]) if raw_times else 0.0,
-        "duration_s": float(new_times[-1]) if new_times else 0.0,
+        "raw_duration_s": raw_duration_s,
+        "duration_s": duration_s,
+        "media_duration_s": (
+            float(len(samples)) / float(effective_fps_value)
+            if samples
+            else 0.0
+        ),
     }
 
 
@@ -1757,6 +1804,8 @@ def trajectory_sampling_report(trajectory: Sequence[dict]) -> Dict[str, object]:
         "duration_s": duration_s,
         "median_dt_s": median_dt,
         "median_hz": (1.0 / median_dt) if median_dt > 0.0 else 0.0,
+        "min_dt_s": min(deltas) if deltas else 0.0,
+        "max_dt_s": max(deltas) if deltas else 0.0,
     }
 
 
@@ -2761,6 +2810,22 @@ def collect_lerobot_rows(
             action_names=action_names,
         )
         trajectory = list(transformed.get("samples") or [])
+        transformed_sampling = trajectory_sampling_report(trajectory)
+        if len(trajectory) != int(source_sampling.get("sample_count", 0) or 0):
+            raise ValueError(
+                "uniform_10hz_frame_count_changed:"
+                f"source={int(source_sampling.get('sample_count', 0) or 0)};"
+                f"export={len(trajectory)};"
+                f"episode={episode.get('episode_index')}"
+            )
+        if len(trajectory) >= 2:
+            transformed_hz = float(transformed_sampling.get("median_hz", 0.0) or 0.0)
+            if abs(transformed_hz - float(base_fps)) > 1.0e-6:
+                raise ValueError(
+                    "uniform_10hz_timeline_validation_failed:"
+                    f"expected={float(base_fps):.6f};actual={transformed_hz:.6f};"
+                    f"episode={episode.get('episode_index')}"
+                )
         export_episode_index = len(episodes)
         first_t = safe_float_value(trajectory[0].get("t"), 0.0) or 0.0
         episode_start_frame = global_frame
@@ -2919,7 +2984,11 @@ def collect_lerobot_rows(
                 or episode.get("source_key")
                 or "",
                 "duration_s": float(transformed.get("duration_s") or 0.0),
+                "media_duration_s": float(transformed.get("media_duration_s") or 0.0),
                 "raw_duration_s": float(transformed.get("raw_duration_s") or 0.0),
+                "source_time_scale": float(transformed.get("source_time_scale") or 1.0),
+                "source_sampling_hz": float(source_sampling.get("median_hz", 0.0) or 0.0),
+                "export_sampling_hz": float(transformed_sampling.get("median_hz", 0.0) or 0.0),
             }
         )
         episode_image_paths.append(current_episode_image_paths)
@@ -3029,12 +3098,21 @@ def export_lerobot_dataset(
     if not rows:
         raise ValueError(f"no exportable frames found for split={split}")
     source_sampling_reports = list(collected.get("source_sampling_reports", []) or [])
-    sampling_tolerance_hz = max(0.5, float(base_export_fps) * 0.20)
+    expected_dt_s = 1.0 / max(1.0e-6, float(base_export_fps))
+    sampling_tolerance_hz = max(0.005, float(base_export_fps) * 0.001)
+    sampling_tolerance_dt_s = max(1.0e-5, expected_dt_s * 0.001)
     sampling_mismatches = [
         report
         for report in source_sampling_reports
         if int(report.get("sample_count", 0) or 0) >= 2
-        and abs(float(report.get("median_hz", 0.0) or 0.0) - float(base_export_fps)) > sampling_tolerance_hz
+        and (
+            abs(float(report.get("median_hz", 0.0) or 0.0) - float(base_export_fps))
+            > sampling_tolerance_hz
+            or abs(float(report.get("min_dt_s", 0.0) or 0.0) - expected_dt_s)
+            > sampling_tolerance_dt_s
+            or abs(float(report.get("max_dt_s", 0.0) or 0.0) - expected_dt_s)
+            > sampling_tolerance_dt_s
+        )
     ]
     if sampling_mismatches:
         examples = [
@@ -3042,14 +3120,16 @@ def export_lerobot_dataset(
                 "episode": report.get("raw_episode_index"),
                 "episode_id": report.get("raw_episode_id"),
                 "source_hz": round(float(report.get("median_hz", 0.0) or 0.0), 4),
-                "export_hz": float(base_export_fps),
+                "min_dt_s": round(float(report.get("min_dt_s", 0.0) or 0.0), 6),
+                "max_dt_s": round(float(report.get("max_dt_s", 0.0) or 0.0), 6),
             }
             for report in sampling_mismatches[:8]
         ]
         raise ValueError(
-            "source_sampling_rate_mismatch: export preserves physical speed and will not retime episodes; "
-            f"expected={base_export_fps:.4f}Hz tolerance={sampling_tolerance_hz:.4f}Hz "
-            f"mismatches={examples}. Export legacy and new sampling rates as separate datasets."
+            "source_sampling_rate_mismatch: normal export requires original uniform "
+            f"{base_export_fps:.4f}Hz data; mismatches={len(sampling_mismatches)}/"
+            f"{len(source_sampling_reports)} examples={examples}. "
+            "Run scripts/repair_dashboard_success_10hz.py once for the legacy success pool."
         )
 
     progress(8.0, "preparing export directory")
@@ -3114,7 +3194,10 @@ def export_lerobot_dataset(
         episode_video = episode_video_manifest[episode_i]
         for key in image_features:
             paths = list(episode_paths_by_key.get(key, []) or [])
-            episode_duration_s = float(current_episode.get("duration_s") or (float(len(paths)) / float(export_fps)))
+            episode_duration_s = float(
+                current_episode.get("media_duration_s")
+                or (float(len(paths)) / float(export_fps))
+            )
             if not paths or not any(paths):
                 entry = {"available": False, "reason": "no_images", "frames": 0, "chunk_index": 0, "file_index": int(episode_i)}
                 episode_video["videos"][key] = entry
@@ -3496,6 +3579,11 @@ def export_lerobot_dataset(
                 "media_config_hash": media_config_hash,
                 "time_policy": normalized_time_policy,
                 "time_policy_hash": str(time_policy_info.get("hash") or export_time_policy_hash(normalized_time_policy)),
+                "source_sampling_hz": float(episode.get("source_sampling_hz", 0.0) or 0.0),
+                "export_sampling_hz": float(episode.get("export_sampling_hz", export_fps) or export_fps),
+                "source_time_scale": float(episode.get("source_time_scale", 1.0) or 1.0),
+                "timeline_duration_s": float(episode.get("duration_s", 0.0) or 0.0),
+                "media_duration_s": float(episode.get("media_duration_s", 0.0) or 0.0),
             }
         )
 

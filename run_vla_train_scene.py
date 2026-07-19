@@ -710,9 +710,17 @@ def main():
         )
     if args.dataset_hz is not None:
         dataset_hz = max(1.0, float(args.dataset_hz))
+        if bool(args.auto_collect) and abs(dataset_hz - 10.0) > 1.0e-6:
+            raise ValueError(
+                f"--auto-collect requires original 10 Hz source data; got --dataset-hz={dataset_hz:g}"
+            )
         env_set_if_value("EXCAVATOR_DATASET_SAMPLE_INTERVAL", 1.0 / dataset_hz)
         env_set_if_value("EXCAVATOR_DATASET_CAMERA_FREQUENCY", int(round(dataset_hz)))
         env_set_if_value("EXCAVATOR_DATASET_CAMERA_BACKGROUND_INTERVAL_S", 1.0 / dataset_hz)
+    if bool(args.auto_collect) and bool(args.fast_sampled_replay):
+        raise ValueError(
+            "--fast-sampled-replay is incompatible with original physical 10 Hz auto-collect data"
+        )
     env_set_if_value("EXCAVATOR_DATASET_CAMERA_CAPTURE_RESOLUTION", args.camera_capture_resolution)
 
     from isaacsim import SimulationApp

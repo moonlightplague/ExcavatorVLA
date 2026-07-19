@@ -296,5 +296,66 @@ class DatasetExportPerformanceTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"media")
 
 
+class DatasetExportTimePolicyTests(unittest.TestCase):
+    def test_legacy_migration_transform_retimes_episode_to_uniform_10hz(self):
+        source_fps = 6.0
+        samples = []
+        for index in range(7):
+            t = index / source_fps
+            swing_unwrapped = math.radians(170.0 + 20.0 * t)
+            swing = (swing_unwrapped + math.pi) % (2.0 * math.pi) - math.pi
+            q = [swing, 0.1 * t, -0.2 * t, 0.3 * t]
+            q_cmd = [swing, 0.1 * t + 0.01, -0.2 * t, 0.3 * t]
+            samples.append(
+                {
+                    "i": index,
+                    "t": t,
+                    "timestamp": 1000.0 + t,
+                    "observation.timestamp": 1000.0 + t,
+                    "action.timestamp": 1000.0 + t,
+                    "timestamp.simulation": 50.0 + t,
+                    "phase": "pre_dig" if index < 3 else "approach_contact",
+                    "obs.q": q,
+                    "obs.q_cmd": q_cmd,
+                    "obs.state_legacy_14d": q + [100.0 * t] + [0.0] * 9,
+                    "observation.effort": [1.0 + t, 2.0 + t, 3.0 + t, 4.0 + t],
+                    "observation.images.0": f"images/0/{index:06d}.ppm",
+                    "observation.images.1": f"images/1/{index:06d}.ppm",
+                    "observation.images.2": f"images/2/{index:06d}.ppm",
+                    "action": [0.0] * 4,
+                    "sand": {"bucket_from_pile": 100.0 * t},
+                }
+            )
+
+        result = excavator_dataset_tools.apply_export_time_policy_to_trajectory(
+            samples,
+            base_fps=10.0,
+        )
+        transformed = result["samples"]
+
+        self.assertEqual(result["time_mode"], "uniform_fps")
+        self.assertEqual(len(transformed), 7)
+        self.assertAlmostEqual(result["raw_duration_s"], 1.0, places=6)
+        self.assertAlmostEqual(result["duration_s"], 0.6, places=6)
+        self.assertAlmostEqual(result["media_duration_s"], 0.7, places=6)
+        self.assertAlmostEqual(result["source_time_scale"], 1.0 / 0.6, places=6)
+        self.assertEqual(
+            [round(row["t"], 6) for row in transformed],
+            [index / 10.0 for index in range(7)],
+        )
+        self.assertAlmostEqual(
+            transformed[3]["obs.dq"][0],
+            math.radians(20.0) * (10.0 / source_fps),
+            places=5,
+        )
+        self.assertAlmostEqual(transformed[6]["timestamp"], 1000.6, places=6)
+        self.assertAlmostEqual(transformed[6]["observation.timestamp"], 1000.6, places=6)
+        self.assertAlmostEqual(transformed[6]["action.timestamp"], 1000.6, places=6)
+        self.assertAlmostEqual(transformed[6]["timestamp.simulation"], 50.6, places=6)
+        self.assertEqual(transformed[6]["timestamp.source"], "export_uniform_fps")
+        self.assertEqual(transformed[6]["observation.effort"], [2.0, 3.0, 4.0, 5.0])
+        self.assertTrue(all(row["export_time_policy"]["version"] == 1 for row in transformed))
+
+
 if __name__ == "__main__":
     unittest.main()

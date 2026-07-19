@@ -3134,7 +3134,9 @@ def config_snapshot(rt):
             "timeouts": int(rt.STATE.get("dataset_sample_wait_timeouts", 0) or 0),
             "pre_submissions": int(rt.STATE.get("dataset_camera_pre_submissions", 0) or 0),
             "pre_submit_failures": int(rt.STATE.get("dataset_camera_pre_submit_failures", 0) or 0),
-            "policy": "pre_submit_before_due_update_then_wall_wait",
+            "paused_render_updates": int(rt.STATE.get("dataset_camera_paused_render_updates", 0) or 0),
+            "timeline_resume_failures": int(rt.STATE.get("dataset_camera_timeline_resume_failures", 0) or 0),
+            "policy": "fixed_sim_grid_pre_submit_then_paused_render_wait",
         },
         "capture_scheduler": {
             "mode": str(
@@ -3146,7 +3148,8 @@ def config_snapshot(rt):
                 )
             ),
             "alignment": "capture_pose_sim_time+capture_q+capture_q_cmd",
-            "timeline_pause": False,
+            "timeline_pause": True,
+            "timeline_pause_scope": "pending viewport readback only",
         },
         "warmup_frames": int(rt.STATE.get("dataset_camera_warmup_frames", 3) or 3),
         "warmup_ready_frames": int(rt.STATE.get("dataset_camera_warmup_ready_frames", 2) or 2),

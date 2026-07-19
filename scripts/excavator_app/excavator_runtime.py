@@ -15071,13 +15071,11 @@ def auto_collect_finish_episode(meta, success, reason):
             "quality_rejected/dataset_source_not_original_uniform_10hz:"
             + str(source_sampling_audit.get("reason", "unknown"))
         )
-        STATE["auto_collect_stop_requested"] = True
-        STATE["auto_collect_last_result"] = f"blocked={reason}"
         info_print(
-            "[ERROR] [AUTO DATASET SAMPLING]",
+            "[WARN] [AUTO DATASET SAMPLING]",
             f"episode={meta.get('episode_id', '')}",
             f"reason={source_sampling_audit.get('reason', '')}",
-            "action=reject_and_stop_auto_collect",
+            "action=reject_episode_and_continue_auto_collect",
             force_log=True,
         )
     score_report = compute_episode_quality_score(execution_success, reason)

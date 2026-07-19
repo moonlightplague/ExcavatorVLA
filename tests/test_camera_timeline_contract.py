@@ -69,6 +69,8 @@ class CameraTimelineContractTests(unittest.TestCase):
         self.assertIn("seen_camera_paths", audit_source)
         self.assertIn("max_capture_grid_error_s", audit_source)
         self.assertIn("dataset_source_not_original_uniform_10hz", finish_source)
+        self.assertIn("reject_episode_and_continue_auto_collect", finish_source)
+        self.assertNotIn("auto_collect_stop_requested", finish_source)
         self.assertIn("dataset_source_rate_must_be_original_10hz", loop_source)
 
     def test_execution_has_start_recovery_and_stage_timeline_gate(self):

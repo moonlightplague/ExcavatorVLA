@@ -35,12 +35,14 @@ class CameraTimelineContractTests(unittest.TestCase):
         calls = called_attribute_names(node)
         self.assertIn("pause", calls)
         self.assertIn("play", calls)
+        self.assertIn("commit", calls)
         self.assertIn("simulation_timeline_is_playing", calls)
         self.assertIn("submit_viewport_capture_triplet", calls)
         self.assertIn("step_updates", calls)
         source = ast.unparse(node)
         self.assertIn("_EXCAVATOR_INTERNAL_TIMELINE_PAUSE_DEPTH", source)
         self.assertIn("raw_pending", source)
+        self.assertGreaterEqual(source.count("timeline.commit()"), 2)
 
     def test_sample_gate_uses_fixed_next_sim_deadline(self):
         due_node = function_node(RUNTIME_PATH, "dataset_record_sample_due")

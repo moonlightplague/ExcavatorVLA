@@ -7445,6 +7445,7 @@ async def dataset_camera_wait_for_scheduled_capture(sample_index):
                 getattr(builtins, "_EXCAVATOR_INTERNAL_TIMELINE_PAUSE_DEPTH", 0) or 0
             ) + 1
             timeline.pause()
+            timeline.commit()
 
         while time.time() <= deadline:
             latest_seq = int(STATE.get("dataset_camera_latest_seq", 0) or 0)
@@ -7499,12 +7500,12 @@ async def dataset_camera_wait_for_scheduled_capture(sample_index):
         STATE["dataset_camera_pose_sync_active"] = bool(previous_pose_sync)
         if resume_timeline and timeline is not None:
             try:
-                timeline.play()
                 for _ in range(3):
+                    timeline.play()
+                    timeline.commit()
                     if bool(timeline.is_playing()):
                         break
                     await asyncio.sleep(0)
-                    timeline.play()
                 if not bool(timeline.is_playing()):
                     STATE["dataset_camera_timeline_resume_failures"] = int(
                         STATE.get("dataset_camera_timeline_resume_failures", 0) or 0

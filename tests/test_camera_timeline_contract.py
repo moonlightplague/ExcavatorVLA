@@ -47,10 +47,15 @@ class CameraTimelineContractTests(unittest.TestCase):
     def test_sample_gate_uses_fixed_next_sim_deadline(self):
         due_node = function_node(RUNTIME_PATH, "dataset_record_sample_due")
         prepare_node = function_node(RUNTIME_PATH, "dataset_camera_prepare_for_scheduled_update")
+        record_node = function_node(RUNTIME_PATH, "dataset_record_sample")
         due_source = ast.unparse(due_node)
         prepare_source = ast.unparse(prepare_node)
+        record_source = ast.unparse(record_node)
         self.assertIn("dataset_next_sim_sample_time", due_source)
         self.assertIn("dataset_next_sim_sample_time", prepare_source)
+        self.assertIn("float(sample_index) * interval", record_source)
+        self.assertIn("camera_simulation_uniform_grid", record_source)
+        self.assertIn("timestamp.capture_offset_s", record_source)
 
     def test_success_requires_original_uniform_10hz_source(self):
         audit_node = function_node(RUNTIME_PATH, "dataset_episode_source_sampling_audit")
@@ -61,6 +66,8 @@ class CameraTimelineContractTests(unittest.TestCase):
         loop_source = ast.unparse(loop_node)
         self.assertIn("reused_camera_rows", audit_source)
         self.assertIn("non_physical_timestamp_rows", audit_source)
+        self.assertIn("seen_camera_paths", audit_source)
+        self.assertIn("max_capture_grid_error_s", audit_source)
         self.assertIn("dataset_source_not_original_uniform_10hz", finish_source)
         self.assertIn("dataset_source_rate_must_be_original_10hz", loop_source)
 

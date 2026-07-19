@@ -12087,8 +12087,17 @@ def dataset_record_sample(
         last_wall_sample = float(
             STATE.get("dataset_last_wall_sample_time", STATE.get("dataset_last_sample_time", 0.0)) or 0.0
         )
-        has_episode_rows = int(STATE.get("dataset_samples", 0) or 0) > int(STATE.get("dataset_episode_sample_start", 0) or 0)
-        if timestamp_override is None:
+        sample_index = int(STATE.get("dataset_samples", 0)) - int(STATE.get("dataset_episode_sample_start", 0))
+        has_episode_rows = sample_index > 0
+        if strict_auto_grid:
+            train_t = float(sample_index) * interval
+            train_abs = episode_start + train_t
+            timestamp_source_text = (
+                "camera_simulation_uniform_grid"
+                if capture_sim_time_override is not None
+                else "simulation_uniform_grid"
+            )
+        elif timestamp_override is None:
             if DATASET_USE_SIM_TIME:
                 train_t = max(0.0, float(sim_now) - episode_start_sim)
                 if has_episode_rows:
@@ -12124,7 +12133,6 @@ def dataset_record_sample(
         if q_real is None:
             q_real = get_real_joint_positions()
 
-        sample_index = int(STATE.get("dataset_samples", 0)) - int(STATE.get("dataset_episode_sample_start", 0))
         if dataset_camera_sample_requires_complete_images(sample_index):
             if camera_payload is None:
                 span_t = time.perf_counter()
@@ -12278,6 +12286,8 @@ def dataset_record_sample(
             "timestamp.wall": float(wall_now),
             "timestamp.simulation": float(sample_sim_time),
             "timestamp.simulation.recorded": float(sim_now),
+            "timestamp.grid_index": int(sample_index),
+            "timestamp.capture_offset_s": float(sample_sim_time - episode_start_sim - train_t),
             "t.wall": float(wall_now) - episode_start,
             "metrics.mode": metrics_mode_text,
             "task": str(STATE.get("dataset_task_text", "Dig soil from the marked area and dump it into the target container.")),
@@ -13498,6 +13508,8 @@ def dataset_episode_source_sampling_audit(path=None, expected_hz=AUTO_DATASET_RE
         "missing_camera_rows": 0,
         "reused_camera_rows": 0,
         "non_physical_timestamp_rows": 0,
+        "non_monotonic_capture_rows": 0,
+        "max_capture_grid_error_s": 0.0,
         "reason": "",
     }
     if not trajectory_path or not os.path.isfile(trajectory_path):
@@ -13505,8 +13517,14 @@ def dataset_episode_source_sampling_audit(path=None, expected_hz=AUTO_DATASET_RE
         return result
 
     times = []
-    previous_camera_paths = None
-    allowed_sources = {"simulation", "camera_simulation"}
+    capture_times = []
+    seen_camera_paths = [set(), set(), set()]
+    allowed_sources = {
+        "simulation",
+        "camera_simulation",
+        "simulation_uniform_grid",
+        "camera_simulation_uniform_grid",
+    }
     try:
         with open(trajectory_path, "r", encoding="utf-8") as handle:
             for raw in handle:
@@ -13524,12 +13542,23 @@ def dataset_episode_source_sampling_audit(path=None, expected_hz=AUTO_DATASET_RE
                 )
                 if not all(camera_paths):
                     result["missing_camera_rows"] += 1
-                if previous_camera_paths is not None and camera_paths == previous_camera_paths:
+                reused = False
+                for camera_index, camera_path in enumerate(camera_paths):
+                    if camera_path and camera_path in seen_camera_paths[camera_index]:
+                        reused = True
+                    if camera_path:
+                        seen_camera_paths[camera_index].add(camera_path)
+                if reused:
                     result["reused_camera_rows"] += 1
-                previous_camera_paths = camera_paths
                 timestamp_source = str(row.get("timestamp.source", "") or "")
                 if timestamp_source not in allowed_sources:
                     result["non_physical_timestamp_rows"] += 1
+                capture_time = float(row.get("timestamp.simulation"))
+                if not math.isfinite(capture_time):
+                    raise ValueError("non_finite_capture_time")
+                if capture_times and capture_time <= capture_times[-1]:
+                    result["non_monotonic_capture_rows"] += 1
+                capture_times.append(capture_time)
     except Exception as exc:
         result["reason"] = f"trajectory_read_failed:{type(exc).__name__}:{exc}"
         return result
@@ -13559,7 +13588,19 @@ def dataset_episode_source_sampling_audit(path=None, expected_hz=AUTO_DATASET_RE
         and int(result["reused_camera_rows"]) == 0
     )
     source_ok = int(result["non_physical_timestamp_rows"]) == 0
-    result["ok"] = bool(cadence_ok and camera_ok and source_ok)
+    capture_ok = int(result["non_monotonic_capture_rows"]) == 0
+    if capture_times:
+        capture_origin = float(capture_times[0])
+        capture_grid_errors = [
+            abs((float(capture_time) - capture_origin) - float(sample_time))
+            for capture_time, sample_time in zip(capture_times, times)
+        ]
+        result["max_capture_grid_error_s"] = float(max(capture_grid_errors, default=0.0))
+        capture_ok = bool(
+            capture_ok
+            and result["max_capture_grid_error_s"] <= expected_dt + AUTO_DATASET_SOURCE_DT_TOLERANCE_S
+        )
+    result["ok"] = bool(cadence_ok and camera_ok and source_ok and capture_ok)
     if not cadence_ok:
         result["reason"] = (
             f"cadence_not_uniform_{expected_hz:g}hz:"
@@ -13573,6 +13614,12 @@ def dataset_episode_source_sampling_audit(path=None, expected_hz=AUTO_DATASET_RE
     elif not source_ok:
         result["reason"] = (
             f"non_physical_timestamp_rows:{result['non_physical_timestamp_rows']}"
+        )
+    elif not capture_ok:
+        result["reason"] = (
+            f"capture_timeline_not_near_uniform_grid:"
+            f"non_monotonic={result['non_monotonic_capture_rows']};"
+            f"max_error={result['max_capture_grid_error_s']:.6f}"
         )
     else:
         result["reason"] = "ok"
@@ -34773,7 +34820,9 @@ def bucket_only_dump_ready(stage_name, dump_deg, label="before_dump"):
 async def wait_for_dump_settle(stage_name, task_id=None):
     max_frames = int(UNLOAD_DUMP_SETTLE_MAX_FRAMES)
     min_frames = int(UNLOAD_DUMP_SETTLE_MIN_FRAMES)
-    sample_frames = max(1, int(UNLOAD_DUMP_SETTLE_SAMPLE_FRAMES))
+    physics_frame_dt = float(CONTROL_DT) / max(1.0, float(control_step_frames()))
+    sample_interval = float(STATE.get("dataset_sample_interval", DATASET_SAMPLE_INTERVAL_DEFAULT) or 0.10)
+    sample_frames = max(1, int(round(sample_interval / max(1.0e-6, physics_frame_dt))))
 
     for frame in range(max_frames):
         if task_id is not None and not task_alive(task_id):

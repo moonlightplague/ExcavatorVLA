@@ -7889,6 +7889,9 @@ def planner_config_snapshot():
         "pre_dig_route_candidate_limit": PRE_DIG_ROUTE_CANDIDATE_LIMIT,
         "pre_dig_route_arc_swing_fractions": list(PRE_DIG_ROUTE_ARC_SWING_FRACTIONS),
         "pre_dig_route_rrt_time_ratio_trigger": PRE_DIG_ROUTE_RRT_TIME_RATIO_TRIGGER,
+        "loaded_route_candidate_limit": LOADED_ROUTE_CANDIDATE_LIMIT,
+        "loaded_route_arc_swing_fractions": list(LOADED_ROUTE_ARC_SWING_FRACTIONS),
+        "loaded_route_rrt_time_ratio_trigger": LOADED_ROUTE_RRT_TIME_RATIO_TRIGGER,
         "path_link_collision_segment_samples": PATH_LINK_COLLISION_SEGMENT_SAMPLES,
         "path_link_collision_radius_m": PATH_LINK_COLLISION_RADIUS_M,
         "collision_world_policy": "rigid_hard_avoid__sand_soft_contact",
@@ -23181,6 +23184,15 @@ PRE_DIG_ROUTE_RRT_TIME_RATIO_TRIGGER = max(
     1.0,
     env_float("EXCAVATOR_PRE_DIG_ROUTE_RRT_TIME_RATIO_TRIGGER", 1.25),
 )
+LOADED_ROUTE_CANDIDATE_LIMIT = max(
+    6,
+    env_int("EXCAVATOR_LOADED_ROUTE_CANDIDATE_LIMIT", 12),
+)
+LOADED_ROUTE_ARC_SWING_FRACTIONS = (0.50, 0.35, 0.65)
+LOADED_ROUTE_RRT_TIME_RATIO_TRIGGER = max(
+    1.0,
+    env_float("EXCAVATOR_LOADED_ROUTE_RRT_TIME_RATIO_TRIGGER", 1.15),
+)
 LOADED_ROUTE_TEST_PLAN_BUDGET_SECONDS = 30.0
 LOADED_ROUTE_MIN_STAGE_SECONDS = 1.80
 LOADED_ROUTE_FINAL_STAGE_SECONDS = 2.20
@@ -27610,7 +27622,7 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
         if not ok_route:
             last_reason = route_reason
             return
-        if pre_dig_route:
+        if pre_dig_route or carry_locked_route:
             route, prune_report = minimize_valid_clearance_waypoints(
                 q_start,
                 route,
@@ -27651,7 +27663,7 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
     def choose_best_candidate():
         if not candidates:
             return None
-        if not pre_dig_route:
+        if not pre_dig_route and not carry_locked_route:
             return sorted(
                 candidates,
                 key=lambda row: (
@@ -27748,7 +27760,7 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
         elif pre_dig_route:
             candidate_limit = int(PRE_DIG_ROUTE_CANDIDATE_LIMIT)
         else:
-            candidate_limit = 8
+            candidate_limit = int(LOADED_ROUTE_CANDIDATE_LIMIT) if carry_locked_route else 8
 
         tried = 0
         detours = PATH_DETERMINISTIC_SWING_DETOURS_DEG if deadline is None else PATH_DETERMINISTIC_SWING_DETOURS_DEG[:7]
@@ -27828,6 +27840,50 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
                 last_reason = f"pre_dig coordinated clearance tried={tried} last={last_reason}"
             return
 
+        if carry_locked_route:
+            pose_rows = []
+            for pose_idx, pose in enumerate(PATH_DETERMINISTIC_ROUTE_POSES_DEG):
+                q_clear = q_with_joint_degrees(q_start_arr, pose)
+                q_clear = clip_command_near(q_clear, reference=q_start_arr)
+                q_clear = force_loaded_carry_bucket_q(
+                    q_clear,
+                    reference=q_start_arr,
+                    label=f"{label}_coordinated_arc",
+                )
+                heuristic = float(
+                    plan_joint_motion_metrics(q_clear, q_start_arr, duration=0.0).get(
+                        "estimated_time",
+                        0.0,
+                    )
+                )
+                pose_rows.append((heuristic, pose_idx, q_clear))
+            pose_rows.sort(key=lambda row: (float(row[0]), int(row[1])))
+
+            total_swing = float(swing_delta(goal_swing, q_start_arr[swing_idx]))
+            arc_candidate_limit = max(2, min(6, candidate_limit - 2))
+            for swing_fraction in LOADED_ROUTE_ARC_SWING_FRACTIONS:
+                for _heuristic, pose_idx, q_clear in pose_rows:
+                    if budget_expired() or len(candidates) >= arc_candidate_limit:
+                        break
+                    q_arc = q_clear.copy()
+                    q_arc[swing_idx] = (
+                        float(q_start_arr[swing_idx])
+                        + float(swing_fraction) * total_swing
+                    )
+                    q_arc = clip_command_near(q_arc, reference=q_start_arr)
+                    add_route(
+                        [q_arc],
+                        "loaded_coordinated_arc",
+                        base_clearance_z,
+                        detail=(
+                            f"pose={pose_idx} "
+                            f"swing_fraction={float(swing_fraction):.2f} "
+                            "boom_arm_swing_coordinated"
+                        ),
+                    )
+                if budget_expired() or len(candidates) >= arc_candidate_limit:
+                    break
+
         for pose_idx, pose in enumerate(PATH_DETERMINISTIC_ROUTE_POSES_DEG):
             if budget_expired():
                 break
@@ -27906,15 +27962,25 @@ def find_clearance_route(q_start, q_goal, mode, label, deadline=None, samples=No
 
     add_deterministic_joint_routes()
     best = choose_best_candidate()
-    if pre_dig_route and best is not None and deadline is not None and not budget_expired():
+    if (
+        (pre_dig_route or carry_locked_route)
+        and best is not None
+        and deadline is not None
+        and not budget_expired()
+    ):
         direct_min_time = float(
             plan_joint_motion_metrics(q_goal, q_start, duration=0.0).get("estimated_time", 0.0)
         )
         route_time = float(best.get("estimated_time", 0.0) or 0.0)
         remaining = max(0.0, float(deadline) - time.time())
+        ratio_trigger = (
+            float(PRE_DIG_ROUTE_RRT_TIME_RATIO_TRIGGER)
+            if pre_dig_route
+            else float(LOADED_ROUTE_RRT_TIME_RATIO_TRIGGER)
+        )
         if (
             direct_min_time > 1.0e-4
-            and route_time > direct_min_time * float(PRE_DIG_ROUTE_RRT_TIME_RATIO_TRIGGER)
+            and route_time > direct_min_time * ratio_trigger
             and remaining >= 0.18
         ):
             try_joint_rrt_route()

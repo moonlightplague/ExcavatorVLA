@@ -7436,7 +7436,33 @@ async def dataset_camera_wait_for_scheduled_capture(sample_index):
     STATE["dataset_camera_pose_sync_active"] = True
     try:
         if not simulation_timeline_is_playing():
-            return False, f"timeline_not_playing_before_capture:sample={int(sample_index)}"
+            if internal_timeline_pause_active():
+                return False, f"timeline_paused_by_other_operation:sample={int(sample_index)}"
+            recovered = await ensure_timeline_playing_async(
+                f"dataset_camera_sample_{int(sample_index)}_pre_submit",
+                max_updates=2,
+            )
+            if not recovered:
+                return False, f"timeline_not_playing_before_capture:sample={int(sample_index)}"
+
+        # Camera initialization and capture submission require a playing
+        # timeline. Confirm an in-flight triplet before freezing the pose.
+        pending = STATE.get("dataset_camera_pending_capture")
+        pending_active = isinstance(pending, dict) and not bool(pending.get("done", False))
+        if not pending_active:
+            submitted, reason = excavator_dataset_camera.submit_viewport_capture_triplet(
+                runtime_module(),
+                sample_index=int(sample_index),
+            )
+            last_reason = str(reason or "capture_submit_failed")
+            pending = STATE.get("dataset_camera_pending_capture")
+            pending_active = isinstance(pending, dict) and not bool(pending.get("done", False))
+            if not submitted and not pending_active:
+                return False, (
+                    f"capture_not_submitted_before_pause:sample={int(sample_index)};"
+                    f"reason={last_reason}"
+                )
+
         if HAS_OMNI_TIMELINE:
             timeline = omni.timeline.get_timeline_interface()
             resume_timeline = bool(timeline is not None and timeline.is_playing())
@@ -7460,16 +7486,6 @@ async def dataset_camera_wait_for_scheduled_capture(sample_index):
 
             pending = STATE.get("dataset_camera_pending_capture")
             pending_active = isinstance(pending, dict) and not bool(pending.get("done", False))
-            if not pending_active:
-                submitted, reason = excavator_dataset_camera.submit_viewport_capture_triplet(
-                    runtime_module(),
-                    sample_index=int(sample_index),
-                )
-                last_reason = str(reason or "capture_submit_failed")
-                if submitted:
-                    pending = STATE.get("dataset_camera_pending_capture")
-                    pending_active = isinstance(pending, dict) and not bool(pending.get("done", False))
-
             # A callback submitted before the due sample may still need a Kit
             # render update. The timeline is paused, so these updates service
             # viewport readback without advancing joints, particles, or sim time.
@@ -7484,6 +7500,9 @@ async def dataset_camera_wait_for_scheduled_capture(sample_index):
                     STATE.get("dataset_camera_paused_render_updates", 0) or 0
                 ) + 1
                 continue
+            if not pending_active:
+                last_reason = "capture_completed_without_fresh_triplet"
+                break
             await asyncio.sleep(float(DATASET_SAMPLE_WAIT_POLL_S))
 
         elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -14947,7 +14966,7 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
             "camera_target_hz": int(STATE.get("dataset_camera_frequency", DATASET_CAMERA_FREQUENCY_DEFAULT) or DATASET_CAMERA_FREQUENCY_DEFAULT),
             "strict_camera_wait": bool(DATASET_STRICT_SAMPLE_WAIT),
             "camera_wait_timeout_s": float(DATASET_SAMPLE_WAIT_TIMEOUT_S),
-            "camera_wait_policy": "fixed_sim_grid_pre_submit_then_paused_render_wait",
+            "camera_wait_policy": "fixed_sim_grid_confirm_submit_then_paused_render_wait",
             "camera_wait_advances_simulation": False,
             "camera_state_alignment": "capture_pose_sim_time+capture_q+capture_q_cmd",
         },

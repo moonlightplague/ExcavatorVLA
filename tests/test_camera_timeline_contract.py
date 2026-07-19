@@ -42,6 +42,13 @@ class CameraTimelineContractTests(unittest.TestCase):
         source = ast.unparse(node)
         self.assertIn("_EXCAVATOR_INTERNAL_TIMELINE_PAUSE_DEPTH", source)
         self.assertIn("raw_pending", source)
+        self.assertIn("capture_not_submitted_before_pause", source)
+        self.assertLess(
+            source.index("submit_viewport_capture_triplet"),
+            source.index("timeline.pause()"),
+        )
+        pause_tail = source[source.index("timeline.pause()") :]
+        self.assertNotIn("submit_viewport_capture_triplet", pause_tail)
         self.assertGreaterEqual(source.count("timeline.commit()"), 2)
 
     def test_sample_gate_uses_fixed_next_sim_deadline(self):

@@ -18,7 +18,7 @@ except Exception:
     Image = None
 
 
-CAMERA_MODULE_VERSION = "dataset_camera_viewport_capture_v29_sample_owned_scheduler"
+CAMERA_MODULE_VERSION = "dataset_camera_viewport_capture_v30_submit_before_pause"
 SYNC_STEP_ERROR_TEXT = "Synchronous call to `step`"
 
 
@@ -3136,7 +3136,7 @@ def config_snapshot(rt):
             "pre_submit_failures": int(rt.STATE.get("dataset_camera_pre_submit_failures", 0) or 0),
             "paused_render_updates": int(rt.STATE.get("dataset_camera_paused_render_updates", 0) or 0),
             "timeline_resume_failures": int(rt.STATE.get("dataset_camera_timeline_resume_failures", 0) or 0),
-            "policy": "fixed_sim_grid_pre_submit_then_paused_render_wait",
+            "policy": "fixed_sim_grid_confirm_submit_then_paused_render_wait",
         },
         "capture_scheduler": {
             "mode": str(

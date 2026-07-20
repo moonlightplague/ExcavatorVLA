@@ -58,8 +58,8 @@ def parse_args():
         type=int,
         default=None,
         help=(
-            "Replay one deployment-contract sand/truck scene for every auto-collect "
-            "attempt. The sampled scene amount overrides --sand-amount after startup."
+            "Reproduce the deployment scene for this seed once, then reuse its exact "
+            "sand/truck pose and amount for every auto-collect attempt."
         ),
     )
     parser.add_argument(
@@ -712,11 +712,11 @@ def main():
         os.environ["EXCAVATOR_SAND_AMOUNT"] = str(args.sand_amount)
     if args.scene_seed is not None:
         os.environ["EXCAVATOR_AUTO_SCENE_REPLAY_SEED"] = str(int(args.scene_seed))
-        os.environ["EXCAVATOR_RANDOM_TRUCK"] = "1"
-        os.environ["EXCAVATOR_RANDOM_TRUCK_YAW"] = "1"
+        os.environ["EXCAVATOR_RANDOM_TRUCK"] = "0"
+        os.environ["EXCAVATOR_RANDOM_TRUCK_YAW"] = "0"
         os.environ["EXCAVATOR_RANDOM_ROBOT_YAW"] = "0"
-        os.environ["EXCAVATOR_RANDOM_SAND_XY"] = "1"
-        os.environ["EXCAVATOR_RANDOM_SAND_AMOUNT"] = "1"
+        os.environ["EXCAVATOR_RANDOM_SAND_XY"] = "0"
+        os.environ["EXCAVATOR_RANDOM_SAND_AMOUNT"] = "0"
     if args.sand_settle_frames is not None:
         settle_frames = int(args.sand_settle_frames)
         os.environ["EXCAVATOR_SAND_RESET_SETTLE_MIN_FRAMES"] = str(settle_frames)

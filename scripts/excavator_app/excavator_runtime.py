@@ -16015,11 +16015,11 @@ def update_unload_models_only(p):
 def auto_scene_randomization_config():
     if AUTO_SCENE_REPLAY_SEED is not None:
         return {
-            "random_truck": True,
-            "random_truck_yaw": True,
+            "random_truck": False,
+            "random_truck_yaw": False,
             "random_robot_yaw": False,
-            "random_sand_xy": True,
-            "random_sand_amount": True,
+            "random_sand_xy": False,
+            "random_sand_amount": False,
             "fixed_scene_replay": True,
             "scene_seed": int(AUTO_SCENE_REPLAY_SEED),
         }
@@ -16037,7 +16037,8 @@ def auto_scene_randomization_config():
 def auto_scene_randomization_any_enabled():
     cfg = auto_scene_randomization_config()
     return bool(
-        cfg["random_truck"]
+        cfg.get("fixed_scene_replay", False)
+        or cfg["random_truck"]
         or cfg["random_truck_yaw"]
         or cfg["random_robot_yaw"]
         or cfg["random_sand_xy"]
@@ -16850,6 +16851,92 @@ def auto_scene_truck_baseline():
     return baseline
 
 
+def auto_scene_deployment_bbox_center_size(path):
+    prim = get_prim(path)
+    if not prim or not prim.IsValid():
+        return None, None, None, None
+    try:
+        bbox_cache = UsdGeom.BBoxCache(
+            Usd.TimeCode.Default(),
+            [
+                UsdGeom.Tokens.default_,
+                UsdGeom.Tokens.render,
+                UsdGeom.Tokens.proxy,
+            ],
+            useExtentsHint=True,
+        )
+        aligned = bbox_cache.ComputeWorldBound(prim).ComputeAlignedRange()
+        if aligned.IsEmpty():
+            return None, None, None, None
+        minimum_value = aligned.GetMin()
+        maximum_value = aligned.GetMax()
+        minimum = np.array(
+            [float(minimum_value[index]) for index in range(3)],
+            dtype=np.float64,
+        )
+        maximum = np.array(
+            [float(maximum_value[index]) for index in range(3)],
+            dtype=np.float64,
+        )
+        center = 0.5 * (minimum + maximum)
+        return center, maximum - minimum, minimum, maximum
+    except Exception:
+        return None, None, None, None
+
+
+def auto_scene_deployment_baseline():
+    cached = STATE.get("auto_scene_deployment_baseline")
+    if isinstance(cached, dict) and cached.get("valid"):
+        return cached
+    truck_center, truck_size, _truck_min, _truck_max = (
+        auto_scene_deployment_bbox_center_size(AUTO_SCENE_TRUCK_ROOT_PATH)
+    )
+    dump_center, _dump_size, _dump_min, _dump_max = (
+        auto_scene_deployment_bbox_center_size(DEFAULT_UNLOAD_SOURCE_MESH_PATH)
+    )
+    if truck_center is None or dump_center is None:
+        baseline = {
+            "valid": False,
+            "reason": "deployment_aligned_bbox_missing",
+            "path": AUTO_SCENE_TRUCK_ROOT_PATH,
+        }
+        STATE["auto_scene_deployment_baseline"] = baseline
+        return baseline
+    try:
+        translation = np.array(
+            get_prim_translation(AUTO_SCENE_TRUCK_ROOT_PATH),
+            dtype=np.float64,
+        ).reshape(-1)[:3]
+    except Exception:
+        translation = np.array(truck_center, dtype=np.float64).reshape(-1)[:3]
+    baseline = {
+        "valid": True,
+        "path": AUTO_SCENE_TRUCK_ROOT_PATH,
+        "center": np.array(truck_center, dtype=np.float64).reshape(-1)[:3],
+        "translation": translation,
+        "yaw_deg": float(
+            get_prim_local_yaw_z_deg(AUTO_SCENE_TRUCK_ROOT_PATH, default=0.0)
+        ),
+        "dump_center": np.array(dump_center, dtype=np.float64).reshape(-1)[:3],
+        "size": np.array(truck_size, dtype=np.float64).reshape(-1)[:3],
+        "bbox_contract": "deployment_world_aligned_bbox",
+    }
+    STATE["auto_scene_deployment_baseline"] = baseline
+    return baseline
+
+
+def auto_scene_deployment_robot_xy():
+    try:
+        if ROBOT is not None:
+            position, _orientation = ROBOT.get_world_pose()
+            value = np.array(position, dtype=np.float64).reshape(-1)
+            if len(value) >= 2 and np.all(np.isfinite(value[:2])):
+                return value[:2]
+    except Exception:
+        pass
+    return np.array(auto_scene_robot_xy(), dtype=np.float64).reshape(-1)[:2]
+
+
 def auto_scene_candidate_legal(candidate):
     workspace = auto_scene_random_workspace_bounds()
     sand_xy = np.array(candidate.get("sand_xy"), dtype=np.float32).reshape(-1)[:2]
@@ -16948,7 +17035,16 @@ def auto_scene_estimate_particles_for_amount(amount):
 
 
 def auto_scene_fixed_replay_candidate(attempt_index, cfg, seed_context):
-    truck_base = auto_scene_truck_baseline()
+    cached = STATE.get("auto_scene_fixed_replay_candidate_template")
+    if (
+        isinstance(cached, dict)
+        and int(cached.get("scene_seed", -1)) == int(seed_context["scene_seed"])
+    ):
+        candidate = copy.deepcopy(cached)
+        candidate["attempt"] = int(attempt_index)
+        return candidate
+
+    truck_base = auto_scene_deployment_baseline()
     if not (isinstance(truck_base, dict) and truck_base.get("valid")):
         return {
             "error": str((truck_base or {}).get("reason", "truck_baseline_invalid")),
@@ -16958,7 +17054,7 @@ def auto_scene_fixed_replay_candidate(attempt_index, cfg, seed_context):
     try:
         profile = deployment_scene_contract.sample_random_scene_profile(
             seed=int(seed_context["scene_seed"]),
-            robot_xy=auto_scene_robot_xy(),
+            robot_xy=auto_scene_deployment_robot_xy(),
             truck_center_xy=np.array(truck_base["center"], dtype=np.float32)[:2],
             truck_dump_center_xy=np.array(
                 truck_base["dump_center"],
@@ -17011,16 +17107,14 @@ def auto_scene_fixed_replay_candidate(attempt_index, cfg, seed_context):
         ),
         "sample_try": int(profile["sample_try"]),
         "deployment_scene_profile": dict(profile),
+        "fixed_scene_direct_apply": True,
+        "deployment_baseline_translation_xyz": np.array(
+            truck_base["translation"],
+            dtype=np.float64,
+        ).reshape(-1)[:3],
     }
-    ok, reason = auto_scene_candidate_legal(candidate)
-    if not ok:
-        return {
-            "error": f"fixed_scene_profile_illegal:{reason}",
-            "attempt": int(attempt_index),
-            "candidate": candidate,
-            **seed_context,
-        }
-    candidate["legal_reason"] = str(reason)
+    candidate["legal_reason"] = "fixed_scene_deferred_to_applied_geometry_gate"
+    STATE["auto_scene_fixed_replay_candidate_template"] = copy.deepcopy(candidate)
     return candidate
 
 
@@ -17030,7 +17124,11 @@ def auto_scene_attempt_record(candidate=None, ok=False, reason="", cfg=None):
     sand_result = candidate.get("sand_site_result") if isinstance(candidate.get("sand_site_result"), dict) else {}
     truck_translation = None
     truck_yaw_deg = None
-    if bool(cfg.get("random_truck", False) or cfg.get("random_truck_yaw", False)):
+    if bool(
+        cfg.get("fixed_scene_replay", False)
+        or cfg.get("random_truck", False)
+        or cfg.get("random_truck_yaw", False)
+    ):
         try:
             truck_translation = vec_list(get_prim_translation(AUTO_SCENE_TRUCK_ROOT_PATH), 3)
         except Exception:
@@ -17233,17 +17331,32 @@ def auto_scene_apply_candidate(candidate):
     if not isinstance(candidate, dict) or candidate.get("error"):
         return False, str((candidate or {}).get("error", "no_candidate"))
     cfg = auto_scene_randomization_config()
+    fixed_scene_replay = bool(cfg.get("fixed_scene_replay", False))
+    apply_truck = bool(
+        fixed_scene_replay
+        or cfg["random_truck"]
+        or cfg["random_truck_yaw"]
+    )
+    apply_sand_xy = bool(fixed_scene_replay or cfg["random_sand_xy"])
+    apply_sand_amount = bool(
+        fixed_scene_replay or cfg["random_sand_amount"]
+    )
     scene_changed = False
     truck_moved = False
 
-    if cfg["random_truck"] or cfg["random_truck_yaw"]:
+    if apply_truck:
         debug_timeline_record(
             "AUTO_SCENE_APPLY_STEP",
             stage="truck_transform",
             result="start",
             data={"attempt": int(candidate.get("attempt", 0) or 0)},
         )
-        truck_base = auto_scene_truck_baseline()
+        fixed_scene_direct = bool(candidate.get("fixed_scene_direct_apply", False))
+        truck_base = (
+            auto_scene_deployment_baseline()
+            if fixed_scene_direct
+            else auto_scene_truck_baseline()
+        )
         if not (isinstance(truck_base, dict) and truck_base.get("valid")):
             return False, str(truck_base.get("reason", "truck_baseline_invalid"))
         target_yaw = float(
@@ -17253,7 +17366,13 @@ def auto_scene_apply_candidate(candidate):
             )
             or 0.0
         )
-        base_translate = np.array(truck_base["translation"], dtype=np.float32).reshape(-1)[:3].copy()
+        base_translate = np.array(
+            candidate.get(
+                "deployment_baseline_translation_xyz",
+                truck_base["translation"],
+            ),
+            dtype=np.float64,
+        ).reshape(-1)[:3].copy()
         truck_moved = bool(
             set_translate_rotate_z_preserve_xform_ops(
                 AUTO_SCENE_TRUCK_ROOT_PATH,
@@ -17263,8 +17382,17 @@ def auto_scene_apply_candidate(candidate):
         )
         if not truck_moved:
             return False, "truck_pose_reset_failed"
-        if cfg["random_truck"]:
-            dump_center, _dump_size, _dump_mn, _dump_mx = bbox_center_size(DEFAULT_UNLOAD_SOURCE_MESH_PATH)
+        if fixed_scene_replay or cfg["random_truck"]:
+            if fixed_scene_direct:
+                dump_center, _dump_size, _dump_mn, _dump_mx = (
+                    auto_scene_deployment_bbox_center_size(
+                        DEFAULT_UNLOAD_SOURCE_MESH_PATH
+                    )
+                )
+            else:
+                dump_center, _dump_size, _dump_mn, _dump_mx = bbox_center_size(
+                    DEFAULT_UNLOAD_SOURCE_MESH_PATH
+                )
             if dump_center is None:
                 return False, "truck_dump_center_missing_after_yaw"
             desired_unload_xy = np.array(candidate.get("unload_xy", [0.0, 0.0]), dtype=np.float32).reshape(-1)[:2]
@@ -17284,6 +17412,48 @@ def auto_scene_apply_candidate(candidate):
             if not truck_moved:
                 return False, "truck_translate_failed"
             candidate["applied_truck_delta_xy"] = delta.copy()
+            if fixed_scene_direct:
+                candidate["fixed_truck_translation_xyz"] = np.array(
+                    target_translate,
+                    dtype=np.float64,
+                ).reshape(-1)[:3].copy()
+                actual_dump, _size, _minimum, _maximum = (
+                    auto_scene_deployment_bbox_center_size(
+                        DEFAULT_UNLOAD_SOURCE_MESH_PATH
+                    )
+                )
+                if actual_dump is None:
+                    return False, "fixed_scene_dump_center_verify_missing"
+                actual_yaw = float(
+                    get_prim_local_yaw_z_deg(
+                        AUTO_SCENE_TRUCK_ROOT_PATH,
+                        default=target_yaw,
+                    )
+                )
+                unload_error = float(
+                    np.linalg.norm(
+                        np.array(actual_dump, dtype=np.float64)[:2]
+                        - np.array(desired_unload_xy, dtype=np.float64)[:2]
+                    )
+                )
+                yaw_error = abs(wrap_deg_180(actual_yaw - target_yaw))
+                candidate["fixed_scene_pose_verification"] = {
+                    "truck_translation_xyz": vec_list(
+                        get_prim_translation(AUTO_SCENE_TRUCK_ROOT_PATH),
+                        3,
+                    ),
+                    "truck_yaw_deg": float(actual_yaw),
+                    "truck_yaw_error_deg": float(yaw_error),
+                    "dump_center_xyz": vec_list(actual_dump, 3),
+                    "unload_xy_error_m": float(unload_error),
+                }
+                if yaw_error > 0.25 or unload_error > 0.05:
+                    return (
+                        False,
+                        "fixed_scene_pose_mismatch:"
+                        f"yaw={yaw_error:.3f}deg,"
+                        f"unload={unload_error:.3f}m",
+                    )
         clear_rigid_obstacle_cache("auto_scene_random_truck")
         scene_changed = True
         debug_timeline_record(
@@ -17302,8 +17472,12 @@ def auto_scene_apply_candidate(candidate):
             result="start",
             data={"attempt": int(candidate.get("attempt", 0) or 0)},
         )
-        sand_xy = candidate.get("sand_xy") if cfg["random_sand_xy"] else None
-        amount = candidate.get("sand_amount_multiplier") if cfg["random_sand_amount"] else None
+        sand_xy = candidate.get("sand_xy") if apply_sand_xy else None
+        amount = (
+            candidate.get("sand_amount_multiplier")
+            if apply_sand_amount
+            else None
+        )
         unload_xy = None
         # Auto collect invalidates the stable-reset flag below; let prepare perform
         # the single real particle rebuild after the robot is safely at home.
@@ -17317,9 +17491,13 @@ def auto_scene_apply_candidate(candidate):
         candidate["sand_site_result"] = result
         if isinstance(result, dict) and result.get("changed"):
             scene_changed = True
-            if cfg["random_sand_xy"] or cfg["random_sand_amount"]:
+            if apply_sand_xy or apply_sand_amount:
                 info_print(
-                    "[AUTO SCENE RANDOMIZE]",
+                    (
+                        "[AUTO SCENE FIXED]"
+                        if fixed_scene_replay
+                        else "[AUTO SCENE RANDOMIZE]"
+                    ),
                     f"cleared_old_sand_particles={bool(candidate.get('cleared_old_sand_particles', False))}",
                     "reason=cleared_before_sand_parameter_apply",
                 )
@@ -17329,7 +17507,7 @@ def auto_scene_apply_candidate(candidate):
             result="ok",
             data={"attempt": int(candidate.get("attempt", 0) or 0)},
         )
-    elif cfg["random_sand_xy"] or cfg["random_sand_amount"]:
+    elif apply_sand_xy or apply_sand_amount:
         return False, "sand_site_apply_api_missing"
 
     if truck_moved:
@@ -17388,6 +17566,12 @@ def auto_scene_apply_candidate(candidate):
 
 async def auto_collect_apply_scene_randomization(attempt_index):
     cfg = auto_scene_randomization_config()
+    fixed_scene_replay = bool(cfg.get("fixed_scene_replay", False))
+    scene_log_label = (
+        "[AUTO SCENE FIXED]"
+        if bool(cfg.get("fixed_scene_replay", False))
+        else "[AUTO SCENE RANDOMIZE]"
+    )
     if not auto_scene_randomization_any_enabled():
         candidate = auto_scene_sample_candidate(attempt_index)
         if not isinstance(candidate, dict) or "error" in candidate:
@@ -17403,7 +17587,7 @@ async def auto_collect_apply_scene_randomization(attempt_index):
             STATE["auto_scene_last_randomization"],
         )
         info_print(
-            "[AUTO SCENE RANDOMIZE]",
+            scene_log_label,
             f"attempt={attempt_index}",
             "ok=True",
             "reason=disabled_precheck_only",
@@ -17430,13 +17614,16 @@ async def auto_collect_apply_scene_randomization(attempt_index):
         STATE["auto_scene_last_randomization"] = record
         append_jsonl(os.path.join(ensure_auto_collect_run_dir(), "scene_randomization.jsonl"), record)
         info_print(
-            "[AUTO SCENE RANDOMIZE]",
+            scene_log_label,
             f"attempt={attempt_index}",
             "ok=False",
             f"reason={candidate.get('error')}",
             f"config={cfg}",
         )
-        update_status(f"[AUTO SCENE RANDOMIZE] skipped invalid sample: {candidate.get('error')}", force=True)
+        update_status(
+            f"{scene_log_label} skipped invalid sample: {candidate.get('error')}",
+            force=True,
+        )
         return False
     debug_timeline_record(
         "AUTO_SCENE_RANDOMIZE_STEP",
@@ -17465,7 +17652,11 @@ async def auto_collect_apply_scene_randomization(attempt_index):
                 trace_label=f"scene_pause:attempt_{int(attempt_index)}",
             )
 
-        if cfg["random_sand_xy"] or cfg["random_sand_amount"]:
+        if (
+            fixed_scene_replay
+            or cfg["random_sand_xy"]
+            or cfg["random_sand_amount"]
+        ):
             api = get_sand_site_api()
             clear_sand_fn = api.get("clear_real_particle_sand") if isinstance(api, dict) else None
             if not callable(clear_sand_fn):
@@ -17512,10 +17703,11 @@ async def auto_collect_apply_scene_randomization(attempt_index):
     STATE["auto_scene_last_randomization"] = record
     append_jsonl(os.path.join(ensure_auto_collect_run_dir(), "scene_randomization.jsonl"), record)
     info_print(
-        "[AUTO SCENE RANDOMIZE]",
+        scene_log_label,
         f"attempt={attempt_index}",
         f"ok={ok}",
         f"reason={reason}",
+        f"fixed={fixed_scene_replay}",
         f"truck={cfg['random_truck']}",
         f"truck_yaw={cfg['random_truck_yaw']}",
         f"robot_yaw={cfg['random_robot_yaw']}",
@@ -17524,7 +17716,7 @@ async def auto_collect_apply_scene_randomization(attempt_index):
         f"candidate={record['candidate']}",
     )
     if not ok:
-        update_status(f"[AUTO SCENE RANDOMIZE] apply failed: {reason}", force=True)
+        update_status(f"{scene_log_label} apply failed: {reason}", force=True)
     return bool(ok)
 
 

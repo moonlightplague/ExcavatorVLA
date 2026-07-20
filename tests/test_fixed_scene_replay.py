@@ -73,9 +73,32 @@ class FixedSceneReplayTests(unittest.TestCase):
             source,
         )
         self.assertIn(
+            "truck_base = auto_scene_deployment_baseline()",
+            source,
+        )
+        self.assertIn(
+            '"fixed_scene_direct_apply": True',
+            source,
+        )
+        self.assertIn(
+            'STATE["auto_scene_fixed_replay_candidate_template"]',
+            source,
+        )
+        self.assertIn(
             "if elapsed >= min_frames and stable_windows >= required_windows:",
             source,
         )
+
+    def test_launcher_does_not_enable_attempt_randomization_for_replay(self):
+        source = (ROOT / "run_vla_train_scene.py").read_text(encoding="utf-8")
+        for name in (
+            "EXCAVATOR_RANDOM_TRUCK",
+            "EXCAVATOR_RANDOM_TRUCK_YAW",
+            "EXCAVATOR_RANDOM_ROBOT_YAW",
+            "EXCAVATOR_RANDOM_SAND_XY",
+            "EXCAVATOR_RANDOM_SAND_AMOUNT",
+        ):
+            self.assertIn(f'os.environ["{name}"] = "0"', source)
 
 
 if __name__ == "__main__":

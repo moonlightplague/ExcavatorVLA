@@ -1,0 +1,22 @@
+{
+  "schema": "excavator_fixed_scene_profile_v1",
+  "scene_seed": 2,
+  "sample_try": 1,
+  "sand_xy": [
+    -0.9082751105784576,
+    7.224985896564733
+  ],
+  "sand_amount_multiplier": 13.025986537553395,
+  "truck_translation_xyz": [
+    -6.088853843812309,
+    -3.4853730551923543,
+    -9.860761315262637e-32
+  ],
+  "truck_yaw_deg": -91.94326,
+  "unload_landing_xyz": [
+    -7.907543289297507,
+    -2.007319897383199,
+    4.152685460553676
+  ],
+  "source": "run_simulation.py scene_seed=2"
+}

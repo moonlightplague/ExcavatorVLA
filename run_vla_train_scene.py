@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import importlib
 import json
+import math
 import os
 import platform
 import runpy
@@ -60,6 +61,15 @@ def parse_args():
         help=(
             "Reproduce the deployment scene for this seed once, then reuse its exact "
             "sand/truck pose and amount for every auto-collect attempt."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-scene-profile",
+        default=None,
+        help=(
+            "JSON file containing the final sand/truck scene applied by the "
+            "deployment simulator. This bypasses scene sampling and truck "
+            "baseline reconstruction."
         ),
     )
     parser.add_argument(
@@ -698,8 +708,13 @@ def main():
     bridge_enabled = args.bridge if args.bridge is not None else (not args.auto_collect and not args.headless)
     if args.headless and bridge_enabled:
         raise SystemExit("--bridge requires a GUI viewport. Use non-headless mode or pass --no-bridge.")
-    if args.scene_seed is not None and not args.auto_collect:
-        raise SystemExit("--scene-seed requires --auto-collect.")
+    if (
+        args.scene_seed is not None
+        or args.fixed_scene_profile is not None
+    ) and not args.auto_collect:
+        raise SystemExit(
+            "--scene-seed/--fixed-scene-profile require --auto-collect."
+        )
     if args.sand_settle_frames is not None and int(args.sand_settle_frames) < 1:
         raise SystemExit("--sand-settle-frames must be at least 1.")
 
@@ -710,8 +725,48 @@ def main():
         os.environ["EXCAVATOR_NO_UI"] = "1"
     if args.sand_amount is not None:
         os.environ["EXCAVATOR_SAND_AMOUNT"] = str(args.sand_amount)
+    if args.fixed_scene_profile is not None:
+        profile_path = paths.resolve_existing_path(
+            args.fixed_scene_profile,
+            root=PROJECT_ROOT,
+        )
+        if not os.path.isfile(profile_path):
+            raise SystemExit(
+                f"--fixed-scene-profile does not exist: {profile_path}"
+            )
+        with open(profile_path, "r", encoding="utf-8") as handle:
+            fixed_profile = json.load(handle)
+        if not isinstance(fixed_profile, dict):
+            raise SystemExit("--fixed-scene-profile must contain a JSON object.")
+        required_vectors = {
+            "sand_xy": 2,
+            "truck_translation_xyz": 3,
+            "unload_landing_xyz": 3,
+        }
+        for key, size in required_vectors.items():
+            value = fixed_profile.get(key)
+            if not isinstance(value, (list, tuple)) or len(value) < size:
+                raise SystemExit(
+                    f"--fixed-scene-profile missing {key}[{size}]"
+                )
+            if not all(math.isfinite(float(item)) for item in value[:size]):
+                raise SystemExit(
+                    f"--fixed-scene-profile has non-finite {key}"
+                )
+        for key in ("sand_amount_multiplier", "truck_yaw_deg"):
+            if not math.isfinite(float(fixed_profile.get(key, float("nan")))):
+                raise SystemExit(
+                    f"--fixed-scene-profile missing finite {key}"
+                )
+        os.environ["EXCAVATOR_AUTO_SCENE_FIXED_PROFILE_JSON"] = json.dumps(
+            fixed_profile,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        os.environ["EXCAVATOR_AUTO_SCENE_FIXED_PROFILE_PATH"] = profile_path
     if args.scene_seed is not None:
         os.environ["EXCAVATOR_AUTO_SCENE_REPLAY_SEED"] = str(int(args.scene_seed))
+    if args.scene_seed is not None or args.fixed_scene_profile is not None:
         os.environ["EXCAVATOR_RANDOM_TRUCK"] = "0"
         os.environ["EXCAVATOR_RANDOM_TRUCK_YAW"] = "0"
         os.environ["EXCAVATOR_RANDOM_ROBOT_YAW"] = "0"
@@ -817,15 +872,16 @@ def main():
             rt.STATE["dataset_stable_render_settings_enabled"] = bool(stable_render_enabled)
         except Exception:
             pass
-        if args.scene_seed is not None:
-            rt.STATE["auto_scene_random_truck_enabled"] = True
-            rt.STATE["auto_scene_random_truck_yaw_enabled"] = True
+        if args.scene_seed is not None or args.fixed_scene_profile is not None:
+            rt.STATE["auto_scene_random_truck_enabled"] = False
+            rt.STATE["auto_scene_random_truck_yaw_enabled"] = False
             rt.STATE["auto_scene_random_robot_yaw_enabled"] = False
-            rt.STATE["auto_scene_random_sand_xy_enabled"] = True
-            rt.STATE["auto_scene_random_sand_amount_enabled"] = True
+            rt.STATE["auto_scene_random_sand_xy_enabled"] = False
+            rt.STATE["auto_scene_random_sand_amount_enabled"] = False
             print(
                 "[INFO] Fixed auto-collect scene replay enabled:",
-                f"scene_seed={int(args.scene_seed)}",
+                f"scene_seed={args.scene_seed if args.scene_seed is not None else 'profile'}",
+                f"profile={args.fixed_scene_profile or 'derived_from_seed'}",
                 f"sand_settle_frames={args.sand_settle_frames or 'runtime-default'}",
                 "robot_yaw=authored",
                 flush=True,

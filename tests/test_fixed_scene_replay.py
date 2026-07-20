@@ -1,3 +1,4 @@
+import json
 import unittest
 from pathlib import Path
 
@@ -54,6 +55,7 @@ class FixedSceneReplayTests(unittest.TestCase):
         )
         self.assertLess(env_index, runtime_index)
         self.assertIn('"--scene-seed"', source)
+        self.assertIn('"--fixed-scene-profile"', source)
         self.assertIn('"--sand-settle-frames"', source)
         self.assertIn(
             'os.environ["EXCAVATOR_SAND_RESET_SETTLE_ENFORCE_MIN"] = "1"',
@@ -99,6 +101,18 @@ class FixedSceneReplayTests(unittest.TestCase):
             "EXCAVATOR_RANDOM_SAND_AMOUNT",
         ):
             self.assertIn(f'os.environ["{name}"] = "0"', source)
+
+    def test_seed_two_exact_profile_contains_final_deployment_pose(self):
+        path = ROOT / "configs" / "deployment_scene_seed2.json"
+        profile = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(profile["scene_seed"], 2)
+        self.assertEqual(len(profile["truck_translation_xyz"]), 3)
+        self.assertAlmostEqual(
+            profile["truck_yaw_deg"],
+            -91.94326,
+            places=5,
+        )
+        self.assertEqual(len(profile["unload_landing_xyz"]), 3)
 
 
 if __name__ == "__main__":

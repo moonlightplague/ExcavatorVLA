@@ -813,6 +813,26 @@ except ValueError as exc:
     raise ValueError(
         "EXCAVATOR_AUTO_SCENE_REPLAY_SEED must be an integer"
     ) from exc
+AUTO_SCENE_FIXED_PROFILE_TEXT = str(
+    os.environ.get("EXCAVATOR_AUTO_SCENE_FIXED_PROFILE_JSON", "") or ""
+).strip()
+try:
+    AUTO_SCENE_FIXED_PROFILE = (
+        json.loads(AUTO_SCENE_FIXED_PROFILE_TEXT)
+        if AUTO_SCENE_FIXED_PROFILE_TEXT
+        else None
+    )
+except Exception as exc:
+    raise ValueError(
+        "EXCAVATOR_AUTO_SCENE_FIXED_PROFILE_JSON must be valid JSON"
+    ) from exc
+if (
+    AUTO_SCENE_FIXED_PROFILE is not None
+    and not isinstance(AUTO_SCENE_FIXED_PROFILE, dict)
+):
+    raise ValueError(
+        "EXCAVATOR_AUTO_SCENE_FIXED_PROFILE_JSON must be a JSON object"
+    )
 AUTO_SCENE_TRUCK_ROOT_PATH = "/World/truck"
 AUTO_SCENE_TRUCK_RANDOM_DX_RANGE = (-1.20, 1.20)
 AUTO_SCENE_TRUCK_RANDOM_DY_RANGE = (-1.20, 1.20)
@@ -16013,7 +16033,17 @@ def update_unload_models_only(p):
 
 
 def auto_scene_randomization_config():
-    if AUTO_SCENE_REPLAY_SEED is not None:
+    if (
+        AUTO_SCENE_FIXED_PROFILE is not None
+        or AUTO_SCENE_REPLAY_SEED is not None
+    ):
+        fixed_seed = (
+            AUTO_SCENE_FIXED_PROFILE.get("scene_seed")
+            if isinstance(AUTO_SCENE_FIXED_PROFILE, dict)
+            else AUTO_SCENE_REPLAY_SEED
+        )
+        if fixed_seed is None:
+            fixed_seed = 0
         return {
             "random_truck": False,
             "random_truck_yaw": False,
@@ -16021,7 +16051,10 @@ def auto_scene_randomization_config():
             "random_sand_xy": False,
             "random_sand_amount": False,
             "fixed_scene_replay": True,
-            "scene_seed": int(AUTO_SCENE_REPLAY_SEED),
+            "fixed_scene_exact_profile": bool(
+                AUTO_SCENE_FIXED_PROFILE is not None
+            ),
+            "scene_seed": int(fixed_seed),
         }
     return {
         "random_truck": bool(STATE.get("auto_scene_random_truck_enabled", AUTO_SCENE_RANDOM_TRUCK_DEFAULT)),
@@ -16030,6 +16063,7 @@ def auto_scene_randomization_config():
         "random_sand_xy": bool(STATE.get("auto_scene_random_sand_xy_enabled", AUTO_SCENE_RANDOM_SAND_XY_DEFAULT)),
         "random_sand_amount": bool(STATE.get("auto_scene_random_sand_amount_enabled", AUTO_SCENE_RANDOM_SAND_AMOUNT_DEFAULT)),
         "fixed_scene_replay": False,
+        "fixed_scene_exact_profile": False,
         "scene_seed": None,
     }
 
@@ -16076,6 +16110,20 @@ def auto_scene_sample_polar_xy(rng, radius_range, angle_deg_range):
 def auto_scene_seed_context(attempt_index):
     run_id = str(STATE.get("auto_collect_run_id", "") or "").strip()
     run_suffix = str(os.environ.get("EXCAVATOR_AUTO_RUN_ID_SUFFIX", "") or "").strip()
+    if AUTO_SCENE_FIXED_PROFILE is not None:
+        fixed_seed = AUTO_SCENE_FIXED_PROFILE.get(
+            "scene_seed",
+            AUTO_SCENE_REPLAY_SEED
+            if AUTO_SCENE_REPLAY_SEED is not None
+            else 0,
+        )
+        return {
+            "scene_seed": int(fixed_seed),
+            "scene_seed_namespace": f"exact-profile-{int(fixed_seed)}",
+            "scene_seed_source": "deployment_final_scene_profile",
+            "scene_seed_worker": "",
+            "scene_sampling_schema": "deployment_final_scene_profile_v1",
+        }
     if AUTO_SCENE_REPLAY_SEED is not None:
         return {
             "scene_seed": int(AUTO_SCENE_REPLAY_SEED),
@@ -17044,6 +17092,66 @@ def auto_scene_fixed_replay_candidate(attempt_index, cfg, seed_context):
         candidate["attempt"] = int(attempt_index)
         return candidate
 
+    if isinstance(AUTO_SCENE_FIXED_PROFILE, dict):
+        profile = copy.deepcopy(AUTO_SCENE_FIXED_PROFILE)
+        sand_xy = np.array(profile["sand_xy"], dtype=np.float32).reshape(-1)[:2]
+        truck_translation = np.array(
+            profile["truck_translation_xyz"],
+            dtype=np.float64,
+        ).reshape(-1)[:3]
+        unload_landing = np.array(
+            profile["unload_landing_xyz"],
+            dtype=np.float64,
+        ).reshape(-1)[:3]
+        amount = float(profile["sand_amount_multiplier"])
+        target_yaw = float(profile["truck_yaw_deg"])
+        candidate = {
+            "attempt": int(attempt_index),
+            **seed_context,
+            "fixed_scene_replay": True,
+            "fixed_scene_exact_profile": True,
+            "fixed_scene_direct_apply": True,
+            "fixed_scene_skip_unload_alignment": True,
+            "random_truck": False,
+            "random_truck_yaw": False,
+            "random_robot_yaw": False,
+            "random_sand_xy": False,
+            "random_sand_amount": False,
+            "sand_xy": sand_xy,
+            "sand_radius_m": auto_scene_xy_radius(sand_xy),
+            "sand_angle_deg": auto_scene_xy_angle_deg(sand_xy),
+            "sand_amount_multiplier": amount,
+            "truck_delta_xy": np.zeros(2, dtype=np.float32),
+            "truck_center_xy": truck_translation[:2].astype(np.float32),
+            "truck_radius_m": auto_scene_xy_radius(truck_translation[:2]),
+            "truck_angle_deg": auto_scene_xy_angle_deg(
+                truck_translation[:2]
+            ),
+            "truck_yaw_deg": target_yaw,
+            "truck_yaw_policy": "deployment_final_scene_profile",
+            "truck_rear_alignment_error_deg": None,
+            "truck_side_offset_deg": None,
+            "robot_body_yaw_deg": None,
+            "unload_xy": unload_landing[:2].astype(np.float32),
+            "unload_radius_m": auto_scene_xy_radius(unload_landing[:2]),
+            "unload_angle_deg": auto_scene_xy_angle_deg(
+                unload_landing[:2]
+            ),
+            "unload_landing_xyz_profile": unload_landing,
+            "estimated_particle_count": auto_scene_estimate_particles_for_amount(
+                amount
+            ),
+            "sample_try": int(profile.get("sample_try", 1) or 1),
+            "deployment_scene_profile": profile,
+            "deployment_baseline_translation_xyz": truck_translation,
+            "fixed_truck_translation_xyz": truck_translation,
+            "legal_reason": "exact_profile_deferred_to_applied_geometry_gate",
+        }
+        STATE["auto_scene_fixed_replay_candidate_template"] = copy.deepcopy(
+            candidate
+        )
+        return candidate
+
     truck_base = auto_scene_deployment_baseline()
     if not (isinstance(truck_base, dict) and truck_base.get("valid")):
         return {
@@ -17081,11 +17189,11 @@ def auto_scene_fixed_replay_candidate(attempt_index, cfg, seed_context):
         "attempt": int(attempt_index),
         **seed_context,
         "fixed_scene_replay": True,
-        "random_truck": True,
-        "random_truck_yaw": True,
+        "random_truck": False,
+        "random_truck_yaw": False,
         "random_robot_yaw": False,
-        "random_sand_xy": True,
-        "random_sand_amount": True,
+        "random_sand_xy": False,
+        "random_sand_amount": False,
         "sand_xy": sand_xy,
         "sand_radius_m": float(profile["sand_radius_m"]),
         "sand_angle_deg": float(profile["sand_angle_deg"]),
@@ -17382,7 +17490,12 @@ def auto_scene_apply_candidate(candidate):
         )
         if not truck_moved:
             return False, "truck_pose_reset_failed"
-        if fixed_scene_replay or cfg["random_truck"]:
+        skip_unload_alignment = bool(
+            candidate.get("fixed_scene_skip_unload_alignment", False)
+        )
+        if (
+            fixed_scene_replay or cfg["random_truck"]
+        ) and not skip_unload_alignment:
             if fixed_scene_direct:
                 dump_center, _dump_size, _dump_mn, _dump_mx = (
                     auto_scene_deployment_bbox_center_size(
@@ -17454,6 +17567,39 @@ def auto_scene_apply_candidate(candidate):
                         f"yaw={yaw_error:.3f}deg,"
                         f"unload={unload_error:.3f}m",
                     )
+        if skip_unload_alignment:
+            expected_translation = np.array(
+                candidate.get("fixed_truck_translation_xyz"),
+                dtype=np.float64,
+            ).reshape(-1)[:3]
+            actual_translation = np.array(
+                get_prim_translation(AUTO_SCENE_TRUCK_ROOT_PATH),
+                dtype=np.float64,
+            ).reshape(-1)[:3]
+            actual_yaw = float(
+                get_prim_local_yaw_z_deg(
+                    AUTO_SCENE_TRUCK_ROOT_PATH,
+                    default=target_yaw,
+                )
+            )
+            translation_error = float(
+                np.linalg.norm(actual_translation - expected_translation)
+            )
+            yaw_error = abs(wrap_deg_180(actual_yaw - target_yaw))
+            candidate["fixed_scene_pose_verification"] = {
+                "truck_translation_xyz": vec_list(actual_translation, 3),
+                "truck_translation_error_m": float(translation_error),
+                "truck_yaw_deg": float(actual_yaw),
+                "truck_yaw_error_deg": float(yaw_error),
+                "source": "deployment_final_scene_profile",
+            }
+            if translation_error > 0.02 or yaw_error > 0.25:
+                return (
+                    False,
+                    "fixed_scene_pose_mismatch:"
+                    f"translation={translation_error:.3f}m,"
+                    f"yaw={yaw_error:.3f}deg",
+                )
         clear_rigid_obstacle_cache("auto_scene_random_truck")
         scene_changed = True
         debug_timeline_record(

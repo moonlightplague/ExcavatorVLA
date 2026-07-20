@@ -39,6 +39,11 @@ LEROBOT_STATE_SCHEMA_VERSION = vla_observation_contract.SCHEMA_VERSION
 LEROBOT_CANONICAL_PHASE_NAMES = list(vla_observation_contract.CANONICAL_PHASE_NAMES)
 LEROBOT_BASE_STATE_NAMES_14D = list(vla_observation_contract.BASE_STATE_NAMES_14D)
 LEROBOT_STATE_NAMES_28D = list(vla_observation_contract.STATE_NAMES_28D)
+LEROBOT_LEGACY_V11_STATE_SCHEMA = "legacy-v1.1-32d"
+LEROBOT_LEGACY_V11_STATE_SCHEMA_VERSION = "excavator_state_v3_28d_plus_4effort_phase_index10"
+LEROBOT_LEGACY_V11_STATE_NAMES_28D = list(
+    vla_observation_contract.LEGACY_STATE_NAMES_28D_V3
+)
 LEROBOT_DEFAULT_EXPORT_DIRNAME = "lerobot_v3"
 LEROBOT_SOURCE_SAMPLING_CONTRACT = "original_uniform_10hz_v1"
 EXPORT_TIME_POLICY_FILENAME = "export_time_policy.json"
@@ -70,6 +75,34 @@ LEROBOT_IMAGE_KEY_ALIASES = {
     "observation.images.1": ["observation.images.1", "observation.images.cameraleft", "observation.images.bucket"],
     "observation.images.2": ["observation.images.2", "observation.images.cameraright", "observation.images.side"],
 }
+
+
+def lerobot_state_schema_spec(state_schema: object = None) -> Dict[str, object]:
+    key = str(state_schema or "current-v4").strip().lower()
+    if key in {"current", "current-v4", "v4"}:
+        return {
+            "key": "current-v4",
+            "version": LEROBOT_STATE_SCHEMA_VERSION,
+            "names": list(LEROBOT_STATE_NAMES_28D),
+            "phase_in_state": False,
+        }
+    if key in {
+        "legacy",
+        "legacy-v1.1",
+        "legacy-v1.1-32d",
+        "v1.1",
+        "v3",
+    }:
+        return {
+            "key": LEROBOT_LEGACY_V11_STATE_SCHEMA,
+            "version": LEROBOT_LEGACY_V11_STATE_SCHEMA_VERSION,
+            "names": list(LEROBOT_LEGACY_V11_STATE_NAMES_28D),
+            "phase_in_state": True,
+        }
+    raise ValueError(
+        f"unknown LeRobot state schema {state_schema!r}; "
+        "expected current-v4 or legacy-v1.1-32d"
+    )
 
 
 def read_json(path: Union[str, os.PathLike], default=None):
@@ -1401,7 +1434,10 @@ def lerobot_export_config_for_run(
     run_dir: Union[str, os.PathLike],
     split: str = "trainable",
     time_policy: object = None,
+    state_schema: object = None,
 ) -> Dict[str, object]:
+    state_schema_spec = lerobot_state_schema_spec(state_schema)
+    state_names = list(state_schema_spec["names"])
     base_export_fps = infer_export_fps(run_dir, None)
     time_policy_info = load_export_time_policy(run_dir, explicit_policy=time_policy)
     normalized_time_policy = dict(time_policy_info.get("policy") or default_export_time_policy())
@@ -1412,10 +1448,11 @@ def lerobot_export_config_for_run(
         "source_sampling_contract": LEROBOT_SOURCE_SAMPLING_CONTRACT,
         "video_keyframe_interval": int(LEROBOT_VIDEO_KEYFRAME_INTERVAL),
         "task_prompt_version": LEROBOT_TASK_PROMPT_VERSION,
-        "state_schema_version": LEROBOT_STATE_SCHEMA_VERSION,
-        "state_dim": len(LEROBOT_STATE_NAMES_28D),
+        "state_schema": str(state_schema_spec["key"]),
+        "state_schema_version": str(state_schema_spec["version"]),
+        "state_dim": len(state_names),
         "effort_dim": 4,
-        "effective_robot_observation_dim": len(LEROBOT_STATE_NAMES_28D) + 4,
+        "effective_robot_observation_dim": len(state_names) + 4,
         "base_fps": float(base_export_fps),
         "time_policy": normalized_time_policy,
         "time_policy_hash": str(time_policy_info.get("hash") or export_time_policy_hash(normalized_time_policy)),
@@ -1427,6 +1464,7 @@ def lerobot_export_config_for_run(
     metadata_only_keys = {
         "task_prompt_version",
         "state_schema_version",
+        "state_schema",
         "state_dim",
         "effort_dim",
         "effective_robot_observation_dim",
@@ -1448,6 +1486,7 @@ def lerobot_export_config_for_run(
         "export_config_hash": export_config_hash,
         "media_config": media_config,
         "media_config_hash": media_config_hash,
+        "state_schema_spec": state_schema_spec,
     }
 
 
@@ -2231,6 +2270,108 @@ def build_lerobot_state_28d(
     return state, "ok"
 
 
+def build_lerobot_state_28d_legacy_v11(
+    sample: dict,
+    episode_meta: dict,
+    episode_row: dict,
+    raw_state_names: Sequence[str],
+    bucket_load_rate_particles_per_s: float,
+) -> Tuple[Optional[List[float]], str]:
+    """Reconstruct the original v1.1 28D state without changing the raw episode."""
+    base_state = _legacy_base_state_from_sample(sample, raw_state_names)
+    if base_state is None:
+        return None, "raw_state_missing_named_14d_components"
+
+    joint_velocity = vector_or_none(sample.get("obs.dq"), 4)
+    if joint_velocity is None:
+        return None, "missing_joint_velocity"
+    effort = vector_or_none(sample.get("observation.effort"), 4)
+    if effort is None:
+        return None, "missing_measured_effort"
+
+    phase_index = canonical_lerobot_phase_index(
+        sample.get("phase") or sample.get("label")
+    )
+    if phase_index is None:
+        return None, f"unknown_phase:{sample.get('phase') or sample.get('label')}"
+
+    scene = _episode_scene_dict(episode_row, episode_meta)
+    candidate = (
+        scene.get("candidate") if isinstance(scene.get("candidate"), dict) else {}
+    )
+    applied = scene.get("applied") if isinstance(scene.get("applied"), dict) else {}
+    scene_context = (
+        applied.get("scene_context")
+        if isinstance(applied.get("scene_context"), dict)
+        else {}
+    )
+
+    dig_target = _first_vector_xyz(
+        sample.get("target"),
+        episode_row.get("target_xyz"),
+        episode_meta.get("target_xyz"),
+        scene_context.get("pile_center"),
+    )
+    if dig_target is None:
+        return None, "missing_dig_target_xyz"
+    unload_landing = _first_vector_xyz(
+        episode_row.get("unload_landing_xyz"),
+        episode_meta.get("unload_landing_xyz"),
+        applied.get("unload_landing_xyz"),
+        scene_context.get("unload_point"),
+        episode_row.get("unload_point_xyz"),
+        episode_meta.get("unload_point_xyz"),
+    )
+    if unload_landing is None:
+        return None, "missing_unload_landing_xyz"
+
+    base_x = float(base_state[0])
+    base_y = float(base_state[1])
+    robot_heading_deg = _first_float(
+        applied.get("robot_body_yaw_deg"),
+        candidate.get("robot_body_yaw_deg"),
+    )
+    if robot_heading_deg is None:
+        robot_heading_rad = float(base_state[2]) + float(base_state[3])
+    else:
+        robot_heading_rad = math.radians(float(robot_heading_deg))
+    dig_local = _point_in_initial_heading_frame(
+        dig_target,
+        [base_x, base_y],
+        robot_heading_rad,
+    )
+    unload_local = _point_in_initial_heading_frame(
+        unload_landing,
+        [base_x, base_y],
+        robot_heading_rad,
+    )
+
+    truck_yaw_deg = _first_float(
+        applied.get("truck_yaw_deg"),
+        candidate.get("truck_yaw_deg"),
+    )
+    if truck_yaw_deg is None:
+        return None, "missing_truck_yaw_deg"
+    truck_relative_yaw = math.radians(float(truck_yaw_deg)) - float(
+        robot_heading_rad
+    )
+
+    state = (
+        [float(value) for value in base_state]
+        + [float(value) for value in joint_velocity]
+        + [float(phase_index)]
+        + [float(value) for value in dig_local]
+        + [float(value) for value in unload_local]
+        + [math.sin(truck_relative_yaw), math.cos(truck_relative_yaw)]
+        + [float(bucket_load_rate_particles_per_s)]
+    )
+    if len(state) != len(LEROBOT_LEGACY_V11_STATE_NAMES_28D):
+        return None, f"state_dimension_mismatch:{len(state)}"
+    if not all(math.isfinite(float(value)) for value in state):
+        return None, "state_contains_non_finite_value"
+    return state, "ok"
+
+
 def try_write_parquet(rows: Sequence[dict], path: str) -> Tuple[bool, str]:
     if not rows:
         return False, "no_rows"
@@ -2742,8 +2883,13 @@ def collect_lerobot_rows(
     limit_episodes: Optional[int] = None,
     time_policy: object = None,
     base_fps: float = 10.0,
+    state_schema: object = None,
 ) -> Dict[str, object]:
     run_dir = str(run_dir)
+    state_schema_spec = lerobot_state_schema_spec(state_schema)
+    legacy_v11_state = (
+        str(state_schema_spec["key"]) == LEROBOT_LEGACY_V11_STATE_SCHEMA
+    )
     hydrate_success_pool_indexes_from_transfer_cache(run_dir)
     episode_rows = load_index(run_dir, split)
     if limit_episodes is not None:
@@ -2766,7 +2912,7 @@ def collect_lerobot_rows(
         "bucket_load_z",
     ]
     raw_state_names = list(raw_state_names)
-    state_names = list(LEROBOT_STATE_NAMES_28D)
+    state_names = list(state_schema_spec["names"])
     action_names = run_meta.get("action_names") or [
         "swing_cmd_velocity",
         "boom_cmd_velocity",
@@ -2836,6 +2982,7 @@ def collect_lerobot_rows(
         current_episode_image_paths = {key: [] for key in LEROBOT_IMAGE_KEYS}
         previous_bucket_fill_fraction: Optional[float] = None
         previous_bucket_fill_rate: Optional[float] = None
+        previous_bucket_load_particles: Optional[float] = None
         previous_sample_t: Optional[float] = None
         for sample in trajectory:
             raw_base_state = _legacy_base_state_from_sample(
@@ -2899,14 +3046,33 @@ def collect_lerobot_rows(
                     previous_bucket_fill_rate,
                     dt_sample,
                 )
-                state, state_reason = build_lerobot_state_28d(
-                    sample,
-                    meta,
-                    episode,
-                    raw_state_names,
-                    fill_fraction,
-                    fill_rate,
+                bucket_load_rate = (
+                    0.0
+                    if previous_bucket_load_particles is None
+                    or previous_sample_t is None
+                    else (
+                        float(bucket_load_particles)
+                        - float(previous_bucket_load_particles)
+                    )
+                    / max(1.0e-6, float(sample_t) - float(previous_sample_t))
                 )
+                if legacy_v11_state:
+                    state, state_reason = build_lerobot_state_28d_legacy_v11(
+                        sample,
+                        meta,
+                        episode,
+                        raw_state_names,
+                        bucket_load_rate,
+                    )
+                else:
+                    state, state_reason = build_lerobot_state_28d(
+                        sample,
+                        meta,
+                        episode,
+                        raw_state_names,
+                        fill_fraction,
+                        fill_rate,
+                    )
             if state is None:
                 skipped_frames += 1
                 missing_vla_state_by_reason[str(state_reason)] += 1
@@ -2956,8 +3122,9 @@ def collect_lerobot_rows(
                 row[key] = image_value
                 row[f"{key}.available"] = True
             rows.append(row)
-            previous_bucket_fill_fraction = float(state[26])
-            previous_bucket_fill_rate = float(state[27])
+            previous_bucket_fill_fraction = float(fill_fraction)
+            previous_bucket_fill_rate = float(fill_rate)
+            previous_bucket_load_particles = float(bucket_load_particles)
             previous_sample_t = float(sample_t)
             episode_length += 1
             global_frame += 1
@@ -3027,7 +3194,8 @@ def collect_lerobot_rows(
         "episode_image_paths": episode_image_paths,
         "state_names": state_names,
         "raw_state_names": raw_state_names,
-        "state_schema_version": LEROBOT_STATE_SCHEMA_VERSION,
+        "state_schema": str(state_schema_spec["key"]),
+        "state_schema_version": str(state_schema_spec["version"]),
         "canonical_phase_names": list(LEROBOT_CANONICAL_PHASE_NAMES),
         "action_names": action_names,
         "effort_names": effort_names,
@@ -3054,6 +3222,7 @@ def export_lerobot_dataset(
     reuse_from_dir: Optional[Union[str, os.PathLike]] = None,
     time_policy: object = None,
     progress_callback=None,
+    state_schema: object = None,
 ) -> Dict[str, object]:
     def progress(percent: float, message: str, current: Optional[int] = None, total: Optional[int] = None) -> None:
         if not progress_callback:
@@ -3078,7 +3247,20 @@ def export_lerobot_dataset(
     except Exception as exc:
         raise RuntimeError(f"pandas is required for strict LeRobot v3 export: {type(exc).__name__}:{exc}") from exc
 
-    export_config_info = lerobot_export_config_for_run(run_dir, split=split, time_policy=time_policy)
+    export_config_info = lerobot_export_config_for_run(
+        run_dir,
+        split=split,
+        time_policy=time_policy,
+        state_schema=state_schema,
+    )
+    state_schema_spec = dict(
+        export_config_info.get("state_schema_spec")
+        or lerobot_state_schema_spec(state_schema)
+    )
+    state_schema_version = str(state_schema_spec["version"])
+    legacy_v11_state = (
+        str(state_schema_spec["key"]) == LEROBOT_LEGACY_V11_STATE_SCHEMA
+    )
     base_export_fps = float(export_config_info.get("base_export_fps") or 10.0)
     time_policy_info = dict(export_config_info.get("time_policy_info") or {})
     normalized_time_policy = dict(export_config_info.get("time_policy") or default_export_time_policy())
@@ -3093,6 +3275,7 @@ def export_lerobot_dataset(
         limit_episodes=limit_episodes,
         time_policy=normalized_time_policy,
         base_fps=base_export_fps,
+        state_schema=state_schema_spec["key"],
     )
     rows: List[dict] = list(collected["rows"])  # type: ignore[arg-type]
     if not rows:
@@ -3425,10 +3608,11 @@ def export_lerobot_dataset(
             "task_index": int(row["task_index"]),
             "observation.state": row["observation.state"],
             "action": row["action"],
-            "observation.stage_current_id": int(
-                row["observation.stage_current_id"]
-            ),
         }
+        if not legacy_v11_state:
+            data_row["observation.stage_current_id"] = int(
+                row["observation.stage_current_id"]
+            )
         if effort_available:
             data_row["observation.effort"] = row["observation.effort"]
         data_rows.append(data_row)
@@ -3491,13 +3675,14 @@ def export_lerobot_dataset(
         "episode_index": {"dtype": "int64", "shape": [1], "names": None},
         "index": {"dtype": "int64", "shape": [1], "names": None},
         "task_index": {"dtype": "int64", "shape": [1], "names": None},
-        "observation.stage_current_id": {
+    }
+    if not legacy_v11_state:
+        features["observation.stage_current_id"] = {
             "dtype": "int64",
             "shape": [1],
             "names": ["stage_current_id"],
             "class_names": list(LEROBOT_CANONICAL_PHASE_NAMES),
-        },
-    }
+        }
     if effort_available:
         features["observation.effort"] = {
             "dtype": "float32",
@@ -3514,13 +3699,22 @@ def export_lerobot_dataset(
     info = {
         "codebase_version": LEROBOT_CODEBASE_VERSION,
         "robot_type": "excavator",
-        "state_schema_version": LEROBOT_STATE_SCHEMA_VERSION,
+        "state_schema": str(state_schema_spec["key"]),
+        "state_schema_version": state_schema_version,
         "state_dim": len(state_names),
         "effort_dim": effort_dim if effort_available else 0,
         "effective_robot_observation_dim": len(state_names) + (effort_dim if effort_available else 0),
         "canonical_phase_names": list(LEROBOT_CANONICAL_PHASE_NAMES),
-        "phase_feature": "observation.stage_current_id",
-        "phase_role": "categorical_supervision_not_policy_input",
+        "phase_feature": (
+            "observation.state[18]"
+            if legacy_v11_state
+            else "observation.stage_current_id"
+        ),
+        "phase_role": (
+            "categorical_supervision_and_legacy_state_index_18"
+            if bool(state_schema_spec.get("phase_in_state"))
+            else "categorical_supervision_not_policy_input"
+        ),
         "total_episodes": len(episodes),
         "total_frames": len(data_rows),
         "total_tasks": len(tasks),
@@ -3604,15 +3798,16 @@ def export_lerobot_dataset(
         "media_config": media_config,
         "media_config_hash": media_config_hash,
         "task_prompt_version": LEROBOT_TASK_PROMPT_VERSION,
-        "state_schema_version": LEROBOT_STATE_SCHEMA_VERSION,
-        "state_names": list(LEROBOT_STATE_NAMES_28D),
+        "state_schema": str(state_schema_spec["key"]),
+        "state_schema_version": state_schema_version,
+        "state_names": list(state_names),
         "effort_names": [
             "swing_measured_effort",
             "boom_measured_effort",
             "arm_measured_effort",
             "bucket_measured_effort",
         ],
-        "effective_robot_observation_dim": len(LEROBOT_STATE_NAMES_28D) + 4,
+        "effective_robot_observation_dim": len(state_names) + 4,
         "canonical_phase_names": list(LEROBOT_CANONICAL_PHASE_NAMES),
         "time_policy": normalized_time_policy,
         "time_policy_hash": str(time_policy_info.get("hash") or export_time_policy_hash(normalized_time_policy)),
@@ -3707,6 +3902,7 @@ def print_lerobot_export(
     require_standard: bool = False,
     require_vla: bool = False,
     time_policy: object = None,
+    state_schema: object = None,
 ) -> None:
     result = export_lerobot_dataset(
         run_dir,
@@ -3717,6 +3913,7 @@ def print_lerobot_export(
         require_standard=require_standard,
         require_vla=require_vla,
         time_policy=time_policy,
+        state_schema=state_schema,
     )
     try:
         write_json(os.path.join(os.path.abspath(str(run_dir)), "lerobot_v3_export.json"), result)
@@ -4559,6 +4756,15 @@ if __name__ == "__main__":
         help="Deprecated compatibility option. Only 1.0 is accepted; export never retimes recorded motion.",
     )
     parser.add_argument("--export-limit", type=int, default=None, help="Limit exported episodes for smoke tests.")
+    parser.add_argument(
+        "--export-state-schema",
+        default="current-v4",
+        choices=["current-v4", LEROBOT_LEGACY_V11_STATE_SCHEMA],
+        help=(
+            "Observation schema for export. legacy-v1.1-32d reconstructs the "
+            "historical 28D state with phase_index at index 18 plus 4D effort."
+        ),
+    )
     parser.add_argument("--export-overwrite", action="store_true", help="Delete and rebuild the export directory if it already exists.")
     parser.add_argument("--export-require-standard", action="store_true", help="Fail if parquet/mp4 standard export cannot be produced.")
     parser.add_argument("--export-require-vla", action="store_true", help="Fail unless image + state + action + task VLA export is ready.")
@@ -4598,6 +4804,7 @@ if __name__ == "__main__":
             require_standard=args.export_require_standard,
             require_vla=args.export_require_vla,
             time_policy=export_time_policy,
+            state_schema=args.export_state_schema,
         )
         did_action = True
     if args.analysis:

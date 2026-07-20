@@ -16670,6 +16670,19 @@ def auto_scene_current_robot_truck_overlap_detail():
     else:
         detail["bbox"] = {"ok": False, "reason": "missing_bbox"}
 
+    bbox_available = bool(
+        isinstance(bbox_detail, dict) and bbox_detail.get("ok", False)
+    )
+    bbox_overlap = bool(
+        bbox_available and bbox_detail.get("overlap", False)
+    )
+    if bbox_available and not bbox_overlap:
+        detail["aabb_overlap_diagnostic_only"] = False
+        detail["overlap_source"] = "collision_bbox_separation"
+        detail["overlap"] = False
+        detail["decision"] = "ok_collision_aabb_separated_skip_mesh"
+        return False, detail
+
     link_hits = []
     if truck_poly is not None:
         for row in auto_scene_robot_link_footprint_rows():
@@ -16689,8 +16702,6 @@ def auto_scene_current_robot_truck_overlap_detail():
         detail["robot_link_footprint_hits"] = link_hits
         detail["robot_link_footprint_gate"] = "mesh_world_hull_zero_margin"
 
-    bbox_available = bool(isinstance(bbox_detail, dict) and bbox_detail.get("ok", False))
-    bbox_overlap = bool(bbox_available and bbox_detail.get("overlap", False))
     mesh_overlap = bool(link_hits)
     detail["aabb_overlap_diagnostic_only"] = bool(bbox_overlap)
     detail["overlap_source"] = "mesh_link_footprint" if truck_poly is not None else "collision_bbox_fallback"

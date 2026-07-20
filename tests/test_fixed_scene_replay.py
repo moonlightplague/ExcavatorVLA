@@ -87,6 +87,10 @@ class FixedSceneReplayTests(unittest.TestCase):
             source,
         )
         self.assertIn(
+            '"ok_collision_aabb_separated_skip_mesh"',
+            source,
+        )
+        self.assertIn(
             "if elapsed >= min_frames and stable_windows >= required_windows:",
             source,
         )

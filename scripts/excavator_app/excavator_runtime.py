@@ -44,6 +44,7 @@ from isaacsim.core.prims import SingleArticulation
 from isaacsim.core.utils.types import ArticulationAction
 
 from excavator_common import planning as common_planning
+from excavator_common import deployment_scene_contract
 from excavator_common import scene_randomization
 from excavator_common import vla_observation_contract
 
@@ -799,6 +800,19 @@ AUTO_SCENE_RANDOM_BASE_SEED = env_int("EXCAVATOR_AUTO_SCENE_BASE_SEED", 410700)
 AUTO_SCENE_RANDOM_SEED_NAMESPACE = str(
     os.environ.get("EXCAVATOR_AUTO_SCENE_SEED_NAMESPACE", "") or ""
 ).strip()
+AUTO_SCENE_REPLAY_SEED_TEXT = str(
+    os.environ.get("EXCAVATOR_AUTO_SCENE_REPLAY_SEED", "") or ""
+).strip()
+try:
+    AUTO_SCENE_REPLAY_SEED = (
+        int(AUTO_SCENE_REPLAY_SEED_TEXT)
+        if AUTO_SCENE_REPLAY_SEED_TEXT
+        else None
+    )
+except ValueError as exc:
+    raise ValueError(
+        "EXCAVATOR_AUTO_SCENE_REPLAY_SEED must be an integer"
+    ) from exc
 AUTO_SCENE_TRUCK_ROOT_PATH = "/World/truck"
 AUTO_SCENE_TRUCK_RANDOM_DX_RANGE = (-1.20, 1.20)
 AUTO_SCENE_TRUCK_RANDOM_DY_RANGE = (-1.20, 1.20)
@@ -924,8 +938,18 @@ SAND_SNAPSHOT_CELL_RADIUS_LIMIT = 10
 AUTO_RESET_SAND_AFTER_WORLD_READY = False
 AUTO_RESET_SAND_AFTER_UI_READY = True
 AUTO_RESET_SAND_UI_READY_DELAY_FRAMES = 60
-SAND_RESET_SETTLE_MIN_FRAMES = 240
-SAND_RESET_SETTLE_MAX_FRAMES = 840
+SAND_RESET_SETTLE_MIN_FRAMES = max(
+    1,
+    env_int("EXCAVATOR_SAND_RESET_SETTLE_MIN_FRAMES", 240),
+)
+SAND_RESET_SETTLE_MAX_FRAMES = max(
+    SAND_RESET_SETTLE_MIN_FRAMES,
+    env_int("EXCAVATOR_SAND_RESET_SETTLE_MAX_FRAMES", 840),
+)
+SAND_RESET_SETTLE_ENFORCE_MIN = env_bool(
+    "EXCAVATOR_SAND_RESET_SETTLE_ENFORCE_MIN",
+    False,
+)
 SAND_RESET_STABLE_WINDOW_FRAMES = 30
 SAND_RESET_STABLE_MEAN_DISPLACEMENT = 0.004
 SAND_RESET_STABLE_P95_DISPLACEMENT = 0.020
@@ -8441,6 +8465,11 @@ def sand_settle_required_windows():
 
 async def wait_for_sand_settled_on_ground(label="sand_settle"):
     label = str(label)
+    min_frames = (
+        int(SAND_RESET_SETTLE_MIN_FRAMES)
+        if SAND_RESET_SETTLE_ENFORCE_MIN
+        else 0
+    )
     max_frames = max(int(SAND_RESET_SETTLE_MIN_FRAMES), int(SAND_RESET_SETTLE_MAX_FRAMES))
     window = max(15, int(SAND_RESET_STABLE_WINDOW_FRAMES))
     update_chunk = max(1, min(window, control_step_frames()))
@@ -8512,7 +8541,7 @@ async def wait_for_sand_settled_on_ground(label="sand_settle"):
             f"fill={fmt_optional(status.get('fill_height'))}",
             force_log=force_settle_log,
         )
-        if stable_windows >= required_windows:
+        if elapsed >= min_frames and stable_windows >= required_windows:
             return True, status
     return False, last_status
 
@@ -12935,6 +12964,7 @@ def ensure_auto_collect_run_dir():
             "post_reset_settle_frames": AUTO_COLLECT_RESET_SETTLE_FRAMES,
             "stable_reset_min_frames": SAND_RESET_SETTLE_MIN_FRAMES,
             "stable_reset_max_frames": SAND_RESET_SETTLE_MAX_FRAMES,
+            "stable_reset_enforce_min": bool(SAND_RESET_SETTLE_ENFORCE_MIN),
         },
     )
     for index_name in [
@@ -15983,12 +16013,24 @@ def update_unload_models_only(p):
 
 
 def auto_scene_randomization_config():
+    if AUTO_SCENE_REPLAY_SEED is not None:
+        return {
+            "random_truck": True,
+            "random_truck_yaw": True,
+            "random_robot_yaw": False,
+            "random_sand_xy": True,
+            "random_sand_amount": True,
+            "fixed_scene_replay": True,
+            "scene_seed": int(AUTO_SCENE_REPLAY_SEED),
+        }
     return {
         "random_truck": bool(STATE.get("auto_scene_random_truck_enabled", AUTO_SCENE_RANDOM_TRUCK_DEFAULT)),
         "random_truck_yaw": bool(STATE.get("auto_scene_random_truck_yaw_enabled", AUTO_SCENE_RANDOM_TRUCK_YAW_DEFAULT)),
         "random_robot_yaw": bool(STATE.get("auto_scene_random_robot_yaw_enabled", AUTO_SCENE_RANDOM_ROBOT_YAW_DEFAULT)),
         "random_sand_xy": bool(STATE.get("auto_scene_random_sand_xy_enabled", AUTO_SCENE_RANDOM_SAND_XY_DEFAULT)),
         "random_sand_amount": bool(STATE.get("auto_scene_random_sand_amount_enabled", AUTO_SCENE_RANDOM_SAND_AMOUNT_DEFAULT)),
+        "fixed_scene_replay": False,
+        "scene_seed": None,
     }
 
 
@@ -16033,6 +16075,14 @@ def auto_scene_sample_polar_xy(rng, radius_range, angle_deg_range):
 def auto_scene_seed_context(attempt_index):
     run_id = str(STATE.get("auto_collect_run_id", "") or "").strip()
     run_suffix = str(os.environ.get("EXCAVATOR_AUTO_RUN_ID_SUFFIX", "") or "").strip()
+    if AUTO_SCENE_REPLAY_SEED is not None:
+        return {
+            "scene_seed": int(AUTO_SCENE_REPLAY_SEED),
+            "scene_seed_namespace": f"fixed-replay-{int(AUTO_SCENE_REPLAY_SEED)}",
+            "scene_seed_source": "deployment_contract_fixed_replay",
+            "scene_seed_worker": "",
+            "scene_sampling_schema": "deployment_scene_contract_v1",
+        }
     if AUTO_SCENE_RANDOM_SEED_NAMESPACE:
         namespace = AUTO_SCENE_RANDOM_SEED_NAMESPACE
         source = "env_namespace"
@@ -16897,6 +16947,83 @@ def auto_scene_estimate_particles_for_amount(amount):
     return max(0, int(round(float(current_est) * max(0.1, float(amount)))))
 
 
+def auto_scene_fixed_replay_candidate(attempt_index, cfg, seed_context):
+    truck_base = auto_scene_truck_baseline()
+    if not (isinstance(truck_base, dict) and truck_base.get("valid")):
+        return {
+            "error": str((truck_base or {}).get("reason", "truck_baseline_invalid")),
+            "attempt": int(attempt_index),
+            **seed_context,
+        }
+    try:
+        profile = deployment_scene_contract.sample_random_scene_profile(
+            seed=int(seed_context["scene_seed"]),
+            robot_xy=auto_scene_robot_xy(),
+            truck_center_xy=np.array(truck_base["center"], dtype=np.float32)[:2],
+            truck_dump_center_xy=np.array(
+                truck_base["dump_center"],
+                dtype=np.float32,
+            )[:2],
+            truck_yaw_deg=float(truck_base.get("yaw_deg", 0.0) or 0.0),
+        )
+    except Exception as exc:
+        return {
+            "error": f"fixed_scene_profile_failed:{type(exc).__name__}:{exc}",
+            "attempt": int(attempt_index),
+            **seed_context,
+        }
+
+    sand_xy = np.array(profile["sand_xy"], dtype=np.float32)
+    unload_xy = np.array(profile["unload_xy"], dtype=np.float32)
+    truck_center_xy = np.array(profile["truck_center_xy"], dtype=np.float32)
+    baseline_center_xy = np.array(
+        truck_base["center"],
+        dtype=np.float32,
+    ).reshape(-1)[:2]
+    amount = float(profile["sand_amount_multiplier"])
+    candidate = {
+        "attempt": int(attempt_index),
+        **seed_context,
+        "fixed_scene_replay": True,
+        "random_truck": True,
+        "random_truck_yaw": True,
+        "random_robot_yaw": False,
+        "random_sand_xy": True,
+        "random_sand_amount": True,
+        "sand_xy": sand_xy,
+        "sand_radius_m": float(profile["sand_radius_m"]),
+        "sand_angle_deg": float(profile["sand_angle_deg"]),
+        "sand_amount_multiplier": amount,
+        "truck_delta_xy": truck_center_xy - baseline_center_xy,
+        "truck_center_xy": truck_center_xy,
+        "truck_radius_m": auto_scene_xy_radius(truck_center_xy),
+        "truck_angle_deg": auto_scene_xy_angle_deg(truck_center_xy),
+        "truck_yaw_deg": float(profile["truck_yaw_deg"]),
+        "truck_yaw_policy": "deployment_contract_fixed_replay",
+        "truck_rear_alignment_error_deg": None,
+        "truck_side_offset_deg": float(profile["truck_side_offset_deg"]),
+        "robot_body_yaw_deg": None,
+        "unload_xy": unload_xy,
+        "unload_radius_m": float(profile["unload_radius_m"]),
+        "unload_angle_deg": float(profile["unload_angle_deg"]),
+        "estimated_particle_count": auto_scene_estimate_particles_for_amount(
+            amount
+        ),
+        "sample_try": int(profile["sample_try"]),
+        "deployment_scene_profile": dict(profile),
+    }
+    ok, reason = auto_scene_candidate_legal(candidate)
+    if not ok:
+        return {
+            "error": f"fixed_scene_profile_illegal:{reason}",
+            "attempt": int(attempt_index),
+            "candidate": candidate,
+            **seed_context,
+        }
+    candidate["legal_reason"] = str(reason)
+    return candidate
+
+
 def auto_scene_attempt_record(candidate=None, ok=False, reason="", cfg=None):
     cfg = auto_scene_randomization_config() if cfg is None else dict(cfg)
     candidate = candidate if isinstance(candidate, dict) else {}
@@ -16930,6 +17057,7 @@ def auto_scene_attempt_record(candidate=None, ok=False, reason="", cfg=None):
             "scene_seed_source": candidate.get("scene_seed_source"),
             "scene_seed_worker": candidate.get("scene_seed_worker"),
             "scene_sampling_schema": candidate.get("scene_sampling_schema"),
+            "fixed_scene_replay": bool(candidate.get("fixed_scene_replay", False)),
             "truck_delta_xy": vec_list(candidate.get("truck_delta_xy"), 2),
             "applied_truck_delta_xy": vec_list(candidate.get("applied_truck_delta_xy"), 2),
             "truck_center_xy": vec_list(candidate.get("truck_center_xy"), 2) if candidate.get("truck_center_xy") is not None else None,
@@ -16977,6 +17105,12 @@ def auto_scene_sample_candidate(attempt_index):
             "workspace": workspace,
             **seed_context,
         }
+    if bool(cfg.get("fixed_scene_replay", False)):
+        return auto_scene_fixed_replay_candidate(
+            attempt_index,
+            cfg,
+            seed_context,
+        )
     base_sand_xy = np.array(ctx.get("pile_center", [0.0, 6.7, 0.0]), dtype=np.float32).reshape(-1)[:2]
     base_unload_xy = np.array(ctx.get("unload_bin_center", [-10.0, -5.0, 0.0]), dtype=np.float32).reshape(-1)[:2]
     rng = np.random.default_rng(int(seed_context["scene_seed"]))

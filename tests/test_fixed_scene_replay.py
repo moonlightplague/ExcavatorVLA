@@ -1,0 +1,82 @@
+import unittest
+from pathlib import Path
+
+from excavator_common import deployment_scene_contract
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class FixedSceneReplayTests(unittest.TestCase):
+    def test_deployment_profile_is_replayable(self):
+        kwargs = {
+            "seed": 2,
+            "robot_xy": (0.0, 0.0),
+            "truck_center_xy": (-5.0, -9.0),
+            "truck_dump_center_xy": (-6.8, -7.5),
+            "truck_yaw_deg": -93.0,
+        }
+        first = deployment_scene_contract.sample_random_scene_profile(**kwargs)
+        second = deployment_scene_contract.sample_random_scene_profile(**kwargs)
+        self.assertEqual(first, second)
+        self.assertEqual(first["seed"], 2)
+        self.assertGreaterEqual(
+            first["sand_unload_distance_m"],
+            deployment_scene_contract.TRAINING_MIN_SAND_UNLOAD_DISTANCE_M,
+        )
+        self.assertGreaterEqual(
+            first["robot_truck_distance_m"],
+            deployment_scene_contract.TRAINING_MIN_ROBOT_TRUCK_DISTANCE_M,
+        )
+
+    def test_different_seed_changes_replayed_scene(self):
+        kwargs = {
+            "robot_xy": (0.0, 0.0),
+            "truck_center_xy": (-5.0, -9.0),
+            "truck_dump_center_xy": (-6.8, -7.5),
+            "truck_yaw_deg": -93.0,
+        }
+        seed_two = deployment_scene_contract.sample_random_scene_profile(
+            seed=2,
+            **kwargs,
+        )
+        seed_three = deployment_scene_contract.sample_random_scene_profile(
+            seed=3,
+            **kwargs,
+        )
+        self.assertNotEqual(seed_two, seed_three)
+
+    def test_launcher_maps_replay_cli_before_runtime_import(self):
+        source = (ROOT / "run_vla_train_scene.py").read_text(encoding="utf-8")
+        env_index = source.index('os.environ["EXCAVATOR_AUTO_SCENE_REPLAY_SEED"]')
+        runtime_index = source.index(
+            "from excavator_app.bootstrap import run_excavator_with_sand"
+        )
+        self.assertLess(env_index, runtime_index)
+        self.assertIn('"--scene-seed"', source)
+        self.assertIn('"--sand-settle-frames"', source)
+        self.assertIn(
+            'os.environ["EXCAVATOR_SAND_RESET_SETTLE_ENFORCE_MIN"] = "1"',
+            source,
+        )
+
+    def test_runtime_uses_deployment_contract_for_fixed_replay(self):
+        source = (
+            ROOT / "scripts" / "excavator_app" / "excavator_runtime.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "deployment_scene_contract.sample_random_scene_profile(",
+            source,
+        )
+        self.assertIn(
+            '"scene_seed_source": "deployment_contract_fixed_replay"',
+            source,
+        )
+        self.assertIn(
+            "if elapsed >= min_frames and stable_windows >= required_windows:",
+            source,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

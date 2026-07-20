@@ -7,6 +7,9 @@ Typical VLA training scene:
 
 Headless auto collect:
     /isaac-sim/python.sh run_vla_train_scene.py --headless --auto-collect --success-count 20 --max-attempts 120
+
+Fixed deployment-scene replay:
+    /isaac-sim/python.sh run_vla_train_scene.py --headless --auto-collect --success-count 5 --scene-seed 2 --sand-settle-frames 240
 """
 
 import argparse
@@ -50,6 +53,21 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Launch ExcavatorVLA full sand-site runtime for VLA training.")
     parser.add_argument("--scene", default=paths.default_scene_path(PROJECT_ROOT), help="USD scene containing the truck and excavator.")
     parser.add_argument("--sand-amount", type=float, default=None, help="Initial sand amount multiplier, clamped by runtime limits.")
+    parser.add_argument(
+        "--scene-seed",
+        type=int,
+        default=None,
+        help=(
+            "Replay one deployment-contract sand/truck scene for every auto-collect "
+            "attempt. The sampled scene amount overrides --sand-amount after startup."
+        ),
+    )
+    parser.add_argument(
+        "--sand-settle-frames",
+        type=int,
+        default=None,
+        help="Fix auto-collect sand settling to exactly this many simulation frames.",
+    )
     parser.add_argument("--headless", action="store_true", help="Run Isaac Sim headless. Intended for auto collect, not viewport bridge.")
     parser.add_argument("--with-ui", action="store_true", help="Show Excavator/Sand control windows. Off by default for this launcher.")
     parser.add_argument("--width", type=int, default=1920)
@@ -680,6 +698,10 @@ def main():
     bridge_enabled = args.bridge if args.bridge is not None else (not args.auto_collect and not args.headless)
     if args.headless and bridge_enabled:
         raise SystemExit("--bridge requires a GUI viewport. Use non-headless mode or pass --no-bridge.")
+    if args.scene_seed is not None and not args.auto_collect:
+        raise SystemExit("--scene-seed requires --auto-collect.")
+    if args.sand_settle_frames is not None and int(args.sand_settle_frames) < 1:
+        raise SystemExit("--sand-settle-frames must be at least 1.")
 
     os.environ["EXCAVATOR_PROJECT_ROOT"] = PROJECT_ROOT
     if args.headless:
@@ -688,6 +710,18 @@ def main():
         os.environ["EXCAVATOR_NO_UI"] = "1"
     if args.sand_amount is not None:
         os.environ["EXCAVATOR_SAND_AMOUNT"] = str(args.sand_amount)
+    if args.scene_seed is not None:
+        os.environ["EXCAVATOR_AUTO_SCENE_REPLAY_SEED"] = str(int(args.scene_seed))
+        os.environ["EXCAVATOR_RANDOM_TRUCK"] = "1"
+        os.environ["EXCAVATOR_RANDOM_TRUCK_YAW"] = "1"
+        os.environ["EXCAVATOR_RANDOM_ROBOT_YAW"] = "0"
+        os.environ["EXCAVATOR_RANDOM_SAND_XY"] = "1"
+        os.environ["EXCAVATOR_RANDOM_SAND_AMOUNT"] = "1"
+    if args.sand_settle_frames is not None:
+        settle_frames = int(args.sand_settle_frames)
+        os.environ["EXCAVATOR_SAND_RESET_SETTLE_MIN_FRAMES"] = str(settle_frames)
+        os.environ["EXCAVATOR_SAND_RESET_SETTLE_MAX_FRAMES"] = str(settle_frames)
+        os.environ["EXCAVATOR_SAND_RESET_SETTLE_ENFORCE_MIN"] = "1"
     if args.dataset_root:
         os.environ["EXCAVATOR_DATASET_ROOT"] = paths.resolve_existing_path(args.dataset_root, root=PROJECT_ROOT)
     if args.disable_export:
@@ -783,7 +817,20 @@ def main():
             rt.STATE["dataset_stable_render_settings_enabled"] = bool(stable_render_enabled)
         except Exception:
             pass
-        if args.sand_amount is not None and not args.random_sand_amount:
+        if args.scene_seed is not None:
+            rt.STATE["auto_scene_random_truck_enabled"] = True
+            rt.STATE["auto_scene_random_truck_yaw_enabled"] = True
+            rt.STATE["auto_scene_random_robot_yaw_enabled"] = False
+            rt.STATE["auto_scene_random_sand_xy_enabled"] = True
+            rt.STATE["auto_scene_random_sand_amount_enabled"] = True
+            print(
+                "[INFO] Fixed auto-collect scene replay enabled:",
+                f"scene_seed={int(args.scene_seed)}",
+                f"sand_settle_frames={args.sand_settle_frames or 'runtime-default'}",
+                "robot_yaw=authored",
+                flush=True,
+            )
+        elif args.sand_amount is not None and not args.random_sand_amount:
             rt.STATE["auto_scene_random_sand_amount_enabled"] = False
             print("[INFO] Auto collect sand amount randomization disabled because --sand-amount was provided.", flush=True)
 

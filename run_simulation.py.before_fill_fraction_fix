@@ -3605,63 +3605,21 @@ def main(args):
                     current_bucket_load - float(deployment_previous_load)
                 ) / max(1.0e-6, bridge_step_seconds)
             deployment_previous_load = current_bucket_load
-            # Fill-fraction features belong only to the optional 28D-v4
-            # observation contract.  The deployed checkpoint uses the legacy
-            # State27 + separate Effort4 contract and does not consume them.
-            #
-            # Older vla_observation_contract.py versions therefore do not
-            # necessarily provide bucket_fill_fraction() or
-            # causal_bucket_fill_rate().  Do not call those optional helpers
-            # while serving the 27D checkpoint.
-            deployment_fill_fraction = None
-            deployment_fill_rate = None
-
-            if (
-                active_contract["observation_schema"]
-                == OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT
-            ):
-                bucket_fill_fraction_fn = getattr(
-                    vla_observation_contract,
-                    "bucket_fill_fraction",
-                    None,
+            deployment_fill_fraction = (
+                vla_observation_contract.bucket_fill_fraction(
+                    current_bucket_load
                 )
-                causal_bucket_fill_rate_fn = getattr(
-                    vla_observation_contract,
-                    "causal_bucket_fill_rate",
-                    None,
+            )
+            deployment_fill_rate = (
+                vla_observation_contract.causal_bucket_fill_rate(
+                    deployment_fill_fraction,
+                    deployment_previous_fill_fraction,
+                    deployment_previous_fill_rate,
+                    bridge_step_seconds,
                 )
-
-                if (
-                    not callable(bucket_fill_fraction_fn)
-                    or not callable(causal_bucket_fill_rate_fn)
-                ):
-                    raise RuntimeError(
-                        "The negotiated 28D-v4 observation schema requires "
-                        "bucket_fill_fraction() and causal_bucket_fill_rate(), "
-                        "but the installed vla_observation_contract.py does "
-                        "not provide them."
-                    )
-
-                deployment_fill_fraction = float(
-                    bucket_fill_fraction_fn(
-                        current_bucket_load
-                    )
-                )
-                deployment_fill_rate = float(
-                    causal_bucket_fill_rate_fn(
-                        deployment_fill_fraction,
-                        deployment_previous_fill_fraction,
-                        deployment_previous_fill_rate,
-                        bridge_step_seconds,
-                    )
-                )
-                deployment_previous_fill_fraction = (
-                    deployment_fill_fraction
-                )
-                deployment_previous_fill_rate = deployment_fill_rate
-            else:
-                deployment_previous_fill_fraction = None
-                deployment_previous_fill_rate = None
+            )
+            deployment_previous_fill_fraction = deployment_fill_fraction
+            deployment_previous_fill_rate = deployment_fill_rate
 
             if (
                 active_contract["observation_schema"]

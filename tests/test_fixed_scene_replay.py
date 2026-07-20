@@ -114,6 +114,14 @@ class FixedSceneReplayTests(unittest.TestCase):
         path = ROOT / "configs" / "deployment_scene_seed2.json"
         profile = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(profile["scene_seed"], 2)
+        self.assertEqual(
+            profile["robot_world_position_xyz"],
+            [-9.2, 6.7, 1.243],
+        )
+        self.assertEqual(
+            profile["robot_world_orientation_wxyz"],
+            [1.0, 0.0, 0.0, 0.0],
+        )
         self.assertEqual(len(profile["truck_translation_xyz"]), 3)
         self.assertAlmostEqual(
             profile["truck_yaw_deg"],

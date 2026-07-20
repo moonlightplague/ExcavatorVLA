@@ -17106,6 +17106,14 @@ def auto_scene_fixed_replay_candidate(attempt_index, cfg, seed_context):
 
     if isinstance(AUTO_SCENE_FIXED_PROFILE, dict):
         profile = copy.deepcopy(AUTO_SCENE_FIXED_PROFILE)
+        robot_position = np.array(
+            profile["robot_world_position_xyz"],
+            dtype=np.float64,
+        ).reshape(-1)[:3]
+        robot_orientation = np.array(
+            profile["robot_world_orientation_wxyz"],
+            dtype=np.float64,
+        ).reshape(-1)[:4]
         sand_xy = np.array(profile["sand_xy"], dtype=np.float32).reshape(-1)[:2]
         truck_translation = np.array(
             profile["truck_translation_xyz"],
@@ -17124,6 +17132,8 @@ def auto_scene_fixed_replay_candidate(attempt_index, cfg, seed_context):
             "fixed_scene_exact_profile": True,
             "fixed_scene_direct_apply": True,
             "fixed_scene_skip_unload_alignment": True,
+            "fixed_robot_world_position_xyz": robot_position,
+            "fixed_robot_world_orientation_wxyz": robot_orientation,
             "random_truck": False,
             "random_truck_yaw": False,
             "random_robot_yaw": False,
@@ -17447,6 +17457,94 @@ def auto_scene_sample_candidate(attempt_index):
     }
 
 
+def auto_scene_apply_fixed_robot_pose(candidate):
+    if not bool(candidate.get("fixed_scene_exact_profile", False)):
+        return True, "not_required"
+    if ROBOT is None:
+        return False, "fixed_scene_robot_not_ready"
+
+    try:
+        expected_position = np.array(
+            candidate["fixed_robot_world_position_xyz"],
+            dtype=np.float32,
+        ).reshape(-1)[:3]
+        expected_orientation = np.array(
+            candidate["fixed_robot_world_orientation_wxyz"],
+            dtype=np.float32,
+        ).reshape(-1)[:4]
+    except Exception as exc:
+        return False, f"fixed_scene_robot_pose_invalid:{type(exc).__name__}:{exc}"
+
+    if not (
+        np.all(np.isfinite(expected_position))
+        and np.all(np.isfinite(expected_orientation))
+    ):
+        return False, "fixed_scene_robot_pose_non_finite"
+
+    orientation_norm = float(np.linalg.norm(expected_orientation))
+    if orientation_norm <= 1.0e-8:
+        return False, "fixed_scene_robot_orientation_zero"
+    expected_orientation = expected_orientation / orientation_norm
+
+    try:
+        ROBOT.set_world_pose(
+            position=expected_position,
+            orientation=expected_orientation,
+        )
+        actual_position_raw, actual_orientation_raw = ROBOT.get_world_pose()
+        actual_position = np.array(
+            actual_position_raw,
+            dtype=np.float32,
+        ).reshape(-1)[:3]
+        actual_orientation = np.array(
+            actual_orientation_raw,
+            dtype=np.float32,
+        ).reshape(-1)[:4]
+    except Exception as exc:
+        return False, f"fixed_scene_robot_pose_apply_failed:{type(exc).__name__}:{exc}"
+
+    actual_orientation_norm = float(np.linalg.norm(actual_orientation))
+    if actual_orientation_norm > 1.0e-8:
+        actual_orientation = actual_orientation / actual_orientation_norm
+    position_error = float(np.linalg.norm(actual_position - expected_position))
+    orientation_dot = float(
+        abs(np.dot(actual_orientation, expected_orientation))
+    )
+    orientation_error_deg = float(
+        math.degrees(
+            2.0 * math.acos(min(1.0, max(-1.0, orientation_dot)))
+        )
+    )
+    verification = {
+        "expected_position_xyz": vec_list(expected_position, 3),
+        "actual_position_xyz": vec_list(actual_position, 3),
+        "position_error_m": position_error,
+        "expected_orientation_wxyz": vec_list(expected_orientation, 4),
+        "actual_orientation_wxyz": vec_list(actual_orientation, 4),
+        "orientation_error_deg": orientation_error_deg,
+        "source": "deployment_run_simulation_set_world_pose",
+    }
+    candidate["fixed_scene_robot_pose_verification"] = verification
+    if position_error > 0.01 or orientation_error_deg > 0.25:
+        return (
+            False,
+            "fixed_scene_robot_pose_mismatch:"
+            f"position={position_error:.4f}m,"
+            f"orientation={orientation_error_deg:.3f}deg",
+        )
+
+    clear_rigid_obstacle_cache("fixed_scene_robot_world_pose")
+    info_print(
+        "[AUTO SCENE FIXED ROBOT]",
+        f"position={vec_list(actual_position, 3)}",
+        f"orientation_wxyz={vec_list(actual_orientation, 4)}",
+        f"position_error={position_error:.6f}m",
+        f"orientation_error={orientation_error_deg:.6f}deg",
+        force_log=True,
+    )
+    return True, "ok"
+
+
 def auto_scene_apply_candidate(candidate):
     if not isinstance(candidate, dict) or candidate.get("error"):
         return False, str((candidate or {}).get("error", "no_candidate"))
@@ -17463,6 +17561,14 @@ def auto_scene_apply_candidate(candidate):
     )
     scene_changed = False
     truck_moved = False
+
+    robot_pose_ok, robot_pose_reason = auto_scene_apply_fixed_robot_pose(
+        candidate
+    )
+    if not robot_pose_ok:
+        return False, robot_pose_reason
+    if robot_pose_reason == "ok":
+        scene_changed = True
 
     if apply_truck:
         debug_timeline_record(

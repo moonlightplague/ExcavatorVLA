@@ -2,6 +2,17 @@
   "schema": "excavator_fixed_scene_profile_v1",
   "scene_seed": 2,
   "sample_try": 1,
+  "robot_world_position_xyz": [
+    -9.2,
+    6.7,
+    1.243
+  ],
+  "robot_world_orientation_wxyz": [
+    1.0,
+    0.0,
+    0.0,
+    0.0
+  ],
   "sand_xy": [
     -0.9082751105784576,
     7.224985896564733

@@ -739,6 +739,8 @@ def main():
         if not isinstance(fixed_profile, dict):
             raise SystemExit("--fixed-scene-profile must contain a JSON object.")
         required_vectors = {
+            "robot_world_position_xyz": 3,
+            "robot_world_orientation_wxyz": 4,
             "sand_xy": 2,
             "truck_translation_xyz": 3,
             "unload_landing_xyz": 3,

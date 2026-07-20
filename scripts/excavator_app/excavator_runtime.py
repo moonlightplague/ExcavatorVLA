@@ -16670,19 +16670,6 @@ def auto_scene_current_robot_truck_overlap_detail():
     else:
         detail["bbox"] = {"ok": False, "reason": "missing_bbox"}
 
-    bbox_available = bool(
-        isinstance(bbox_detail, dict) and bbox_detail.get("ok", False)
-    )
-    bbox_overlap = bool(
-        bbox_available and bbox_detail.get("overlap", False)
-    )
-    if bbox_available and not bbox_overlap:
-        detail["aabb_overlap_diagnostic_only"] = False
-        detail["overlap_source"] = "collision_bbox_separation"
-        detail["overlap"] = False
-        detail["decision"] = "ok_collision_aabb_separated_skip_mesh"
-        return False, detail
-
     link_hits = []
     if truck_poly is not None:
         for row in auto_scene_robot_link_footprint_rows():
@@ -16702,6 +16689,8 @@ def auto_scene_current_robot_truck_overlap_detail():
         detail["robot_link_footprint_hits"] = link_hits
         detail["robot_link_footprint_gate"] = "mesh_world_hull_zero_margin"
 
+    bbox_available = bool(isinstance(bbox_detail, dict) and bbox_detail.get("ok", False))
+    bbox_overlap = bool(bbox_available and bbox_detail.get("overlap", False))
     mesh_overlap = bool(link_hits)
     detail["aabb_overlap_diagnostic_only"] = bool(bbox_overlap)
     detail["overlap_source"] = "mesh_link_footprint" if truck_poly is not None else "collision_bbox_fallback"
@@ -21071,8 +21060,20 @@ def q_from_pose_deg(pose, reference=None):
 
 
 def auto_collect_initial_pose_for_attempt(attempt_index):
-    poses = AUTO_COLLECT_INITIAL_POSES_DEG
-    pose = dict(poses[(max(1, int(attempt_index)) - 1) % max(1, len(poses))])
+    fixed_pose = None
+    if isinstance(AUTO_SCENE_FIXED_PROFILE, dict):
+        candidate = AUTO_SCENE_FIXED_PROFILE.get("initial_pose_deg")
+        if isinstance(candidate, dict):
+            fixed_pose = dict(candidate)
+    if fixed_pose is not None:
+        pose = fixed_pose
+        pose["id"] = str(
+            pose.get("id", "fixed_scene_initial_pose")
+            or "fixed_scene_initial_pose"
+        )
+    else:
+        poses = AUTO_COLLECT_INITIAL_POSES_DEG
+        pose = dict(poses[(max(1, int(attempt_index)) - 1) % max(1, len(poses))])
     scene_record = STATE.get("auto_scene_last_randomization", {})
     scene_candidate = scene_record.get("candidate", {}) if isinstance(scene_record, dict) else {}
     robot_body_yaw = None

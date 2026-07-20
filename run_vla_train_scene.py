@@ -758,6 +758,20 @@ def main():
                 raise SystemExit(
                     f"--fixed-scene-profile missing finite {key}"
                 )
+        initial_pose = fixed_profile.get("initial_pose_deg")
+        if initial_pose is not None:
+            if not isinstance(initial_pose, dict):
+                raise SystemExit(
+                    "--fixed-scene-profile initial_pose_deg must be an object."
+                )
+            for joint_name in ("swing", "boom", "arm", "bucket"):
+                if not math.isfinite(
+                    float(initial_pose.get(joint_name, float("nan")))
+                ):
+                    raise SystemExit(
+                        "--fixed-scene-profile initial_pose_deg missing finite "
+                        f"{joint_name}"
+                    )
         os.environ["EXCAVATOR_AUTO_SCENE_FIXED_PROFILE_JSON"] = json.dumps(
             fixed_profile,
             ensure_ascii=True,

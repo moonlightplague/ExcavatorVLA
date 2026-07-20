@@ -87,7 +87,7 @@ class FixedSceneReplayTests(unittest.TestCase):
             source,
         )
         self.assertIn(
-            '"ok_collision_aabb_separated_skip_mesh"',
+            'AUTO_SCENE_FIXED_PROFILE.get("initial_pose_deg")',
             source,
         )
         self.assertIn(
@@ -117,6 +117,16 @@ class FixedSceneReplayTests(unittest.TestCase):
             places=5,
         )
         self.assertEqual(len(profile["unload_landing_xyz"]), 3)
+        self.assertEqual(
+            profile["initial_pose_deg"],
+            {
+                "id": "fixed_scene_target_side_high",
+                "swing": 40.0,
+                "boom": 46.0,
+                "arm": -62.0,
+                "bucket": -20.0,
+            },
+        )
 
 
 if __name__ == "__main__":

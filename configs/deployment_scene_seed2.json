@@ -18,5 +18,12 @@
     -2.007319897383199,
     4.152685460553676
   ],
+  "initial_pose_deg": {
+    "id": "fixed_scene_target_side_high",
+    "swing": 40.0,
+    "boom": 46.0,
+    "arm": -62.0,
+    "bucket": -20.0
+  },
   "source": "run_simulation.py scene_seed=2"
 }

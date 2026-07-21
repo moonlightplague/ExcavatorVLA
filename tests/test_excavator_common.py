@@ -358,6 +358,35 @@ class DatasetExportTimePolicyTests(unittest.TestCase):
         self.assertAlmostEqual(result["samples"][1]["action"][3], 1.0, places=6)
         self.assertEqual(result["action_semantic_audit"]["corrected_hold_transitions"], 0)
 
+    def test_discontinuous_position_setpoint_uses_executed_transition_velocity(self):
+        samples = [
+            {
+                "i": 0,
+                "t": 0.0,
+                "phase": "unload_to_bin",
+                "label": "unload_to_bin",
+                "obs.q": [0.0, 0.0, 0.0, 0.0],
+                "obs.q_cmd": [0.0, 0.0, 0.0, -2.0],
+                "action": [0.0] * 4,
+            },
+            {
+                "i": 1,
+                "t": 0.1,
+                "phase": "unload_to_bin",
+                "label": "unload_to_bin",
+                "obs.q": [0.0, 0.0, 0.0, 0.1],
+                "obs.q_cmd": [0.0, 0.0, 0.0, 0.5],
+                "action": [0.0] * 4,
+            },
+        ]
+
+        result = excavator_dataset_tools.apply_export_time_policy_to_trajectory(samples, base_fps=10.0)
+
+        self.assertAlmostEqual(result["samples"][0]["action"][3], 1.0, places=6)
+        self.assertEqual(result["samples"][0]["action.semantic"], "setpoint_fallback")
+        self.assertEqual(result["action_semantic_audit"]["setpoint_fallback_transitions"], 1)
+        self.assertEqual(result["action_semantic_audit"]["hard_limit_violations"], 0)
+
     def test_legacy_migration_transform_retimes_episode_to_uniform_10hz(self):
         source_fps = 6.0
         samples = []

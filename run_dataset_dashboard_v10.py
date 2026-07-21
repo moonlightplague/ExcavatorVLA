@@ -8144,7 +8144,7 @@ function renderEpisode(data){
   const exactPublished=exported.available===true;
   const actionAudit=exported.action_semantic_audit||{};
   const sourceInfo=exactPublished
-    ? `published parquet · action=${exported.action_policy_version||"unknown"} · hold fixes=${Number(actionAudit.corrected_hold_transitions||0)} · max=${fmt(actionAudit.max_abs_action_rad_s,3)} rad/s`
+    ? `published parquet · action=${exported.action_policy_version||"unknown"} · hold fixes=${Number(actionAudit.corrected_hold_transitions||0)} · setpoint fixes=${Number(actionAudit.setpoint_fallback_transitions||0)} · max=${fmt(actionAudit.max_abs_action_rad_s,3)} rad/s`
     : `raw preview · ${exported.reason||"not exported"}`;
   $("episodeMeta").textContent=`${statusKey(ep.status)} | score=${fmt(ep.score,1)} | samples=${data.sample_count} | shown=${data.returned_points} | ${tpInfo} | ${sourceInfo} | ${shortText(ep.dataset_skip_reason || ep.reason||ep.warning_reason||"",260)}`;
   $("rawBox").textContent=JSON.stringify({episode:ep,time_policy:data.time_policy,stage_spans:data.stage_spans,camera_preview:data.camera_preview,exported_vla:{available:exported.available,reason:exported.reason,source:exported.source,relative_path:exported.relative_path,export_episode_index:exported.export_episode_index,frame_count:exported.frame_count,state_names:exported.state_names,effort_names:exported.effort_names,action_names:exported.action_names,action_policy_version:exported.action_policy_version,action_semantic_audit:exported.action_semantic_audit}},null,2);

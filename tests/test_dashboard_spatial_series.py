@@ -52,7 +52,7 @@ class DashboardSpatialSeriesTests(unittest.TestCase):
                 os.path.join(meta_dir, "info.json"),
                 {
                     "canonical_phase_names": ["pre_dig"],
-                    "action_policy_version": "cmd_velocity_v2_hold_aware",
+                    "action_policy_version": "cmd_velocity_v3_setpoint_aware",
                     "features": {
                         "observation.state": {"names": state_names},
                         "observation.effort": {"names": effort_names},
@@ -67,7 +67,7 @@ class DashboardSpatialSeriesTests(unittest.TestCase):
                     "effort_names": effort_names,
                     "action_names": action_names,
                     "canonical_phase_names": ["pre_dig"],
-                    "action_policy_version": "cmd_velocity_v2_hold_aware",
+                    "action_policy_version": "cmd_velocity_v3_setpoint_aware",
                     "episodes": [
                         {
                             "episode_index": 0,

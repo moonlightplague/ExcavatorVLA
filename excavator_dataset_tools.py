@@ -49,7 +49,8 @@ LEROBOT_SOURCE_SAMPLING_CONTRACT = "original_uniform_10hz_v1"
 EXPORT_TIME_POLICY_FILENAME = "export_time_policy.json"
 LEROBOT_IMAGE_SHAPE = [256, 256, 3]
 LEROBOT_VIDEO_KEYFRAME_INTERVAL = 4
-LEROBOT_ACTION_POLICY_VERSION = "cmd_velocity_v2_hold_aware"
+LEROBOT_ACTION_POLICY_VERSION = "cmd_velocity_v3_setpoint_aware"
+LEROBOT_COMMAND_DISCONTINUITY_RAD_S = 6.0
 LEROBOT_ACTION_HARD_MAX_RAD_S = 12.0
 LEROBOT_VIDEO_WORKERS_ENV = "EXCAVATOR_LEROBOT_VIDEO_WORKERS"
 LEROBOT_VIDEO_ENCODER_THREADS_ENV = "EXCAVATOR_LEROBOT_VIDEO_ENCODER_THREADS"
@@ -1639,6 +1640,7 @@ def _sample_command_semantic(sample: object) -> str:
 def _hold_aware_command_actions(
     samples: Sequence[dict],
     q_cmd_values: Sequence[Sequence[Optional[float]]],
+    q_real_values: Sequence[Sequence[Optional[float]]],
     timestamps: Sequence[float],
     dim: int,
 ) -> Tuple[List[List[Optional[float]]], List[List[Optional[float]]], Dict[str, object]]:
@@ -1646,13 +1648,17 @@ def _hold_aware_command_actions(
     previous_action: List[List[Optional[float]]] = [[0.0] * int(dim)]
     transition_semantics = ["initial"]
     corrected_examples: List[dict] = []
+    setpoint_fallback_examples: List[dict] = []
     hard_limit_examples: List[dict] = []
     corrected_count = 0
+    setpoint_fallback_count = 0
 
     for index in range(1, len(q_cmd_values)):
         dt = float(timestamps[index]) - float(timestamps[index - 1])
         previous_values = list(q_cmd_values[index - 1] or [])
         current_values = list(q_cmd_values[index] or [])
+        previous_real_values = list(q_real_values[index - 1] or [])
+        current_real_values = list(q_real_values[index] or [])
         semantic = _sample_command_semantic(samples[index] if index < len(samples) else {})
         raw_velocity: List[Optional[float]] = []
         for axis in range(int(dim)):
@@ -1683,6 +1689,40 @@ def _hold_aware_command_actions(
                             "raw_max_abs_rad_s": float(raw_max),
                         }
                     )
+        elif max((abs(float(value)) for value in raw_velocity if value is not None), default=0.0) > float(
+            LEROBOT_COMMAND_DISCONTINUITY_RAD_S
+        ):
+            velocity = []
+            for axis in range(int(dim)):
+                try:
+                    value = (
+                        (float(current_real_values[axis]) - float(previous_real_values[axis])) / dt
+                        if dt > 1.0e-9
+                        else 0.0
+                    )
+                except Exception:
+                    value = None
+                velocity.append(value)
+            semantic = "setpoint_fallback"
+            setpoint_fallback_count += 1
+            if len(setpoint_fallback_examples) < 20:
+                row = samples[index] if index < len(samples) else {}
+                setpoint_fallback_examples.append(
+                    {
+                        "destination_index": int(index),
+                        "raw_sample_index": row.get("i") if isinstance(row, dict) else None,
+                        "label": str(row.get("label") or "") if isinstance(row, dict) else "",
+                        "phase": str(row.get("phase") or "") if isinstance(row, dict) else "",
+                        "raw_command_max_abs_rad_s": max(
+                            (abs(float(value)) for value in raw_velocity if value is not None),
+                            default=0.0,
+                        ),
+                        "executed_max_abs_rad_s": max(
+                            (abs(float(value)) for value in velocity if value is not None),
+                            default=0.0,
+                        ),
+                    }
+                )
         else:
             velocity = raw_velocity
         previous_action.append(velocity)
@@ -1729,6 +1769,8 @@ def _hold_aware_command_actions(
         "version": LEROBOT_ACTION_POLICY_VERSION,
         "corrected_hold_transitions": int(corrected_count),
         "corrected_examples": corrected_examples,
+        "setpoint_fallback_transitions": int(setpoint_fallback_count),
+        "setpoint_fallback_examples": setpoint_fallback_examples,
         "transition_semantics": transition_semantics,
         "max_abs_action_rad_s": float(max_abs),
         "hard_max_rad_s": float(LEROBOT_ACTION_HARD_MAX_RAD_S),
@@ -1861,6 +1903,7 @@ def apply_export_time_policy_to_trajectory(
         previous_action, action, action_semantic_audit = _hold_aware_command_actions(
             samples,
             q_cmd_unwrapped,
+            q_unwrapped,
             new_times,
             dim,
         )
@@ -1886,6 +1929,8 @@ def apply_export_time_policy_to_trajectory(
             "source": "raw_action_fallback",
             "corrected_hold_transitions": 0,
             "corrected_examples": [],
+            "setpoint_fallback_transitions": 0,
+            "setpoint_fallback_examples": [],
             "transition_semantics": ["raw_action"] * len(previous_action),
             "max_abs_action_rad_s": max(
                 (abs(float(value)) for row in action for value in row if value is not None),
@@ -3134,10 +3179,12 @@ def collect_lerobot_rows(
     action_semantic_audit = {
         "version": LEROBOT_ACTION_POLICY_VERSION,
         "corrected_hold_transitions": 0,
+        "setpoint_fallback_transitions": 0,
         "max_abs_action_rad_s": 0.0,
         "hard_max_rad_s": float(LEROBOT_ACTION_HARD_MAX_RAD_S),
         "hard_limit_violations": 0,
         "corrected_examples": [],
+        "setpoint_fallback_examples": [],
         "hard_limit_examples": [],
     }
     global_frame = 0
@@ -3163,11 +3210,14 @@ def collect_lerobot_rows(
         action_semantic_audit["hard_limit_violations"] += int(
             episode_action_audit.get("hard_limit_violations", 0) or 0
         )
+        action_semantic_audit["setpoint_fallback_transitions"] += int(
+            episode_action_audit.get("setpoint_fallback_transitions", 0) or 0
+        )
         action_semantic_audit["max_abs_action_rad_s"] = max(
             float(action_semantic_audit.get("max_abs_action_rad_s", 0.0) or 0.0),
             float(episode_action_audit.get("max_abs_action_rad_s", 0.0) or 0.0),
         )
-        for audit_key in ("corrected_examples", "hard_limit_examples"):
+        for audit_key in ("corrected_examples", "setpoint_fallback_examples", "hard_limit_examples"):
             target_examples = action_semantic_audit[audit_key]
             for example in list(episode_action_audit.get(audit_key) or []):
                 if len(target_examples) >= 50:

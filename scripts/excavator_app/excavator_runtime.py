@@ -138,6 +138,7 @@ AUTO_ATTEMPT_DUMP_SPEED_SCALE = max(
     0.1,
     env_float("EXCAVATOR_AUTO_ATTEMPT_DUMP_SPEED_SCALE", 1.0),
 )
+DATASET_COMMAND_DISCONTINUITY_RAD_S = 6.0
 
 
 def _load_optional_joint_space_planner():
@@ -11145,17 +11146,25 @@ def dataset_motion_derivatives(q_cmd, q_real, sample_time, command_intent="traje
     last_dq_real = STATE.get("dataset_last_dq_real")
     last_ddq_real = STATE.get("dataset_last_ddq_real")
 
-    if str(command_intent or "trajectory").strip().lower() == "hold":
-        action = np.zeros(4, dtype=np.float32)
-    elif last_q_cmd is None or dt <= 0.0:
-        action = np.zeros(4, dtype=np.float32)
-    else:
-        action = dataset_q_delta(q_cmd, np.array(last_q_cmd, dtype=np.float32)) / dt
-
     if last_q_real is None or dt <= 0.0:
         dq_real = np.zeros(4, dtype=np.float32)
     else:
         dq_real = dataset_q_delta(q_real, np.array(last_q_real, dtype=np.float32)) / dt
+
+    action_source = "command_velocity"
+    if str(command_intent or "trajectory").strip().lower() == "hold":
+        action = np.zeros(4, dtype=np.float32)
+        action_source = "hold_zero"
+    elif last_q_cmd is None or dt <= 0.0:
+        action = np.zeros(4, dtype=np.float32)
+        action_source = "initial_zero"
+    else:
+        raw_action = dataset_q_delta(q_cmd, np.array(last_q_cmd, dtype=np.float32)) / dt
+        if float(np.max(np.abs(raw_action))) > float(DATASET_COMMAND_DISCONTINUITY_RAD_S):
+            action = dq_real.copy()
+            action_source = "executed_velocity_for_discontinuous_setpoint"
+        else:
+            action = raw_action
 
     if last_dq_real is None or dt <= 0.0:
         ddq_real = np.zeros(4, dtype=np.float32)
@@ -11182,6 +11191,7 @@ def dataset_motion_derivatives(q_cmd, q_real, sample_time, command_intent="traje
     return {
         "dt": float(dt),
         "action": [float(x) for x in action],
+        "action_source": action_source,
         "dq_real": [float(x) for x in dq_real],
         "ddq_real": [float(x) for x in ddq_real],
         "action_ddq": [float(x) for x in action_ddq],
@@ -12398,6 +12408,7 @@ def dataset_record_sample(
             "obs.q_cmd": vec_list(q_cmd, 4),
             "obs.q_err": dataset_joint_error(q_cmd, q_real),
             "action": action,
+            "action.source": dynamics["action_source"],
             "action.ddq": dynamics["action_ddq"],
             "goal.q": vec_list(q_goal, 4),
             "target": vec_list(target, 3),

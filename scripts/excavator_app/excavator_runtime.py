@@ -11125,7 +11125,14 @@ def update_episode_quality_trackers(metrics, phase, q_cmd=None, q_real=None, act
             pass
 
 
-def dataset_motion_derivatives(q_cmd, q_real, sample_time):
+def dataset_command_intent(mode=None):
+    mode_text = str(STATE.get("last_action_mode", "") if mode is None else mode).strip().lower()
+    if any(token in mode_text for token in ("hold_real", "freeze_hold", "verify_hold", "reconcile", "sync_to_real", "hold_current")):
+        return "hold"
+    return "trajectory"
+
+
+def dataset_motion_derivatives(q_cmd, q_real, sample_time, command_intent="trajectory"):
     q_cmd = np.array(q_cmd, dtype=np.float32).reshape(-1)[:4]
     q_real = np.array(q_real, dtype=np.float32).reshape(-1)[:4]
     sample_time = float(sample_time)
@@ -11138,7 +11145,9 @@ def dataset_motion_derivatives(q_cmd, q_real, sample_time):
     last_dq_real = STATE.get("dataset_last_dq_real")
     last_ddq_real = STATE.get("dataset_last_ddq_real")
 
-    if last_q_cmd is None or dt <= 0.0:
+    if str(command_intent or "trajectory").strip().lower() == "hold":
+        action = np.zeros(4, dtype=np.float32)
+    elif last_q_cmd is None or dt <= 0.0:
         action = np.zeros(4, dtype=np.float32)
     else:
         action = dataset_q_delta(q_cmd, np.array(last_q_cmd, dtype=np.float32)) / dt
@@ -12225,7 +12234,14 @@ def dataset_record_sample(
                 return False
 
         span_t = time.perf_counter()
-        dynamics = dataset_motion_derivatives(q_cmd, q_real, train_abs)
+        control_mode = str(STATE.get("last_action_mode", "") or "")
+        control_intent = dataset_command_intent(control_mode)
+        dynamics = dataset_motion_derivatives(
+            q_cmd,
+            q_real,
+            train_abs,
+            command_intent=control_intent,
+        )
         action = dynamics["action"]
         joint_velocity = dynamics["dq_real"]
         joint_acceleration = dynamics["ddq_real"]
@@ -12368,6 +12384,9 @@ def dataset_record_sample(
             "phase.one_hot": phase_features["one_hot"],
             "phase.context": phase_features["context"],
             "label": str(label),
+            "control.mode": control_mode,
+            "control.intent": control_intent,
+            "control.command_position": vec_list(STATE.get("last_action_q"), 4),
             "observation.state": obs_state,
             "observation.effort": observation_effort,
             "observation.effort_meta": effort_obs,

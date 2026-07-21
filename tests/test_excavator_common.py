@@ -297,6 +297,67 @@ class DatasetExportPerformanceTests(unittest.TestCase):
 
 
 class DatasetExportTimePolicyTests(unittest.TestCase):
+    def test_hold_real_transition_does_not_become_motion_action(self):
+        samples = [
+            {
+                "i": 0,
+                "t": 0.0,
+                "phase": "unload_to_bin",
+                "label": "dump_release",
+                "obs.q": [0.0, 0.0, 0.0, 0.0],
+                "obs.q_cmd": [0.0, 0.0, 0.0, 1.0],
+                "action": [0.0] * 4,
+            },
+            {
+                "i": 1,
+                "t": 0.1,
+                "phase": "unload_to_bin",
+                "label": "after_dump_direct",
+                "obs.q": [0.0, 0.0, 0.0, 0.6],
+                "obs.q_cmd": [0.0, 0.0, 0.0, 0.6],
+                "action": [0.0] * 4,
+            },
+            {
+                "i": 2,
+                "t": 0.2,
+                "phase": "unload_to_bin",
+                "label": "after_dump_settle",
+                "obs.q": [0.0, 0.0, 0.0, 0.6],
+                "obs.q_cmd": [0.0, 0.0, 0.0, 0.6],
+                "action": [0.0] * 4,
+            },
+        ]
+
+        result = excavator_dataset_tools.apply_export_time_policy_to_trajectory(samples, base_fps=10.0)
+
+        self.assertEqual(result["samples"][0]["action"], [0.0] * 4)
+        self.assertEqual(result["samples"][1]["action"], [0.0] * 4)
+        self.assertEqual(result["samples"][1]["action.semantic"], "hold")
+        self.assertEqual(result["action_semantic_audit"]["corrected_hold_transitions"], 1)
+        self.assertEqual(result["action_semantic_audit"]["hard_limit_violations"], 0)
+
+    def test_trajectory_transition_preserves_command_velocity(self):
+        samples = []
+        for index, bucket in enumerate([0.0, 0.1, 0.2]):
+            samples.append(
+                {
+                    "i": index,
+                    "t": index * 0.1,
+                    "phase": "pre_dig",
+                    "label": "pre_dig",
+                    "control.intent": "trajectory",
+                    "obs.q": [0.0, 0.0, 0.0, bucket],
+                    "obs.q_cmd": [0.0, 0.0, 0.0, bucket],
+                    "action": [0.0] * 4,
+                }
+            )
+
+        result = excavator_dataset_tools.apply_export_time_policy_to_trajectory(samples, base_fps=10.0)
+
+        self.assertAlmostEqual(result["samples"][0]["action"][3], 1.0, places=6)
+        self.assertAlmostEqual(result["samples"][1]["action"][3], 1.0, places=6)
+        self.assertEqual(result["action_semantic_audit"]["corrected_hold_transitions"], 0)
+
     def test_legacy_migration_transform_retimes_episode_to_uniform_10hz(self):
         source_fps = 6.0
         samples = []

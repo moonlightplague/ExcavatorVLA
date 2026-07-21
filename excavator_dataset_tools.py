@@ -49,6 +49,8 @@ LEROBOT_SOURCE_SAMPLING_CONTRACT = "original_uniform_10hz_v1"
 EXPORT_TIME_POLICY_FILENAME = "export_time_policy.json"
 LEROBOT_IMAGE_SHAPE = [256, 256, 3]
 LEROBOT_VIDEO_KEYFRAME_INTERVAL = 4
+LEROBOT_ACTION_POLICY_VERSION = "cmd_velocity_v2_hold_aware"
+LEROBOT_ACTION_HARD_MAX_RAD_S = 12.0
 LEROBOT_VIDEO_WORKERS_ENV = "EXCAVATOR_LEROBOT_VIDEO_WORKERS"
 LEROBOT_VIDEO_ENCODER_THREADS_ENV = "EXCAVATOR_LEROBOT_VIDEO_ENCODER_THREADS"
 LEROBOT_VIDEO_PRESET_ENV = "EXCAVATOR_LEROBOT_VIDEO_PRESET"
@@ -1448,6 +1450,7 @@ def lerobot_export_config_for_run(
         "source_sampling_contract": LEROBOT_SOURCE_SAMPLING_CONTRACT,
         "video_keyframe_interval": int(LEROBOT_VIDEO_KEYFRAME_INTERVAL),
         "task_prompt_version": LEROBOT_TASK_PROMPT_VERSION,
+        "action_policy_version": LEROBOT_ACTION_POLICY_VERSION,
         "state_schema": str(state_schema_spec["key"]),
         "state_schema_version": str(state_schema_spec["version"]),
         "state_dim": len(state_names),
@@ -1463,6 +1466,7 @@ def lerobot_export_config_for_run(
     }
     metadata_only_keys = {
         "task_prompt_version",
+        "action_policy_version",
         "state_schema_version",
         "state_schema",
         "state_dim",
@@ -1610,6 +1614,129 @@ def _forward_difference_vectors(
     return out
 
 
+def _sample_command_semantic(sample: object) -> str:
+    """Classify command transitions without treating controller bookkeeping as motion."""
+    row = sample if isinstance(sample, dict) else {}
+    explicit = str(row.get("control.intent") or row.get("action.intent") or "").strip().lower()
+    if explicit in {"hold", "reconcile", "sync", "noop", "stop"}:
+        return "hold"
+    if explicit in {"trajectory", "motion", "move"}:
+        return "trajectory"
+
+    mode = str(row.get("control.mode") or row.get("action.mode") or "").strip().lower()
+    if any(token in mode for token in ("hold_real", "reconcile", "sync_to_real", "hold_current")):
+        return "hold"
+
+    # Legacy episodes did not record the controller mode. These labels are
+    # emitted only after the dump command is cancelled and the current real
+    # joint pose is held during the outcome-settle observation window.
+    label = str(row.get("label") or "").strip().lower()
+    if label in {"after_dump_direct", "after_dump_settle", "after_dump_settle_probe"}:
+        return "hold"
+    return "trajectory"
+
+
+def _hold_aware_command_actions(
+    samples: Sequence[dict],
+    q_cmd_values: Sequence[Sequence[Optional[float]]],
+    timestamps: Sequence[float],
+    dim: int,
+) -> Tuple[List[List[Optional[float]]], List[List[Optional[float]]], Dict[str, object]]:
+    """Build causal/next command velocities while preserving hold semantics."""
+    previous_action: List[List[Optional[float]]] = [[0.0] * int(dim)]
+    transition_semantics = ["initial"]
+    corrected_examples: List[dict] = []
+    hard_limit_examples: List[dict] = []
+    corrected_count = 0
+
+    for index in range(1, len(q_cmd_values)):
+        dt = float(timestamps[index]) - float(timestamps[index - 1])
+        previous_values = list(q_cmd_values[index - 1] or [])
+        current_values = list(q_cmd_values[index] or [])
+        semantic = _sample_command_semantic(samples[index] if index < len(samples) else {})
+        raw_velocity: List[Optional[float]] = []
+        for axis in range(int(dim)):
+            try:
+                value = (
+                    (float(current_values[axis]) - float(previous_values[axis])) / dt
+                    if dt > 1.0e-9
+                    else 0.0
+                )
+            except Exception:
+                value = None
+            raw_velocity.append(value)
+
+        if semantic == "hold":
+            velocity = [0.0] * int(dim)
+            raw_max = max((abs(float(value)) for value in raw_velocity if value is not None), default=0.0)
+            if raw_max > 1.0e-6:
+                corrected_count += 1
+                if len(corrected_examples) < 20:
+                    row = samples[index] if index < len(samples) else {}
+                    corrected_examples.append(
+                        {
+                            "destination_index": int(index),
+                            "raw_sample_index": row.get("i") if isinstance(row, dict) else None,
+                            "label": str(row.get("label") or "") if isinstance(row, dict) else "",
+                            "phase": str(row.get("phase") or "") if isinstance(row, dict) else "",
+                            "control_mode": str(row.get("control.mode") or "") if isinstance(row, dict) else "",
+                            "raw_max_abs_rad_s": float(raw_max),
+                        }
+                    )
+        else:
+            velocity = raw_velocity
+        previous_action.append(velocity)
+        transition_semantics.append(semantic)
+
+    action = [
+        list(previous_action[index + 1])
+        if index + 1 < len(previous_action)
+        else [0.0] * int(dim)
+        for index in range(len(previous_action))
+    ]
+    finite_actions = [
+        abs(float(value))
+        for row in action
+        for value in row
+        if value is not None and math.isfinite(float(value))
+    ]
+    max_abs = max(finite_actions, default=0.0)
+    hard_limit_violations = sum(
+        1
+        for row in action
+        if any(
+            value is not None and abs(float(value)) > float(LEROBOT_ACTION_HARD_MAX_RAD_S)
+            for value in row
+        )
+    )
+    for index, row in enumerate(action):
+        row_max = max((abs(float(value)) for value in row if value is not None), default=0.0)
+        if row_max <= float(LEROBOT_ACTION_HARD_MAX_RAD_S):
+            continue
+        if len(hard_limit_examples) >= 20:
+            break
+        source = samples[index] if index < len(samples) else {}
+        hard_limit_examples.append(
+            {
+                "source_index": int(index),
+                "raw_sample_index": source.get("i") if isinstance(source, dict) else None,
+                "phase": str(source.get("phase") or "") if isinstance(source, dict) else "",
+                "label": str(source.get("label") or "") if isinstance(source, dict) else "",
+                "max_abs_rad_s": float(row_max),
+            }
+        )
+    return previous_action, action, {
+        "version": LEROBOT_ACTION_POLICY_VERSION,
+        "corrected_hold_transitions": int(corrected_count),
+        "corrected_examples": corrected_examples,
+        "transition_semantics": transition_semantics,
+        "max_abs_action_rad_s": float(max_abs),
+        "hard_max_rad_s": float(LEROBOT_ACTION_HARD_MAX_RAD_S),
+        "hard_limit_violations": int(hard_limit_violations),
+        "hard_limit_examples": hard_limit_examples,
+    }
+
+
 def _rewrap_angles(values: Sequence[Optional[float]]) -> List[Optional[float]]:
     out: List[Optional[float]] = []
     for value in values:
@@ -1729,13 +1856,10 @@ def apply_export_time_policy_to_trajectory(
     q_cmd_unwrapped = _unwrap_angle_series(q_cmd_raw, dim)
     dq = _causal_difference_vectors(q_unwrapped, new_times, dim)
     ddq = _causal_difference_vectors(dq, new_times, dim)
-    if any(vec is not None for vec in q_cmd_raw):
-        previous_action = _causal_difference_vectors(
-            q_cmd_unwrapped,
-            new_times,
-            dim,
-        )
-        action = _forward_difference_vectors(
+    action_semantic_audit: Dict[str, object]
+    if all(vec is not None for vec in q_cmd_raw):
+        previous_action, action, action_semantic_audit = _hold_aware_command_actions(
+            samples,
             q_cmd_unwrapped,
             new_times,
             dim,
@@ -1757,6 +1881,24 @@ def apply_export_time_policy_to_trajectory(
             else [0.0] * dim
             for index in range(len(previous_action))
         ]
+        action_semantic_audit = {
+            "version": LEROBOT_ACTION_POLICY_VERSION,
+            "source": "raw_action_fallback",
+            "corrected_hold_transitions": 0,
+            "corrected_examples": [],
+            "transition_semantics": ["raw_action"] * len(previous_action),
+            "max_abs_action_rad_s": max(
+                (abs(float(value)) for row in action for value in row if value is not None),
+                default=0.0,
+            ),
+            "hard_max_rad_s": float(LEROBOT_ACTION_HARD_MAX_RAD_S),
+            "hard_limit_violations": sum(
+                1
+                for row in action
+                if any(abs(float(value or 0.0)) > float(LEROBOT_ACTION_HARD_MAX_RAD_S) for value in row)
+            ),
+            "hard_limit_examples": [],
+        }
     action_ddq = _causal_difference_vectors(
         previous_action,
         new_times,
@@ -1792,6 +1934,9 @@ def apply_export_time_policy_to_trajectory(
         ]
         out["action"] = [float(value or 0.0) for value in action[index]]
         out["action.ddq"] = [float(value or 0.0) for value in action_ddq[index]]
+        semantics = list(action_semantic_audit.get("transition_semantics") or [])
+        out["action.source"] = LEROBOT_ACTION_POLICY_VERSION
+        out["action.semantic"] = semantics[index + 1] if index + 1 < len(semantics) else "terminal"
         state = vector_or_none(out.get("observation.state")) or vector_or_none(out.get("obs.state"))
         updated_state = _set_state_named_values(
             state,
@@ -1806,6 +1951,11 @@ def apply_export_time_policy_to_trajectory(
         transformed.append(out)
     return {
         "samples": transformed,
+        "action_semantic_audit": {
+            key: value
+            for key, value in action_semantic_audit.items()
+            if key != "transition_semantics"
+        },
         "time_policy": normalized,
         "time_policy_hash": export_time_policy_hash(normalized),
         "base_fps": float(base_fps or 10.0),
@@ -2722,6 +2872,13 @@ def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Di
     missing = [relpath_posix(path, export_dir) for path in required if not os.path.exists(path)]
     info = read_json(os.path.join(export_dir, "meta", "info.json"), default={}) or {}
     reasons = []
+    action_audit = {
+        "version": str(info.get("action_policy_version") or ""),
+        "max_abs_action_rad_s": 0.0,
+        "hard_max_rad_s": float(LEROBOT_ACTION_HARD_MAX_RAD_S),
+        "hard_limit_violations": 0,
+        "non_finite_rows": 0,
+    }
     if missing:
         reasons.append(f"missing:{','.join(missing)}")
     if info.get("codebase_version") != LEROBOT_CODEBASE_VERSION:
@@ -2730,6 +2887,8 @@ def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Di
         reasons.append("info/video_path_not_v3")
     if info.get("data_path") != "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet":
         reasons.append("info/data_path_not_v3")
+    if info.get("action_policy_version") != LEROBOT_ACTION_POLICY_VERSION:
+        reasons.append("info/action_policy_version_mismatch")
     features = info.get("features", {}) if isinstance(info.get("features"), dict) else {}
     stats = read_json(os.path.join(export_dir, "meta", "stats.json"), default={}) or {}
     if not isinstance(stats, dict):
@@ -2793,10 +2952,43 @@ def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Di
                             reasons.append(f"videos/missing_{key}_file_{file_index:03d}")
         except Exception as exc:
             reasons.append(f"episodes/read_failed:{type(exc).__name__}:{exc}")
+    data_path = os.path.join(export_dir, "data", "chunk-000", "file-000.parquet")
+    if os.path.exists(data_path):
+        try:
+            import pandas as pd  # type: ignore
+
+            action_df = pd.read_parquet(data_path, columns=["action"])
+            for value in action_df["action"].tolist():
+                action = vector_or_none(value)
+                if action is None or not action:
+                    action_audit["non_finite_rows"] += 1
+                    continue
+                if any(not math.isfinite(float(axis)) for axis in action):
+                    action_audit["non_finite_rows"] += 1
+                    continue
+                row_max = max(abs(float(axis)) for axis in action)
+                action_audit["max_abs_action_rad_s"] = max(
+                    float(action_audit["max_abs_action_rad_s"]),
+                    float(row_max),
+                )
+                if row_max > float(LEROBOT_ACTION_HARD_MAX_RAD_S):
+                    action_audit["hard_limit_violations"] += 1
+            if int(action_audit["non_finite_rows"]) > 0:
+                reasons.append(f"action/non_finite_rows:{int(action_audit['non_finite_rows'])}")
+            if int(action_audit["hard_limit_violations"]) > 0:
+                reasons.append(
+                    "action/hard_limit_violations:"
+                    f"{int(action_audit['hard_limit_violations'])};"
+                    f"max={float(action_audit['max_abs_action_rad_s']):.6f};"
+                    f"limit={float(LEROBOT_ACTION_HARD_MAX_RAD_S):.6f}"
+                )
+        except Exception as exc:
+            reasons.append(f"action/read_failed:{type(exc).__name__}:{exc}")
     return {
         "ok": not reasons,
         "reasons": reasons,
         "missing": missing,
+        "action_audit": action_audit,
     }
 
 
@@ -2939,6 +3131,15 @@ def collect_lerobot_rows(
     missing_vla_state_by_reason: Counter = Counter()
     missing_vla_state_examples: List[dict] = []
     source_sampling_reports: List[dict] = []
+    action_semantic_audit = {
+        "version": LEROBOT_ACTION_POLICY_VERSION,
+        "corrected_hold_transitions": 0,
+        "max_abs_action_rad_s": 0.0,
+        "hard_max_rad_s": float(LEROBOT_ACTION_HARD_MAX_RAD_S),
+        "hard_limit_violations": 0,
+        "corrected_examples": [],
+        "hard_limit_examples": [],
+    }
     global_frame = 0
     for source_episode_index, episode in enumerate(episode_rows):
         episode_dir = episode_dir_from_row(episode, run_dir=run_dir)
@@ -2955,6 +3156,29 @@ def collect_lerobot_rows(
             state_names=raw_state_names,
             action_names=action_names,
         )
+        episode_action_audit = dict(transformed.get("action_semantic_audit") or {})
+        action_semantic_audit["corrected_hold_transitions"] += int(
+            episode_action_audit.get("corrected_hold_transitions", 0) or 0
+        )
+        action_semantic_audit["hard_limit_violations"] += int(
+            episode_action_audit.get("hard_limit_violations", 0) or 0
+        )
+        action_semantic_audit["max_abs_action_rad_s"] = max(
+            float(action_semantic_audit.get("max_abs_action_rad_s", 0.0) or 0.0),
+            float(episode_action_audit.get("max_abs_action_rad_s", 0.0) or 0.0),
+        )
+        for audit_key in ("corrected_examples", "hard_limit_examples"):
+            target_examples = action_semantic_audit[audit_key]
+            for example in list(episode_action_audit.get(audit_key) or []):
+                if len(target_examples) >= 50:
+                    break
+                target_examples.append(
+                    {
+                        "raw_episode_index": episode.get("episode_index"),
+                        "raw_episode_id": episode.get("episode_id", ""),
+                        **dict(example),
+                    }
+                )
         trajectory = list(transformed.get("samples") or [])
         transformed_sampling = trajectory_sampling_report(trajectory)
         if len(trajectory) != int(source_sampling.get("sample_count", 0) or 0):
@@ -3156,6 +3380,7 @@ def collect_lerobot_rows(
                 "source_time_scale": float(transformed.get("source_time_scale") or 1.0),
                 "source_sampling_hz": float(source_sampling.get("median_hz", 0.0) or 0.0),
                 "export_sampling_hz": float(transformed_sampling.get("median_hz", 0.0) or 0.0),
+                "action_semantic_audit": episode_action_audit,
             }
         )
         episode_image_paths.append(current_episode_image_paths)
@@ -3184,6 +3409,14 @@ def collect_lerobot_rows(
             "cannot build complete 28D VLA state plus 4D effort: "
             f"missing={dict(missing_vla_state_by_reason)} examples={missing_vla_state_examples[:5]}"
         )
+    if int(action_semantic_audit.get("hard_limit_violations", 0) or 0) > 0:
+        raise ValueError(
+            "export_action_semantics_validation_failed:"
+            f"max_abs_rad_s={float(action_semantic_audit.get('max_abs_action_rad_s', 0.0) or 0.0):.6f};"
+            f"hard_max_rad_s={float(LEROBOT_ACTION_HARD_MAX_RAD_S):.6f};"
+            f"violations={int(action_semantic_audit.get('hard_limit_violations', 0) or 0)};"
+            f"examples={list(action_semantic_audit.get('hard_limit_examples') or [])[:5]}"
+        )
     tasks = [{"task_index": index, "task": text} for text, index in sorted(tasks_by_text.items(), key=lambda item: item[1])]
     return {
         "rows": rows,
@@ -3207,6 +3440,7 @@ def collect_lerobot_rows(
         "missing_camera_examples": missing_camera_examples,
         "source_sampling_reports": source_sampling_reports,
         "source_episode_count": len(episode_rows),
+        "action_semantic_audit": action_semantic_audit,
     }
 
 
@@ -3704,6 +3938,7 @@ def export_lerobot_dataset(
         "state_dim": len(state_names),
         "effort_dim": effort_dim if effort_available else 0,
         "effective_robot_observation_dim": len(state_names) + (effort_dim if effort_available else 0),
+        "action_policy_version": LEROBOT_ACTION_POLICY_VERSION,
         "canonical_phase_names": list(LEROBOT_CANONICAL_PHASE_NAMES),
         "phase_feature": (
             "observation.state[18]"
@@ -3776,6 +4011,7 @@ def export_lerobot_dataset(
                 "source_sampling_hz": float(episode.get("source_sampling_hz", 0.0) or 0.0),
                 "export_sampling_hz": float(episode.get("export_sampling_hz", export_fps) or export_fps),
                 "source_time_scale": float(episode.get("source_time_scale", 1.0) or 1.0),
+                "action_semantic_audit": dict(episode.get("action_semantic_audit") or {}),
                 "timeline_duration_s": float(episode.get("duration_s", 0.0) or 0.0),
                 "media_duration_s": float(episode.get("media_duration_s", 0.0) or 0.0),
             }
@@ -3798,9 +4034,12 @@ def export_lerobot_dataset(
         "media_config": media_config,
         "media_config_hash": media_config_hash,
         "task_prompt_version": LEROBOT_TASK_PROMPT_VERSION,
+        "action_policy_version": LEROBOT_ACTION_POLICY_VERSION,
+        "action_semantic_audit": dict(collected.get("action_semantic_audit") or {}),
         "state_schema": str(state_schema_spec["key"]),
         "state_schema_version": state_schema_version,
         "state_names": list(state_names),
+        "action_names": list(action_names),
         "effort_names": [
             "swing_measured_effort",
             "boom_measured_effort",

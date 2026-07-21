@@ -2537,6 +2537,9 @@ FRAME_IMAGE_CACHE_TTL = 60.0
 FRAME_IMAGE_CACHE_LIMIT = 512
 FRAME_IMAGE_CACHE: Dict[str, Dict[str, object]] = {}
 FRAME_IMAGE_CACHE_LOCK = threading.Lock()
+EXPORTED_VLA_EPISODE_CACHE_LIMIT = 64
+EXPORTED_VLA_EPISODE_CACHE: Dict[Tuple[str, int, int, int], Dict[str, object]] = {}
+EXPORTED_VLA_EPISODE_CACHE_LOCK = threading.Lock()
 
 
 def fast_jsonl_count(path: Union[str, os.PathLike]) -> int:
@@ -5407,6 +5410,8 @@ def dashboard_export_success_pool(
         result["time_policy"] = policy_info.get("policy")
         result["time_policy_hash"] = policy_info.get("hash")
         write_json(os.path.join(final_export_dir, "manifest.json"), result)
+        with EXPORTED_VLA_EPISODE_CACHE_LOCK:
+            EXPORTED_VLA_EPISODE_CACHE.clear()
         progress(100.0, "VLA export complete", 1, 1)
         return result
     except Exception:
@@ -6720,6 +6725,169 @@ def dashboard_vla_observation_preview(
     }
 
 
+def dashboard_published_vla_episode(
+    run_dir: Union[str, os.PathLike],
+    export_status: Dict[str, object],
+) -> Dict[str, object]:
+    """Read the exact episode tensors published by the shared VLA exporter."""
+    if export_status.get("export_ready") is not True:
+        return {
+            "available": False,
+            "reason": str(export_status.get("export_reason") or "episode_not_export_ready"),
+            "source": "published_parquet",
+        }
+    try:
+        export_episode_index = int(export_status.get("export_episode_index"))
+    except Exception:
+        return {"available": False, "reason": "missing_export_episode_index", "source": "published_parquet"}
+
+    export_root = os.path.join(os.path.abspath(str(run_dir)), LEROBOT_DEFAULT_EXPORT_DIRNAME)
+    data_path = os.path.join(export_root, "data", "chunk-000", "file-000.parquet")
+    info_path = os.path.join(export_root, "meta", "info.json")
+    manifest_path = os.path.join(export_root, "manifest.json")
+    if not os.path.isfile(data_path):
+        return {"available": False, "reason": "published_data_parquet_missing", "source": "published_parquet"}
+    try:
+        stat = os.stat(data_path)
+        cache_key = (
+            os.path.normcase(os.path.abspath(data_path)),
+            int(stat.st_mtime_ns),
+            int(stat.st_size),
+            int(export_episode_index),
+        )
+    except Exception as exc:
+        return {"available": False, "reason": f"published_data_stat_failed:{type(exc).__name__}:{exc}", "source": "published_parquet"}
+    with EXPORTED_VLA_EPISODE_CACHE_LOCK:
+        cached = EXPORTED_VLA_EPISODE_CACHE.get(cache_key)
+        if isinstance(cached, dict):
+            return cached
+
+    try:
+        import pandas as pd  # type: ignore
+
+        wanted_columns = [
+            "episode_index",
+            "frame_index",
+            "timestamp",
+            "observation.state",
+            "observation.effort",
+            "observation.stage_current_id",
+            "action",
+        ]
+        try:
+            frame = pd.read_parquet(
+                data_path,
+                columns=wanted_columns,
+                filters=[("episode_index", "==", int(export_episode_index))],
+            )
+        except Exception:
+            frame = pd.read_parquet(data_path)
+            frame = frame[frame["episode_index"] == int(export_episode_index)]
+        if frame.empty:
+            return {"available": False, "reason": "published_episode_rows_missing", "source": "published_parquet"}
+        frame = frame.sort_values("frame_index", kind="stable")
+    except Exception as exc:
+        return {"available": False, "reason": f"published_parquet_read_failed:{type(exc).__name__}:{exc}", "source": "published_parquet"}
+
+    info = read_json(info_path, default={}) or {}
+    manifest = read_json(manifest_path, default={}) or {}
+    features = info.get("features") if isinstance(info.get("features"), dict) else {}
+    state_feature = features.get("observation.state") if isinstance(features.get("observation.state"), dict) else {}
+    effort_feature = features.get("observation.effort") if isinstance(features.get("observation.effort"), dict) else {}
+    action_feature = features.get("action") if isinstance(features.get("action"), dict) else {}
+    state_names = list(manifest.get("state_names") or state_feature.get("names") or [])
+    effort_names = list(manifest.get("effort_names") or effort_feature.get("names") or [])
+    action_names = list(manifest.get("action_names") or action_feature.get("names") or [
+        "swing_cmd_velocity", "boom_cmd_velocity", "arm_cmd_velocity", "bucket_cmd_velocity",
+    ])
+    phase_names = list(manifest.get("canonical_phase_names") or info.get("canonical_phase_names") or [])
+    joint_position_names = ["swing_position", "boom_position", "arm_position", "bucket_position"]
+    joint_velocity_names = ["swing_velocity", "boom_velocity", "arm_velocity", "bucket_velocity"]
+    q_indices = [state_names.index(name) for name in joint_position_names] if all(name in state_names for name in joint_position_names) else []
+    dq_indices = [state_names.index(name) for name in joint_velocity_names] if all(name in state_names for name in joint_velocity_names) else []
+
+    rows = []
+    series = {"t": [], "phase": [], "q_deg": [], "dq_deg_s": [], "action_deg_s": [], "effort": []}
+    for _, parquet_row in frame.iterrows():
+        state = vector_or_none(parquet_row.get("observation.state")) or []
+        effort = vector_or_none(parquet_row.get("observation.effort")) or []
+        action = vector_or_none(parquet_row.get("action")) or []
+        timestamp = float(safe_float_value(parquet_row.get("timestamp"), 0.0) or 0.0)
+        try:
+            phase_index = int(parquet_row.get("observation.stage_current_id"))
+        except Exception:
+            phase_index = -1
+        phase = phase_names[phase_index] if 0 <= phase_index < len(phase_names) else f"stage_{phase_index}"
+        frame_index = int(parquet_row.get("frame_index"))
+        valid = len(state) == len(state_names) and len(effort) == len(effort_names) and len(action) == len(action_names)
+        rows.append(
+            {
+                "index": frame_index,
+                "t": timestamp,
+                "phase": phase,
+                "phase_index": phase_index,
+                "valid": bool(valid),
+                "reason": "ok" if valid else "published_vector_shape_mismatch",
+                "state": state,
+                "effort": effort,
+                "action": action,
+                "values": state + effort,
+            }
+        )
+        series["t"].append(timestamp)
+        series["phase"].append(phase)
+        series["q_deg"].append(
+            [float(state[index]) * 180.0 / math.pi for index in q_indices]
+            if q_indices and len(state) > max(q_indices)
+            else [None, None, None, None]
+        )
+        series["dq_deg_s"].append(
+            [float(state[index]) * 180.0 / math.pi for index in dq_indices]
+            if dq_indices and len(state) > max(dq_indices)
+            else [None, None, None, None]
+        )
+        series["action_deg_s"].append(radians_vector_to_degrees(action))
+        series["effort"].append(effort if len(effort) == 4 else [None, None, None, None])
+
+    episode_manifest = {}
+    for candidate in list(manifest.get("episodes") or []):
+        if not isinstance(candidate, dict):
+            continue
+        try:
+            candidate_episode_index = int(candidate.get("episode_index"))
+        except Exception:
+            continue
+        if candidate_episode_index == int(export_episode_index):
+            episode_manifest = candidate
+            break
+    result = {
+        "available": bool(rows and all(row.get("valid") is True for row in rows)),
+        "reason": "ok" if rows and all(row.get("valid") is True for row in rows) else "published_rows_invalid",
+        "source": "published_parquet",
+        "relative_path": "lerobot_v3/data/chunk-000/file-000.parquet",
+        "export_episode_index": int(export_episode_index),
+        "frame_count": int(len(rows)),
+        "state_names": state_names,
+        "effort_names": effort_names,
+        "action_names": action_names,
+        "names": state_names + effort_names,
+        "action_policy_version": str(manifest.get("action_policy_version") or info.get("action_policy_version") or ""),
+        "action_semantic_audit": dict(episode_manifest.get("action_semantic_audit") or {}),
+        "rows": rows,
+        "series": series,
+        "stage_spans": contiguous_stage_spans(
+            [{"t": row["t"], "phase": row["phase"]} for row in rows],
+            0.0,
+        ),
+    }
+    with EXPORTED_VLA_EPISODE_CACHE_LOCK:
+        EXPORTED_VLA_EPISODE_CACHE[cache_key] = result
+        if len(EXPORTED_VLA_EPISODE_CACHE) > EXPORTED_VLA_EPISODE_CACHE_LIMIT:
+            oldest_key = next(iter(EXPORTED_VLA_EPISODE_CACHE))
+            EXPORTED_VLA_EPISODE_CACHE.pop(oldest_key, None)
+    return result
+
+
 def dashboard_sample_spatial_xyz(
     sample: dict,
     field_key: str,
@@ -6790,6 +6958,7 @@ def dashboard_episode_payload(
     run_meta = read_json(os.path.join(run_dir, "run_meta.json"), default={}) or {}
     spatial_state_names = list(run_meta.get("state_names") or [])
     episode_summary = dashboard_episode_summary(selected, runtime_s=trajectory_runtime_s(trajectory))
+    export_status: Dict[str, object] = {}
     if is_dashboard_success_pool_dir(run_dir):
         try:
             export_status = dashboard_row_export_status(selected, dashboard_success_pool_export_lookup(run_dir))
@@ -6871,6 +7040,35 @@ def dashboard_episode_payload(
         series["action_deg_s"].append(radians_vector_to_degrees(sample.get("action")))
         series["action_accel_deg_s2"].append(radians_vector_to_degrees(sample.get("action.ddq")))
         series["effort"].append(effort[:4] if effort else [None, None, None, None])
+    published_vla = (
+        dashboard_published_vla_episode(run_dir, export_status)
+        if is_dashboard_success_pool_dir(run_dir)
+        else {"available": False, "reason": "not_dashboard_success_pool", "source": "published_parquet"}
+    )
+    if published_vla.get("available") is True:
+        episode_summary["vla_data_source"] = "published_parquet"
+        episode_summary["vla_action_policy_version"] = published_vla.get("action_policy_version", "")
+        episode_summary["vla_action_semantic_audit"] = published_vla.get("action_semantic_audit", {})
+        vla_observation_preview = {
+            "available": True,
+            "reason": "ok",
+            "schema": "published observation.state + observation.effort",
+            "source": "published_parquet",
+            "state_names": published_vla.get("state_names", []),
+            "effort_names": published_vla.get("effort_names", []),
+            "names": published_vla.get("names", []),
+            "rows": published_vla.get("rows", []),
+            "valid_rows": published_vla.get("frame_count", 0),
+            "frame_count": published_vla.get("frame_count", 0),
+        }
+    else:
+        episode_summary["vla_data_source"] = "raw_reconstructed_preview"
+        vla_observation_preview = dashboard_vla_observation_preview(
+            run_dir,
+            trajectory,
+            selected,
+            episode_meta,
+        )
     return {
         "ok": True,
         "run_dir": run_dir,
@@ -6880,6 +7078,7 @@ def dashboard_episode_payload(
         "stage_spans": contiguous_stage_spans(trajectory, first_t),
         "joint_names": ["swing", "boom", "arm", "bucket"],
         "series": series,
+        "exported_vla": published_vla,
         "time_policy": episode_summary["export_time_policy"],
         "camera_preview": build_episode_camera_preview(
             selected,
@@ -6887,12 +7086,7 @@ def dashboard_episode_payload(
             first_t,
             image_paths=frame_context.get("image_paths") if isinstance(frame_context.get("image_paths"), dict) else None,
         ),
-        "vla_observation_preview": dashboard_vla_observation_preview(
-            run_dir,
-            trajectory,
-            selected,
-            episode_meta,
-        ),
+        "vla_observation_preview": vla_observation_preview,
     }
 
 
@@ -7167,6 +7361,7 @@ body main details>summary:after,.managerPanel>summary:after,.detailsPanel>summar
           <div id="bucketLoadXyzChart" class="timelineChart"></div>
           <div id="qChart" class="timelineChart"></div>
           <div id="dqChart" class="timelineChart"></div>
+          <div id="actionChart" class="timelineChart"></div>
           <div id="ddqChart" class="timelineChart"></div>
           <div id="effortChart" class="timelineChart"></div>
         </div>
@@ -7945,19 +8140,28 @@ function renderEpisode(data){
   const tp=data.time_policy||ep.export_time_policy||{};
   const tpPolicy=normalizeExportTimePolicyJS(tp.policy||tp.time_policy||{});
   const tpInfo="recorded physical speed, uniform time";
-  $("episodeMeta").textContent=`${statusKey(ep.status)} | score=${fmt(ep.score,1)} | samples=${data.sample_count} | shown=${data.returned_points} | ${tpInfo} | ${shortText(ep.dataset_skip_reason || ep.reason||ep.warning_reason||"",260)}`;
-  $("rawBox").textContent=JSON.stringify({episode:ep,time_policy:data.time_policy,stage_spans:data.stage_spans,camera_preview:data.camera_preview},null,2);
+  const exported=(data&&data.exported_vla)||{};
+  const exactPublished=exported.available===true;
+  const actionAudit=exported.action_semantic_audit||{};
+  const sourceInfo=exactPublished
+    ? `published parquet · action=${exported.action_policy_version||"unknown"} · hold fixes=${Number(actionAudit.corrected_hold_transitions||0)} · max=${fmt(actionAudit.max_abs_action_rad_s,3)} rad/s`
+    : `raw preview · ${exported.reason||"not exported"}`;
+  $("episodeMeta").textContent=`${statusKey(ep.status)} | score=${fmt(ep.score,1)} | samples=${data.sample_count} | shown=${data.returned_points} | ${tpInfo} | ${sourceInfo} | ${shortText(ep.dataset_skip_reason || ep.reason||ep.warning_reason||"",260)}`;
+  $("rawBox").textContent=JSON.stringify({episode:ep,time_policy:data.time_policy,stage_spans:data.stage_spans,camera_preview:data.camera_preview,exported_vla:{available:exported.available,reason:exported.reason,source:exported.source,relative_path:exported.relative_path,export_episode_index:exported.export_episode_index,frame_count:exported.frame_count,state_names:exported.state_names,effort_names:exported.effort_names,action_names:exported.action_names,action_policy_version:exported.action_policy_version,action_semantic_audit:exported.action_semantic_audit}},null,2);
   const promptEl=$("episodeTaskPrompt"); const promptText=String(ep.task_prompt||"").trim(); if(promptEl){promptEl.style.display=promptText?"block":"none"; promptEl.innerHTML=promptText?`<span class="taskPromptLabel">Task prompt</span>${esc(promptText)}`:"";}
   updateTrashEpisodeButton(ep);
   renderCameraPreview(data);
   renderVlaObservationPreview(data);
   const s=data.series||{};
+  const vs=exactPublished?(exported.series||{}):s;
+  const vspans=exactPublished?(exported.stage_spans||data.stage_spans):data.stage_spans;
   drawLineChart("bucketChart","Bucket sand holding",s.t,[{name:"bucket_from_pile",values:s.bucket_from_pile},{name:"bucket_total",values:s.bucket_total}],data.stage_spans,"particles");
   drawSpatialSeriesCharts(s,data.stage_spans||[]);
-  drawVectorChart("qChart","Joint angles",s.t,s.q_deg,data.stage_spans,"deg");
-  drawVectorChart("dqChart","Joint velocity",s.t,s.dq_deg_s,data.stage_spans,"deg/s");
+  drawVectorChart("qChart",exactPublished?"Joint angles · published parquet":"Joint angles",vs.t,vs.q_deg,vspans,"deg");
+  drawVectorChart("dqChart",exactPublished?"Joint velocity · published parquet":"Joint velocity",vs.t,vs.dq_deg_s,vspans,"deg/s");
+  drawVectorChart("actionChart",exactPublished?"VLA target action · published parquet":"VLA target action · raw preview",vs.t,vs.action_deg_s,vspans,"deg/s");
   drawVectorChart("ddqChart","Joint acceleration",s.t,s.ddq_deg_s2,data.stage_spans,"deg/s²");
-  drawVectorChart("effortChart","Measured joint effort",s.t,s.effort,data.stage_spans,"effort");
+  drawVectorChart("effortChart",exactPublished?"Measured joint effort · published parquet":"Measured joint effort",vs.t,vs.effort,vspans,"effort");
   updateTimelineCursors();
   markSelectedTab(ep.episode_index);
   syncEpisodeInspectorHeight();

@@ -16,16 +16,16 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 
 STAGE_NAMES = [
-    "pre_dig_align",
+    "pre_dig",
     "approach_contact",
-    "insert",
-    "pull_mid",
-    "pull_exit",
-    "curl",
+    "insert_cut",
+    "pull_mid_cut",
+    "curl_to_hold_material",
+    "pull_exit_cut",
     "secure_load",
     "lift_carry",
+    "loaded_transit",
     "unload_to_bin",
-    "unload_dump",
 ]
 ACTION_NAMES = ["swing", "boom", "arm", "bucket"]
 
@@ -253,7 +253,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Create detailed figures for the median representative episode "
-            "selected by evaluate_smolvla_random50_episodes.py."
+            "selected by evaluate_smolvla_episodes.py."
         )
     )
     parser.add_argument(
@@ -617,7 +617,7 @@ def main() -> None:
         (
             "The episode was chosen as the sampled episode whose composite "
             "representative score was closest to the median score among the "
-            "50 randomly selected episodes."
+            "the evaluated episode set."
         ),
         "",
         "## Generated outputs",

@@ -7,22 +7,28 @@ This repository contains the Isaac Sim excavator runtime, the full sand-site sce
 Use these entry points according to the workflow:
 
 - [`main.py`](main.py): Isaac Sim Script Editor entry. Use this when Isaac Sim GUI is already open and you want the full interactive runtime, UI controls, sand controls, and manual auto-collect buttons.
-- [`run_simulation.py`](run_simulation.py): optimized protocol-v2 simulator bridge for deploying the existing 18D SmolVLA checkpoint. This is the authoritative bridge for the July 16 latency work.
+- [`run_isaacsim_ckpt18450_seed2_one_episode.sh`](run_isaacsim_ckpt18450_seed2_one_episode.sh): canonical checkpoint-18450, seed-2, one-episode Isaac Sim evaluation launcher. Runtime replanning and ensemble settings are defined inside the script.
+- [`run_simulation.py`](run_simulation.py): protocol-v2 simulator bridge used by the canonical launcher.
+- [`resume_latest_checkpoint_seed2_fixed5ep_canonical_300epochs.sh`](resume_latest_checkpoint_seed2_fixed5ep_canonical_300epochs.sh): canonical continuation-training launcher for the five fixed seed-2 episodes.
 - [`run_vla_train_scene.py`](run_vla_train_scene.py): Isaac Sim Python launcher for the full training scene and headless auto collect. Its optional TCP bridge is the older ticks-based protocol and is not compatible with the current protocol-v2 policy client.
 - [`run_excavator_standalone.py`](run_excavator_standalone.py): legacy bridge launcher. Do not use it as the primary VLA training scene when you need the full sand-site runtime; it has older scene setup behavior and can show the old unload-bin style scene.
 - `main_zsp.py`: legacy/removed entry in the current checkout. Do not use it unless you intentionally restore that file.
 
-There is currently one active `main.py`. Keep `main.py` for Isaac Sim GUI / Script Editor debugging and interactive auto collect, use `run_vla_train_scene.py` for new data-collection runs, and use `run_simulation.py` for old-18D SmolVLA deployment.
+There is currently one active `main.py`. Keep `main.py` for Isaac Sim GUI / Script Editor debugging and interactive auto collect, use `run_vla_train_scene.py` for new data-collection runs, and use the canonical shell launcher above for checkpoint evaluation.
 
 ## Repository Layout
 
 Top-level files are kept for active launch commands, configuration, dataset tooling, and this single project README.
 
 - [`main.py`](main.py): Script Editor launcher for the full GUI runtime.
-- [`run_simulation.py`](run_simulation.py): optimized old-18D SmolVLA deployment bridge.
+- [`run_simulation.py`](run_simulation.py): current SmolVLA deployment bridge.
+- [`run_isaacsim_ckpt18450_seed2_one_episode.sh`](run_isaacsim_ckpt18450_seed2_one_episode.sh): current Isaac Sim checkpoint evaluation launcher.
+- [`resume_latest_checkpoint_seed2_fixed5ep_canonical_300epochs.sh`](resume_latest_checkpoint_seed2_fixed5ep_canonical_300epochs.sh): current five-episode continuation-training launcher.
+- [`run_action_stage_chunk_sweep.sh`](run_action_stage_chunk_sweep.sh): offline action/stage chunk-size sweep launcher.
+- [`run_isaacsim_offline_episode_replay_chunk1.sh`](run_isaacsim_offline_episode_replay_chunk1.sh): offline episode-action replay launcher for Isaac Sim.
+- [`run_latest_three_checkpoints_seed2_fixed5ep_eval.sh`](run_latest_three_checkpoints_seed2_fixed5ep_eval.sh): fixed-five-episode comparison for the latest three checkpoints.
 - [`run_vla_train_scene.py`](run_vla_train_scene.py): primary VLA training and headless auto-collect launcher.
 - [`run_excavator_standalone.py`](run_excavator_standalone.py): legacy standalone bridge launcher.
-- [`run.sh`](run.sh): shell wrapper for the legacy standalone launcher.
 - [`excavator_dataset_tools.py`](excavator_dataset_tools.py): dataset inspection, plotting, dashboard, and LeRobot export CLI.
 - [`run_dataset_dashboard.py`](run_dataset_dashboard.py): small dashboard launcher around `excavator_dataset_tools.py`.
 - [`excavator_config.json`](excavator_config.json): project/runtime configuration.
@@ -30,8 +36,6 @@ Top-level files are kept for active launch commands, configuration, dataset tool
 
 Project folders:
 
-- [`archive/`](archive): old runtime variants retained only for reference.
-  - [`archive/standalone/`](archive/standalone): archived standalone camera/API backup launcher.
 - [`assets/`](assets): checked-in Isaac Sim and model assets.
   - `assets/usd/`: original USD scene.
   - `assets/fbx/`: truck FBX/USD assets.
@@ -42,10 +46,14 @@ Project folders:
 - [`scripts/`](scripts): runtime modules and helper scripts.
   - [`scripts/excavator_app/`](scripts/excavator_app): main Isaac Sim excavator/sand runtime modules.
   - [`scripts/bridge_test/`](scripts/bridge_test): current bridge servers and external bridge clients.
-  - `scripts/bridge_test/archive/`: archived SmolVLA client variants retained for reference.
+  - `scripts/dataset/`: dataset inspection utilities.
+  - `scripts/evaluation/`: checkpoint, rollout, action, and stage analysis utilities.
+  - `scripts/training/`: SmolVLA patch installers and training-log summaries.
 - [`tests/`](tests): lightweight tests for shared helpers.
 
-## Optimized 18D SmolVLA Deployment
+Repository/server cleanup is intentionally explicit and non-recursive. Run `bash scripts/maintenance/cleanup_obsolete_vla_files.sh` to preview the obsolete-file allowlist, then rerun it with `--apply` to delete those exact files. The script never deletes datasets, checkpoints, logs, or evaluation results.
+
+## Legacy Optimized 18D SmolVLA Deployment
 
 The July 16 bridge optimization targets the existing checkpoint contract:
 
@@ -128,8 +136,6 @@ python scripts/bridge_test/smolvla_policy_client.py \
   --vlm /path/to/local/SmolVLM2-500M-Video-Instruct \
   --dataset-meta "$SMOLVLA_DATASET_META"
 ```
-
-[`scripts/bridge_test/persistent_bridge_server.py`](scripts/bridge_test/persistent_bridge_server.py) is now a diagnostic/status helper, not a second server. The authoritative server is embedded in `run_simulation.py`.
 
 ### Current Validation Status
 
@@ -284,8 +290,6 @@ python gui_client.py --host 127.0.0.1 --port 5555
 ```
 
 Use this legacy path only when you intentionally want the older standalone bridge behavior. For full sand + truck + excavator training, prefer `run_vla_train_scene.py`.
-
-Older standalone backup variants are archived under [`archive/standalone/`](archive/standalone).
 
 ## Environment Variables
 

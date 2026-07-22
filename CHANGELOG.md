@@ -15,8 +15,8 @@ This release optimizes deployment of the existing 18-dimensional SmolVLA checkpo
 - Replaced serial camera switching and settle frames with three persistent camera viewports. Camera requests are submitted together, and image resize work runs concurrently.
 - Moved TCP request handling to a dedicated network thread so socket waiting no longer drives a tight simulator render loop.
 - Stopped rendering during physics-only substeps and throttled idle UI updates with `--idle-ui-hz` (default: 5 Hz), reducing unnecessary RayTracedLighting work while waiting for policy inference.
-- Updated [`scripts/bridge_test/smolvla_policy_client.py`](scripts/bridge_test/smolvla_policy_client.py) and [`scripts/bridge_test/persistent_policy_client.py`](scripts/bridge_test/persistent_policy_client.py) for the protocol-v2 handshake and removed the obsolete `ticks` contract.
-- Converted [`scripts/bridge_test/persistent_bridge_server.py`](scripts/bridge_test/persistent_bridge_server.py) into a status/diagnostic helper so it cannot compete with the bridge embedded in `run_simulation.py`.
+- Updated [`scripts/bridge_test/smolvla_policy_client.py`](scripts/bridge_test/smolvla_policy_client.py) and the former persistent policy client for the protocol-v2 handshake and removed the obsolete `ticks` contract.
+- Converted the former persistent bridge server into a status helper; that redundant helper was later removed after `run_simulation.py` became authoritative.
 
 ### Added
 

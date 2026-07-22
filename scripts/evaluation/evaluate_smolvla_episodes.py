@@ -40,16 +40,16 @@ except ImportError:
 
 
 STAGE_NAMES = [
-    "pre_dig_align",
+    "pre_dig",
     "approach_contact",
-    "insert",
-    "pull_mid",
-    "pull_exit",
-    "curl",
+    "insert_cut",
+    "pull_mid_cut",
+    "curl_to_hold_material",
+    "pull_exit_cut",
     "secure_load",
     "lift_carry",
+    "loaded_transit",
     "unload_to_bin",
-    "unload_dump",
 ]
 ACTION_NAMES = ["swing", "boom", "arm", "bucket"]
 
@@ -1098,8 +1098,8 @@ def print_important_summary(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate the final custom SmolVLA checkpoint on 50 random "
-            "dataset episodes and select the median representative episode."
+            "Evaluate SmolVLA checkpoints on selected dataset episodes and "
+            "select a representative episode."
         )
     )
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import math
 import os
 import shutil
 from collections import Counter
@@ -16,16 +17,57 @@ import pandas as pd
 
 
 DEFAULT_STAGE_NAMES = [
-    "pre_dig_align",
+    "pre_dig",
     "approach_contact",
-    "insert",
-    "pull_mid",
-    "pull_exit",
-    "curl",
+    "insert_cut",
+    "pull_mid_cut",
+    "curl_to_hold_material",
+    "pull_exit_cut",
     "secure_load",
     "lift_carry",
+    "loaded_transit",
     "unload_to_bin",
-    "unload_dump",
+]
+
+
+# The checkpoint uses the legacy v3 state with phase_index removed.  The v4
+# runtime also has 28 values, but those values have different meanings and
+# cannot be converted to the checkpoint schema by deleting one dimension.
+V4_STATE_MARKERS = {
+    "swing_tracking_error",
+    "previous_swing_action",
+    "dig_target_from_tip_forward",
+    "bucket_fill_fraction",
+}
+
+LEGACY_STATE_NAMES_27D = [
+    "base_x",
+    "base_y",
+    "base_yaw",
+    "swing",
+    "boom",
+    "arm",
+    "bucket",
+    "bucket_load_estimate",
+    "bucket_tip_x",
+    "bucket_tip_y",
+    "bucket_tip_z",
+    "bucket_load_x",
+    "bucket_load_y",
+    "bucket_load_z",
+    "swing_velocity",
+    "boom_velocity",
+    "arm_velocity",
+    "bucket_velocity",
+    "dig_target_local_x",
+    "dig_target_local_y",
+    "dig_target_local_z",
+    "unload_landing_local_x",
+    "unload_landing_local_y",
+    "unload_landing_local_z",
+    "truck_heading_relative_sin",
+    "truck_heading_relative_cos",
+    "bucket_load_rate",
 ]
 
 
@@ -63,6 +105,395 @@ def read_stage_names(runtime_path: Path | None) -> list[str]:
         print(f"[WARN] Could not parse DATASET_PHASE_NAMES: {exc}")
 
     return DEFAULT_STAGE_NAMES.copy()
+
+
+def resolve_phase_dimension(
+    state_names: list[str],
+    states: np.ndarray,
+    num_stages: int,
+) -> tuple[int, str]:
+    """Locate the legacy phase dimension without confusing v4 for v3."""
+    if "phase_index" in state_names:
+        return state_names.index("phase_index"), "metadata"
+
+    if V4_STATE_MARKERS.intersection(state_names):
+        markers = sorted(V4_STATE_MARKERS.intersection(state_names))
+        raise RuntimeError(
+            "The source uses the v4 28D observation schema, which is not "
+            "dimension-compatible with the checkpoint's legacy 27D schema. "
+            "v4 stores no phase_index inside observation.state and dimension "
+            "18 is dig_target_from_tip_forward, not a stage label. Re-export "
+            "or regenerate this episode with the legacy v3/27D checkpoint "
+            f"observation contract. Detected v4 fields: {markers}"
+        )
+
+    if states.ndim != 2 or states.shape[1] != 28:
+        raise RuntimeError(
+            f"Cannot infer phase_index from state matrix shape {states.shape}; "
+            "expected [N,28]"
+        )
+
+    # Some older exports contain the correct legacy v3 values but incomplete
+    # or generic metadata names.  Dimension 18 is accepted only after checking
+    # every value, so a continuous v4 geometry feature cannot be silently used
+    # as a label.
+    candidate_dimension = 18
+    raw_stage = states[:, candidate_dimension]
+    rounded = np.rint(raw_stage)
+    finite = np.all(np.isfinite(raw_stage))
+    integral = np.allclose(raw_stage, rounded, atol=1e-6)
+    in_range = bool(
+        raw_stage.size
+        and np.min(rounded) >= 0
+        and np.max(rounded) < num_stages
+    )
+    if finite and integral and in_range:
+        return candidate_dimension, "validated_dimension_18_fallback"
+
+    preview = state_names[:6]
+    raise RuntimeError(
+        "phase_index is absent from observation.state names and legacy "
+        "dimension 18 did not contain valid integer stage ids. The source "
+        "cannot be safely converted to the checkpoint's 27D schema. "
+        f"names_count={len(state_names)}, names_preview={preview}, "
+        f"dimension18_min={float(np.nanmin(raw_stage))}, "
+        f"dimension18_max={float(np.nanmax(raw_stage))}"
+    )
+
+
+def numeric_vector(value: Any, size: int, label: str) -> list[float]:
+    try:
+        result = [float(item) for item in value]
+    except Exception as exc:
+        raise RuntimeError(f"{label} is not a numeric vector: {exc}") from exc
+    if len(result) != size:
+        raise RuntimeError(f"{label} must contain {size} values, got {len(result)}")
+    if not all(math.isfinite(item) for item in result):
+        raise RuntimeError(f"{label} contains NaN or Inf")
+    return result
+
+
+def point_in_heading_frame(
+    point_xyz: list[float],
+    origin_xy: list[float],
+    heading_rad: float,
+) -> list[float]:
+    dx = float(point_xyz[0]) - float(origin_xy[0])
+    dy = float(point_xyz[1]) - float(origin_xy[1])
+    c = math.cos(float(heading_rad))
+    s = math.sin(float(heading_rad))
+    return [
+        c * dx + s * dy,
+        -s * dx + c * dy,
+        float(point_xyz[2]),
+    ]
+
+
+def heading_frame_delta_to_world(
+    forward_left_up: list[float],
+    heading_rad: float,
+) -> list[float]:
+    forward, left, up = forward_left_up
+    c = math.cos(float(heading_rad))
+    s = math.sin(float(heading_rad))
+    return [
+        c * forward - s * left,
+        s * forward + c * left,
+        up,
+    ]
+
+
+def checkpoint_stage_index(sample: dict[str, Any]) -> int:
+    """Resolve a raw v4 phase using the canonical 10-stage contract."""
+    raw_index = sample.get("phase.index")
+    if raw_index is not None:
+        try:
+            value = float(raw_index)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Invalid canonical phase.index: {raw_index!r}"
+            ) from exc
+        index = int(round(value))
+        if not math.isfinite(value) or abs(value - index) > 1.0e-6:
+            raise RuntimeError(f"Non-integer canonical phase.index: {raw_index!r}")
+        if not 0 <= index < len(DEFAULT_STAGE_NAMES):
+            raise RuntimeError(f"Canonical phase.index is out of range: {index}")
+        return index
+
+    phase = str(sample.get("phase") or "").strip().lower()
+    label = str(sample.get("label") or "").strip().lower()
+    text = f"{phase} {label}"
+
+    if (
+        "loaded_transit" in text
+        or "clearance_route_post" in text
+        or "staged_unload" in text
+        or "high_carry" in text
+    ):
+        return 8
+    if "unload_to_bin" in text or "unload" in text or "dump" in text:
+        return 9
+    if "pre_dig" in text or "travel" in text or "align" in text:
+        return 0
+    if "approach_contact" in text or (
+        "approach" in text and "contact" in text
+    ):
+        return 1
+    if "insert" in text:
+        return 2
+    if "pull_mid" in text:
+        return 3
+    if "curl" in text:
+        return 4
+    if "pull_exit" in text:
+        return 5
+    if "secure" in text:
+        return 6
+    if "lift" in text or "carry" in text:
+        return 7
+    raise RuntimeError(
+        "Cannot map raw v4 phase to the canonical stage order: "
+        f"phase={phase!r}, label={label!r}"
+    )
+
+
+def reconstruct_legacy_state_27d(
+    sample: dict[str, Any],
+    v4_state: list[float],
+    initial_origin_xy: list[float],
+    initial_heading_rad: float,
+    bucket_load_rate: float,
+) -> list[float]:
+    """Rebuild the exact legacy checkpoint state from retained raw fields."""
+    legacy14 = numeric_vector(
+        sample.get("obs.state_legacy_14d"),
+        14,
+        "obs.state_legacy_14d",
+    )
+    state_v4 = numeric_vector(v4_state, 28, "v4 observation.state")
+
+    upper_heading = float(legacy14[2]) + float(legacy14[3])
+    tip_world = legacy14[8:11]
+    load_world = legacy14[11:14]
+
+    dig_delta_world = heading_frame_delta_to_world(
+        state_v4[18:21],
+        upper_heading,
+    )
+    unload_delta_world = heading_frame_delta_to_world(
+        state_v4[21:24],
+        upper_heading,
+    )
+    dig_target_world = [
+        tip_world[index] + dig_delta_world[index]
+        for index in range(3)
+    ]
+    unload_landing_world = [
+        load_world[index] + unload_delta_world[index]
+        for index in range(3)
+    ]
+
+    dig_target_local = point_in_heading_frame(
+        dig_target_world,
+        initial_origin_xy,
+        initial_heading_rad,
+    )
+    unload_landing_local = point_in_heading_frame(
+        unload_landing_world,
+        initial_origin_xy,
+        initial_heading_rad,
+    )
+
+    # v4 stores the truck heading relative to the rotating upper structure.
+    # Convert it back to the legacy heading relative to the episode's initial
+    # body heading without depending on rounded scene metadata.
+    truck_from_upper = math.atan2(state_v4[24], state_v4[25])
+    truck_from_initial = (
+        truck_from_upper + upper_heading - float(initial_heading_rad)
+    )
+
+    result = (
+        legacy14
+        + state_v4[4:8]
+        + dig_target_local
+        + unload_landing_local
+        + [
+            math.sin(truck_from_initial),
+            math.cos(truck_from_initial),
+            float(bucket_load_rate),
+        ]
+    )
+    if len(result) != 27 or not all(math.isfinite(value) for value in result):
+        raise RuntimeError("Reconstructed legacy state is not a finite 27D vector")
+    return result
+
+
+def reconstruct_v4_dataset_rows(
+    raw_run: Path,
+    raw_split: str,
+    all_data: pd.DataFrame,
+    old_states: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    try:
+        import excavator_dataset_tools as tools
+    except Exception as exc:
+        raise RuntimeError(
+            "The v4 reconstruction requires excavator_dataset_tools.py "
+            "beside this converter"
+        ) from exc
+
+    collected = tools.collect_lerobot_rows(str(raw_run), split=raw_split)
+    exported_rows = list(collected.get("rows") or [])
+    if len(exported_rows) != len(all_data):
+        raise RuntimeError(
+            "Raw/export alignment failed: "
+            f"raw collector produced {len(exported_rows)} rows, "
+            f"but parquet contains {len(all_data)} rows"
+        )
+
+    episode_rows = tools.load_index(str(raw_run), raw_split)
+    sample_lookup: dict[tuple[str, int], dict[str, Any]] = {}
+    initial_pose_by_episode: dict[str, tuple[list[float], float]] = {}
+
+    for episode in episode_rows:
+        episode_id = str(episode.get("episode_id") or "")
+        episode_dir = tools.episode_dir_from_row(episode, run_dir=str(raw_run))
+        trajectory_path = tools.resolve_episode_file(
+            episode_dir,
+            tools.row_path_value(episode, "trajectory"),
+        )
+        trajectory = tools.read_jsonl(trajectory_path)
+        if not trajectory:
+            continue
+        if not episode_id:
+            episode_id = str(trajectory[0].get("id") or "")
+
+        first_legacy = None
+        for sample in trajectory:
+            try:
+                first_legacy = numeric_vector(
+                    sample.get("obs.state_legacy_14d"),
+                    14,
+                    "obs.state_legacy_14d",
+                )
+                break
+            except RuntimeError:
+                continue
+        if first_legacy is None:
+            raise RuntimeError(
+                f"Episode {episode_id!r} has no obs.state_legacy_14d"
+            )
+        initial_pose_by_episode[episode_id] = (
+            first_legacy[:2],
+            float(first_legacy[2]),
+        )
+
+        for sample in trajectory:
+            sample_index = sample.get("i")
+            if sample_index is None:
+                continue
+            sample_lookup[(episode_id, int(sample_index))] = sample
+
+    reconstructed: list[list[float]] = []
+    stages: list[int] = []
+    previous_by_export_episode: dict[int, tuple[float, float]] = {}
+
+    for row_index, exported_row in enumerate(exported_rows):
+        export_episode = int(exported_row["episode_index"])
+        frame_index = int(exported_row["frame_index"])
+        raw_episode_id = str(exported_row.get("raw_episode_id") or "")
+        raw_sample_index = int(exported_row["raw_sample_index"])
+        key = (raw_episode_id, raw_sample_index)
+        sample = sample_lookup.get(key)
+        if sample is None:
+            raise RuntimeError(f"Raw sample not found for {key}")
+
+        parquet_episode = int(all_data.iloc[row_index]["episode_index"])
+        parquet_frame = int(all_data.iloc[row_index]["frame_index"])
+        if (export_episode, frame_index) != (parquet_episode, parquet_frame):
+            raise RuntimeError(
+                "Raw/parquet row identity mismatch at row "
+                f"{row_index}: raw={(export_episode, frame_index)}, "
+                f"parquet={(parquet_episode, parquet_frame)}"
+            )
+
+        source_state = numeric_vector(
+            exported_row["observation.state"],
+            28,
+            "raw exported observation.state",
+        )
+        if not np.allclose(
+            np.asarray(source_state, dtype=np.float32),
+            old_states[row_index],
+            atol=1e-6,
+        ):
+            raise RuntimeError(
+                f"Raw/parquet observation.state mismatch at row {row_index}"
+            )
+
+        legacy14 = numeric_vector(
+            sample.get("obs.state_legacy_14d"),
+            14,
+            "obs.state_legacy_14d",
+        )
+        current_load = float(legacy14[7])
+        current_time = float(sample.get("t", exported_row.get("timestamp", 0.0)))
+        previous = previous_by_export_episode.get(export_episode)
+        if previous is None:
+            load_rate = 0.0
+        else:
+            previous_load, previous_time = previous
+            dt = current_time - previous_time
+            if not math.isfinite(dt) or dt <= 0.0:
+                raise RuntimeError(
+                    f"Non-positive raw timestep in episode {export_episode}: {dt}"
+                )
+            load_rate = (current_load - previous_load) / dt
+        previous_by_export_episode[export_episode] = (current_load, current_time)
+
+        if raw_episode_id not in initial_pose_by_episode:
+            raise RuntimeError(f"Initial pose missing for episode {raw_episode_id!r}")
+        initial_origin_xy, initial_heading = initial_pose_by_episode[raw_episode_id]
+        reconstructed.append(
+            reconstruct_legacy_state_27d(
+                sample,
+                source_state,
+                initial_origin_xy,
+                initial_heading,
+                load_rate,
+            )
+        )
+        stages.append(checkpoint_stage_index(sample))
+
+    states = np.asarray(reconstructed, dtype=np.float32)
+    stage_ids = np.asarray(stages, dtype=np.int64)
+    if states.shape != (len(all_data), 27):
+        raise RuntimeError(f"Unexpected reconstructed state shape: {states.shape}")
+
+    return states, stage_ids, {
+        "mode": "v4_raw_trajectory_to_legacy_27d",
+        "raw_run": str(raw_run),
+        "raw_split": raw_split,
+        "raw_frames": len(exported_rows),
+        "stage_id_source": "raw phase.index with canonical text fallback",
+        "canonical_stage_ids": {
+            "curl_to_hold_material": 4,
+            "pull_exit_cut": 5,
+            "loaded_transit": 8,
+            "unload_to_bin/dump": 9,
+        },
+    }
+
+
+def vector_statistics(values: np.ndarray) -> dict[str, Any]:
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "count": [int(array.shape[0])],
+        "mean": np.mean(array, axis=0).tolist(),
+        "std": np.std(array, axis=0).tolist(),
+        "min": np.min(array, axis=0).tolist(),
+        "max": np.max(array, axis=0).tolist(),
+    }
 
 
 def copy_tree_without_videos(src: Path, dst: Path) -> None:
@@ -263,7 +694,20 @@ def append_readme(
     source: Path,
     horizon: int,
     minimum_purity: float,
+    conversion_mode: str,
 ) -> None:
+    if conversion_mode == "v4_raw_trajectory_to_legacy_27d":
+        state_change = (
+            "- Reconstructed the checkpoint's legacy 27D state from the v4 "
+            "28D export and retained raw trajectory fields.\n"
+            "- Preserved the v4 canonical 10-stage IDs used by the "
+            "checkpoint stage head."
+        )
+    else:
+        state_change = (
+            "- Removed `phase_index` from `observation.state`.\n"
+            "- Changed `observation.state` from 28 dimensions to 27 dimensions."
+        )
     block = f"""
 
 ## Stage-label conversion
@@ -274,9 +718,10 @@ This dataset was derived from:
 
 Changes:
 
-- Removed `phase_index` from `observation.state`.
-- Changed `observation.state` from 28 dimensions to 27 dimensions.
-- Added `stage_current_id` as a scalar integer label in `[0, 9]`.
+{state_change}
+- Added `observation.stage_current_id` as the checkpoint's scalar stage label
+  in `[0, 9]`.
+- Kept `stage_current_id` as a diagnostic compatibility alias.
 - Added `stage_target_{horizon}` as the dominant stage in the next {horizon} frames.
 - Added `stage_purity_{horizon}` and `stage_valid_{horizon}`.
 - A future-stage label is valid only when the full {horizon}-frame window exists
@@ -300,6 +745,7 @@ def validate_with_lerobot(dst: Path) -> None:
 
     assert tuple(sample["observation.state"].shape) == (27,)
     assert tuple(sample["action"].shape) == (4,)
+    assert "observation.stage_current_id" in sample
     assert "stage_current_id" in sample
     assert "stage_target_30" in sample
     assert "stage_purity_30" in sample
@@ -317,6 +763,7 @@ def validate_with_lerobot(dst: Path) -> None:
                 else type(sample[key]).__name__
             )
             for key in (
+                "observation.stage_current_id",
                 "stage_current_id",
                 "stage_target_30",
                 "stage_purity_30",
@@ -335,6 +782,20 @@ def main() -> None:
     )
     parser.add_argument("--src", required=True, type=Path)
     parser.add_argument("--dst", required=True, type=Path)
+    parser.add_argument(
+        "--raw-run",
+        type=Path,
+        default=None,
+        help=(
+            "Raw auto-collection run used to reconstruct a v4 28D export "
+            "into the checkpoint's legacy 27D state"
+        ),
+    )
+    parser.add_argument(
+        "--raw-split",
+        default="trainable",
+        help="Raw-run episode split corresponding to the exported dataset",
+    )
     parser.add_argument(
         "--runtime",
         type=Path,
@@ -356,6 +817,11 @@ def main() -> None:
     src = args.src.expanduser().resolve()
     dst = args.dst.expanduser().resolve()
     runtime = args.runtime.expanduser().resolve()
+    raw_run = (
+        args.raw_run.expanduser().resolve()
+        if args.raw_run is not None
+        else None
+    )
 
     if not src.exists():
         raise FileNotFoundError(src)
@@ -400,33 +866,47 @@ def main() -> None:
 
     state_names = list(state_spec.get("names") or [])
     old_shape = state_spec.get("shape")
+    source_is_v4 = bool(V4_STATE_MARKERS.intersection(state_names))
 
     if old_shape != [28]:
         raise RuntimeError(
             f"Expected observation.state shape [28], got {old_shape}"
         )
 
-    if "phase_index" not in state_names:
-        raise RuntimeError(
-            "phase_index is not present in observation.state names"
-        )
+    phase_dimension = (
+        state_names.index("phase_index")
+        if "phase_index" in state_names
+        else None
+    )
 
-    phase_dimension = state_names.index("phase_index")
+    stage_names = (
+        DEFAULT_STAGE_NAMES.copy()
+        if source_is_v4
+        else read_stage_names(runtime)
+    )
 
-    if phase_dimension != 18:
-        print(
-            f"[WARN] phase_index is at dimension {phase_dimension}, "
-            "not dimension 18; using the name-based location"
-        )
-
-    stage_names = read_stage_names(runtime)
+    if source_is_v4:
+        if raw_run is None:
+            raise RuntimeError(
+                "The source is v4 28D. Pass --raw-run pointing to the raw "
+                "auto-collection run so the legacy 27D state can be rebuilt."
+            )
+        if not raw_run.is_dir():
+            raise FileNotFoundError(raw_run)
 
     print("=" * 88)
     print("SOURCE")
     print("=" * 88)
     print(f"src: {src}")
     print(f"dst: {dst}")
-    print(f"phase dimension: {phase_dimension}")
+    print(f"source schema: {'v4 28D' if source_is_v4 else 'legacy v3 28D'}")
+    if raw_run is not None:
+        print(f"raw run: {raw_run}")
+        print(f"raw split: {args.raw_split}")
+    print(
+        "phase dimension: "
+        f"{phase_dimension if phase_dimension is not None else 'pending data validation'}"
+    )
     print(f"stage names ({len(stage_names)}): {stage_names}")
     print(f"future-stage horizon: {args.horizon}")
     print(f"minimum purity: {args.minimum_purity}")
@@ -482,30 +962,70 @@ def main() -> None:
             f"Runtime state matrix is {old_states.shape}, expected [N,28]"
         )
 
-    raw_stage = old_states[:, phase_dimension]
-    stage_current = np.rint(raw_stage).astype(np.int64)
-
-    if not np.allclose(
-        raw_stage,
-        stage_current,
-        atol=1e-6,
-    ):
-        raise RuntimeError(
-            "phase_index contains non-integer values"
+    reconstruction_details: dict[str, Any] = {}
+    if source_is_v4:
+        assert raw_run is not None
+        phase_dimension = None
+        phase_dimension_source = "raw_trajectory_phase_remap"
+        new_states, stage_current, reconstruction_details = (
+            reconstruct_v4_dataset_rows(
+                raw_run,
+                args.raw_split,
+                all_data,
+                old_states,
+            )
+        )
+        output_state_names = LEGACY_STATE_NAMES_27D.copy()
+        print(
+            "Reconstructed checkpoint state from raw trajectory: "
+            f"{new_states.shape}"
+        )
+    else:
+        phase_dimension, phase_dimension_source = resolve_phase_dimension(
+            state_names,
+            old_states,
+            len(stage_names),
+        )
+        if phase_dimension != 18:
+            print(
+                f"[WARN] phase_index is at dimension {phase_dimension}, "
+                "not dimension 18; using the name-based location"
+            )
+        elif phase_dimension_source != "metadata":
+            print(
+                "[WARN] observation.state metadata has no phase_index name; "
+                "using legacy dimension 18 after validating every stage value"
+            )
+        print(
+            f"Resolved phase dimension: {phase_dimension} "
+            f"(source={phase_dimension_source})"
         )
 
-    if np.min(stage_current) < 0 or np.max(stage_current) >= len(stage_names):
-        raise RuntimeError(
-            "phase_index contains values outside the defined stage range: "
-            f"min={np.min(stage_current)}, max={np.max(stage_current)}, "
-            f"num_stages={len(stage_names)}"
-        )
+        raw_stage = old_states[:, phase_dimension]
+        stage_current = np.rint(raw_stage).astype(np.int64)
 
-    new_states = np.delete(
-        old_states,
-        phase_dimension,
-        axis=1,
-    ).astype(np.float32)
+        if not np.allclose(raw_stage, stage_current, atol=1e-6):
+            raise RuntimeError("phase_index contains non-integer values")
+
+        if (
+            np.min(stage_current) < 0
+            or np.max(stage_current) >= len(stage_names)
+        ):
+            raise RuntimeError(
+                "phase_index contains values outside the defined stage range: "
+                f"min={np.min(stage_current)}, max={np.max(stage_current)}, "
+                f"num_stages={len(stage_names)}"
+            )
+
+        new_states = np.delete(
+            old_states,
+            phase_dimension,
+            axis=1,
+        ).astype(np.float32)
+        output_state_names = (
+            state_names[:phase_dimension]
+            + state_names[phase_dimension + 1 :]
+        )
 
     if new_states.shape[1] != 27:
         raise AssertionError(new_states.shape)
@@ -542,21 +1062,26 @@ def main() -> None:
 
     all_data.insert(
         insert_at,
-        "stage_current_id",
+        "observation.stage_current_id",
         stage_current,
     )
     all_data.insert(
         insert_at + 1,
+        "stage_current_id",
+        stage_current,
+    )
+    all_data.insert(
+        insert_at + 2,
         target_name,
         stage_target,
     )
     all_data.insert(
-        insert_at + 2,
+        insert_at + 3,
         purity_name,
         stage_purity.astype(np.float32),
     )
     all_data.insert(
-        insert_at + 3,
+        insert_at + 4,
         valid_name,
         stage_valid.astype(np.int64),
     )
@@ -595,17 +1120,18 @@ def main() -> None:
         if feature_name == "observation.state":
             new_state_spec = dict(feature_spec)
             new_state_spec["shape"] = [27]
-            new_state_spec["names"] = (
-                state_names[:phase_dimension]
-                + state_names[phase_dimension + 1 :]
-            )
+            new_state_spec["names"] = output_state_names
             new_features[feature_name] = new_state_spec
 
-            new_features["stage_current_id"] = {
+            stage_feature_spec = {
                 "dtype": "int64",
                 "shape": [1],
                 "names": None,
             }
+            new_features["observation.stage_current_id"] = dict(
+                stage_feature_spec
+            )
+            new_features["stage_current_id"] = dict(stage_feature_spec)
             new_features[target_name] = {
                 "dtype": "int64",
                 "shape": [1],
@@ -632,13 +1158,17 @@ def main() -> None:
     if stats_path.exists():
         stats = load_json(stats_path)
         if "observation.state" in stats:
-            stats["observation.state"] = (
-                remove_state_dimension_from_stats(
-                    stats["observation.state"],
-                    phase_dimension,
-                    old_width=28,
+            if source_is_v4:
+                stats["observation.state"] = vector_statistics(new_states)
+            else:
+                assert phase_dimension is not None
+                stats["observation.state"] = (
+                    remove_state_dimension_from_stats(
+                        stats["observation.state"],
+                        phase_dimension,
+                        old_width=28,
+                    )
                 )
-            )
 
         template = (
             stats.get("task_index")
@@ -646,10 +1176,12 @@ def main() -> None:
             or stats.get("episode_index")
         )
 
-        stats["stage_current_id"] = build_stats_like(
+        current_stage_stats = build_stats_like(
             template,
             stage_current,
         )
+        stats["observation.stage_current_id"] = current_stage_stats
+        stats["stage_current_id"] = current_stage_stats
         stats[target_name] = build_stats_like(
             template,
             stage_target,
@@ -678,12 +1210,21 @@ def main() -> None:
             str(index): name
             for index, name in enumerate(stage_names)
         },
-        "source_feature": "observation.state",
+        "source_feature": (
+            "raw trajectory: obs.state_legacy_14d + v4 observation.state"
+            if source_is_v4
+            else "observation.state"
+        ),
         "source_dimension": phase_dimension,
-        "source_name": "phase_index",
+        "source_name": (
+            "raw phase/label resolved with the v4 canonical stage contract"
+            if source_is_v4
+            else "phase_index"
+        ),
         "input_state_shape_before": [28],
         "input_state_shape_after": [27],
-        "current_stage_field": "stage_current_id",
+        "current_stage_field": "observation.stage_current_id",
+        "current_stage_compatibility_alias": "stage_current_id",
         "future_stage_field": target_name,
         "future_stage_horizon_frames": horizon,
         "minimum_future_stage_purity": args.minimum_purity,
@@ -693,6 +1234,7 @@ def main() -> None:
             "Stage fields are supervision labels. "
             "Do not include them in model input_features."
         ),
+        "reconstruction": reconstruction_details,
     }
     save_json(
         dst / "meta" / "stage_schema.json",
@@ -727,6 +1269,8 @@ def main() -> None:
             np.mean(stage_valid)
         ),
         "video_copy": video_counts,
+        "phase_source": phase_dimension_source,
+        "reconstruction": reconstruction_details,
     }
     save_json(
         dst / "meta" / "stage_conversion_manifest.json",
@@ -740,6 +1284,9 @@ def main() -> None:
             source=src,
             horizon=horizon,
             minimum_purity=args.minimum_purity,
+            conversion_mode=str(
+                reconstruction_details.get("mode") or "legacy_phase_removal"
+            ),
         )
 
     print("\n" + "=" * 88)
@@ -753,6 +1300,7 @@ def main() -> None:
 
     assert output_features["observation.state"]["shape"] == [27]
     assert "phase_index" not in output_features["observation.state"]["names"]
+    assert output_features["observation.stage_current_id"]["dtype"] == "int64"
     assert output_features["stage_current_id"]["dtype"] == "int64"
     assert output_features[target_name]["dtype"] == "int64"
 
@@ -778,8 +1326,15 @@ def main() -> None:
     print(f"[OK] source frames: {len(all_data)}")
     print(f"[OK] destination frames: {destination_rows}")
     print(f"[OK] observation.state: 28D -> 27D")
-    print(f"[OK] phase_index removed from model state")
-    print(f"[OK] stage_current_id range: {stage_current.min()}..{stage_current.max()}")
+    if source_is_v4:
+        print("[OK] v4 state reconstructed as checkpoint legacy 27D")
+        print("[OK] v4 phases use canonical checkpoint stage ids")
+    else:
+        print("[OK] phase_index removed from model state")
+    print(
+        "[OK] observation.stage_current_id range: "
+        f"{stage_current.min()}..{stage_current.max()}"
+    )
     print(
         f"[OK] {target_name} range: "
         f"{stage_target.min()}..{stage_target.max()}"

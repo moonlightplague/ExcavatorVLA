@@ -95,6 +95,7 @@ ACTION_NAMES_4D = [
     "arm_cmd_velocity",
     "bucket_cmd_velocity",
 ]
+ACTION_LIMITS_RAD_S_4D = [6.0, 2.5, 2.5, 6.0]
 
 SCHEMA_VERSION = "excavator_state_v4_28d_plus_4effort_categorical_phase10"
 BUCKET_FILL_CAPACITY_PARTICLES = 6400.0

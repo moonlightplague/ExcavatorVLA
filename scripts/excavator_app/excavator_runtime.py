@@ -12486,6 +12486,7 @@ def dataset_record_sample(
             STATE["dataset_next_sim_sample_time"] = float(next_sim)
         STATE["dataset_last_train_sample_time"] = float(train_t)
         STATE["dataset_train_time_cursor"] = float(train_t)
+        STATE["dataset_last_recorded_phase_index"] = int(phase_features["index"])
         STATE["dataset_samples"] = int(STATE.get("dataset_samples", 0)) + 1
         if sample_spans:
             STATE["dataset_record_sample_spans"] = sample_spans
@@ -12762,6 +12763,24 @@ def dataset_record_stage_boundary_sample(stage_name, result, q_real=None):
         return
     result_text = str(result or "")
     if result_text not in {"start", "done", "failed"}:
+        return
+    boundary_phase_index = int(dataset_phase_index(stage_name))
+    last_phase_index = int(STATE.get("dataset_last_recorded_phase_index", -1))
+    if (
+        result_text in {"done", "failed"}
+        and boundary_phase_index >= 0
+        and last_phase_index > boundary_phase_index
+    ):
+        dataset_record_event(
+            "stage_boundary_skipped",
+            f"stale_parent_boundary:{stage_name}_{result_text}",
+            data={
+                "stage_name": str(stage_name or ""),
+                "result": result_text,
+                "boundary_phase_index": boundary_phase_index,
+                "last_recorded_phase_index": last_phase_index,
+            },
+        )
         return
     try:
         q_cmd = CTRL.q_cmd.copy()
@@ -14906,6 +14925,7 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
     STATE["dataset_last_action"] = None
     STATE["dataset_last_dq_real"] = None
     STATE["dataset_last_ddq_real"] = None
+    STATE["dataset_last_recorded_phase_index"] = -1
     STATE["dataset_bucket_fill_previous_fraction"] = None
     STATE["dataset_bucket_fill_previous_rate"] = None
     STATE["dataset_bucket_fill_previous_time"] = None

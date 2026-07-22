@@ -34,7 +34,7 @@ SEGMENT_FILES = {
 
 LEROBOT_EXPORT_SCHEMA = "excavator_lerobot_export_v3"
 LEROBOT_CODEBASE_VERSION = "v3.0"
-LEROBOT_TASK_PROMPT_VERSION = "excavator_relative_task_v3_heading_frame"
+LEROBOT_TASK_PROMPT_VERSION = "excavator_relative_task_v4_initial_base_pose"
 LEROBOT_STATE_SCHEMA_VERSION = vla_observation_contract.SCHEMA_VERSION
 LEROBOT_CANONICAL_PHASE_NAMES = list(vla_observation_contract.CANONICAL_PHASE_NAMES)
 LEROBOT_BASE_STATE_NAMES_14D = list(vla_observation_contract.BASE_STATE_NAMES_14D)
@@ -52,6 +52,19 @@ LEROBOT_VIDEO_KEYFRAME_INTERVAL = 4
 LEROBOT_ACTION_POLICY_VERSION = "cmd_velocity_v3_setpoint_aware"
 LEROBOT_COMMAND_DISCONTINUITY_RAD_S = 6.0
 LEROBOT_ACTION_HARD_MAX_RAD_S = 12.0
+LEROBOT_EFFORT_POLICY_RAW = "raw"
+LEROBOT_EFFORT_POLICY_EXCLUDE = "exclude"
+LEROBOT_QUALITY_POLICY_ALL = "all"
+LEROBOT_QUALITY_POLICY_GOLD_V1 = "gold-v1"
+LEROBOT_STAGE_POLICY_VERSION = "repair_stale_parent_boundary_v1"
+LEROBOT_GOLD_MIN_SCORE = 70.0
+LEROBOT_GOLD_MAX_SPILL_RATIO = 0.30
+LEROBOT_GOLD_JOINT_LIMIT_TOLERANCE_DEG = 1.0
+LEROBOT_GOLD_JOINT_LIMITS_DEG = {
+    "boom": (-75.0, 75.0),
+    "arm": (-95.0, 95.0),
+    "bucket": (-120.0, 90.0),
+}
 LEROBOT_VIDEO_WORKERS_ENV = "EXCAVATOR_LEROBOT_VIDEO_WORKERS"
 LEROBOT_VIDEO_ENCODER_THREADS_ENV = "EXCAVATOR_LEROBOT_VIDEO_ENCODER_THREADS"
 LEROBOT_VIDEO_PRESET_ENV = "EXCAVATOR_LEROBOT_VIDEO_PRESET"
@@ -106,6 +119,33 @@ def lerobot_state_schema_spec(state_schema: object = None) -> Dict[str, object]:
         f"unknown LeRobot state schema {state_schema!r}; "
         "expected current-v4 or legacy-v1.1-32d"
     )
+
+
+def normalize_lerobot_effort_policy(policy: object = None) -> str:
+    value = str(policy or LEROBOT_EFFORT_POLICY_RAW).strip().lower().replace("_", "-")
+    aliases = {
+        "raw": LEROBOT_EFFORT_POLICY_RAW,
+        "include": LEROBOT_EFFORT_POLICY_RAW,
+        "excluded": LEROBOT_EFFORT_POLICY_EXCLUDE,
+        "exclude": LEROBOT_EFFORT_POLICY_EXCLUDE,
+        "none": LEROBOT_EFFORT_POLICY_EXCLUDE,
+    }
+    if value not in aliases:
+        raise ValueError(f"unknown effort policy {policy!r}; expected raw or exclude")
+    return aliases[value]
+
+
+def normalize_lerobot_quality_policy(policy: object = None) -> str:
+    value = str(policy or LEROBOT_QUALITY_POLICY_ALL).strip().lower().replace("_", "-")
+    aliases = {
+        "all": LEROBOT_QUALITY_POLICY_ALL,
+        "none": LEROBOT_QUALITY_POLICY_ALL,
+        "gold": LEROBOT_QUALITY_POLICY_GOLD_V1,
+        "gold-v1": LEROBOT_QUALITY_POLICY_GOLD_V1,
+    }
+    if value not in aliases:
+        raise ValueError(f"unknown quality policy {policy!r}; expected all or gold-v1")
+    return aliases[value]
 
 
 def read_json(path: Union[str, os.PathLike], default=None):
@@ -1438,9 +1478,14 @@ def lerobot_export_config_for_run(
     split: str = "trainable",
     time_policy: object = None,
     state_schema: object = None,
+    effort_policy: object = None,
+    quality_policy: object = None,
 ) -> Dict[str, object]:
     state_schema_spec = lerobot_state_schema_spec(state_schema)
     state_names = list(state_schema_spec["names"])
+    effort_policy_name = normalize_lerobot_effort_policy(effort_policy)
+    quality_policy_name = normalize_lerobot_quality_policy(quality_policy)
+    effort_dim = 4 if effort_policy_name == LEROBOT_EFFORT_POLICY_RAW else 0
     base_export_fps = infer_export_fps(run_dir, None)
     time_policy_info = load_export_time_policy(run_dir, explicit_policy=time_policy)
     normalized_time_policy = dict(time_policy_info.get("policy") or default_export_time_policy())
@@ -1452,11 +1497,15 @@ def lerobot_export_config_for_run(
         "video_keyframe_interval": int(LEROBOT_VIDEO_KEYFRAME_INTERVAL),
         "task_prompt_version": LEROBOT_TASK_PROMPT_VERSION,
         "action_policy_version": LEROBOT_ACTION_POLICY_VERSION,
+        "action_limits_rad_s": list(vla_observation_contract.ACTION_LIMITS_RAD_S_4D),
         "state_schema": str(state_schema_spec["key"]),
         "state_schema_version": str(state_schema_spec["version"]),
         "state_dim": len(state_names),
-        "effort_dim": 4,
-        "effective_robot_observation_dim": len(state_names) + 4,
+        "effort_policy": effort_policy_name,
+        "effort_dim": effort_dim,
+        "effective_robot_observation_dim": len(state_names) + effort_dim,
+        "quality_policy": quality_policy_name,
+        "stage_policy_version": LEROBOT_STAGE_POLICY_VERSION,
         "base_fps": float(base_export_fps),
         "time_policy": normalized_time_policy,
         "time_policy_hash": str(time_policy_info.get("hash") or export_time_policy_hash(normalized_time_policy)),
@@ -1468,11 +1517,15 @@ def lerobot_export_config_for_run(
     metadata_only_keys = {
         "task_prompt_version",
         "action_policy_version",
+        "action_limits_rad_s",
         "state_schema_version",
         "state_schema",
         "state_dim",
         "effort_dim",
         "effective_robot_observation_dim",
+        "effort_policy",
+        "quality_policy",
+        "stage_policy_version",
     }
     media_config = {key: value for key, value in export_config.items() if key not in metadata_only_keys}
     media_config_hash = hashlib.sha1(
@@ -2104,9 +2157,11 @@ def _state_xy_yaw(sample: Optional[dict], state_names: Optional[Sequence[str]] =
     if state is None:
         return None, None
     names = list(state_names or [])
-    x_index = names.index("base_x") if "base_x" in names else 0
-    y_index = names.index("base_y") if "base_y" in names else 1
-    yaw_index = names.index("base_yaw") if "base_yaw" in names else 2
+    if not all(name in names for name in ("base_x", "base_y", "base_yaw")):
+        return None, None
+    x_index = names.index("base_x")
+    y_index = names.index("base_y")
+    yaw_index = names.index("base_yaw")
     xy = None
     yaw = None
     if len(state) > max(x_index, y_index):
@@ -2188,8 +2243,24 @@ def build_episode_task_text(
     scene_context = applied.get("scene_context") if isinstance(applied.get("scene_context"), dict) else {}
 
     state_xy, state_yaw = _state_xy_yaw(sample, state_names=state_names)
+    legacy_base_state = (
+        _legacy_base_state_from_sample(sample, list(state_names or []))
+        if isinstance(sample, dict)
+        else None
+    )
+    legacy_xy = (
+        [float(legacy_base_state[0]), float(legacy_base_state[1])]
+        if legacy_base_state is not None and len(legacy_base_state) >= 3
+        else None
+    )
+    legacy_yaw = (
+        float(legacy_base_state[2])
+        if legacy_base_state is not None and len(legacy_base_state) >= 3
+        else None
+    )
     robot_xy = _first_vector_xy(
         _nested_value(applied, ["robot_translation_xyz"]),
+        legacy_xy,
         state_xy,
         [0.0, 0.0],
     )
@@ -2197,7 +2268,11 @@ def build_episode_task_text(
         applied.get("robot_body_yaw_deg") if isinstance(applied, dict) else None,
         candidate.get("robot_body_yaw_deg") if isinstance(candidate, dict) else None,
     )
-    robot_yaw_rad = math.radians(robot_yaw_deg) if robot_yaw_deg is not None else state_yaw
+    robot_yaw_rad = (
+        math.radians(robot_yaw_deg)
+        if robot_yaw_deg is not None
+        else (legacy_yaw if legacy_yaw is not None else state_yaw)
+    )
 
     # The language goal must describe the points actually used by this episode,
     # while exact world transforms remain in state/meta rather than becoming a
@@ -2276,6 +2351,110 @@ def canonical_lerobot_phase_index(phase: object) -> Optional[int]:
     if "lift" in text or "carry" in text:
         return 7
     return None
+
+
+def lerobot_export_phase_index(
+    sample: dict,
+    previous_phase_index: Optional[int] = None,
+) -> Tuple[Optional[int], bool]:
+    phase_index = canonical_lerobot_phase_index(
+        sample.get("phase") or sample.get("label")
+    )
+    if phase_index is None:
+        return None, False
+    label = str(sample.get("label") or "").strip().lower()
+    stale_parent_boundary = bool(
+        previous_phase_index == 9
+        and int(phase_index) < 9
+        and label.endswith(("_done_boundary", "_failed_boundary"))
+    )
+    if stale_parent_boundary:
+        return 9, True
+    return int(phase_index), False
+
+
+def lerobot_episode_quality_decision(
+    episode: dict,
+    trajectory: Optional[Sequence[dict]] = None,
+    policy: object = None,
+) -> Dict[str, object]:
+    policy_name = normalize_lerobot_quality_policy(policy)
+    if policy_name == LEROBOT_QUALITY_POLICY_ALL:
+        return {"selected": True, "reason": "all", "policy": policy_name}
+
+    score = safe_float_value(episode.get("score"), None)
+    if score is None or float(score) < float(LEROBOT_GOLD_MIN_SCORE):
+        return {
+            "selected": False,
+            "reason": "score_below_minimum",
+            "policy": policy_name,
+            "score": score,
+        }
+    lift = max(
+        0.0,
+        float(safe_float_value(episode.get("lift_bucket_from_pile_particles"), 0.0) or 0.0),
+    )
+    spill = max(
+        0.0,
+        float(safe_float_value(episode.get("final_spill_from_pile_particles"), 0.0) or 0.0),
+    )
+    spill_ratio = spill / max(1.0, lift)
+    if spill_ratio > float(LEROBOT_GOLD_MAX_SPILL_RATIO):
+        return {
+            "selected": False,
+            "reason": "spill_ratio_above_maximum",
+            "policy": policy_name,
+            "spill_ratio": float(spill_ratio),
+        }
+    if trajectory is None:
+        return {
+            "selected": True,
+            "reason": "episode_metrics_ok",
+            "policy": policy_name,
+            "score": float(score),
+            "spill_ratio": float(spill_ratio),
+        }
+
+    tolerance = math.radians(float(LEROBOT_GOLD_JOINT_LIMIT_TOLERANCE_DEG))
+    joint_names = ("swing", "boom", "arm", "bucket")
+    for sample_index, sample in enumerate(trajectory):
+        q = vector_or_none(sample.get("obs.q"), 4)
+        if q is None:
+            return {
+                "selected": False,
+                "reason": "missing_observed_joint_position",
+                "policy": policy_name,
+                "sample_index": int(sample_index),
+            }
+        if not all(math.isfinite(float(value)) for value in q):
+            return {
+                "selected": False,
+                "reason": "non_finite_observed_joint_position",
+                "policy": policy_name,
+                "sample_index": int(sample_index),
+            }
+        for joint_index, joint_name in enumerate(joint_names):
+            limits = LEROBOT_GOLD_JOINT_LIMITS_DEG.get(joint_name)
+            if limits is None:
+                continue
+            lower = math.radians(float(limits[0])) - tolerance
+            upper = math.radians(float(limits[1])) + tolerance
+            if float(q[joint_index]) < lower or float(q[joint_index]) > upper:
+                return {
+                    "selected": False,
+                    "reason": f"observed_{joint_name}_outside_physical_limit",
+                    "policy": policy_name,
+                    "sample_index": int(sample_index),
+                    "value_deg": math.degrees(float(q[joint_index])),
+                    "limit_deg": [float(limits[0]), float(limits[1])],
+                }
+    return {
+        "selected": True,
+        "reason": "gold_quality_ok",
+        "policy": policy_name,
+        "score": float(score),
+        "spill_ratio": float(spill_ratio),
+    }
 
 
 def _first_vector_xyz(*values: object) -> Optional[List[float]]:
@@ -2367,6 +2546,7 @@ def build_lerobot_state_28d(
     raw_state_names: Sequence[str],
     bucket_fill_fraction: float,
     bucket_fill_rate_fraction_per_s: float,
+    require_effort: bool = True,
 ) -> Tuple[Optional[List[float]], str]:
     base_state = _legacy_base_state_from_sample(sample, raw_state_names)
     if base_state is None:
@@ -2393,7 +2573,7 @@ def build_lerobot_state_28d(
     if previous_action is None:
         return None, "missing_causal_previous_action"
     effort = vector_or_none(sample.get("observation.effort"), 4)
-    if effort is None:
+    if require_effort and effort is None:
         return None, "missing_measured_effort"
 
     phase_index = canonical_lerobot_phase_index(sample.get("phase") or sample.get("label"))
@@ -2471,6 +2651,8 @@ def build_lerobot_state_28d_legacy_v11(
     episode_row: dict,
     raw_state_names: Sequence[str],
     bucket_load_rate_particles_per_s: float,
+    require_effort: bool = True,
+    phase_index_override: Optional[int] = None,
 ) -> Tuple[Optional[List[float]], str]:
     """Reconstruct the original v1.1 28D state without changing the raw episode."""
     base_state = _legacy_base_state_from_sample(sample, raw_state_names)
@@ -2481,11 +2663,13 @@ def build_lerobot_state_28d_legacy_v11(
     if joint_velocity is None:
         return None, "missing_joint_velocity"
     effort = vector_or_none(sample.get("observation.effort"), 4)
-    if effort is None:
+    if require_effort and effort is None:
         return None, "missing_measured_effort"
 
-    phase_index = canonical_lerobot_phase_index(
-        sample.get("phase") or sample.get("label")
+    phase_index = (
+        int(phase_index_override)
+        if phase_index_override is not None
+        else canonical_lerobot_phase_index(sample.get("phase") or sample.get("label"))
     )
     if phase_index is None:
         return None, f"unknown_phase:{sample.get('phase') or sample.get('label')}"
@@ -2934,7 +3118,21 @@ def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Di
         reasons.append("info/data_path_not_v3")
     if info.get("action_policy_version") != LEROBOT_ACTION_POLICY_VERSION:
         reasons.append("info/action_policy_version_mismatch")
+    if list(info.get("action_limits_rad_s") or []) != list(
+        vla_observation_contract.ACTION_LIMITS_RAD_S_4D
+    ):
+        reasons.append("info/action_limits_rad_s_mismatch")
+    if info.get("stage_policy_version") != LEROBOT_STAGE_POLICY_VERSION:
+        reasons.append("info/stage_policy_version_mismatch")
     features = info.get("features", {}) if isinstance(info.get("features"), dict) else {}
+    effort_policy = normalize_lerobot_effort_policy(
+        info.get("effort_policy") or LEROBOT_EFFORT_POLICY_RAW
+    )
+    if effort_policy == LEROBOT_EFFORT_POLICY_EXCLUDE:
+        if "observation.effort" in features:
+            reasons.append("info/effort_excluded_but_feature_present")
+        if int(info.get("effort_dim", 0) or 0) != 0:
+            reasons.append("info/effort_excluded_but_dim_nonzero")
     stats = read_json(os.path.join(export_dir, "meta", "stats.json"), default={}) or {}
     if not isinstance(stats, dict):
         reasons.append("stats/not_dict")
@@ -3002,7 +3200,10 @@ def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Di
         try:
             import pandas as pd  # type: ignore
 
-            action_df = pd.read_parquet(data_path, columns=["action"])
+            requested_columns = ["action", "episode_index", "observation.state"]
+            if "observation.stage_current_id" in features:
+                requested_columns.append("observation.stage_current_id")
+            action_df = pd.read_parquet(data_path, columns=requested_columns)
             for value in action_df["action"].tolist():
                 action = vector_or_none(value)
                 if action is None or not action:
@@ -3027,6 +3228,39 @@ def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Di
                     f"max={float(action_audit['max_abs_action_rad_s']):.6f};"
                     f"limit={float(LEROBOT_ACTION_HARD_MAX_RAD_S):.6f}"
                 )
+            if "observation.stage_current_id" in action_df.columns:
+                stage_regressions = 0
+                for _episode_index, group in action_df.groupby("episode_index", sort=False):
+                    previous_stage = None
+                    for value in group["observation.stage_current_id"].tolist():
+                        stage = int(value)
+                        if previous_stage == 9 and stage < 9:
+                            stage_regressions += 1
+                        previous_stage = stage
+                if stage_regressions:
+                    reasons.append(f"stage/regressions_after_unload:{stage_regressions}")
+            if str(info.get("quality_policy") or "") == LEROBOT_QUALITY_POLICY_GOLD_V1:
+                state_schema = str(info.get("state_schema") or "current-v4")
+                joint_offset = 3 if state_schema == LEROBOT_LEGACY_V11_STATE_SCHEMA else 0
+                limit_violations = 0
+                tolerance = math.radians(float(LEROBOT_GOLD_JOINT_LIMIT_TOLERANCE_DEG))
+                for value in action_df["observation.state"].tolist():
+                    state = vector_or_none(value)
+                    if state is None or len(state) < joint_offset + 4:
+                        limit_violations += 1
+                        continue
+                    for joint_index, joint_name in enumerate(("swing", "boom", "arm", "bucket")):
+                        limits = LEROBOT_GOLD_JOINT_LIMITS_DEG.get(joint_name)
+                        if limits is None:
+                            continue
+                        observed = float(state[joint_offset + joint_index])
+                        lower = math.radians(float(limits[0])) - tolerance
+                        upper = math.radians(float(limits[1])) + tolerance
+                        if observed < lower or observed > upper:
+                            limit_violations += 1
+                            break
+                if limit_violations:
+                    reasons.append(f"quality/gold_joint_limit_violations:{limit_violations}")
         except Exception as exc:
             reasons.append(f"action/read_failed:{type(exc).__name__}:{exc}")
     return {
@@ -3121,16 +3355,19 @@ def collect_lerobot_rows(
     time_policy: object = None,
     base_fps: float = 10.0,
     state_schema: object = None,
+    effort_policy: object = None,
+    quality_policy: object = None,
 ) -> Dict[str, object]:
     run_dir = str(run_dir)
     state_schema_spec = lerobot_state_schema_spec(state_schema)
     legacy_v11_state = (
         str(state_schema_spec["key"]) == LEROBOT_LEGACY_V11_STATE_SCHEMA
     )
+    effort_policy_name = normalize_lerobot_effort_policy(effort_policy)
+    quality_policy_name = normalize_lerobot_quality_policy(quality_policy)
+    include_effort = effort_policy_name == LEROBOT_EFFORT_POLICY_RAW
     hydrate_success_pool_indexes_from_transfer_cache(run_dir)
     episode_rows = load_index(run_dir, split)
-    if limit_episodes is not None:
-        episode_rows = episode_rows[: max(0, int(limit_episodes))]
     run_meta = read_json(os.path.join(run_dir, "run_meta.json"), default={}) or {}
     raw_state_names = run_meta.get("state_names") or [
         "base_x",
@@ -3187,14 +3424,66 @@ def collect_lerobot_rows(
         "setpoint_fallback_examples": [],
         "hard_limit_examples": [],
     }
+    quality_filter_audit = {
+        "policy": quality_policy_name,
+        "source_episodes": len(episode_rows),
+        "selected_episodes": 0,
+        "excluded_episodes": 0,
+        "excluded_by_reason": Counter(),
+        "excluded_examples": [],
+    }
+    stage_policy_audit = {
+        "version": LEROBOT_STAGE_POLICY_VERSION,
+        "corrected_stale_parent_boundaries": 0,
+        "corrected_examples": [],
+    }
     global_frame = 0
     for source_episode_index, episode in enumerate(episode_rows):
+        if limit_episodes is not None and len(episodes) >= max(0, int(limit_episodes)):
+            break
+        pre_decision = lerobot_episode_quality_decision(
+            episode,
+            trajectory=None,
+            policy=quality_policy_name,
+        )
+        if not bool(pre_decision.get("selected")):
+            reason = str(pre_decision.get("reason") or "quality_filter")
+            quality_filter_audit["excluded_episodes"] += 1
+            quality_filter_audit["excluded_by_reason"][reason] += 1
+            if len(quality_filter_audit["excluded_examples"]) < 50:
+                quality_filter_audit["excluded_examples"].append(
+                    {
+                        "raw_episode_index": episode.get("episode_index"),
+                        "raw_episode_id": episode.get("episode_id", ""),
+                        **dict(pre_decision),
+                    }
+                )
+            continue
         episode_dir = episode_dir_from_row(episode, run_dir=run_dir)
         trajectory_path = resolve_episode_file(episode_dir, row_path_value(episode, "trajectory"))
         trajectory = read_jsonl(trajectory_path)
         meta = read_json(resolve_episode_file(episode_dir, row_path_value(episode, "meta")), default={}) or {}
         if not trajectory:
             continue
+        quality_decision = lerobot_episode_quality_decision(
+            episode,
+            trajectory=trajectory,
+            policy=quality_policy_name,
+        )
+        if not bool(quality_decision.get("selected")):
+            reason = str(quality_decision.get("reason") or "quality_filter")
+            quality_filter_audit["excluded_episodes"] += 1
+            quality_filter_audit["excluded_by_reason"][reason] += 1
+            if len(quality_filter_audit["excluded_examples"]) < 50:
+                quality_filter_audit["excluded_examples"].append(
+                    {
+                        "raw_episode_index": episode.get("episode_index"),
+                        "raw_episode_id": episode.get("episode_id", ""),
+                        **dict(quality_decision),
+                    }
+                )
+            continue
+        quality_filter_audit["selected_episodes"] += 1
         source_sampling = trajectory_sampling_report(trajectory)
         transformed = apply_export_time_policy_to_trajectory(
             trajectory,
@@ -3258,6 +3547,7 @@ def collect_lerobot_rows(
         previous_bucket_fill_rate: Optional[float] = None
         previous_bucket_load_particles: Optional[float] = None
         previous_sample_t: Optional[float] = None
+        previous_phase_index: Optional[int] = None
         for sample in trajectory:
             raw_base_state = _legacy_base_state_from_sample(
                 sample,
@@ -3293,7 +3583,32 @@ def collect_lerobot_rows(
                         }
                     )
                 continue
-            effort = vector_or_none(sample.get("observation.effort"), len(effort_names))
+            effort = (
+                vector_or_none(sample.get("observation.effort"), len(effort_names))
+                if include_effort
+                else None
+            )
+            phase_index, phase_corrected = lerobot_export_phase_index(
+                sample,
+                previous_phase_index=previous_phase_index,
+            )
+            if phase_index is None:
+                skipped_frames += 1
+                missing_vla_state_by_reason["unknown_phase"] += 1
+                continue
+            if phase_corrected:
+                stage_policy_audit["corrected_stale_parent_boundaries"] += 1
+                if len(stage_policy_audit["corrected_examples"]) < 50:
+                    stage_policy_audit["corrected_examples"].append(
+                        {
+                            "raw_episode_index": episode.get("episode_index"),
+                            "raw_episode_id": episode.get("episode_id", ""),
+                            "raw_sample_index": sample.get("i"),
+                            "phase": str(sample.get("phase", "")),
+                            "label": str(sample.get("label", "")),
+                            "corrected_phase_index": int(phase_index),
+                        }
+                    )
             sample_t = safe_float_value(sample.get("t"), first_t) or first_t
             bucket_load_particles = _sample_bucket_load_particles(
                 sample,
@@ -3337,6 +3652,8 @@ def collect_lerobot_rows(
                         episode,
                         raw_state_names,
                         bucket_load_rate,
+                        require_effort=include_effort,
+                        phase_index_override=phase_index,
                     )
                 else:
                     state, state_reason = build_lerobot_state_28d(
@@ -3346,6 +3663,7 @@ def collect_lerobot_rows(
                         raw_state_names,
                         fill_fraction,
                         fill_rate,
+                        require_effort=include_effort,
                     )
             if state is None:
                 skipped_frames += 1
@@ -3366,13 +3684,6 @@ def collect_lerobot_rows(
             if task_text not in tasks_by_text:
                 tasks_by_text[task_text] = len(tasks_by_text)
             task_index = tasks_by_text[task_text]
-            phase_index = canonical_lerobot_phase_index(
-                sample.get("phase") or sample.get("label")
-            )
-            if phase_index is None:
-                skipped_frames += 1
-                missing_vla_state_by_reason["unknown_phase"] += 1
-                continue
             row = {
                 "index": global_frame,
                 "episode_index": export_episode_index,
@@ -3382,13 +3693,14 @@ def collect_lerobot_rows(
                 "task": task_text,
                 "observation.state": state,
                 "action": action,
-                "observation.effort": effort,
                 "observation.stage_current_id": int(phase_index),
                 "phase": str(sample.get("phase", "")),
                 "raw_episode_index": episode.get("episode_index"),
                 "raw_episode_id": episode.get("episode_id", sample.get("id", "")),
                 "raw_sample_index": sample.get("i"),
             }
+            if include_effort:
+                row["observation.effort"] = effort
             for key in LEROBOT_IMAGE_KEYS:
                 image_value, abs_image = resolved_images[key]
                 image_paths[key].append(abs_image)
@@ -3400,6 +3712,7 @@ def collect_lerobot_rows(
             previous_bucket_fill_rate = float(fill_rate)
             previous_bucket_load_particles = float(bucket_load_particles)
             previous_sample_t = float(sample_t)
+            previous_phase_index = int(phase_index)
             episode_length += 1
             global_frame += 1
         if episode_length <= 0:
@@ -3456,7 +3769,7 @@ def collect_lerobot_rows(
         )
     if missing_vla_state_by_reason:
         raise ValueError(
-            "cannot build complete 28D VLA state plus 4D effort: "
+            "cannot build complete VLA observation state: "
             f"missing={dict(missing_vla_state_by_reason)} examples={missing_vla_state_examples[:5]}"
         )
     if int(action_semantic_audit.get("hard_limit_violations", 0) or 0) > 0:
@@ -3491,6 +3804,13 @@ def collect_lerobot_rows(
         "source_sampling_reports": source_sampling_reports,
         "source_episode_count": len(episode_rows),
         "action_semantic_audit": action_semantic_audit,
+        "effort_policy": effort_policy_name,
+        "quality_policy": quality_policy_name,
+        "quality_filter_audit": {
+            **quality_filter_audit,
+            "excluded_by_reason": dict(quality_filter_audit["excluded_by_reason"]),
+        },
+        "stage_policy_audit": stage_policy_audit,
     }
 
 
@@ -3507,6 +3827,8 @@ def export_lerobot_dataset(
     time_policy: object = None,
     progress_callback=None,
     state_schema: object = None,
+    effort_policy: object = None,
+    quality_policy: object = None,
 ) -> Dict[str, object]:
     def progress(percent: float, message: str, current: Optional[int] = None, total: Optional[int] = None) -> None:
         if not progress_callback:
@@ -3536,6 +3858,8 @@ def export_lerobot_dataset(
         split=split,
         time_policy=time_policy,
         state_schema=state_schema,
+        effort_policy=effort_policy,
+        quality_policy=quality_policy,
     )
     state_schema_spec = dict(
         export_config_info.get("state_schema_spec")
@@ -3560,6 +3884,8 @@ def export_lerobot_dataset(
         time_policy=normalized_time_policy,
         base_fps=base_export_fps,
         state_schema=state_schema_spec["key"],
+        effort_policy=export_config_info.get("export_config", {}).get("effort_policy"),
+        quality_policy=export_config_info.get("export_config", {}).get("quality_policy"),
     )
     rows: List[dict] = list(collected["rows"])  # type: ignore[arg-type]
     if not rows:
@@ -3872,7 +4198,14 @@ def export_lerobot_dataset(
     progress(78.0, "building parquet tables and metadata")
     state_names = list(collected["state_names"])  # type: ignore[arg-type]
     action_names = list(collected["action_names"])  # type: ignore[arg-type]
-    effort_names = list(collected.get("effort_names", []))  # type: ignore[arg-type]
+    effort_policy_name = str(
+        collected.get("effort_policy") or LEROBOT_EFFORT_POLICY_RAW
+    )
+    effort_names = (
+        list(collected.get("effort_names", []))  # type: ignore[arg-type]
+        if effort_policy_name == LEROBOT_EFFORT_POLICY_RAW
+        else []
+    )
     effort_dim = len(effort_names)
     effort_available = bool(
         effort_dim > 0
@@ -3986,9 +4319,13 @@ def export_lerobot_dataset(
         "state_schema": str(state_schema_spec["key"]),
         "state_schema_version": state_schema_version,
         "state_dim": len(state_names),
+        "effort_policy": effort_policy_name,
         "effort_dim": effort_dim if effort_available else 0,
         "effective_robot_observation_dim": len(state_names) + (effort_dim if effort_available else 0),
+        "quality_policy": str(collected.get("quality_policy") or LEROBOT_QUALITY_POLICY_ALL),
+        "stage_policy_version": LEROBOT_STAGE_POLICY_VERSION,
         "action_policy_version": LEROBOT_ACTION_POLICY_VERSION,
+        "action_limits_rad_s": list(vla_observation_contract.ACTION_LIMITS_RAD_S_4D),
         "canonical_phase_names": list(LEROBOT_CANONICAL_PHASE_NAMES),
         "phase_feature": (
             "observation.state[18]"
@@ -4085,18 +4422,19 @@ def export_lerobot_dataset(
         "media_config_hash": media_config_hash,
         "task_prompt_version": LEROBOT_TASK_PROMPT_VERSION,
         "action_policy_version": LEROBOT_ACTION_POLICY_VERSION,
+        "action_limits_rad_s": list(vla_observation_contract.ACTION_LIMITS_RAD_S_4D),
         "action_semantic_audit": dict(collected.get("action_semantic_audit") or {}),
+        "effort_policy": effort_policy_name,
+        "quality_policy": str(collected.get("quality_policy") or LEROBOT_QUALITY_POLICY_ALL),
+        "quality_filter_audit": dict(collected.get("quality_filter_audit") or {}),
+        "stage_policy_version": LEROBOT_STAGE_POLICY_VERSION,
+        "stage_policy_audit": dict(collected.get("stage_policy_audit") or {}),
         "state_schema": str(state_schema_spec["key"]),
         "state_schema_version": state_schema_version,
         "state_names": list(state_names),
         "action_names": list(action_names),
-        "effort_names": [
-            "swing_measured_effort",
-            "boom_measured_effort",
-            "arm_measured_effort",
-            "bucket_measured_effort",
-        ],
-        "effective_robot_observation_dim": len(state_names) + 4,
+        "effort_names": list(effort_names),
+        "effective_robot_observation_dim": len(state_names) + (effort_dim if effort_available else 0),
         "canonical_phase_names": list(LEROBOT_CANONICAL_PHASE_NAMES),
         "time_policy": normalized_time_policy,
         "time_policy_hash": str(time_policy_info.get("hash") or export_time_policy_hash(normalized_time_policy)),
@@ -4166,7 +4504,11 @@ def export_lerobot_dataset(
         "- `meta/episodes/chunk-000/file-000.parquet`: episode metadata and video/data chunk indices",
         "- `meta/stats.json`: state/action/effort/scalar statistics plus video normalization entries",
         "- `data/chunk-000/file-000.parquet`: frame table",
-        "- `observation.effort` is included in the frame table only when Isaac measured joint efforts were available for every exported frame.",
+        (
+            "- `observation.effort` is excluded from policy input because raw Isaac efforts contain solver outliers."
+            if effort_policy_name == LEROBOT_EFFORT_POLICY_EXCLUDE
+            else "- `observation.effort` is included only when Isaac measured joint efforts were available for every exported frame."
+        ),
         "- `videos/observation.images.0/chunk-000/file-XYZ.mp4`: camera 0 stream for episode file_index XYZ",
         "- `videos/observation.images.1/chunk-000/file-XYZ.mp4`: camera 1 stream for episode file_index XYZ",
         "- `videos/observation.images.2/chunk-000/file-XYZ.mp4`: camera 2 stream for episode file_index XYZ",
@@ -4192,6 +4534,9 @@ def print_lerobot_export(
     require_vla: bool = False,
     time_policy: object = None,
     state_schema: object = None,
+    effort_policy: object = None,
+    quality_policy: object = None,
+    reuse_from_dir: Optional[Union[str, os.PathLike]] = None,
 ) -> None:
     result = export_lerobot_dataset(
         run_dir,
@@ -4203,6 +4548,9 @@ def print_lerobot_export(
         require_vla=require_vla,
         time_policy=time_policy,
         state_schema=state_schema,
+        effort_policy=effort_policy,
+        quality_policy=quality_policy,
+        reuse_from_dir=reuse_from_dir,
     )
     try:
         write_json(os.path.join(os.path.abspath(str(run_dir)), "lerobot_v3_export.json"), result)
@@ -5037,6 +5385,11 @@ if __name__ == "__main__":
     parser.add_argument("--export-lerobot", action="store_true", help="Create run_dir/lerobot_v3 with clean LeRobot v3 VLA training data.")
     parser.add_argument("--export-lerobot-v3", action="store_true", help="Alias for --export-lerobot.")
     parser.add_argument("--export-dir", default=None, help="Output directory for --export-lerobot. Defaults to run_dir/lerobot_v3.")
+    parser.add_argument(
+        "--export-reuse-from-dir",
+        default=None,
+        help="Reuse matching per-episode MP4 files from an existing export.",
+    )
     parser.add_argument("--export-split", default="trainable", help="Episode index split to export, default: trainable.")
     parser.add_argument(
         "--export-speed-scale",
@@ -5053,6 +5406,18 @@ if __name__ == "__main__":
             "Observation schema for export. legacy-v1.1-32d reconstructs the "
             "historical 28D state with phase_index at index 18 plus 4D effort."
         ),
+    )
+    parser.add_argument(
+        "--export-effort-policy",
+        default=LEROBOT_EFFORT_POLICY_RAW,
+        choices=[LEROBOT_EFFORT_POLICY_RAW, LEROBOT_EFFORT_POLICY_EXCLUDE],
+        help="Use raw Isaac effort as a separate feature, or exclude it from policy input.",
+    )
+    parser.add_argument(
+        "--export-quality-policy",
+        default=LEROBOT_QUALITY_POLICY_ALL,
+        choices=[LEROBOT_QUALITY_POLICY_ALL, LEROBOT_QUALITY_POLICY_GOLD_V1],
+        help="Export all trainable episodes or the gold score/spill/joint-limit subset.",
     )
     parser.add_argument("--export-overwrite", action="store_true", help="Delete and rebuild the export directory if it already exists.")
     parser.add_argument("--export-require-standard", action="store_true", help="Fail if parquet/mp4 standard export cannot be produced.")
@@ -5094,6 +5459,9 @@ if __name__ == "__main__":
             require_vla=args.export_require_vla,
             time_policy=export_time_policy,
             state_schema=args.export_state_schema,
+            effort_policy=args.export_effort_policy,
+            quality_policy=args.export_quality_policy,
+            reuse_from_dir=args.export_reuse_from_dir,
         )
         did_action = True
     if args.analysis:

@@ -26,6 +26,12 @@ from excavator_common.bridge_protocol import (
 from excavator_common import vla_observation_contract
 
 
+DEPLOYMENT_ACTION_LIMITS_RAD_S = np.asarray(
+    vla_observation_contract.ACTION_LIMITS_RAD_S_4D,
+    dtype=np.float32,
+)
+
+
 def rgb_to_tensor(rgb, device):
     """
     Input:
@@ -154,14 +160,9 @@ def checkpoint_feature_dims(checkpoint_dir, state_dim_override=0, effort_dim_ove
             "Use --state-dim 14, 18, or 28 and verify it against training metadata."
         )
     if effort_dim < 0:
-        effort_dim = 4 if state_dim == 28 else 0
+        effort_dim = 0
     if effort_dim not in (0, 4):
         raise RuntimeError(f"Unsupported observation.effort dimension: {effort_dim}")
-    if state_dim == 28 and effort_dim != 4:
-        raise RuntimeError(
-            "The 28D checkpoint contract requires a separate 4D "
-            "observation.effort feature."
-        )
     return state_dim, effort_dim
 
 
@@ -179,14 +180,17 @@ def validate_bridge_contract(reply, state_dim, effort_dim):
     expected_action_names = list(vla_observation_contract.ACTION_NAMES_4D)
     if not isinstance(state_spec, dict) or state_spec.get("names") != expected_state_names:
         raise RuntimeError("Bridge observation.state names/order do not match the 28D contract")
-    if not isinstance(effort_spec, dict) or effort_spec.get("names") != expected_effort_names:
+    if int(effort_dim) > 0 and (
+        not isinstance(effort_spec, dict)
+        or effort_spec.get("names") != expected_effort_names
+    ):
         raise RuntimeError("Bridge observation.effort names/order do not match the 4D contract")
     if not isinstance(action_spec, dict) or action_spec.get("names") != expected_action_names:
         raise RuntimeError("Bridge action names/order do not match the canonical 4D contract")
     if str(action_spec.get("unit", "")).strip().lower() != "rad/s":
         raise RuntimeError(f"Bridge action unit must be rad/s, got {action_spec.get('unit')!r}")
-    if int(effort_dim) != 4:
-        raise RuntimeError(f"Bridge effort dimension mismatch: expected 4, got {effort_dim}")
+    if int(effort_dim) not in (0, 4):
+        raise RuntimeError(f"Bridge effort dimension must be 0 or 4, got {effort_dim}")
 
 
 def load_observation_context(path):
@@ -199,7 +203,7 @@ def load_observation_context(path):
     return data
 
 
-def action_to_joint_velocities(action, num_joints, max_vel=1.0):
+def action_to_joint_velocities(action, num_joints, max_vel=0.0):
     """
     Model action order:
       action[0] = swing
@@ -214,8 +218,15 @@ def action_to_joint_velocities(action, num_joints, max_vel=1.0):
     if a.ndim == 2:
         a = a[0]
 
-    a = np.asarray(a, dtype=np.float32)
-    a = np.tanh(a) * max_vel
+    a = np.asarray(a, dtype=np.float32).reshape(-1)
+    if a.size < 4:
+        raise RuntimeError(f"Model action must contain 4 joint velocities, got {a.size}")
+    if not np.all(np.isfinite(a)):
+        raise RuntimeError(f"Model action contains NaN or Inf: {a.tolist()}")
+    limits = DEPLOYMENT_ACTION_LIMITS_RAD_S.copy()
+    if float(max_vel or 0.0) > 0.0:
+        limits = np.minimum(limits, float(max_vel))
+    a = np.clip(a[:4], -limits, limits)
 
     vel = np.zeros(num_joints, dtype=np.float32)
 
@@ -310,7 +321,15 @@ def main():
         default="Dig soil from the marked area and dump it into the target container.",
     )
 
-    parser.add_argument("--max-vel", type=float, default=0.02)
+    parser.add_argument(
+        "--max-vel",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional additional scalar velocity cap in rad/s. By default the "
+            "model's physical rad/s output is preserved within the dataset limits."
+        ),
+    )
     parser.add_argument("--ticks", type=int, default=4)
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--sleep", type=float, default=0.01)

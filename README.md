@@ -53,6 +53,404 @@ Project folders:
 
 Repository/server cleanup is intentionally explicit and non-recursive. Run `bash scripts/maintenance/cleanup_obsolete_vla_files.sh` to preview the obsolete-file allowlist, then rerun it with `--apply` to delete those exact files. The script never deletes datasets, checkpoints, logs, or evaluation results.
 
+## Reproducible Fixed-Five-Episode SmolVLA Workflow
+
+This is the authoritative workflow for continuing SmolVLA training on the five
+fixed seed-2 episodes, evaluating the final checkpoints on those same episodes,
+selecting an execution chunk size, and deploying checkpoint 18450 in Isaac Sim.
+Run the commands on the Linux GPU server unless a command is explicitly marked
+as PowerShell.
+
+### 1. Fixed Paths And Runtime Assumptions
+
+The checked-in launchers use these server paths:
+
+```bash
+PROJECT=/root/isaacsim/ExcavatorVLA
+POLICY_PYTHON=/opt/conda/envs/smolvla/bin/python
+TRAIN=/opt/conda/envs/smolvla/bin/lerobot-train
+ISAAC_PYTHON=/root/isaacsim/python.sh
+
+DATASET=/root/gpufree-data/excavator_route_compare/seed_2_fixed_scene_pose_exact/run_20260720_194053/lerobot_v3_eval27_stage10_h30_obslabels
+VLM=/root/gpufree-data/checkpoints/SmolVLM2-500M-Video-Instruct
+PRIOR=/root/gpufree-data/excavator_stage_action_analysis/stage_action_prior_training.json
+TRAIN_ROOT=/root/gpufree-data/outputs/train
+LOG_ROOT=/root/gpufree-data/excavator_logs
+```
+
+The dataset contract is deliberately strict:
+
+| Item | Required value |
+| --- | --- |
+| Episodes | 5 |
+| Frames | 810 |
+| `observation.state` | 27 values |
+| `observation.effort` | 4 values |
+| Camera inputs | Three `3 x 256 x 256` images |
+| Action | `[swing, boom, arm, bucket]`, 4 values |
+| Current stage key | `observation.stage_current_id` |
+| Scene and sampling seed | 2 |
+
+The canonical stage IDs are:
+
+```text
+0 pre_dig
+1 approach_contact
+2 insert_cut
+3 pull_mid_cut
+4 curl_to_hold_material
+5 pull_exit_cut
+6 secure_load
+7 lift_carry
+8 loaded_transit
+9 unload_to_bin
+```
+
+Do not substitute the old stage order in which stages 4/5 or 8/9 were renamed
+or exchanged. Both the training and evaluation launchers stop before model work
+if the metadata differs from this contract.
+
+### 2. Synchronize And Record The Code Revision
+
+Refuse to update over locally modified tracked files:
+
+```bash
+set -euo pipefail
+
+cd /root/isaacsim/ExcavatorVLA
+
+if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo "[ERROR] Tracked local changes exist."
+    git status --short
+    exit 1
+fi
+
+git fetch origin smolvla
+git switch smolvla
+git pull --ff-only origin smolvla
+
+git rev-parse HEAD | tee /root/gpufree-data/excavator_logs/reproduction_git_revision.txt
+bash scripts/maintenance/cleanup_obsolete_vla_files.sh --dry-run
+bash scripts/maintenance/cleanup_obsolete_vla_files.sh --apply
+```
+
+Always keep `reproduction_git_revision.txt` with the training and evaluation
+artifacts. It is the code identity for the run.
+
+### 3. Validate Or Install The SmolVLA Training Patches
+
+The continuation checkpoint depends on custom stage-sequence, stage-action,
+direction, low-motion, padding, and local metric-logging changes in the installed
+LeRobot package. The training launcher validates the final low-motion markers
+and runs a two-step CUDA smoke test before starting the real job.
+
+Check an already prepared environment first:
+
+```bash
+SMOLVLA_DIR=/opt/conda/envs/smolvla/lib/python3.10/site-packages/lerobot/policies/smolvla
+
+grep -n 'stage_action_low_motion_weight' "$SMOLVLA_DIR/configuration_smolvla.py"
+grep -n 'stage_action_low_motion_raw_loss' "$SMOLVLA_DIR/modeling_smolvla.py"
+grep -n 'stage_action_prior_direction' "$SMOLVLA_DIR/modeling_smolvla.py"
+```
+
+If this is a fresh compatible LeRobot environment and those patches have not
+been applied, install the patch chain exactly once and in this order:
+
+```bash
+cd /root/isaacsim/ExcavatorVLA
+PYTHON=/opt/conda/envs/smolvla/bin/python
+
+"$PYTHON" scripts/training/patch_smolvla_stage_training.py
+"$PYTHON" scripts/training/patch_smolvla_stage_seq50.py
+"$PYTHON" scripts/training/patch_smolvla_dynamic_stage_seq50.py
+"$PYTHON" scripts/training/patch_stage_batch_and_logging.py
+"$PYTHON" scripts/training/patch_smolvla_stage_action_direction_loss.py
+"$PYTHON" scripts/training/patch_smolvla_stage_action_low_motion_loss.py
+
+"$PYTHON" -m py_compile \
+  /opt/conda/envs/smolvla/lib/python3.10/site-packages/lerobot/policies/smolvla/configuration_smolvla.py \
+  /opt/conda/envs/smolvla/lib/python3.10/site-packages/lerobot/policies/smolvla/modeling_smolvla.py \
+  /opt/conda/envs/smolvla/lib/python3.10/site-packages/lerobot/datasets/factory.py \
+  /opt/conda/envs/smolvla/lib/python3.10/site-packages/lerobot/scripts/lerobot_train.py
+```
+
+The patchers match exact source text and intentionally fail on an incompatible
+or unexpectedly modified LeRobot installation. Do not keep applying them after
+the markers already exist. Record the effective Python environment as well:
+
+```bash
+/opt/conda/envs/smolvla/bin/python -m pip freeze \
+  > /root/gpufree-data/excavator_logs/smolvla_environment.txt
+```
+
+### 4. Continue Training For 300 Dataset Epochs
+
+The canonical launcher is
+`resume_latest_checkpoint_seed2_fixed5ep_canonical_300epochs.sh`. By default it
+finds the highest complete checkpoint under:
+
+```text
+/root/gpufree-data/outputs/train/excavator_smolvla_stage05_prior020_lowmotion05_resume3840_autobatch_b144_add30ep
+```
+
+A complete source checkpoint must include model weights, train/policy configs,
+optimizer state, optimizer parameter groups, scheduler state, and
+`training_step.json`. The source run is never modified: the launcher copies its
+latest complete checkpoint into a new isolated output and performs a true
+optimizer/scheduler resume.
+
+The continuation settings are:
+
+| Parameter | Value |
+| --- | ---: |
+| Additional epochs | 300 |
+| Batch size | 144 |
+| Workers | 8 |
+| Save interval | 50 epochs |
+| Optimizer learning rate | `5e-5` |
+| Stage loss weight | `0.5` |
+| Stage exception weight | `10.0` |
+| Stage-action loss weight | `0.20` |
+| Low-motion weight / margin | `0.5` / `0.10` |
+
+Confirm the GPU is idle, then launch:
+
+```bash
+cd /root/isaacsim/ExcavatorVLA
+nvidia-smi
+
+bash resume_latest_checkpoint_seed2_fixed5ep_canonical_300epochs.sh
+```
+
+To reproduce from a different source run without editing the script:
+
+```bash
+cd /root/isaacsim/ExcavatorVLA
+
+SOURCE_OUTPUT=/root/gpufree-data/outputs/train/EXACT_SOURCE_RUN \
+  bash resume_latest_checkpoint_seed2_fixed5ep_canonical_300epochs.sh
+```
+
+For the known source step 16650, 810 frames and batch size 144 produce six
+optimizer steps per dataset epoch. Three hundred additional epochs therefore
+add 1800 steps and target checkpoint step 18450. The output name is:
+
+```text
+/root/gpufree-data/outputs/train/excavator_smolvla_seed2_fixed5ep_canonical300_from16650_b144
+```
+
+The launcher starts training with `nohup`, writes a PID file, and maintains a
+latest-log symlink. Monitor it with:
+
+```bash
+LATEST_LOG="$(ls -t \
+  /root/gpufree-data/excavator_logs/excavator_smolvla_seed2_fixed5ep_canonical300_from*_b144_latest.log \
+  | head -1)"
+
+tail -f "$LATEST_LOG"
+```
+
+Inspect the custom losses separately:
+
+```bash
+tail -f "$LATEST_LOG" | grep --line-buffered -E \
+  'policy_metrics|stage_action_direction_raw_loss|stage_action_low_motion_raw_loss|weighted_stage_action_loss|action_loss|stage_accuracy|loss'
+```
+
+Do not start evaluation or Isaac Sim while this training process is using the
+GPU. The evaluation launcher also rejects incomplete training runs.
+
+### 5. Evaluate The Last Three Checkpoints On The Same Five Episodes
+
+Run the offline evaluator only after training reaches its configured target:
+
+```bash
+cd /root/isaacsim/ExcavatorVLA
+
+TRAIN_RUN=/root/gpufree-data/outputs/train/excavator_smolvla_seed2_fixed5ep_canonical300_from16650_b144 \
+  bash run_latest_three_checkpoints_seed2_fixed5ep_eval.sh
+```
+
+The launcher:
+
+1. revalidates the five-episode/810-frame/27D/canonical-stage contract;
+2. selects the three highest complete checkpoint steps from the completed run;
+3. evaluates every checkpoint with seed 2 on the same five episodes;
+4. saves per-frame arrays, per-episode metrics, plots, and median episode output;
+5. builds `checkpoint_comparison.csv` and `checkpoint_comparison.json`; and
+6. packages the result and updates a stable `latest.tar.gz` symlink.
+
+The main comparison fields include current-stage accuracy, action tolerance and
+sign accuracy, stage-transition F1, stage-action-prior accuracy, low-motion
+satisfaction, and per-joint MAE. `micro_representative_score` is the mean of:
+
+```text
+stage_current_accuracy
+action_current_within_tolerance_accuracy
+action_current_sign_accuracy
+stage_action_prior_current_accuracy
+low_motion_current_satisfaction
+```
+
+For the known run, the stable archive path is:
+
+```text
+/root/gpufree-data/excavator_offline_eval/excavator_smolvla_seed2_fixed5ep_canonical300_from16650_b144_latest3_5episodes_latest.tar.gz
+```
+
+### 6. Sweep Offline Action/Stage Execution Chunks
+
+After the latest-three evaluation completes, run:
+
+```bash
+cd /root/isaacsim/ExcavatorVLA
+bash run_action_stage_chunk_sweep.sh
+```
+
+This first selects the checkpoint with the highest
+`micro_representative_score`, then evaluates stitched action and stage outputs
+for execution chunk sizes:
+
+```text
+1 2 3 5 10 15 20 30 50
+```
+
+Chunk 1 must exactly reproduce the original evaluator metrics; the sweep fails
+if it does not. Review these outputs rather than selecting from a single metric:
+
+```text
+chunk_sweep_summary.json
+chunk_sweep_micro.csv
+chunk_sweep_macro.csv
+chunk_sweep_episode_metrics.csv
+chunk_stitch_accuracy.png
+```
+
+For a best checkpoint at step 18450, the stable archive is:
+
+```text
+/root/gpufree-data/excavator_offline_eval/action_stage_chunk_sweep_ckpt18450_latest.tar.gz
+```
+
+Important: this offline execution-chunk sweep is not the same setting as the
+Isaac Sim policy client's replanning interval or temporal ensemble width.
+
+### 7. Optional Chunk-1 Replay Sanity Check In Isaac Sim
+
+Before running the live policy, replay the saved offline output into the same
+seed-2 scene:
+
+```bash
+cd /root/isaacsim/ExcavatorVLA
+
+EPISODE_ID=0 MAX_STEPS=0 \
+  bash run_isaacsim_offline_episode_replay_chunk1.sh
+```
+
+If `EPISODE_NPZ` is omitted, the launcher resolves the best checkpoint from the
+latest evaluation and uses that checkpoint's selected episode array. Override
+it explicitly when exact artifact identity matters:
+
+```bash
+EPISODE_ID=0 \
+EPISODE_NPZ=/absolute/path/to/episode_000000.npz \
+MAX_STEPS=0 \
+  bash run_isaacsim_offline_episode_replay_chunk1.sh
+```
+
+Replay results are packaged under
+`/root/gpufree-data/excavator_isaacsim_replay`, with the stable archive:
+
+```text
+/root/gpufree-data/excavator_isaacsim_replay/isaacsim_offline_episode_chunk1_latest.tar.gz
+```
+
+### 8. Deploy Checkpoint 18450 In Isaac Sim
+
+The current deployment launcher is deliberately pinned to checkpoint step
+18450 and seed 2:
+
+```bash
+cd /root/isaacsim/ExcavatorVLA
+bash run_isaacsim_ckpt18450_seed2_one_episode.sh
+```
+
+It requires an idle GPU, no existing training/simulator/policy process, and a
+viewport-capable X11 `DISPLAY`. It validates the checkpoint, 27D dataset
+metadata, exact dataset task text, deployment contracts, and complete training
+state before starting Isaac Sim.
+
+The current deployment settings are:
+
+| Setting | Value |
+| --- | ---: |
+| Policy steps | 500 |
+| Model output chunk size | 50 |
+| Replan interval | 3 |
+| Temporal ensemble width | 1 |
+| Temporal ensemble decay | `0.35` |
+| Excavation sequence supervisor | Enabled |
+| Legacy load-retention constraint | Disabled |
+| Legacy unload-geometry gate | Disabled |
+| Normalized state/effort OOD limits | 8 sigma |
+
+With temporal ensemble width 1, no averaging across overlapping historical
+chunks occurs. The client infers a new model chunk every three policy steps and
+executes indices 0, 1, and 2 before replanning. The sequence supervisor may
+modify the model action for forced descent, curl/load security, lift, closed-loop
+turning, positioning over the truck, and dumping. Therefore this run is not a
+pure-model rollout; every modified step is recorded in the trace metadata.
+
+The launcher writes simulator and client logs, the action/stage chunk log, the
+executed policy trace, input dumps, video, analysis plots, and
+`rollout_validation.json`. Validation checks all 500 step IDs, chunk origins,
+chunk indices, ensemble weights/actions, checkpoint identity, and monotonic
+supervisor phase progression.
+
+The stable archive is:
+
+```text
+/root/gpufree-data/excavator_isaacsim_eval/isaacsim_seed2_ckpt18450_replan3_ensemble1_supervisor1_latest.tar.gz
+```
+
+### 9. Download The Reproducibility Artifacts
+
+Run these commands in Windows PowerShell:
+
+```powershell
+$Remote = "root@120.209.70.195"
+$Port = 30105
+$Destination = "E:\Downloads"
+
+scp -P $Port "${Remote}:/root/gpufree-data/excavator_offline_eval/excavator_smolvla_seed2_fixed5ep_canonical300_from16650_b144_latest3_5episodes_latest.tar.gz" $Destination
+scp -P $Port "${Remote}:/root/gpufree-data/excavator_offline_eval/action_stage_chunk_sweep_ckpt18450_latest.tar.gz" $Destination
+scp -P $Port "${Remote}:/root/gpufree-data/excavator_isaacsim_replay/isaacsim_offline_episode_chunk1_latest.tar.gz" $Destination
+scp -P $Port "${Remote}:/root/gpufree-data/excavator_isaacsim_eval/isaacsim_seed2_ckpt18450_replan3_ensemble1_supervisor1_latest.tar.gz" $Destination
+scp -P $Port "${Remote}:/root/gpufree-data/excavator_logs/reproduction_git_revision.txt" $Destination
+scp -P $Port "${Remote}:/root/gpufree-data/excavator_logs/smolvla_environment.txt" $Destination
+```
+
+Keep the Git revision, environment manifest, dataset metadata, checkpoint
+selection manifest, comparison CSV/JSON, chunk sweep, replay archive, and live
+simulation archive together. Those files are the minimum evidence needed to
+reconstruct which code, data contract, checkpoint, execution strategy, and
+supervisor produced a result.
+
+### 10. Reproduction Completion Checklist
+
+- The Git worktree is clean and its exact revision was recorded.
+- The dataset reports 5 episodes, 810 frames, 27D state, and canonical stages.
+- The same dataset task text is present in `meta/tasks.parquet`.
+- The installed LeRobot files contain the direction and low-motion markers.
+- Training passed its two-step smoke test and true-resumed optimizer/scheduler state.
+- The continuation run reached its configured target step and contains three complete checkpoints.
+- All three checkpoints were evaluated with seed 2 on the same five episodes.
+- The best checkpoint and execution chunk were selected from saved comparison files.
+- Isaac Sim used the fixed seed-2 pose, targets, checkpoint, and viewport-capable display.
+- `rollout_validation.json` reports `"status": "passed"`.
+- All stable archives and the two reproducibility manifests were downloaded.
+
 ## Legacy Optimized 18D SmolVLA Deployment
 
 The July 16 bridge optimization targets the existing checkpoint contract:
@@ -155,9 +553,8 @@ The current implementation is optimized deterministic lockstep. Holding or inter
 This is the only `README.md` in the project. Other Markdown files are indexed here:
 
 - [`CHANGELOG.md`](CHANGELOG.md): project change log.
-- [`docs/analysis/CODE_REDUNDANCY_ERROR_ANALYSIS.md`](docs/analysis/CODE_REDUNDANCY_ERROR_ANALYSIS.md): static redundancy and risk review.
-- [`docs/analysis/SCRIPT_FUNCTION_MEMO_INDEX.md`](docs/analysis/SCRIPT_FUNCTION_MEMO_INDEX.md): generated function inventory and navigation memo.
 - [`docs/analysis/excavator_dataset_schema_analysis.md`](docs/analysis/excavator_dataset_schema_analysis.md): dataset schema and export notes.
+- [`docs/vla_32d_collection_code_guide.md`](docs/vla_32d_collection_code_guide.md): 32D data-collection code guide retained for the collection workflow.
 
 ## Project Configuration
 

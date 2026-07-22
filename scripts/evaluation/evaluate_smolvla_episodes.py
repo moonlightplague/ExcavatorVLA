@@ -1490,7 +1490,7 @@ def main() -> None:
             "representative_score": float(
                 median_row["representative_score"]
             ),
-            "numerical_median_of_50_scores": numerical_median,
+            "numerical_median_score": numerical_median,
             "selection_rule": (
                 "episode whose representative_score is closest to the "
                 "numerical median; ties use the smaller episode_id"

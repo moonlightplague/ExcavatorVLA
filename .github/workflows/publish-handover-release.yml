@@ -1,0 +1,26 @@
+name: Publish handover release
+
+on:
+  push:
+    tags:
+      - "handover-*"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged handover index
+        uses: actions/checkout@v4
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          --repo "$GITHUB_REPOSITORY"
+          --verify-tag
+          --title "ExcavatorVLA Project Handover (2026-07-23)"
+          --notes-file RELEASE_NOTES.md

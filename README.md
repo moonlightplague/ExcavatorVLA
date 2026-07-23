@@ -6,10 +6,10 @@ training/deployment have different runtime environments and dependencies.
 
 ## Choose the correct branch
 
-| Workflow | Branch and documentation | Handover commit | Local workspace used for this handover |
-| --- | --- | --- | --- |
-| Isaac Sim scene setup, sand/truck randomization, automated data collection, and LeRobot export | [`isaac` branch](https://github.com/jxbb824/ExcavatorVLA/tree/isaac) / [`isaac` README](https://github.com/jxbb824/ExcavatorVLA/blob/isaac/README.md) | `dada72d0eefd1dda9a63739862a571fc0f1a7b8a` | `E:\2025-2026 Senior\2026 Summer Senior\ME 450\Code\ExcavatorVLA` |
-| SmolVLA training, checkpoint evaluation, protocol-v2 bridge, and simulation demo | [`smolvla` branch](https://github.com/jxbb824/ExcavatorVLA/tree/smolvla) / [`smolvla` README](https://github.com/jxbb824/ExcavatorVLA/blob/smolvla/README.md) | `19ba3240d463a671a1147a018005f1fdf3ff458d` | `E:\2025-2026 Senior\2026 Summer Senior\ME 450\Code_zrt\ExcavatorVLA` |
+| Workflow | Branch and documentation | Handover commit |
+| --- | --- | --- |
+| Isaac Sim scene setup, sand/truck randomization, automated data collection, and LeRobot export | [`isaac` branch](https://github.com/jxbb824/ExcavatorVLA/tree/isaac) / [`isaac` README](https://github.com/jxbb824/ExcavatorVLA/blob/isaac/README.md) | `dada72d0eefd1dda9a63739862a571fc0f1a7b8a` |
+| SmolVLA training, checkpoint evaluation, protocol-v2 bridge, and simulation demo | [`smolvla` branch](https://github.com/jxbb824/ExcavatorVLA/tree/smolvla) / [`smolvla` README](https://github.com/jxbb824/ExcavatorVLA/blob/smolvla/README.md) | `19ba3240d463a671a1147a018005f1fdf3ff458d` |
 
 Do not use `main` as the Isaac Sim or SmolVLA runtime checkout. Start with the
 README on the relevant branch and keep branch-specific changes on that branch.
@@ -52,14 +52,17 @@ The dataset copied for this handover comes from:
 /root/gpufree-data/ExcavatorVLA/excavator_auto_dataset/.dashboard_success/lerobot_v3
 ```
 
-Local handover destination:
+The dataset is delivered separately from the Git release as:
 
 ```text
-E:\2025-2026 Senior\2026 Summer Senior\ME 450\ExcavatorVLA_Handover\datasets\lerobot_v3
+ExcavatorVLA-lerobot_v3-handover.zip
+ExcavatorVLA-lerobot_v3-handover.zip.sha256
 ```
 
-The dataset is approximately 15 GB and contains 4,279 files. See
-[`HANDOVER.md`](HANDOVER.md) for verification and release details.
+The archive contains the top-level `lerobot_v3/` directory. The source dataset
+is approximately 15 GB and contains 4,279 files. Verify the ZIP against the
+accompanying SHA-256 checksum before extracting it. See [`HANDOVER.md`](HANDOVER.md)
+for verification and release details.
 
 ## Release
 

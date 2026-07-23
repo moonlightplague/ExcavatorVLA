@@ -975,6 +975,10 @@ AUTO_COLLECT_DEFAULT_MAX_ATTEMPTS = AUTO_COLLECT_DEFAULT_COUNT * AUTO_COLLECT_MA
 AUTO_COLLECT_EXPORT_LEROBOT_V3_ON_FINISH = str(
     os.environ.get("EXCAVATOR_AUTO_EXPORT_LEROBOT_V3", "1")
 ).strip().lower() not in ("0", "false", "no", "off")
+AUTO_COLLECT_PRUNE_NONTRAINABLE_MEDIA = env_bool(
+    "EXCAVATOR_PRUNE_NONTRAINABLE_MEDIA",
+    False,
+)
 AUTO_COLLECT_LEROBOT_V3_SPLIT = str(os.environ.get("EXCAVATOR_LEROBOT_V3_SPLIT", "trainable") or "trainable")
 AUTO_COLLECT_LEROBOT_V3_DIRNAME = str(os.environ.get("EXCAVATOR_LEROBOT_V3_DIRNAME", "lerobot_v3") or "lerobot_v3")
 AUTO_COLLECT_LEROBOT_V3_EXPORT_PYTHON = str(
@@ -7413,6 +7417,61 @@ def dataset_writer_flush(label=""):
             f"errors={len(errors)}",
             f"last={errors[-1]}",
         )
+
+
+def auto_collect_prune_nontrainable_media(episode_dir, status):
+    if not AUTO_COLLECT_PRUNE_NONTRAINABLE_MEDIA or str(status) == "trainable":
+        return {"enabled": bool(AUTO_COLLECT_PRUNE_NONTRAINABLE_MEDIA), "pruned": False}
+    episode_path = os.path.realpath(str(episode_dir or ""))
+    run_path = os.path.realpath(str(STATE.get("auto_collect_run_dir", "") or ""))
+    try:
+        inside_active_run = (
+            os.path.normcase(os.path.commonpath([episode_path, run_path]))
+            == os.path.normcase(run_path)
+        )
+    except ValueError:
+        inside_active_run = False
+    if (
+        not episode_path
+        or not run_path
+        or not os.path.basename(episode_path).startswith("episode_")
+        or not inside_active_run
+    ):
+        return {
+            "enabled": True,
+            "pruned": False,
+            "reason": "episode_path_outside_active_run",
+        }
+    images_path = os.path.join(episode_path, "images")
+    if not os.path.isdir(images_path):
+        return {"enabled": True, "pruned": False, "reason": "images_missing"}
+    file_count = 0
+    byte_count = 0
+    for root, _, files in os.walk(images_path):
+        for name in files:
+            file_count += 1
+            try:
+                byte_count += int(os.path.getsize(os.path.join(root, name)))
+            except OSError:
+                pass
+    import shutil
+
+    shutil.rmtree(images_path)
+    info_print(
+        "[AUTO DATASET MEDIA PRUNE]",
+        f"status={status}",
+        f"files={file_count}",
+        f"bytes={byte_count}",
+        f"episode={os.path.basename(episode_path)}",
+        force_log=True,
+    )
+    return {
+        "enabled": True,
+        "pruned": True,
+        "status": str(status),
+        "files": int(file_count),
+        "bytes": int(byte_count),
+    }
 
 
 def dataset_writer_shutdown(label="shutdown"):
@@ -15657,6 +15716,10 @@ def auto_collect_finish_episode(meta, success, reason):
         "timeline_resume_failures": int(STATE.get("dataset_camera_timeline_resume_failures", 0) or 0),
     }
     meta["camera_episode_summary"] = dataset_camera_episode_summary(meta=meta)
+    meta["nontrainable_media_prune"] = auto_collect_prune_nontrainable_media(
+        STATE.get("dataset_episode_dir", ""),
+        status,
+    )
     write_json_file(STATE.get("dataset_meta_path", ""), meta)
     score_path = os.path.join(str(STATE.get("dataset_episode_dir", "")), "score.json")
     write_json_file(score_path, score_report)

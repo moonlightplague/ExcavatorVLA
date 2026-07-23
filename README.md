@@ -59,6 +59,9 @@ ExcavatorVLA-lerobot_v3-handover.zip
 ExcavatorVLA-lerobot_v3-handover.zip.sha256
 ```
 
+Download the handover dataset from
+[SharePoint](https://utexas-my.sharepoint.com/:f:/g/personal/ly6487_eid_utexas_edu/IgABgzdy4w8FRr4zC0IYaAhgAdI010D5qpShhyt25JPLJUg?e=b35Ebc).
+
 The archive contains the top-level `lerobot_v3/` directory. The source dataset
 is approximately 15 GB and contains 4,279 files. Verify the ZIP against the
 accompanying SHA-256 checksum before extracting it. See [`HANDOVER.md`](HANDOVER.md)

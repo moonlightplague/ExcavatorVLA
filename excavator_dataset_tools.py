@@ -57,6 +57,15 @@ LEROBOT_EFFORT_POLICY_EXCLUDE = "exclude"
 LEROBOT_QUALITY_POLICY_ALL = "all"
 LEROBOT_QUALITY_POLICY_GOLD_V1 = "gold-v1"
 LEROBOT_STAGE_POLICY_VERSION = "repair_stale_parent_boundary_v1"
+LEROBOT_RECOVERY_SUPERVISION_VERSION = "multi_scoop_recovery_v1"
+LEROBOT_RECOVERY_TYPE_NAMES = [
+    "none",
+    "controlled_pose_offset",
+    "carry_posture",
+    "path_replan",
+    "underfill_redig",
+    "unload_alignment",
+]
 LEROBOT_GOLD_MIN_SCORE = 70.0
 LEROBOT_GOLD_MAX_SPILL_RATIO = 0.30
 LEROBOT_GOLD_JOINT_LIMIT_TOLERANCE_DEG = 1.0
@@ -1506,6 +1515,13 @@ def lerobot_export_config_for_run(
         "effective_robot_observation_dim": len(state_names) + effort_dim,
         "quality_policy": quality_policy_name,
         "stage_policy_version": LEROBOT_STAGE_POLICY_VERSION,
+        "recovery_supervision_version": LEROBOT_RECOVERY_SUPERVISION_VERSION,
+        "recovery_type_names": list(LEROBOT_RECOVERY_TYPE_NAMES),
+        "action_loss_mask_feature": (
+            "action_loss_weight"
+            if str(state_schema_spec["key"]) != LEROBOT_LEGACY_V11_STATE_SCHEMA
+            else ""
+        ),
         "base_fps": float(base_export_fps),
         "time_policy": normalized_time_policy,
         "time_policy_hash": str(time_policy_info.get("hash") or export_time_policy_hash(normalized_time_policy)),
@@ -1526,6 +1542,9 @@ def lerobot_export_config_for_run(
         "effort_policy",
         "quality_policy",
         "stage_policy_version",
+        "recovery_supervision_version",
+        "recovery_type_names",
+        "action_loss_mask_feature",
     }
     media_config = {key: value for key, value in export_config.items() if key not in metadata_only_keys}
     media_config_hash = hashlib.sha1(
@@ -2105,7 +2124,17 @@ def is_generic_lerobot_task_text(text: object) -> bool:
         return True
     generic = re.sub(r"\s+", " ", GENERIC_LEROBOT_TASK_TEXT.lower())
     legacy_generated = normalized.startswith("dig soil from the sand pile near (") and "dump it into the truck bed near (" in normalized
-    return normalized == generic or ("marked area" in normalized and "target container" in normalized) or legacy_generated
+    multi_generated = (
+        normalized.startswith("excavate and dump ")
+        and " consecutive scoops of sand " in normalized
+        and "without resetting the scene" in normalized
+    )
+    return (
+        normalized == generic
+        or ("marked area" in normalized and "target container" in normalized)
+        or legacy_generated
+        or multi_generated
+    )
 
 
 def is_generated_relative_lerobot_task_text(text: object) -> bool:
@@ -2297,6 +2326,23 @@ def build_episode_task_text(
     )
     sand_dir = _direction_label_from_xy(sand_xy, robot_xy, robot_yaw_rad)
     unload_dir = _direction_label_from_xy(unload_xy, robot_xy, robot_yaw_rad)
+    scoops_target = 1
+    adaptive_scoop_stop = False
+    for source_dict in (sample, episode_meta, episode_row):
+        if not isinstance(source_dict, dict):
+            continue
+        value = source_dict.get(
+            "observation.scoops_target",
+            source_dict.get("scoops_target", 1),
+        )
+        try:
+            scoops_target = max(scoops_target, int(value or 1))
+        except (TypeError, ValueError):
+            pass
+        adaptive_scoop_stop = bool(
+            adaptive_scoop_stop
+            or source_dict.get("adaptive_scoop_stop", False)
+        )
     if sand_xy is not None or unload_xy is not None:
         source = (
             _task_relative_phrase("sand pile", sand_dir)
@@ -2308,6 +2354,22 @@ def build_episode_task_text(
             if unload_xy is not None
             else "the visible truck bed"
         )
+        if adaptive_scoop_stop:
+            text = (
+                f"Continue excavating and dumping sand from {source} into {destination} "
+                "without resetting the scene until no effective dig target remains."
+            )
+            if scoops_target > 1:
+                text = (
+                    text[:-1]
+                    + f", completing at least {scoops_target} successful scoops."
+                )
+            return text
+        if scoops_target > 1:
+            return (
+                f"Excavate and dump {scoops_target} consecutive scoops of sand from {source} "
+                f"into {destination}, carrying and unloading each scoop without resetting the scene."
+            )
         return (
             f"Excavate one scoop of sand from {source}, then carry and dump the collected material into {destination}."
         )
@@ -3080,7 +3142,18 @@ def build_lerobot_v3_stats(
     }
     if effort_dim is not None and effort_dim > 0:
         stats["observation.effort"] = vector_stats_for_rows(rows, "observation.effort", effort_dim)
-    for key in ["timestamp", "frame_index", "episode_index", "index", "task_index"]:
+    for key in [
+        "timestamp",
+        "frame_index",
+        "episode_index",
+        "index",
+        "task_index",
+        "observation.recovery_active",
+        "observation.recovery_type_id",
+        "observation.recovery_attempt_index",
+        "action_is_expert",
+        "action_loss_weight",
+    ]:
         stats[key] = scalar_stats_for_rows(rows, key)
     for key in (list(image_keys) if image_keys is not None else LEROBOT_IMAGE_KEYS):
         stats[str(key)] = visual_identity_stats()
@@ -3125,6 +3198,16 @@ def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Di
     if info.get("stage_policy_version") != LEROBOT_STAGE_POLICY_VERSION:
         reasons.append("info/stage_policy_version_mismatch")
     features = info.get("features", {}) if isinstance(info.get("features"), dict) else {}
+    if "action_loss_weight" in features:
+        if (
+            info.get("recovery_supervision_version")
+            != LEROBOT_RECOVERY_SUPERVISION_VERSION
+        ):
+            reasons.append("info/recovery_supervision_version_mismatch")
+        if list(info.get("recovery_type_names") or []) != list(
+            LEROBOT_RECOVERY_TYPE_NAMES
+        ):
+            reasons.append("info/recovery_type_names_mismatch")
     effort_policy = normalize_lerobot_effort_policy(
         info.get("effort_policy") or LEROBOT_EFFORT_POLICY_RAW
     )
@@ -3150,6 +3233,15 @@ def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Di
     ]
     if "observation.effort" in features:
         required_stats.append("observation.effort")
+    for key in [
+        "observation.recovery_active",
+        "observation.recovery_type_id",
+        "observation.recovery_attempt_index",
+        "action_is_expert",
+        "action_loss_weight",
+    ]:
+        if key in features:
+            required_stats.append(key)
     for key in image_keys:
         ft = features.get(key, {}) if isinstance(features.get(key), dict) else {}
         if ft.get("dtype") != "video":
@@ -3203,6 +3295,17 @@ def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Di
             requested_columns = ["action", "episode_index", "observation.state"]
             if "observation.stage_current_id" in features:
                 requested_columns.append("observation.stage_current_id")
+            if "observation.scoop_index" in features:
+                requested_columns.append("observation.scoop_index")
+            for key in [
+                "observation.recovery_active",
+                "observation.recovery_type_id",
+                "observation.recovery_attempt_index",
+                "action_is_expert",
+                "action_loss_weight",
+            ]:
+                if key in features:
+                    requested_columns.append(key)
             action_df = pd.read_parquet(data_path, columns=requested_columns)
             for value in action_df["action"].tolist():
                 action = vector_or_none(value)
@@ -3228,15 +3331,58 @@ def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Di
                     f"max={float(action_audit['max_abs_action_rad_s']):.6f};"
                     f"limit={float(LEROBOT_ACTION_HARD_MAX_RAD_S):.6f}"
                 )
+            if "action_loss_weight" in action_df.columns:
+                invalid_loss_weights = 0
+                invalid_expert_labels = 0
+                inconsistent_mask_rows = 0
+                for weight, expert in zip(
+                    action_df["action_loss_weight"].tolist(),
+                    action_df["action_is_expert"].tolist(),
+                ):
+                    weight = float(weight)
+                    expert = int(expert)
+                    if not math.isfinite(weight) or weight < 0.0 or weight > 1.0:
+                        invalid_loss_weights += 1
+                    if expert not in (0, 1):
+                        invalid_expert_labels += 1
+                    if expert == 0 and abs(weight) > 1.0e-6:
+                        inconsistent_mask_rows += 1
+                if invalid_loss_weights:
+                    reasons.append(
+                        f"recovery/invalid_action_loss_weights:{invalid_loss_weights}"
+                    )
+                if invalid_expert_labels:
+                    reasons.append(
+                        f"recovery/invalid_action_is_expert:{invalid_expert_labels}"
+                    )
+                if inconsistent_mask_rows:
+                    reasons.append(
+                        f"recovery/perturbation_rows_with_nonzero_loss:{inconsistent_mask_rows}"
+                    )
             if "observation.stage_current_id" in action_df.columns:
                 stage_regressions = 0
                 for _episode_index, group in action_df.groupby("episode_index", sort=False):
                     previous_stage = None
-                    for value in group["observation.stage_current_id"].tolist():
+                    previous_scoop = None
+                    stage_values = group["observation.stage_current_id"].tolist()
+                    scoop_values = (
+                        group["observation.scoop_index"].tolist()
+                        if "observation.scoop_index" in group.columns
+                        else [0] * len(stage_values)
+                    )
+                    for value, scoop_value in zip(stage_values, scoop_values):
                         stage = int(value)
-                        if previous_stage == 9 and stage < 9:
+                        scoop = int(scoop_value)
+                        valid_next_scoop = bool(
+                            previous_stage == 9
+                            and stage == 0
+                            and previous_scoop is not None
+                            and scoop == previous_scoop + 1
+                        )
+                        if previous_stage == 9 and stage < 9 and not valid_next_scoop:
                             stage_regressions += 1
                         previous_stage = stage
+                        previous_scoop = scoop
                 if stage_regressions:
                     reasons.append(f"stage/regressions_after_unload:{stage_regressions}")
             if str(info.get("quality_policy") or "") == LEROBOT_QUALITY_POLICY_GOLD_V1:
@@ -3684,6 +3830,31 @@ def collect_lerobot_rows(
             if task_text not in tasks_by_text:
                 tasks_by_text[task_text] = len(tasks_by_text)
             task_index = tasks_by_text[task_text]
+            recovery_active = int(
+                bool(int(sample.get("observation.recovery_active", 0) or 0))
+            )
+            recovery_type_id = int(
+                sample.get("observation.recovery_type_id", 0) or 0
+            )
+            if recovery_type_id < 0 or recovery_type_id >= len(
+                LEROBOT_RECOVERY_TYPE_NAMES
+            ):
+                recovery_type_id = 0
+            recovery_attempt_index = max(
+                0,
+                int(sample.get("observation.recovery_attempt_index", 0) or 0),
+            )
+            action_is_expert = int(
+                bool(int(sample.get("action_is_expert", 1) or 0))
+            )
+            action_loss_weight = safe_float_value(
+                sample.get("action_loss_weight"),
+                1.0 if action_is_expert else 0.0,
+            )
+            action_loss_weight = max(
+                0.0,
+                min(1.0, float(action_loss_weight)),
+            )
             row = {
                 "index": global_frame,
                 "episode_index": export_episode_index,
@@ -3694,6 +3865,44 @@ def collect_lerobot_rows(
                 "observation.state": state,
                 "action": action,
                 "observation.stage_current_id": int(phase_index),
+                "observation.scoop_index": int(
+                    sample.get("observation.scoop_index", 0) or 0
+                ),
+                "observation.scoops_target": int(
+                    sample.get(
+                        "observation.scoops_target",
+                        meta.get("scoops_target", episode.get("scoops_target", 1)),
+                    )
+                    or 1
+                ),
+                "observation.scoops_min": int(
+                    sample.get(
+                        "observation.scoops_min",
+                        meta.get(
+                            "scoops_min",
+                            episode.get("scoops_min", episode.get("scoops_target", 1)),
+                        ),
+                    )
+                    or 1
+                ),
+                "observation.scoops_max": int(
+                    sample.get(
+                        "observation.scoops_max",
+                        meta.get(
+                            "scoops_max",
+                            episode.get("scoops_max", episode.get("scoops_target", 1)),
+                        ),
+                    )
+                    or 1
+                ),
+                "observation.scoops_completed": int(
+                    sample.get("observation.scoops_completed", 0) or 0
+                ),
+                "observation.recovery_active": recovery_active,
+                "observation.recovery_type_id": recovery_type_id,
+                "observation.recovery_attempt_index": recovery_attempt_index,
+                "action_is_expert": action_is_expert,
+                "action_loss_weight": action_loss_weight,
                 "phase": str(sample.get("phase", "")),
                 "raw_episode_index": episode.get("episode_index"),
                 "raw_episode_id": episode.get("episode_id", sample.get("id", "")),
@@ -4230,6 +4439,24 @@ def export_lerobot_dataset(
             data_row["observation.stage_current_id"] = int(
                 row["observation.stage_current_id"]
             )
+            data_row["observation.scoop_index"] = int(row["observation.scoop_index"])
+            data_row["observation.scoops_target"] = int(row["observation.scoops_target"])
+            data_row["observation.scoops_min"] = int(row["observation.scoops_min"])
+            data_row["observation.scoops_max"] = int(row["observation.scoops_max"])
+            data_row["observation.scoops_completed"] = int(
+                row["observation.scoops_completed"]
+            )
+            data_row["observation.recovery_active"] = int(
+                row["observation.recovery_active"]
+            )
+            data_row["observation.recovery_type_id"] = int(
+                row["observation.recovery_type_id"]
+            )
+            data_row["observation.recovery_attempt_index"] = int(
+                row["observation.recovery_attempt_index"]
+            )
+            data_row["action_is_expert"] = int(row["action_is_expert"])
+            data_row["action_loss_weight"] = float(row["action_loss_weight"])
         if effort_available:
             data_row["observation.effort"] = row["observation.effort"]
         data_rows.append(data_row)
@@ -4300,6 +4527,59 @@ def export_lerobot_dataset(
             "names": ["stage_current_id"],
             "class_names": list(LEROBOT_CANONICAL_PHASE_NAMES),
         }
+        features["observation.scoop_index"] = {
+            "dtype": "int64",
+            "shape": [1],
+            "names": ["scoop_index"],
+        }
+        features["observation.scoops_target"] = {
+            "dtype": "int64",
+            "shape": [1],
+            "names": ["scoops_target"],
+        }
+        features["observation.scoops_min"] = {
+            "dtype": "int64",
+            "shape": [1],
+            "names": ["scoops_min"],
+        }
+        features["observation.scoops_max"] = {
+            "dtype": "int64",
+            "shape": [1],
+            "names": ["scoops_max"],
+        }
+        features["observation.scoops_completed"] = {
+            "dtype": "int64",
+            "shape": [1],
+            "names": ["scoops_completed"],
+        }
+        features["observation.recovery_active"] = {
+            "dtype": "int64",
+            "shape": [1],
+            "names": ["recovery_active"],
+            "class_names": ["inactive", "active"],
+        }
+        features["observation.recovery_type_id"] = {
+            "dtype": "int64",
+            "shape": [1],
+            "names": ["recovery_type_id"],
+            "class_names": list(LEROBOT_RECOVERY_TYPE_NAMES),
+        }
+        features["observation.recovery_attempt_index"] = {
+            "dtype": "int64",
+            "shape": [1],
+            "names": ["recovery_attempt_index"],
+        }
+        features["action_is_expert"] = {
+            "dtype": "int64",
+            "shape": [1],
+            "names": ["action_is_expert"],
+            "class_names": ["perturbation", "expert"],
+        }
+        features["action_loss_weight"] = {
+            "dtype": "float32",
+            "shape": [1],
+            "names": ["action_loss_weight"],
+        }
     if effort_available:
         features["observation.effort"] = {
             "dtype": "float32",
@@ -4324,6 +4604,11 @@ def export_lerobot_dataset(
         "effective_robot_observation_dim": len(state_names) + (effort_dim if effort_available else 0),
         "quality_policy": str(collected.get("quality_policy") or LEROBOT_QUALITY_POLICY_ALL),
         "stage_policy_version": LEROBOT_STAGE_POLICY_VERSION,
+        "recovery_supervision_version": LEROBOT_RECOVERY_SUPERVISION_VERSION,
+        "recovery_type_names": list(LEROBOT_RECOVERY_TYPE_NAMES),
+        "action_loss_mask_feature": (
+            "action_loss_weight" if not legacy_v11_state else ""
+        ),
         "action_policy_version": LEROBOT_ACTION_POLICY_VERSION,
         "action_limits_rad_s": list(vla_observation_contract.ACTION_LIMITS_RAD_S_4D),
         "canonical_phase_names": list(LEROBOT_CANONICAL_PHASE_NAMES),

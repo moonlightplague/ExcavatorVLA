@@ -113,9 +113,31 @@ def parse_args():
     parser.add_argument("--export-python", default="", help="Python executable used for LeRobot export subprocess.")
     parser.add_argument(
         "--log-mode",
-        choices=("data", "debug", "profile"),
+        choices=("data", "data_multi", "data_multi_recovery", "debug", "profile"),
         default="",
-        help="Runtime log mode: data is fastest, debug enables diagnostics/Calc Viz, profile also records timing telemetry.",
+        help=(
+            "Runtime mode: data collects one scoop per episode; data_multi collects "
+            "multiple consecutive scoops in one v2.0 episode; data_multi_recovery "
+            "adds controlled recoverable deviations and recovery supervision."
+        ),
+    )
+    parser.add_argument(
+        "--scoops-per-episode",
+        type=int,
+        default=1,
+        help=(
+            "Optional quality floor for data_multi modes, not a fixed scoop count. "
+            "Collection continues until no effective dig target remains (default: 1)."
+        ),
+    )
+    parser.add_argument(
+        "--max-scoops-per-episode",
+        type=int,
+        default=64,
+        help=(
+            "Technical runaway guard for adaptive multi-scoop collection. Reaching this "
+            "limit is rejected rather than treated as natural completion (default: 64)."
+        ),
     )
     parser.add_argument(
         "--stable-camera-render",
@@ -755,6 +777,22 @@ def main():
                 raise SystemExit(
                     f"--fixed-scene-profile has non-finite {key}"
                 )
+        selected_unload_landing = fixed_profile.get(
+            "selected_unload_landing_xyz"
+        )
+        if selected_unload_landing is not None:
+            if (
+                not isinstance(selected_unload_landing, (list, tuple))
+                or len(selected_unload_landing) < 3
+                or not all(
+                    math.isfinite(float(item))
+                    for item in selected_unload_landing[:3]
+                )
+            ):
+                raise SystemExit(
+                    "--fixed-scene-profile selected_unload_landing_xyz "
+                    "must contain three finite values."
+                )
         for key in ("sand_amount_multiplier", "truck_yaw_deg"):
             if not math.isfinite(float(fixed_profile.get(key, float("nan")))):
                 raise SystemExit(
@@ -802,7 +840,24 @@ def main():
     # Do not inherit a stale EXCAVATOR_LOG_MODE=profile/debug from the shell.
     # Auto collection should default to the fastest data mode unless the launch
     # command explicitly requests diagnostics.
-    os.environ["EXCAVATOR_LOG_MODE"] = str(args.log_mode or "data")
+    selected_log_mode = str(args.log_mode or "data")
+    os.environ["EXCAVATOR_LOG_MODE"] = selected_log_mode
+    multi_scoop_mode = selected_log_mode in ("data_multi", "data_multi_recovery")
+    os.environ["EXCAVATOR_MULTI_SCOOP"] = "1" if multi_scoop_mode else "0"
+    os.environ["EXCAVATOR_MULTI_SCOOP_RECOVERY"] = (
+        "1" if selected_log_mode == "data_multi_recovery" else "0"
+    )
+    multi_scoop_min = max(1, int(args.scoops_per_episode)) if multi_scoop_mode else 1
+    multi_scoop_max = (
+        max(multi_scoop_min + 1, int(args.max_scoops_per_episode))
+        if multi_scoop_mode
+        else 1
+    )
+    os.environ["EXCAVATOR_MULTI_SCOOP_ADAPTIVE_STOP"] = "1" if multi_scoop_mode else "0"
+    os.environ["EXCAVATOR_MULTI_SCOOPS_MIN_PER_EPISODE"] = str(multi_scoop_min)
+    os.environ["EXCAVATOR_MULTI_SCOOPS_MAX_PER_EPISODE"] = str(multi_scoop_max)
+    # Compatibility alias for older runtime/tools that still read the fixed-count name.
+    os.environ["EXCAVATOR_MULTI_SCOOPS_PER_EPISODE"] = str(multi_scoop_min)
     os.environ["EXCAVATOR_BRIDGE_HOST"] = str(args.bridge_host)
     os.environ["EXCAVATOR_BRIDGE_PORT"] = str(args.bridge_port)
     os.environ["EXCAVATOR_FAST_SAMPLED_REPLAY"] = "1" if bool(args.fast_sampled_replay) else "0"
@@ -878,7 +933,7 @@ def main():
 
         rt = run_excavator_with_sand()
         try:
-            rt.set_log_mode(str(args.log_mode or "data"), announce=bool(args.log_mode))
+            rt.set_log_mode(selected_log_mode, announce=bool(args.log_mode))
         except Exception:
             pass
         wait_runtime_ready(simulation_app, rt, args.wait_runtime_seconds)

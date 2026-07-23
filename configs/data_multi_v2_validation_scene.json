@@ -1,0 +1,43 @@
+{
+  "schema": "excavator_fixed_scene_profile_v1",
+  "source": "local data_multi 3-of-3 physical success regression scene",
+  "robot_world_position_xyz": [
+    -6.95066,
+    2.23256,
+    1.243
+  ],
+  "robot_world_orientation_wxyz": [
+    1.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "sand_xy": [
+    -0.7725063562393188,
+    7.038151741027832
+  ],
+  "sand_amount_multiplier": 3.307702714837126,
+  "truck_translation_xyz": [
+    -6.533700942993164,
+    -4.0452880859375,
+    0.0
+  ],
+  "truck_yaw_deg": -81.78028869628906,
+  "unload_landing_xyz": [
+    -8.593329429626465,
+    -2.906538486480713,
+    4.222683429718018
+  ],
+  "selected_unload_landing_xyz": [
+    -7.314274787902832,
+    -3.802290916442871,
+    4.222683429718018
+  ],
+  "initial_pose_deg": {
+    "id": "data_multi_v2_validation",
+    "swing": -70.95496709800695,
+    "boom": 42.0,
+    "arm": -58.0,
+    "bucket": -18.0
+  }
+}

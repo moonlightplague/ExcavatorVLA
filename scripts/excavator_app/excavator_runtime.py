@@ -85,6 +85,57 @@ def env_int(name, default):
 NO_UI = env_bool("EXCAVATOR_NO_UI", False) or env_bool("EXCAVATOR_HEADLESS", False)
 _INITIAL_LOG_MODE_RAW = str(os.environ.get("EXCAVATOR_LOG_MODE", "data") or "data").strip().lower()
 _INITIAL_DEBUG_VISUALS_VISIBLE = _INITIAL_LOG_MODE_RAW in ("debug", "profile", "trace")
+MULTI_SCOOP_ENABLED = env_bool(
+    "EXCAVATOR_MULTI_SCOOP",
+    _INITIAL_LOG_MODE_RAW in ("data_multi", "data_multi_recovery"),
+)
+MULTI_SCOOP_RECOVERY_ENABLED = env_bool(
+    "EXCAVATOR_MULTI_SCOOP_RECOVERY",
+    _INITIAL_LOG_MODE_RAW == "data_multi_recovery",
+)
+MULTI_SCOOPS_MIN_PER_EPISODE = (
+    max(
+        1,
+        env_int(
+            "EXCAVATOR_MULTI_SCOOPS_MIN_PER_EPISODE",
+            env_int("EXCAVATOR_MULTI_SCOOPS_PER_EPISODE", 1),
+        ),
+    )
+    if MULTI_SCOOP_ENABLED
+    else 1
+)
+MULTI_SCOOPS_MAX_PER_EPISODE = (
+    max(
+        MULTI_SCOOPS_MIN_PER_EPISODE + 1,
+        env_int("EXCAVATOR_MULTI_SCOOPS_MAX_PER_EPISODE", 64),
+    )
+    if MULTI_SCOOP_ENABLED
+    else 1
+)
+MULTI_SCOOP_ADAPTIVE_STOP_ENABLED = env_bool(
+    "EXCAVATOR_MULTI_SCOOP_ADAPTIVE_STOP",
+    MULTI_SCOOP_ENABLED,
+)
+# Compatibility alias: older metadata/export code treats this as the required count.
+MULTI_SCOOPS_PER_EPISODE = MULTI_SCOOPS_MIN_PER_EPISODE
+MULTI_SCOOP_DATASET_RELEASE = "v2.0"
+MULTI_SCOOP_RECOVERY_CONTRACT = "multi_scoop_recovery_v1"
+MULTI_SCOOP_RECOVERY_CONTROLLED_SCOOP_INDEX = max(
+    1,
+    env_int("EXCAVATOR_MULTI_SCOOP_RECOVERY_SCOOP_INDEX", 1),
+)
+MULTI_SCOOP_RECOVERY_PERTURB_SECONDS = max(
+    0.3,
+    env_float("EXCAVATOR_MULTI_SCOOP_RECOVERY_PERTURB_SECONDS", 0.7),
+)
+DATASET_RECOVERY_TYPE_NAMES = [
+    "none",
+    "controlled_pose_offset",
+    "carry_posture",
+    "path_replan",
+    "underfill_redig",
+    "unload_alignment",
+]
 DATASET_SAMPLE_INTERVAL_DEFAULT = max(0.02, env_float("EXCAVATOR_DATASET_SAMPLE_INTERVAL", 0.10))
 AUTO_DATASET_REQUIRED_SOURCE_HZ = 10.0
 AUTO_DATASET_SOURCE_DT_TOLERANCE_S = 1.0e-4
@@ -522,6 +573,38 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_effort_missing_samples": 0,
     "dataset_max_abs_effort": 0.0,
     "dataset_phase_metrics": {},
+    "dataset_multi_scoop_enabled": bool(MULTI_SCOOP_ENABLED),
+    "dataset_scoops_target": int(MULTI_SCOOPS_PER_EPISODE),
+    "dataset_scoops_min": int(MULTI_SCOOPS_MIN_PER_EPISODE),
+    "dataset_scoops_max": int(MULTI_SCOOPS_MAX_PER_EPISODE),
+    "dataset_scoop_adaptive_stop_enabled": bool(MULTI_SCOOP_ADAPTIVE_STOP_ENABLED),
+    "dataset_scoop_stop_reason": "",
+    "dataset_scoop_stop_natural": False,
+    "dataset_scoop_stop_detail": {},
+    "multi_scoop_last_viability": {},
+    "multi_scoop_ranked_targets_all": [],
+    "multi_scoop_new_target_planning_exhausted": False,
+    "multi_scoop_new_target_planning_detail": {},
+    "dataset_scoop_index": 0,
+    "multi_scoop_planning_index": None,
+    "dataset_scoops_completed": 0,
+    "dataset_scoop_results": [],
+    "dataset_scoop_cycle_baseline": {},
+    "dataset_scoop_phase_metrics": {},
+    "dataset_scoop_target_history": [],
+    "dataset_recovery_mode_enabled": bool(MULTI_SCOOP_RECOVERY_ENABLED),
+    "dataset_recovery_active": False,
+    "dataset_recovery_type": "none",
+    "dataset_recovery_type_id": 0,
+    "dataset_recovery_attempt_index": 0,
+    "dataset_recovery_action_is_expert": True,
+    "dataset_recovery_action_loss_weight": 1.0,
+    "dataset_recovery_state": "inactive",
+    "dataset_recovery_events": [],
+    "dataset_recovery_count": 0,
+    "dataset_recovery_completed_count": 0,
+    "dataset_controlled_recovery_injected": False,
+    "dataset_controlled_recovery_completed": False,
     "sand_metrics_last_time": 0.0,
     "sand_metrics_last": None,
     "sand_snapshot_last_time": 0.0,
@@ -1062,6 +1145,18 @@ QUALITY_MIN_BUCKET_PARTICLES = 5
 QUALITY_MIN_DUMP_PARTICLES = 3
 QUALITY_MIN_SCORE = 55.0
 QUALITY_MAX_SPILL_RATIO = 0.65
+MULTI_SCOOP_MIN_SCORE = max(
+    QUALITY_MIN_SCORE,
+    env_float("EXCAVATOR_MULTI_SCOOP_MIN_SCORE", 70.0),
+)
+MULTI_SCOOP_MAX_SPILL_RATIO = min(
+    QUALITY_MAX_SPILL_RATIO,
+    max(0.0, env_float("EXCAVATOR_MULTI_SCOOP_MAX_SPILL_RATIO", 0.30)),
+)
+MULTI_SCOOP_TARGET_MIN_SPACING_M = max(
+    0.0,
+    env_float("EXCAVATOR_MULTI_SCOOP_TARGET_MIN_SPACING_M", 0.28),
+)
 AUTO_COLLECT_SAND_RESET_WARN_PARTICLE_COUNT = int(
     os.environ.get("EXCAVATOR_AUTO_COLLECT_SAND_RESET_WARN_PARTICLES", "800000") or 800000
 )
@@ -1439,6 +1534,9 @@ async def step_updates(n=1, trace_label=""):
                     emit_step_updates_edge_trace(trace_label, "update_ok", caller, frame_index, frames)
                 if profile:
                     update_ms += (time.perf_counter() - update_t) * 1000.0
+            scheduled_recorder = globals().get("dataset_record_scheduled_update_sample_async")
+            if callable(scheduled_recorder):
+                await scheduled_recorder()
     finally:
         if profile:
             try:
@@ -1471,7 +1569,7 @@ def safe_float(x, default=0.0):
     return default
 
 
-LOG_MODES = ["data", "debug", "profile"]
+LOG_MODES = ["data", "data_multi", "data_multi_recovery", "debug", "profile"]
 LOG_CYCLE_MODES = ["data", "debug", "profile"]
 LOG_MODE_ALIASES = {
     "": "data",
@@ -1618,7 +1716,7 @@ def debug_profile_enabled():
 
 
 def non_quiet_diagnostics_enabled():
-    return current_log_mode() != "data"
+    return current_log_mode() not in ("data", "data_multi", "data_multi_recovery")
 
 
 def execution_profile_enabled():
@@ -1876,7 +1974,7 @@ def should_emit_log(text, force=False):
 
     mode = current_log_mode()
     important = log_matches_any(text, LOG_IMPORTANT_TOKENS)
-    if mode == "data" and not important:
+    if mode in ("data", "data_multi", "data_multi_recovery") and not important:
         return False
 
     return True
@@ -4824,6 +4922,67 @@ def choose_unload_landing_point_for_flat_fill():
     safe_poly = unload_context_polygon_xy(ctx, safe_margin=margin)
     wall_top = float(bin_z_range[1]) if len(bin_z_range) >= 2 else GROUND_TOP_Z
     landing_z = wall_top + 0.06
+
+    fixed_landing = None
+    if isinstance(AUTO_SCENE_FIXED_PROFILE, dict):
+        fixed_landing = AUTO_SCENE_FIXED_PROFILE.get(
+            "selected_unload_landing_xyz"
+        )
+    if fixed_landing is not None:
+        landing = np.array(fixed_landing, dtype=np.float32).reshape(-1)[:3]
+        landing[2] = float(landing_z)
+        inside_safe_polygon = unload_xy_inside_context(
+            ctx,
+            landing[:2],
+            safe_margin=margin,
+        )
+        radius_status = unload_landing_radius_status(
+            landing[:2],
+            random_truck=None,
+            soft_margin=AUTO_SCENE_UNLOAD_LANDING_RADIUS_SOFT_MARGIN,
+        )
+        if inside_safe_polygon and bool(radius_status.get("ok", False)):
+            chosen = {
+                "landing": vec_list(landing, 3),
+                "cell_height": None,
+                "cell_count": None,
+                "center_norm": float(
+                    np.linalg.norm(
+                        (landing[:2] - bin_center[:2])
+                        / np.maximum(safe_half, 1.0e-4)
+                    )
+                ),
+                "motion_dist": None,
+                "radius_m": float(radius_status.get("radius_m", 0.0)),
+                "radius_ok": True,
+                "radius_window": [
+                    float(radius_status.get("min_m", 0.0)),
+                    float(radius_status.get("max_m", 0.0)),
+                ],
+                "radius_window_source": str(
+                    radius_status.get("source", "")
+                ),
+                "score": 0.0,
+                "source": "fixed_scene_selected_unload_landing",
+            }
+            STATE["active_unload_landing_point"] = landing.copy()
+            STATE["last_auto_unload_scores"] = [chosen]
+            info_print(
+                "[AUTO UNLOAD SELECT]",
+                f"landing={vec_list(landing, 3)}",
+                "source=fixed_scene_selected_unload_landing",
+            )
+            return landing
+        info_print(
+            "[WARN] [AUTO UNLOAD SELECT]",
+            "fixed landing rejected; falling back to flat-fill selection",
+            f"landing={vec_list(landing, 3)}",
+            f"inside_safe_polygon={inside_safe_polygon}",
+            f"radius_ok={radius_status.get('ok')}",
+            f"radius={fmt_optional(radius_status.get('radius_m'))}",
+            f"window={[radius_status.get('min_m'), radius_status.get('max_m')]}",
+        )
+
     points = sand_particle_positions()
     grid = max(3, int(AUTO_UNLOAD_GRID_SIZE))
     if safe_poly is not None:
@@ -7538,7 +7697,11 @@ async def dataset_camera_wait_for_scheduled_capture(sample_index):
             if pending_active and raw_pending:
                 await step_updates(
                     1,
-                    trace_label=f"dataset_camera_paused_render:{int(sample_index)}:{paused_render_updates + 1}",
+                    trace_label=(
+                        f"dataset_camera_paused_render:{int(sample_index)}:{paused_render_updates + 1}"
+                        if debug_profile_enabled()
+                        else ""
+                    ),
                 )
                 paused_render_updates += 1
                 STATE["dataset_camera_paused_render_updates"] = int(
@@ -7992,7 +8155,33 @@ def auto_scene_sand_amount_range():
 def auto_dataset_config_snapshot():
     sand_amount_range = auto_scene_sand_amount_range()
     return {
-        "schema": AUTO_COLLECT_SCHEMA,
+        "schema": (
+            "excavator_auto_multi_scoop_v2.0"
+            if multi_scoop_mode_enabled()
+            else AUTO_COLLECT_SCHEMA
+        ),
+        "dataset_release": (
+            MULTI_SCOOP_DATASET_RELEASE
+            if multi_scoop_mode_enabled()
+            else "v1.x_single_scoop"
+        ),
+        "episode_mode": (
+            "multi_scoop" if multi_scoop_mode_enabled() else "single_scoop"
+        ),
+        "recovery_mode": (
+            "controlled_recovery"
+            if multi_scoop_recovery_mode_enabled()
+            else "expert_only"
+        ),
+        "recovery_contract": (
+            MULTI_SCOOP_RECOVERY_CONTRACT
+            if multi_scoop_recovery_mode_enabled()
+            else ""
+        ),
+        "scoops_per_episode": int(multi_scoop_target_count()),
+        "scoops_min_per_episode": int(multi_scoop_target_count()),
+        "scoops_max_per_episode": int(multi_scoop_max_count()),
+        "adaptive_scoop_stop": bool(multi_scoop_adaptive_stop_enabled()),
         "trajectory_format": DATASET_TRAJECTORY_FORMAT,
         "dataset_root": AUTO_COLLECT_DATASET_ROOT,
         "default_count": AUTO_COLLECT_DEFAULT_COUNT,
@@ -12356,6 +12545,11 @@ def dataset_record_sample(
         else:
             joint_force_obs = None
         observation_effort = effort_obs.get("observation.effort") if isinstance(effort_obs, dict) else None
+        recovery_annotation = dataset_recovery_annotation_for_sample(
+            phase=phase,
+            label=label,
+            control_mode=control_mode,
+        )
         mark_span("dataset_record_sample.features", features_t, threshold_ms=4.0)
 
         STATE["dataset_effort_sample_count"] = int(STATE.get("dataset_effort_sample_count", 0) or 0) + 1
@@ -12388,6 +12582,11 @@ def dataset_record_sample(
             "t.wall": float(wall_now) - episode_start,
             "metrics.mode": metrics_mode_text,
             "task": str(STATE.get("dataset_task_text", "Dig soil from the marked area and dump it into the target container.")),
+            "observation.scoop_index": int(STATE.get("dataset_scoop_index", 0) or 0),
+            "observation.scoops_target": int(STATE.get("dataset_scoops_target", 1) or 1),
+            "observation.scoops_min": int(STATE.get("dataset_scoops_min", 1) or 1),
+            "observation.scoops_max": int(STATE.get("dataset_scoops_max", 1) or 1),
+            "observation.scoops_completed": int(STATE.get("dataset_scoops_completed", 0) or 0),
             "phase": str(phase),
             "phase.index": phase_features["index"],
             "observation.stage_current_id": int(phase_features["index"]),
@@ -12417,6 +12616,7 @@ def dataset_record_sample(
             "bucket.pour": vec_list(bucket_pour_pos(), 3),
             "sand": compact_bucket_load_metrics(bucket_metrics),
         }
+        sample.update(recovery_annotation)
         if debug_extra:
             sample.update(
                 {
@@ -12451,6 +12651,10 @@ def dataset_record_sample(
                     "t_wall": float(wall_now) - episode_start,
                     "phase": str(phase),
                     "label": str(label),
+                    "scoop_index": int(STATE.get("dataset_scoop_index", 0) or 0),
+                    "scoops_target": int(STATE.get("dataset_scoops_target", 1) or 1),
+                    "scoops_min": int(STATE.get("dataset_scoops_min", 1) or 1),
+                    "scoops_max": int(STATE.get("dataset_scoops_max", 1) or 1),
                     "sand": compact_bucket_load_metrics(bucket_metrics),
                 },
             )
@@ -12720,6 +12924,32 @@ async def dataset_record_wait_sample_async(phase, label="", q_cmd=None):
             info_print("[WARN] dataset wait sample failed:", type(e).__name__, e)
 
 
+async def dataset_record_scheduled_update_sample_async():
+    """Record strict 10 Hz data from the single Isaac update clock."""
+    if not bool(DATASET_STRICT_SAMPLE_WAIT):
+        return False
+    if bool(STATE.get("dataset_camera_pose_sync_active", False)):
+        return False
+    if bool(STATE.get("dataset_global_sample_active", False)):
+        return False
+    if not dataset_record_sample_due():
+        return False
+
+    STATE["dataset_global_sample_active"] = True
+    try:
+        phase = str(STATE.get("last_action_mode", "") or "wait")
+        q_cmd = CTRL.q_cmd.copy()
+        return bool(
+            await dataset_record_sample_async(
+                phase,
+                q_cmd=q_cmd,
+                label=phase,
+            )
+        )
+    finally:
+        STATE["dataset_global_sample_active"] = False
+
+
 def dataset_record_event(event, detail="", data=None):
     if not bool(STATE.get("dataset_recording", False)):
         return
@@ -12731,7 +12961,28 @@ def dataset_record_event(event, detail="", data=None):
             "event": str(event),
             "detail": str(detail),
             "active_task": str(STATE.get("active_task_name", "idle")),
-            "schema": AUTO_COLLECT_SCHEMA,
+            "schema": (
+                "excavator_auto_multi_scoop_v2.0"
+                if multi_scoop_mode_enabled()
+                else AUTO_COLLECT_SCHEMA
+            ),
+            "dataset_release": (
+                MULTI_SCOOP_DATASET_RELEASE
+                if multi_scoop_mode_enabled()
+                else "v1.x_single_scoop"
+            ),
+            "episode_mode": (
+                "multi_scoop" if multi_scoop_mode_enabled() else "single_scoop"
+            ),
+            "recovery_mode": (
+                "controlled_recovery"
+                if multi_scoop_recovery_mode_enabled()
+                else "expert_only"
+            ),
+            "scoops_per_episode": int(multi_scoop_target_count()),
+            "scoops_min_per_episode": int(multi_scoop_target_count()),
+            "scoops_max_per_episode": int(multi_scoop_max_count()),
+            "adaptive_scoop_stop": bool(multi_scoop_adaptive_stop_enabled()),
             "state_schema_version": vla_observation_contract.SCHEMA_VERSION,
         }
         if data is not None:
@@ -12760,6 +13011,12 @@ def dataset_record_stage_boundary_sample(stage_name, result, q_real=None):
     if not bool(STATE.get("dataset_recording", False)):
         return
     if not bool(STATE.get("dataset_stage_boundary_samples", True)):
+        return
+    if (
+        DATASET_USE_SIM_TIME
+        and DATASET_STRICT_SAMPLE_WAIT
+        and bool(STATE.get("auto_collect_active", False))
+    ):
         return
     result_text = str(result or "")
     if result_text not in {"start", "done", "failed"}:
@@ -12886,6 +13143,16 @@ def ensure_auto_collect_run_dir():
                 "observation.state.bucket_fill_fraction": "source-tracked bucket particles normalized by the versioned 6400-particle capacity",
                 "observation.effort": DATASET_EFFORT_NAMES,
                 "observation.stage_current_id": "categorical 0..9 stage supervision; not part of the continuous 28D policy input",
+                "observation.scoop_index": "zero-based consecutive scoop index within the episode",
+                "observation.scoops_target": "compatibility alias for the minimum successful scoop count",
+                "observation.scoops_min": "minimum successful scoop count before natural exhaustion may end the episode",
+                "observation.scoops_max": "technical runaway guard; reaching it is not successful completion",
+                "observation.scoops_completed": "number of completed scoop-and-dump cycles before this sample",
+                "observation.recovery_active": "1 while a supervised recovery is being perturbed or corrected",
+                "observation.recovery_type_id": DATASET_RECOVERY_TYPE_NAMES,
+                "observation.recovery_attempt_index": "monotonic recovery attempt index within the episode",
+                "action_is_expert": "1 for expert actions; 0 for deliberately injected perturbation actions",
+                "action_loss_weight": "training action-loss mask; perturbation actions are 0 and expert correction actions are 1",
                 "obs.joint_force_torque": "optional measured per-joint [Fx,Fy,Fz,Tx,Ty,Tz] diagnostics",
                 "action": DATASET_ACTION_NAMES,
                 "task": "episode-level and per-sample natural language task string",
@@ -12895,6 +13162,16 @@ def ensure_auto_collect_run_dir():
                 "observation.state": DATASET_STATE_NAMES,
                 "observation.effort": DATASET_EFFORT_NAMES,
                 "observation.effort_meta": "availability/source/reason for measured joint efforts",
+                "observation.scoop_index": "zero-based consecutive scoop index",
+                "observation.scoops_target": "compatibility alias for episode minimum scoop count",
+                "observation.scoops_min": "episode minimum scoop count",
+                "observation.scoops_max": "episode technical maximum guard",
+                "observation.scoops_completed": "completed scoop count",
+                "observation.recovery_active": "binary supervised recovery state",
+                "observation.recovery_type_id": DATASET_RECOVERY_TYPE_NAMES,
+                "observation.recovery_attempt_index": "monotonic episode-local recovery attempt",
+                "action_is_expert": "binary expert-action label",
+                "action_loss_weight": "float action-loss weight in [0,1]",
                 "observation.images.0": "relative path to RGB image",
                 "observation.images.1": "relative path to RGB image",
                 "observation.images.2": "relative path to RGB image",
@@ -13093,6 +13370,25 @@ def auto_collect_write_run_summary():
             "updated_at": time.time(),
             "planner_version": PLANNER_VERSION,
             "quality_gate_version": QUALITY_GATE_VERSION,
+            "dataset_release": (
+                MULTI_SCOOP_DATASET_RELEASE
+                if multi_scoop_mode_enabled()
+                else "v1.x_single_scoop"
+            ),
+            "episode_mode": (
+                "multi_scoop" if multi_scoop_mode_enabled() else "single_scoop"
+            ),
+            "recovery_mode": (
+                "controlled_recovery"
+                if multi_scoop_recovery_mode_enabled()
+                else "expert_only"
+            ),
+            "recovery_contract": (
+                MULTI_SCOOP_RECOVERY_CONTRACT
+                if multi_scoop_recovery_mode_enabled()
+                else ""
+            ),
+            "scoops_per_episode": int(multi_scoop_target_count()),
             "config_hash": current_config_hash(),
             "requested": int(STATE.get("auto_collect_requested", 0)),
             "max_attempts_requested": int(STATE.get("auto_collect_max_attempts_requested", 0)),
@@ -13594,7 +13890,7 @@ def auto_collect_episode_metrics():
         "support_clearance": support_clearance_detail(),
         "freeze_count": int(STATE.get("dataset_episode_freezes", 0)),
         "samples": int(STATE.get("dataset_samples", 0)) - int(STATE.get("dataset_episode_sample_start", 0)),
-        "dig_plan_step_index": int(STATE.get("dig_plan_step_index", 0)),
+        "dig_plan_step_index": int(STATE.get("dig_plan_step_index", 0) or 0),
         "max_bucket_from_pile_particles": int(STATE.get("dataset_max_bucket_from_pile_particles", 0)),
         "lift_bucket_from_pile_particles": int(STATE.get("dataset_lift_bucket_from_pile_particles", 0)),
         "final_bucket_from_pile_particles": int(STATE.get("dataset_final_bucket_from_pile_particles", 0)),
@@ -14934,7 +15230,45 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
     STATE["dataset_camera_dropped_incomplete_samples"] = 0
     STATE["dataset_camera_black_rejected"] = 0
     STATE["dataset_camera_warmup_status"] = {}
-    STATE["dataset_task_text"] = "Dig soil from the marked area and dump it into the target container."
+    multi_scoop = multi_scoop_mode_enabled()
+    scoops_target = multi_scoop_target_count()
+    scoops_max = multi_scoop_max_count()
+    STATE["dataset_multi_scoop_enabled"] = bool(multi_scoop)
+    STATE["dataset_scoops_target"] = int(scoops_target)
+    STATE["dataset_scoops_min"] = int(scoops_target)
+    STATE["dataset_scoops_max"] = int(scoops_max)
+    STATE["dataset_scoop_adaptive_stop_enabled"] = bool(
+        multi_scoop and MULTI_SCOOP_ADAPTIVE_STOP_ENABLED
+    )
+    STATE["dataset_scoop_stop_reason"] = ""
+    STATE["dataset_scoop_stop_natural"] = False
+    STATE["dataset_scoop_stop_detail"] = {}
+    STATE["multi_scoop_last_viability"] = {}
+    STATE["multi_scoop_ranked_targets_all"] = []
+    STATE["multi_scoop_new_target_planning_exhausted"] = False
+    STATE["multi_scoop_new_target_planning_detail"] = {}
+    STATE["dataset_scoop_index"] = 0
+    STATE["multi_scoop_planning_index"] = None
+    STATE["dataset_scoops_completed"] = 0
+    STATE["dataset_scoop_results"] = []
+    STATE["dataset_scoop_cycle_baseline"] = {}
+    STATE["dataset_scoop_phase_metrics"] = {}
+    STATE["dataset_scoop_target_history"] = [vec_list(target, 3)]
+    STATE["dataset_recovery_mode_enabled"] = bool(
+        MULTI_SCOOP_RECOVERY_ENABLED or current_log_mode() == "data_multi_recovery"
+    )
+    STATE["dataset_recovery_events"] = []
+    STATE["dataset_recovery_count"] = 0
+    STATE["dataset_recovery_completed_count"] = 0
+    STATE["dataset_recovery_attempt_index"] = 0
+    STATE["dataset_controlled_recovery_injected"] = False
+    STATE["dataset_controlled_recovery_completed"] = False
+    dataset_clear_recovery_annotation()
+    STATE["dataset_task_text"] = (
+        multi_scoop_generic_task_text(scoops_target)
+        if multi_scoop
+        else "Dig soil from the marked area and dump it into the target container."
+    )
     STATE["last_execution_failure_reason"] = ""
     STATE["sand_metrics_last_time"] = 0.0
     STATE["sand_metrics_last"] = None
@@ -15041,7 +15375,33 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
         "status": "running",
         "created_at": STATE["dataset_episode_start_time"],
         "created_at_simulation": float(STATE["dataset_episode_start_sim_time"]),
-        "schema": AUTO_COLLECT_SCHEMA,
+        "schema": (
+            "excavator_auto_multi_scoop_v2.0"
+            if multi_scoop
+            else AUTO_COLLECT_SCHEMA
+        ),
+        "dataset_release": (
+            MULTI_SCOOP_DATASET_RELEASE if multi_scoop else "v1.x_single_scoop"
+        ),
+        "episode_mode": "multi_scoop" if multi_scoop else "single_scoop",
+        "recovery_mode": (
+            "controlled_recovery"
+            if multi_scoop_recovery_mode_enabled()
+            else "expert_only"
+        ),
+        "recovery_contract": (
+            MULTI_SCOOP_RECOVERY_CONTRACT
+            if multi_scoop_recovery_mode_enabled()
+            else ""
+        ),
+        "scoops_target": int(scoops_target),
+        "scoops_min": int(scoops_target),
+        "scoops_max": int(scoops_max),
+        "adaptive_scoop_stop": bool(
+            multi_scoop and MULTI_SCOOP_ADAPTIVE_STOP_ENABLED
+        ),
+        "scoops_completed": 0,
+        "scoop_results": [],
         "state_schema_version": vla_observation_contract.SCHEMA_VERSION,
         "planner_version": PLANNER_VERSION,
         "quality_gate_version": QUALITY_GATE_VERSION,
@@ -15049,7 +15409,7 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
         "episode_seed": episode_seed,
         "sand_seed": sand_seed,
         "candidate_sampling_seed": candidate_sampling_seed,
-        "task": "Dig soil from the marked area and dump it into the target container.",
+        "task": str(STATE["dataset_task_text"]),
         "trajectory_format": DATASET_TRAJECTORY_FORMAT,
         "camera_observations": dataset_camera_episode_metadata(),
         "camera_capture_policy": {
@@ -15100,7 +15460,11 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
         "plan_candidates": candidates_compact,
         "plan_attempts": plan_attempts,
         "plan": auto_collect_plan_summary(seq),
-        "trainable_rule": "full_dig_lift_dump_only",
+        "trainable_rule": (
+            "minimum_scoops_complete_then_natural_no_effective_target_stop"
+            if multi_scoop
+            else "full_dig_lift_dump_only"
+        ),
         "state_names": DATASET_STATE_NAMES,
         "action_names": DATASET_ACTION_NAMES,
         "effort_names": DATASET_EFFORT_NAMES,
@@ -15179,6 +15543,11 @@ def auto_collect_finish_episode(meta, success, reason):
     now = time.time()
     finished_simulation = dataset_simulation_time_seconds()
     dataset_writer_flush("episode_finish")
+    multi_summary = (
+        multi_scoop_apply_episode_aggregate()
+        if bool(meta.get("episode_mode") == "multi_scoop" or multi_scoop_mode_enabled())
+        else {}
+    )
     execution_success = bool(success)
     reason = str(reason)
     source_sampling_audit = dataset_episode_source_sampling_audit()
@@ -15215,6 +15584,42 @@ def auto_collect_finish_episode(meta, success, reason):
     meta["failure_reason"] = "" if success else score_report.get("failure_reason", reason)
     meta["warning_reason"] = score_report.get("warning_reason", "")
     meta["quality_warnings"] = score_report.get("quality_warnings", [])
+    if multi_summary:
+        meta["scoops_target"] = int(multi_summary.get("scoops_target", 1) or 1)
+        meta["scoops_min"] = int(multi_summary.get("scoops_min", 1) or 1)
+        meta["scoops_max"] = int(multi_summary.get("scoops_max", 1) or 1)
+        meta["scoops_completed"] = int(multi_summary.get("scoops_completed", 0) or 0)
+        meta["adaptive_scoop_stop"] = bool(
+            multi_summary.get("adaptive_scoop_stop", False)
+        )
+        meta["scoop_stop_reason"] = str(
+            multi_summary.get("scoop_stop_reason", "") or ""
+        )
+        meta["scoop_stop_natural"] = bool(
+            multi_summary.get("scoop_stop_natural", False)
+        )
+        meta["scoop_stop_detail"] = multi_summary.get("scoop_stop_detail", {})
+        meta["all_scoops_success"] = bool(multi_summary.get("all_scoops_success", False))
+        meta["scoop_results"] = multi_summary.get("scoop_results", [])
+    meta["recovery_summary"] = {
+        "mode_enabled": bool(multi_scoop_recovery_mode_enabled()),
+        "contract": (
+            MULTI_SCOOP_RECOVERY_CONTRACT
+            if multi_scoop_recovery_mode_enabled()
+            else ""
+        ),
+        "recovery_count": int(STATE.get("dataset_recovery_count", 0) or 0),
+        "completed_count": int(
+            STATE.get("dataset_recovery_completed_count", 0) or 0
+        ),
+        "controlled_injected": bool(
+            STATE.get("dataset_controlled_recovery_injected", False)
+        ),
+        "controlled_completed": bool(
+            STATE.get("dataset_controlled_recovery_completed", False)
+        ),
+        "events": list(STATE.get("dataset_recovery_events", []) or []),
+    }
     meta["score_summary"] = {
         "score": score_report.get("score"),
         "success": score_report.get("success"),
@@ -15281,6 +15686,19 @@ def auto_collect_finish_episode(meta, success, reason):
         "unload_landing_xyz": meta.get("unload_landing_xyz"),
         "unload_release_xyz": meta.get("unload_release_xyz"),
         "initial_pose_id": meta.get("initial_pose_id", ""),
+        "dataset_release": meta.get("dataset_release", ""),
+        "episode_mode": meta.get("episode_mode", "single_scoop"),
+        "scoops_target": int(meta.get("scoops_target", 1) or 1),
+        "scoops_min": int(meta.get("scoops_min", meta.get("scoops_target", 1)) or 1),
+        "scoops_max": int(meta.get("scoops_max", meta.get("scoops_target", 1)) or 1),
+        "scoops_completed": int(meta.get("scoops_completed", 0) or 0),
+        "adaptive_scoop_stop": bool(meta.get("adaptive_scoop_stop", False)),
+        "scoop_stop_reason": str(meta.get("scoop_stop_reason", "") or ""),
+        "scoop_stop_natural": bool(meta.get("scoop_stop_natural", False)),
+        "all_scoops_success": bool(meta.get("all_scoops_success", False)),
+        "scoop_results": meta.get("scoop_results", []),
+        "recovery_mode": meta.get("recovery_mode", "expert_only"),
+        "recovery_summary": meta.get("recovery_summary", {}),
         "q_initial_deg": meta.get("q_initial_deg"),
         "scene_randomization": meta.get("scene_randomization", {}),
         "shared_plan_id": (meta.get("shared_dig_plan") or {}).get("plan_id", ""),
@@ -15955,13 +16373,29 @@ def auto_collect_rank_dig_targets(attempt_index):
                 )
                 rows.append(row)
 
+    later_multi_scoop = bool(
+        multi_scoop_mode_enabled()
+        and active_multi_scoop_index_for_planning() > 0
+    )
     rows.sort(
         key=lambda row: (
             int(row.get("ring_index", 999)),
             0 if bool(row.get("planned", False)) else 1,
-            -float(row.get("score", -1.0e9)),
-            float(row.get("center_distance", 1.0e9)),
-            -float(row.get("target_depth", 0.0) or 0.0),
+            (
+                -float(row.get("plan_surface_z", GROUND_TOP_Z) or GROUND_TOP_Z)
+                if later_multi_scoop
+                else -float(row.get("score", -1.0e9))
+            ),
+            (
+                abs(float(row.get("depth_candidate", 0.22) or 0.22) - 0.22)
+                if later_multi_scoop
+                else float(row.get("center_distance", 1.0e9))
+            ),
+            (
+                -float(row.get("score", -1.0e9))
+                if later_multi_scoop
+                else -float(row.get("target_depth", 0.0) or 0.0)
+            ),
         )
     )
     usable = [row for row in rows if bool(row.get("planned", False))]
@@ -15987,7 +16421,22 @@ def auto_collect_rank_dig_targets(attempt_index):
     per_ring_limit = max(1, int(AUTO_DIG_FULL_PLAN_TOPK_PER_RING))
     for ring_index in sorted({int(row.get("ring_index", 999)) for row in usable}):
         ring_rows = [row for row in usable if int(row.get("ring_index", 999)) == ring_index]
-        selected_usable.extend(ring_rows[:per_ring_limit])
+        # Prefer spatially distinct targets before adding alternate depths at the
+        # same XY. Otherwise a ring's Top-K is consumed by depth variants and
+        # adaptive multi-scoop collection appears exhausted after only a few XYs.
+        unique_xy_rows = []
+        alternate_depth_rows = []
+        seen_angle_indices = set()
+        for row in ring_rows:
+            angle_index = int(row.get("angle_index", 0))
+            if angle_index in seen_angle_indices:
+                alternate_depth_rows.append(row)
+                continue
+            seen_angle_indices.add(angle_index)
+            unique_xy_rows.append(row)
+        selected_usable.extend(
+            (unique_xy_rows + alternate_depth_rows)[:per_ring_limit]
+        )
     info_print(
         "[AUTO DIG TARGET SELECT]",
         f"candidates={len(rows)}",
@@ -18577,8 +19026,745 @@ async def auto_collect_prepare_environment(initial_info=None, attempt_index=None
     return True
 
 
-async def auto_collect_find_plan(attempt_index):
-    return await auto_dataset_collect.find_plan(runtime_module(), attempt_index)
+async def auto_collect_find_plan(attempt_index, ranked_targets=None):
+    return await auto_dataset_collect.find_plan(
+        runtime_module(),
+        attempt_index,
+        ranked_targets=ranked_targets,
+    )
+
+
+def multi_scoop_mode_enabled():
+    return bool(
+        STATE.get("dataset_multi_scoop_enabled", MULTI_SCOOP_ENABLED)
+        or current_log_mode() in ("data_multi", "data_multi_recovery")
+    )
+
+
+def multi_scoop_recovery_mode_enabled():
+    return bool(
+        STATE.get("dataset_recovery_mode_enabled", MULTI_SCOOP_RECOVERY_ENABLED)
+        or current_log_mode() == "data_multi_recovery"
+    )
+
+
+def dataset_recovery_type_id(recovery_type):
+    recovery_type = str(recovery_type or "none")
+    try:
+        return int(DATASET_RECOVERY_TYPE_NAMES.index(recovery_type))
+    except ValueError:
+        return 0
+
+
+def dataset_recovery_register_event(recovery_type, source="", state="correcting", data=None):
+    recovery_type = str(recovery_type or "none")
+    attempt_index = int(STATE.get("dataset_recovery_attempt_index", 0) or 0) + 1
+    STATE["dataset_recovery_attempt_index"] = attempt_index
+    STATE["dataset_recovery_count"] = int(STATE.get("dataset_recovery_count", 0) or 0) + 1
+    event = {
+        "attempt_index": attempt_index,
+        "type": recovery_type,
+        "type_id": dataset_recovery_type_id(recovery_type),
+        "state": str(state or "correcting"),
+        "source": str(source or ""),
+        "scoop_index": int(STATE.get("dataset_scoop_index", 0) or 0),
+        "sample_index": int(STATE.get("dataset_samples", 0) or 0)
+        - int(STATE.get("dataset_episode_sample_start", 0) or 0),
+        "simulation_time": float(dataset_simulation_time_seconds()),
+    }
+    if isinstance(data, dict) and data:
+        event["data"] = dict(data)
+    events = list(STATE.get("dataset_recovery_events", []) or [])
+    events.append(event)
+    STATE["dataset_recovery_events"] = events
+    dataset_record_event(
+        "recovery_event",
+        (
+            f"type={recovery_type}; attempt={attempt_index}; "
+            f"state={event['state']}; source={event['source']}"
+        ),
+        data=event,
+    )
+    return attempt_index
+
+
+def dataset_set_recovery_annotation(
+    recovery_type,
+    state,
+    action_is_expert,
+    action_loss_weight,
+    attempt_index=None,
+):
+    recovery_type = str(recovery_type or "none")
+    STATE["dataset_recovery_active"] = recovery_type != "none"
+    STATE["dataset_recovery_type"] = recovery_type
+    STATE["dataset_recovery_type_id"] = dataset_recovery_type_id(recovery_type)
+    STATE["dataset_recovery_state"] = str(state or "inactive")
+    STATE["dataset_recovery_action_is_expert"] = bool(action_is_expert)
+    STATE["dataset_recovery_action_loss_weight"] = max(
+        0.0,
+        min(1.0, float(action_loss_weight)),
+    )
+    if attempt_index is not None:
+        STATE["dataset_recovery_attempt_index"] = int(attempt_index)
+
+
+def dataset_clear_recovery_annotation():
+    dataset_set_recovery_annotation(
+        "none",
+        "inactive",
+        action_is_expert=True,
+        action_loss_weight=1.0,
+    )
+
+
+def dataset_recovery_annotation_for_sample(phase="", label="", control_mode=""):
+    text = " ".join(
+        [
+            str(phase or ""),
+            str(label or ""),
+            str(control_mode or ""),
+        ]
+    ).lower()
+    runtime_carry_recovery = bool(
+        "runtime_recovery" in text or "final_carry_recovery" in text
+    )
+    if runtime_carry_recovery:
+        recovery_type = "carry_posture"
+        active = True
+        state = "correcting"
+        action_is_expert = True
+        action_loss_weight = 1.0
+    elif bool(STATE.get("dataset_recovery_active", False)):
+        recovery_type = str(STATE.get("dataset_recovery_type", "none") or "none")
+        active = recovery_type != "none"
+        state = str(STATE.get("dataset_recovery_state", "correcting") or "correcting")
+        action_is_expert = bool(STATE.get("dataset_recovery_action_is_expert", True))
+        action_loss_weight = float(
+            STATE.get("dataset_recovery_action_loss_weight", 1.0) or 0.0
+        )
+    else:
+        recovery_type = "none"
+        active = False
+        state = "inactive"
+        action_is_expert = True
+        action_loss_weight = 1.0
+    return {
+        "observation.recovery_active": int(bool(active)),
+        "observation.recovery_type_id": int(dataset_recovery_type_id(recovery_type)),
+        "observation.recovery_attempt_index": int(
+            STATE.get("dataset_recovery_attempt_index", 0) or 0
+        ),
+        "action_is_expert": int(bool(action_is_expert)),
+        "action_loss_weight": max(0.0, min(1.0, float(action_loss_weight))),
+        "recovery.type": recovery_type,
+        "recovery.state": state,
+    }
+
+
+async def multi_scoop_inject_controlled_recovery(scoop_index):
+    scoop_index = max(0, int(scoop_index))
+    if not multi_scoop_recovery_mode_enabled():
+        return True
+    if scoop_index != int(MULTI_SCOOP_RECOVERY_CONTROLLED_SCOOP_INDEX):
+        return True
+    if bool(STATE.get("dataset_controlled_recovery_injected", False)):
+        return True
+
+    try:
+        q_start = q_real_near_command(get_real_joint_positions(), CTRL.q_cmd)
+    except Exception:
+        q_start = np.array(CTRL.q_cmd, dtype=np.float32).copy()
+    boom_idx = CTRL.name_to_idx.get("boom", 1)
+    arm_idx = CTRL.name_to_idx.get("arm", 2)
+    bucket_idx = CTRL.name_to_idx.get("bucket", 3)
+    candidate_offsets_deg = [
+        (1.0, -1.0, 10.0),
+        (0.5, -0.5, -8.0),
+        (1.5, -1.0, 6.0),
+    ]
+    selected = None
+    rejected = []
+    for boom_deg, arm_deg, bucket_deg in candidate_offsets_deg:
+        candidate = np.array(q_start, dtype=np.float32).copy()
+        candidate[boom_idx] += math.radians(float(boom_deg))
+        candidate[arm_idx] += math.radians(float(arm_deg))
+        candidate[bucket_idx] += math.radians(float(bucket_deg))
+        candidate = CTRL.clip_action_limits(candidate)
+        if float(np.max(np.abs(candidate - q_start))) < math.radians(2.0):
+            rejected.append({"offset_deg": [boom_deg, arm_deg, bucket_deg], "reason": "clipped_no_motion"})
+            continue
+        path_ok, path_kind, path_reason, path_sample, _path_report = path_segment_check(
+            q_start,
+            candidate,
+            "pre_dig",
+            samples=8,
+        )
+        if path_ok:
+            selected = candidate
+            break
+        rejected.append(
+            {
+                "offset_deg": [boom_deg, arm_deg, bucket_deg],
+                "reason": f"{path_kind}:{path_reason}",
+                "sample": int(path_sample),
+            }
+        )
+    if selected is None:
+        dataset_record_event(
+            "controlled_recovery_injection_failed",
+            f"scoop_index={scoop_index}; no_path_valid_candidate",
+            data={"rejected": rejected},
+        )
+        return False
+
+    attempt_index = dataset_recovery_register_event(
+        "controlled_pose_offset",
+        source="path_validated_unloaded_pose_offset",
+        state="perturbing",
+        data={
+            "q_start_deg": q_deg_values(q_start, wrap_swing_for_display=True),
+            "q_target_deg": q_deg_values(selected, wrap_swing_for_display=True),
+            "rejected": rejected,
+        },
+    )
+    dataset_set_recovery_annotation(
+        "controlled_pose_offset",
+        "perturbing",
+        action_is_expert=False,
+        action_loss_weight=0.0,
+        attempt_index=attempt_index,
+    )
+    ok = await move_to_profile(
+        selected,
+        seconds=float(MULTI_SCOOP_RECOVERY_PERTURB_SECONDS),
+        label="controlled_recovery_perturbation",
+        task_id=None,
+        mode="pre_dig",
+    )
+    if not ok:
+        dataset_clear_recovery_annotation()
+        return False
+    STATE["dataset_controlled_recovery_injected"] = True
+    dataset_set_recovery_annotation(
+        "controlled_pose_offset",
+        "correcting",
+        action_is_expert=True,
+        action_loss_weight=1.0,
+        attempt_index=attempt_index,
+    )
+    dataset_record_event(
+        "controlled_recovery_correction_start",
+        f"scoop_index={scoop_index}; attempt={attempt_index}; planner_restarts_from_actual_pose",
+    )
+    return True
+
+
+def multi_scoop_complete_controlled_recovery_if_active(stage_name):
+    if not bool(STATE.get("dataset_recovery_active", False)):
+        return False
+    if str(STATE.get("dataset_recovery_type", "")) != "controlled_pose_offset":
+        return False
+    if str(STATE.get("dataset_recovery_state", "")) != "correcting":
+        return False
+    if dig_plan_semantic_phase_name(stage_name) != "pre_dig":
+        return False
+    STATE["dataset_controlled_recovery_completed"] = True
+    STATE["dataset_recovery_completed_count"] = int(
+        STATE.get("dataset_recovery_completed_count", 0) or 0
+    ) + 1
+    dataset_record_event(
+        "controlled_recovery_complete",
+        (
+            f"scoop_index={int(STATE.get('dataset_scoop_index', 0) or 0)}; "
+            f"attempt={int(STATE.get('dataset_recovery_attempt_index', 0) or 0)}"
+        ),
+    )
+    dataset_clear_recovery_annotation()
+    return True
+
+
+def multi_scoop_target_count():
+    if not multi_scoop_mode_enabled():
+        return 1
+    return max(
+        1,
+        int(
+            STATE.get("dataset_scoops_min", MULTI_SCOOPS_MIN_PER_EPISODE)
+            or MULTI_SCOOPS_MIN_PER_EPISODE
+        ),
+    )
+
+
+def multi_scoop_max_count():
+    if not multi_scoop_mode_enabled():
+        return 1
+    return max(
+        multi_scoop_target_count() + 1,
+        int(
+            STATE.get("dataset_scoops_max", MULTI_SCOOPS_MAX_PER_EPISODE)
+            or MULTI_SCOOPS_MAX_PER_EPISODE
+        ),
+    )
+
+
+def multi_scoop_adaptive_stop_enabled():
+    return bool(
+        multi_scoop_mode_enabled()
+        and STATE.get(
+            "dataset_scoop_adaptive_stop_enabled",
+            MULTI_SCOOP_ADAPTIVE_STOP_ENABLED,
+        )
+    )
+
+
+def active_multi_scoop_index_for_planning():
+    planning_index = STATE.get("multi_scoop_planning_index")
+    if planning_index is not None:
+        try:
+            return max(0, int(planning_index))
+        except Exception:
+            pass
+    return max(0, int(STATE.get("dataset_scoop_index", 0) or 0))
+
+
+def multi_scoop_generic_task_text(count=None):
+    count = multi_scoop_target_count() if count is None else max(1, int(count))
+    text = (
+        "Continue excavating and dumping sand from the visible sand pile into the visible "
+        "truck bed without resetting the scene until no effective dig target remains."
+    )
+    if count > 1:
+        text = text[:-1] + f", completing at least {count} successful scoops."
+    return text
+
+
+def multi_scoop_dig_viability_report(snapshot, ranked_targets):
+    rows = [
+        row
+        for row in (STATE.get("last_auto_dig_target_scores", []) or [])
+        if isinstance(row, dict)
+    ]
+    settled_points = snapshot.get("settled_points") if isinstance(snapshot, dict) else None
+    particle_count = 0 if settled_points is None else int(len(settled_points))
+    reason_counts = {}
+    for row in rows:
+        reason = str(row.get("reason", "") or "unknown")
+        reason_key = reason.split(":", 1)[0]
+        reason_counts[reason_key] = int(reason_counts.get(reason_key, 0)) + 1
+
+    material_reasons = {
+        "low_swept_sand_density",
+        "low_local_sand_density",
+        "no_real_surface_near_target",
+    }
+    geometry_ignored_reasons = {"outside_sand_polygon"}
+    material_rejections = sum(
+        count for reason, count in reason_counts.items() if reason in material_reasons
+    )
+    blocking_reasons = {
+        reason: count
+        for reason, count in reason_counts.items()
+        if reason not in material_reasons and reason not in geometry_ignored_reasons
+    }
+    usable_count = int(len(ranked_targets or []))
+    no_material_particles = bool(
+        particle_count < max(1, int(AUTO_DIG_MIN_SWEPT_PARTICLES))
+    )
+    natural_exhaustion = bool(
+        usable_count == 0
+        and (
+            no_material_particles
+            or (
+                material_rejections > 0
+                and not blocking_reasons
+            )
+        )
+    )
+    if usable_count > 0:
+        reason = "usable_target_available"
+    elif natural_exhaustion:
+        reason = "no_effective_dig_target_remaining"
+    elif not rows:
+        reason = "target_ranking_unavailable"
+    else:
+        reason = "no_reachable_dig_candidate"
+    return {
+        "ok": bool(usable_count > 0),
+        "natural_exhaustion": natural_exhaustion,
+        "reason": reason,
+        "usable_count": usable_count,
+        "candidate_count": int(len(rows)),
+        "settled_particle_count": particle_count,
+        "material_rejection_count": int(material_rejections),
+        "reason_counts": reason_counts,
+        "blocking_reasons": blocking_reasons,
+    }
+
+
+def multi_scoop_filter_new_spatial_targets(ranked_targets):
+    ranked_targets = list(ranked_targets or [])
+    history = [
+        np.array(value, dtype=np.float32).reshape(-1)[:3]
+        for value in (STATE.get("dataset_scoop_target_history", []) or [])
+        if value is not None and len(np.array(value).reshape(-1)) >= 2
+    ]
+    minimum_spacing_m = max(0.0, float(MULTI_SCOOP_TARGET_MIN_SPACING_M))
+    if not history or minimum_spacing_m <= 0.0:
+        return ranked_targets, {
+            "history_count": int(len(history)),
+            "minimum_spacing_m": minimum_spacing_m,
+            "fresh_target_count": int(len(ranked_targets)),
+            "spatially_exhausted": False,
+        }
+    fresh_targets = []
+    for row in ranked_targets:
+        candidate = np.array(row.get("target_xyz"), dtype=np.float32).reshape(-1)[:3]
+        nearest_xy = min(
+            float(np.linalg.norm(candidate[:2] - previous[:2]))
+            for previous in history
+        )
+        row["previous_scoop_nearest_xy_m"] = nearest_xy
+        if nearest_xy >= minimum_spacing_m:
+            fresh_targets.append(row)
+    return fresh_targets, {
+        "history_count": int(len(history)),
+        "minimum_spacing_m": minimum_spacing_m,
+        "ranked_target_count": int(len(ranked_targets)),
+        "fresh_target_count": int(len(fresh_targets)),
+        "spatially_exhausted": bool(ranked_targets and not fresh_targets),
+    }
+
+
+def multi_scoop_repeat_target_candidates(ranked_targets):
+    ranked_targets = list(ranked_targets or [])
+    history = [
+        np.array(value, dtype=np.float32).reshape(-1)[:3]
+        for value in (STATE.get("dataset_scoop_target_history", []) or [])
+        if value is not None and len(np.array(value).reshape(-1)) >= 2
+    ]
+    if not history:
+        return []
+    minimum_spacing_m = max(0.0, float(MULTI_SCOOP_TARGET_MIN_SPACING_M))
+    repeat_targets = []
+    for row in ranked_targets:
+        candidate = np.array(row.get("target_xyz"), dtype=np.float32).reshape(-1)[:3]
+        nearest_xy = min(
+            float(np.linalg.norm(candidate[:2] - previous[:2]))
+            for previous in history
+        )
+        if nearest_xy < minimum_spacing_m:
+            repeat_targets.append(row)
+    return repeat_targets
+
+
+def multi_scoop_set_stop(reason, natural, detail=None):
+    detail = dict(detail or {})
+    STATE["dataset_scoop_stop_reason"] = str(reason)
+    STATE["dataset_scoop_stop_natural"] = bool(natural)
+    STATE["dataset_scoop_stop_detail"] = detail
+    dataset_record_event(
+        "multi_scoop_stop",
+        (
+            f"reason={reason}; natural={bool(natural)}; "
+            f"completed={int(STATE.get('dataset_scoops_completed', 0) or 0)}; "
+            f"minimum={multi_scoop_target_count()}; detail={debug_short_string(detail, 320)}"
+        ),
+    )
+
+
+def multi_scoop_reset_cycle_trackers(scoop_index):
+    scoop_index = max(0, int(scoop_index))
+    STATE["last_action_mode"] = "pre_dig"
+    sand = sand_metrics_current(force=True, label=f"multi_scoop_{scoop_index + 1}_start")
+    baseline = {
+        "scoop_index": scoop_index,
+        "started_at": time.time(),
+        "started_at_simulation": dataset_simulation_time_seconds(),
+        "sample_start": int(STATE.get("dataset_samples", 0))
+        - int(STATE.get("dataset_episode_sample_start", 0)),
+        "freeze_start": int(STATE.get("dataset_episode_freezes", 0) or 0),
+        "bin_from_pile_start": int(sand.get("bin_from_pile_count", 0) or 0)
+        if isinstance(sand, dict)
+        else 0,
+        "raw_region_spill_start": int(sand.get("spill_from_pile_count", 0) or 0)
+        if isinstance(sand, dict)
+        else 0,
+    }
+    STATE["dataset_scoop_index"] = scoop_index
+    STATE["dataset_scoop_cycle_baseline"] = baseline
+    STATE["dataset_max_bucket_particles"] = 0
+    STATE["dataset_max_bucket_from_pile_particles"] = 0
+    STATE["dataset_lift_bucket_from_pile_particles"] = 0
+    STATE["dataset_final_bucket_from_pile_particles"] = 0
+    STATE["dataset_final_bin_from_pile_particles"] = int(baseline["bin_from_pile_start"])
+    STATE["dataset_final_spill_from_pile_particles"] = 0
+    STATE["dataset_raw_region_spill_from_pile_particles"] = int(
+        baseline["raw_region_spill_start"]
+    )
+    STATE["dataset_max_joint_error_deg"] = 0.0
+    STATE["dataset_max_action_speed"] = 0.0
+    STATE["dataset_phase_metrics"] = {}
+    STATE["dataset_best_effort_unload_warning"] = ""
+    dataset_record_event(
+        "scoop_start",
+        (
+            f"scoop_index={scoop_index}; "
+            f"scoops_target={multi_scoop_target_count()}; "
+            f"bin_start={baseline['bin_from_pile_start']}"
+        ),
+    )
+    return baseline
+
+
+def multi_scoop_cycle_report(execution_success, reason=""):
+    baseline = dict(STATE.get("dataset_scoop_cycle_baseline", {}) or {})
+    metrics = auto_collect_episode_metrics()
+    max_bucket = int(metrics.get("max_bucket_from_pile_particles", 0) or 0)
+    lift_bucket = int(metrics.get("lift_bucket_from_pile_particles", 0) or 0)
+    final_bucket = int(metrics.get("final_bucket_from_pile_particles", 0) or 0)
+    bin_end = int(metrics.get("final_bin_from_pile_particles", 0) or 0)
+    bin_start = int(baseline.get("bin_from_pile_start", 0) or 0)
+    bin_gain = max(0, bin_end - bin_start)
+    raw_region_spill_end = int(
+        metrics.get("raw_region_spill_from_pile_particles", 0) or 0
+    )
+    raw_region_spill_start = int(baseline.get("raw_region_spill_start", 0) or 0)
+    raw_region_spill_gain = max(0, raw_region_spill_end - raw_region_spill_start)
+    spill = max(0, lift_bucket - final_bucket - bin_gain)
+    spill_ratio = float(spill) / max(1.0, float(lift_bucket))
+    max_joint_err = float(metrics.get("max_joint_error_deg", 0.0) or 0.0)
+    dig_load_score = clamp01(max_bucket / max(1.0, float(QUALITY_TARGET_BUCKET_PARTICLES)))
+    dump_transfer_score = clamp01(bin_gain / max(1.0, float(max(lift_bucket, max_bucket))))
+    retention_score = clamp01(lift_bucket / max(1.0, float(max_bucket)))
+    smoothness_score = clamp01(1.0 - max(0.0, max_joint_err - 8.0) / 35.0)
+    score = (
+        35.0 * dig_load_score
+        + 30.0 * dump_transfer_score
+        + 15.0 * retention_score
+        + 10.0 * smoothness_score
+        + (10.0 if execution_success else 0.0)
+        - min(20.0, spill_ratio * 20.0)
+    )
+    score = max(0.0, min(100.0, score))
+    freeze_delta = max(
+        0,
+        int(STATE.get("dataset_episode_freezes", 0) or 0)
+        - int(baseline.get("freeze_start", 0) or 0),
+    )
+    failures = []
+    if not execution_success:
+        failures.append(str(reason or "execution_failed"))
+    if max_bucket < int(QUALITY_MIN_BUCKET_PARTICLES):
+        failures.append(f"low_bucket_particles:{max_bucket}")
+    if lift_bucket < int(QUALITY_MIN_BUCKET_PARTICLES):
+        failures.append(f"low_lift_particles:{lift_bucket}")
+    if bin_gain < int(QUALITY_MIN_DUMP_PARTICLES):
+        failures.append(f"low_bin_gain:{bin_gain}")
+    if spill_ratio > float(MULTI_SCOOP_MAX_SPILL_RATIO):
+        failures.append(f"high_spill_ratio:{spill_ratio:.3f}")
+    if score < float(MULTI_SCOOP_MIN_SCORE):
+        failures.append(f"score_below_minimum:{score:.1f}")
+    if freeze_delta > 0:
+        failures.append(f"freeze_detected:{freeze_delta}")
+    report = {
+        "scoop_index": int(baseline.get("scoop_index", STATE.get("dataset_scoop_index", 0)) or 0),
+        "success": not failures,
+        "execution_success": bool(execution_success),
+        "reason": ";".join(failures),
+        "raw_reason": str(reason or ""),
+        "score": float(score),
+        "max_bucket_from_pile_particles": max_bucket,
+        "lift_bucket_from_pile_particles": lift_bucket,
+        "final_bucket_from_pile_particles": final_bucket,
+        "bin_from_pile_start": bin_start,
+        "bin_from_pile_end": bin_end,
+        "bin_gain_from_pile_particles": bin_gain,
+        "spill_from_lift_particles": spill,
+        "spill_ratio": spill_ratio,
+        "raw_region_spill_start": raw_region_spill_start,
+        "raw_region_spill_end": raw_region_spill_end,
+        "raw_region_spill_gain": raw_region_spill_gain,
+        "freeze_count": freeze_delta,
+        "samples": max(
+            0,
+            int(metrics.get("samples", 0) or 0)
+            - int(baseline.get("sample_start", 0) or 0),
+        ),
+        "duration_wall_s": max(0.0, time.time() - float(baseline.get("started_at", time.time()))),
+        "duration_simulation_s": max(
+            0.0,
+            dataset_simulation_time_seconds()
+            - float(baseline.get("started_at_simulation", dataset_simulation_time_seconds())),
+        ),
+        "max_joint_error_deg": max_joint_err,
+        "max_action_speed": float(metrics.get("max_action_speed", 0.0) or 0.0),
+        "phase_metrics": copy.deepcopy(STATE.get("dataset_phase_metrics", {}) or {}),
+        "target_xyz": vec_list(get_target_pos() if TARGET_PATH else None, 3),
+        "unload_landing_xyz": vec_list(unload_bin_landing_point(), 3),
+        "unload_release_xyz": vec_list(unload_bin_dump_point(), 3),
+    }
+    results = list(STATE.get("dataset_scoop_results", []) or [])
+    results.append(report)
+    STATE["dataset_scoop_results"] = results
+    if report["success"]:
+        STATE["dataset_scoops_completed"] = len(
+            [row for row in results if isinstance(row, dict) and row.get("success")]
+        )
+    dataset_record_event(
+        "scoop_end",
+        (
+            f"scoop_index={report['scoop_index']}; success={report['success']}; "
+            f"score={score:.1f}; bucket={max_bucket}; lift={lift_bucket}; "
+            f"bin_gain={bin_gain}; spill={spill}; reason={report['reason']}"
+        ),
+    )
+    return report
+
+
+def multi_scoop_apply_episode_aggregate():
+    results = [
+        row for row in (STATE.get("dataset_scoop_results", []) or []) if isinstance(row, dict)
+    ]
+    if not results:
+        return {}
+    phase_metrics = {}
+    for row in results:
+        prefix = f"scoop_{int(row.get('scoop_index', 0)) + 1}"
+        for label, value in (row.get("phase_metrics", {}) or {}).items():
+            phase_metrics[f"{prefix}:{label}"] = value
+    STATE["dataset_phase_metrics"] = phase_metrics
+    STATE["dataset_max_bucket_from_pile_particles"] = max(
+        int(row.get("max_bucket_from_pile_particles", 0) or 0) for row in results
+    )
+    STATE["dataset_max_bucket_particles"] = int(
+        STATE["dataset_max_bucket_from_pile_particles"]
+    )
+    STATE["dataset_lift_bucket_from_pile_particles"] = sum(
+        int(row.get("lift_bucket_from_pile_particles", 0) or 0) for row in results
+    )
+    STATE["dataset_final_bucket_from_pile_particles"] = int(
+        results[-1].get("final_bucket_from_pile_particles", 0) or 0
+    )
+    STATE["dataset_final_bin_from_pile_particles"] = int(
+        results[-1].get("bin_from_pile_end", 0) or 0
+    )
+    STATE["dataset_final_spill_from_pile_particles"] = sum(
+        int(row.get("spill_from_lift_particles", 0) or 0) for row in results
+    )
+    STATE["dataset_raw_region_spill_from_pile_particles"] = max(
+        int(row.get("raw_region_spill_end", 0) or 0) for row in results
+    )
+    STATE["dataset_max_joint_error_deg"] = max(
+        float(row.get("max_joint_error_deg", 0.0) or 0.0) for row in results
+    )
+    STATE["dataset_max_action_speed"] = max(
+        float(row.get("max_action_speed", 0.0) or 0.0) for row in results
+    )
+    completed = int(STATE.get("dataset_scoops_completed", 0) or 0)
+    minimum = multi_scoop_target_count()
+    stop_reason = str(STATE.get("dataset_scoop_stop_reason", "") or "")
+    stop_natural = bool(STATE.get("dataset_scoop_stop_natural", False))
+    return {
+        "scoops_target": minimum,
+        "scoops_min": minimum,
+        "scoops_max": multi_scoop_max_count(),
+        "scoops_completed": completed,
+        "adaptive_scoop_stop": bool(multi_scoop_adaptive_stop_enabled()),
+        "scoop_stop_reason": stop_reason,
+        "scoop_stop_natural": stop_natural,
+        "scoop_stop_detail": dict(STATE.get("dataset_scoop_stop_detail", {}) or {}),
+        "all_scoops_success": bool(
+            completed >= minimum
+            and all(bool(row.get("success", False)) for row in results)
+            and (
+                not multi_scoop_adaptive_stop_enabled()
+                or stop_natural
+            )
+        ),
+        "scoop_results": results,
+    }
+
+
+def auto_collect_prepare_next_scoop_candidates(attempt_index, scoop_index):
+    scoop_index = max(1, int(scoop_index))
+    clear_sand_contact_state(reason=f"multi_scoop_{scoop_index + 1}_replan")
+    sync_motion_start_q(f"multi_scoop_{scoop_index + 1}_start")
+    clear_planning_runtime_caches(f"multi_scoop_{scoop_index + 1}_fresh_scene")
+    snapshot = get_sand_snapshot(
+        force=True,
+        label=f"multi_scoop_{scoop_index + 1}_planning",
+        max_age=0.0,
+    )
+    STATE["auto_collect_episode_sand_snapshot"] = snapshot
+    STATE["auto_collect_episode_sand_snapshot_time"] = float(time.time())
+    STATE["last_execution_failure_reason"] = ""
+    plan_key = int(attempt_index) * 100 + scoop_index
+    STATE["multi_scoop_planning_index"] = scoop_index
+    try:
+        ranked_targets = auto_collect_rank_dig_targets(plan_key)
+    except Exception as e:
+        ranked_targets = []
+        STATE["last_auto_dig_target_scores"] = []
+        info_print(
+            "[WARN] [AUTO DIG TARGET SELECT]",
+            f"scoop={scoop_index + 1}",
+            "result=ranking_failed",
+            f"error={type(e).__name__}:{e}",
+        )
+    finally:
+        STATE["multi_scoop_planning_index"] = None
+    STATE["multi_scoop_ranked_targets_all"] = list(ranked_targets)
+    ranked_targets, spatial_report = multi_scoop_filter_new_spatial_targets(
+        ranked_targets
+    )
+    viability = multi_scoop_dig_viability_report(snapshot, ranked_targets)
+    viability["spatial_target_filter"] = spatial_report
+    if bool(spatial_report.get("spatially_exhausted", False)):
+        viability.update(
+            {
+                "ok": False,
+                "natural_exhaustion": True,
+                "reason": "no_new_effective_spatial_target",
+            }
+        )
+    STATE["multi_scoop_last_viability"] = dict(viability)
+    dataset_record_event(
+        "scoop_replan",
+        (
+            f"scoop_index={scoop_index}; plan_key={plan_key}; "
+            f"source=current_actual_q_and_fresh_sand; "
+            f"viability={debug_short_string(viability, 320)}"
+        ),
+    )
+    return plan_key, ranked_targets, viability
+
+
+async def auto_collect_plan_next_scoop(
+    attempt_index,
+    scoop_index,
+    plan_key=None,
+    ranked_targets=None,
+):
+    scoop_index = max(1, int(scoop_index))
+    if plan_key is None or ranked_targets is None:
+        plan_key, ranked_targets, _viability = auto_collect_prepare_next_scoop_candidates(
+            attempt_index,
+            scoop_index,
+        )
+    if not ranked_targets:
+        return None, None, []
+    # A recovery perturbation may have moved the robot after candidate viability
+    # was checked. Full planning must start from that actual post-perturbation pose.
+    sync_motion_start_q(f"multi_scoop_{scoop_index + 1}_full_plan_actual_pose")
+    STATE["multi_scoop_planning_index"] = scoop_index
+    try:
+        return await auto_collect_find_plan(
+            plan_key,
+            ranked_targets=ranked_targets,
+        )
+    finally:
+        STATE["multi_scoop_planning_index"] = None
 
 
 def auto_collect_wall_stage_name(row):
@@ -19086,6 +20272,7 @@ async def auto_collect_one_episode():
     auto_collect_attempt_progress(attempt, "begin_episode", "start")
     meta = auto_collect_begin_episode(attempt, target, plan_attempts, seq, initial_info=initial_info)
     auto_collect_attempt_progress(attempt, "begin_episode", "ok", detail=meta.get("episode_id", ""))
+    STATE["last_action_mode"] = "pre_dig"
     await dataset_camera_warmup_for_auto_run_once(label=f"auto_collect_episode_{attempt:06d}")
 
     shared_plan = STATE.get("current_dig_plan")
@@ -19123,39 +20310,314 @@ async def auto_collect_one_episode():
         f"unload_landing={vec_list(unload_bin_landing_point(), 3)}",
     )
     dataset_camera_start_background(label=f"auto_collect_episode_{attempt:06d}")
-    result = await execute_dig_target_ball(
-        rebuild_plan=False,
-        task_name=f"auto_collect_episode_{attempt:06d}",
-        return_home=False,
-    )
-    freezes = int(STATE.get("dataset_episode_freezes", 0))
-    if not result:
-        failure_reason = str(STATE.get("last_execution_failure_reason", "") or "execution_failed/stage_failed")
-        info_print(
-            "[AUTO DATASET ATTEMPT]",
-            f"attempt={attempt}",
-            "result=execution_failed",
-            "executed=True",
-            f"freezes={freezes}",
-            f"reason={failure_reason}",
+    multi_enabled = multi_scoop_mode_enabled()
+    scoops_target = multi_scoop_target_count()
+    scoops_max = multi_scoop_max_count()
+    adaptive_stop = multi_scoop_adaptive_stop_enabled()
+    scoop_loop_limit = scoops_max if adaptive_stop else scoops_target
+    for scoop_index in range(scoop_loop_limit):
+        cycle_trackers_ready = False
+        if scoop_index > 0:
+            plan_key, ranked_targets, viability = auto_collect_prepare_next_scoop_candidates(
+                attempt,
+                scoop_index,
+            )
+            if not ranked_targets:
+                completed = int(STATE.get("dataset_scoops_completed", 0) or 0)
+                natural_stop = bool(viability.get("natural_exhaustion", False))
+                if adaptive_stop and natural_stop and completed >= scoops_target:
+                    multi_scoop_set_stop(
+                        "no_effective_dig_target_remaining",
+                        True,
+                        viability,
+                    )
+                    info_print(
+                        "[AUTO DATASET V2.0 STOP]",
+                        f"attempt={attempt}",
+                        f"completed={completed}",
+                        f"minimum={scoops_target}",
+                        "reason=no_effective_dig_target_remaining",
+                        f"detail={debug_short_string(viability, 320)}",
+                    )
+                    break
+                if natural_stop:
+                    failure_reason = (
+                        "quality_rejected/multi_scoop_exhausted_before_minimum:"
+                        f"completed={completed};minimum={scoops_target}"
+                    )
+                else:
+                    failure_reason = (
+                        f"planning_failed/multi_scoop_{scoop_index + 1}:"
+                        f"{viability.get('reason', 'no_reachable_dig_candidate')}"
+                    )
+                multi_scoop_set_stop(failure_reason, False, viability)
+                dataset_record_event(
+                    "scoop_plan_failed",
+                    (
+                        f"scoop_index={scoop_index}; reason={failure_reason}; "
+                        f"viability={debug_short_string(viability, 320)}"
+                    ),
+                )
+                multi_scoop_apply_episode_aggregate()
+                dataset_camera_stop_background("auto_collect_multi_scoop_plan_failed")
+                return auto_collect_finish_episode(meta, False, failure_reason)
+
+            completed = int(STATE.get("dataset_scoops_completed", 0) or 0)
+            using_repeat_fallback = False
+            if bool(STATE.get("multi_scoop_new_target_planning_exhausted", False)):
+                exhausted_detail = dict(
+                    STATE.get("multi_scoop_new_target_planning_detail", {}) or {}
+                )
+                if adaptive_stop and completed >= scoops_target:
+                    multi_scoop_set_stop(
+                        "no_plannable_new_dig_target",
+                        True,
+                        exhausted_detail,
+                    )
+                    info_print(
+                        "[AUTO DATASET V2.0 STOP]",
+                        f"attempt={attempt}",
+                        f"completed={completed}",
+                        f"minimum={scoops_target}",
+                        "reason=no_plannable_new_dig_target",
+                    )
+                    break
+                repeat_targets = multi_scoop_repeat_target_candidates(
+                    STATE.get("multi_scoop_ranked_targets_all", []) or []
+                )
+                if repeat_targets:
+                    ranked_targets = repeat_targets
+                    using_repeat_fallback = True
+
+            if multi_enabled and multi_scoop_recovery_mode_enabled():
+                multi_scoop_reset_cycle_trackers(scoop_index)
+                cycle_trackers_ready = True
+                recovery_ok = await multi_scoop_inject_controlled_recovery(scoop_index)
+                if not recovery_ok:
+                    failure_reason = (
+                        f"execution_failed/multi_scoop_{scoop_index + 1}:"
+                        "controlled_recovery_injection_failed"
+                    )
+                    multi_scoop_apply_episode_aggregate()
+                    dataset_camera_stop_background(
+                        "auto_collect_controlled_recovery_injection_failed"
+                    )
+                    return auto_collect_finish_episode(meta, False, failure_reason)
+            update_status(
+                (
+                    f"[AUTO DATASET V2.0] planning scoop {scoop_index + 1}; "
+                    f"minimum={scoops_target} max_guard={scoops_max}"
+                ),
+                force=True,
+            )
+            target, seq, next_plan_attempts = await auto_collect_plan_next_scoop(
+                attempt,
+                scoop_index,
+                plan_key=plan_key,
+                ranked_targets=ranked_targets,
+            )
+            if (
+                not seq
+                and not using_repeat_fallback
+                and adaptive_stop
+            ):
+                planning_detail = {
+                    "reason": "fresh_targets_failed_full_planning",
+                    "completed": int(
+                        STATE.get("dataset_scoops_completed", 0) or 0
+                    ),
+                    "minimum": int(scoops_target),
+                    "fresh_target_count": int(len(ranked_targets)),
+                    "plan_attempts": compact_auto_plan_attempts(
+                        next_plan_attempts,
+                        limit=8,
+                    ),
+                }
+                STATE["multi_scoop_new_target_planning_exhausted"] = True
+                STATE["multi_scoop_new_target_planning_detail"] = planning_detail
+                completed = int(STATE.get("dataset_scoops_completed", 0) or 0)
+                if completed >= scoops_target:
+                    multi_scoop_set_stop(
+                        "no_plannable_new_dig_target",
+                        True,
+                        planning_detail,
+                    )
+                    info_print(
+                        "[AUTO DATASET V2.0 STOP]",
+                        f"attempt={attempt}",
+                        f"completed={completed}",
+                        f"minimum={scoops_target}",
+                        "reason=no_plannable_new_dig_target",
+                    )
+                    break
+                repeat_targets = multi_scoop_repeat_target_candidates(
+                    STATE.get("multi_scoop_ranked_targets_all", []) or []
+                )
+                if repeat_targets:
+                    dataset_record_event(
+                        "scoop_plan_fallback",
+                        (
+                            f"scoop_index={scoop_index}; "
+                            "reason=fresh_targets_failed_full_planning; "
+                            f"fallback_candidates={len(repeat_targets)}"
+                        ),
+                    )
+                    target, seq, fallback_attempts = await auto_collect_plan_next_scoop(
+                        attempt,
+                        scoop_index,
+                        plan_key=plan_key,
+                        ranked_targets=repeat_targets,
+                    )
+                    next_plan_attempts = list(next_plan_attempts or []) + list(
+                        fallback_attempts or []
+                    )
+                    using_repeat_fallback = bool(seq)
+            if not seq:
+                failure_reason = (
+                    f"planning_failed/multi_scoop_{scoop_index + 1}:"
+                    "no_reachable_dig_candidate_from_current_pose"
+                )
+                dataset_record_event(
+                    "scoop_plan_failed",
+                    (
+                        f"scoop_index={scoop_index}; reason={failure_reason}; "
+                        f"plan_attempts={len(next_plan_attempts or [])}"
+                    ),
+                )
+                multi_scoop_apply_episode_aggregate()
+                dataset_camera_stop_background("auto_collect_multi_scoop_plan_failed")
+                return auto_collect_finish_episode(meta, False, failure_reason)
+            meta.setdefault("scoop_plans", []).append(
+                {
+                    "scoop_index": scoop_index,
+                    "target_xyz": vec_list(target, 3),
+                    "unload_landing_xyz": vec_list(unload_bin_landing_point(), 3),
+                    "unload_release_xyz": vec_list(unload_bin_dump_point(), 3),
+                    "plan_attempts": compact_auto_plan_attempts(next_plan_attempts, limit=4),
+                    "plan": auto_collect_plan_summary(seq),
+                    "repeat_target_fallback": bool(using_repeat_fallback),
+                }
+            )
+            history = list(STATE.get("dataset_scoop_target_history", []) or [])
+            history.append(vec_list(target, 3))
+            STATE["dataset_scoop_target_history"] = history
+
+        if multi_enabled and not cycle_trackers_ready:
+            multi_scoop_reset_cycle_trackers(scoop_index)
+        update_status(
+            (
+                (
+                    f"[AUTO DATASET V2.0] scoop {scoop_index + 1}; "
+                    f"minimum={scoops_target} max_guard={scoops_max}"
+                )
+                if multi_enabled
+                else f"[AUTO DATASET] scoop 1/1"
+            ),
+            force=True,
         )
-        dataset_camera_stop_background("auto_collect_episode_execution_failed")
+        result = await execute_dig_target_ball(
+            rebuild_plan=False,
+            task_name=(
+                f"auto_collect_episode_{attempt:06d}_scoop_{scoop_index + 1:02d}"
+                if multi_enabled
+                else f"auto_collect_episode_{attempt:06d}"
+            ),
+            return_home=False,
+        )
+        failure_reason = str(
+            STATE.get("last_execution_failure_reason", "")
+            or ("" if result else "execution_failed/stage_failed")
+        )
+        scoop_report = (
+            multi_scoop_cycle_report(bool(result), failure_reason)
+            if multi_enabled
+            else {
+                "success": bool(result),
+                "freeze_count": int(STATE.get("dataset_episode_freezes", 0) or 0),
+            }
+        )
+        single_scoop_freeze = bool(
+            (not multi_enabled)
+            and int(STATE.get("dataset_episode_freezes", 0) or 0) > 0
+        )
+        if not result or single_scoop_freeze or not bool(scoop_report.get("success", False)):
+            failure_reason = (
+                f"execution_failed/freeze_detected:{int(STATE.get('dataset_episode_freezes', 0) or 0)}"
+                if single_scoop_freeze
+                else
+                failure_reason
+                if not result and failure_reason
+                else (
+                    f"quality_rejected/multi_scoop_{scoop_index + 1}:"
+                    f"{scoop_report.get('reason', 'cycle_quality_failed')}"
+                )
+            )
+            info_print(
+                "[AUTO DATASET ATTEMPT]",
+                f"attempt={attempt}",
+                f"scoop={scoop_index + 1}",
+                f"minimum={scoops_target}",
+                "result=execution_failed" if not result else "result=scoop_quality_failed",
+                "executed=True",
+                f"freezes={scoop_report.get('freeze_count', 0)}",
+                f"reason={failure_reason}",
+            )
+            if multi_enabled:
+                multi_scoop_apply_episode_aggregate()
+            dataset_camera_stop_background("auto_collect_episode_scoop_failed")
+            return auto_collect_finish_episode(meta, False, failure_reason)
+        if multi_enabled:
+            info_print(
+                "[AUTO DATASET SCOOP]",
+                f"attempt={attempt}",
+                f"scoop={scoop_index + 1}",
+                f"minimum={scoops_target}",
+                "result=success",
+                f"score={float(scoop_report.get('score', 0.0)):.1f}",
+                f"bucket={scoop_report.get('max_bucket_from_pile_particles', 0)}",
+                f"lift={scoop_report.get('lift_bucket_from_pile_particles', 0)}",
+                f"bin_gain={scoop_report.get('bin_gain_from_pile_particles', 0)}",
+                f"spill={scoop_report.get('spill_from_lift_particles', 0)}",
+            )
+
+    if adaptive_stop and not str(STATE.get("dataset_scoop_stop_reason", "") or ""):
+        multi_scoop_set_stop(
+            "technical_safety_cap_reached",
+            False,
+            {
+                "completed": int(STATE.get("dataset_scoops_completed", 0) or 0),
+                "minimum": int(scoops_target),
+                "max_guard": int(scoops_max),
+            },
+        )
+    multi_summary = multi_scoop_apply_episode_aggregate() if multi_enabled else {}
+    if multi_enabled and not bool(multi_summary.get("all_scoops_success", False)):
+        failure_reason = (
+            "quality_rejected/multi_scoop_incomplete:"
+            f"completed={multi_summary.get('scoops_completed', 0)};"
+            f"minimum={multi_summary.get('scoops_min', scoops_target)};"
+            f"stop={multi_summary.get('scoop_stop_reason', '')}"
+        )
+        dataset_camera_stop_background("auto_collect_episode_multi_incomplete")
         return auto_collect_finish_episode(meta, False, failure_reason)
-    if freezes > 0:
-        info_print(
-            "[AUTO DATASET ATTEMPT]",
-            f"attempt={attempt}",
-            "result=freeze_failed",
-            "executed=True",
-            f"freezes={freezes}",
+    if (
+        multi_scoop_recovery_mode_enabled()
+        and not bool(STATE.get("dataset_controlled_recovery_completed", False))
+    ):
+        failure_reason = (
+            "quality_rejected/recovery_supervision_incomplete:"
+            f"injected={bool(STATE.get('dataset_controlled_recovery_injected', False))};"
+            f"completed={bool(STATE.get('dataset_controlled_recovery_completed', False))}"
         )
-        dataset_camera_stop_background("auto_collect_episode_freeze_failed")
-        return auto_collect_finish_episode(meta, False, f"execution_failed/freeze_detected:{freezes}")
+        dataset_camera_stop_background("auto_collect_episode_recovery_incomplete")
+        return auto_collect_finish_episode(meta, False, failure_reason)
     info_print(
         "[AUTO DATASET ATTEMPT]",
         f"attempt={attempt}",
         "result=execution_ok",
         "executed=True",
+        f"scoops={multi_summary.get('scoops_completed', 1) if multi_enabled else 1}",
+        f"stop={multi_summary.get('scoop_stop_reason', '') if multi_enabled else 'single_scoop_complete'}",
     )
     dataset_camera_stop_background("auto_collect_episode_finished")
     return auto_collect_finish_episode(meta, True, "ok")
@@ -22741,6 +24203,12 @@ async def wait_for_motion_reached(
                                 mode=recovery_mode,
                             )
                             if ok_recovery:
+                                dataset_recovery_register_event(
+                                    "carry_posture",
+                                    source="final_gravity_carry_gate",
+                                    state="correcting",
+                                    data={"recovery_detail": recovery_detail},
+                                )
                                 final_carry_recovery_count += 1
                                 q_goal = CTRL.clip_limits(np.array(recovery_q, dtype=np.float32).copy())
                                 STATE["dataset_current_q_goal"] = q_goal.copy()
@@ -23037,6 +24505,23 @@ async def move_to_profile(
         requested_seconds=seconds,
         speed_multiplier=sm,
     )
+    multi_scoop_return_motion = bool(
+        multi_scoop_mode_enabled()
+        and active_multi_scoop_index_for_planning() > 0
+        and "pre_dig" in f"{label} {mode}".lower()
+    )
+    if multi_scoop_return_motion:
+        minimum_return_seconds = float(
+            plan_joint_motion_metrics(q1, q0, duration=0.0).get(
+                "estimated_time",
+                0.0,
+            )
+            or 0.0
+        )
+        seconds_eff = max(
+            float(seconds_eff),
+            minimum_return_seconds + float(MOVE_DURATION_MARGIN_SECONDS),
+        )
     if motion_path_points is not None:
         seconds_eff = max(
             float(seconds_eff),
@@ -23404,6 +24889,20 @@ async def move_to_profile(
                         ok_recovery, recovery_reason = CTRL.apply_target_direct(recovery_q, mode=recovery_mode)
                         execution_stage_profile_add_elapsed(exec_profile, "apply_target_ms", recovery_apply_t)
                         if ok_recovery:
+                            dataset_recovery_register_event(
+                                "carry_posture",
+                                source=str(
+                                    recovery_detail.get(
+                                        "source",
+                                        "runtime_carry_recovery",
+                                    )
+                                ),
+                                state="correcting",
+                                data={
+                                    "stage": str(contact_stage_name),
+                                    "carry_reason": str(carry_recovery_reason or ""),
+                                },
+                            )
                             runtime_carry_recovery_count += 1
                             q0 = np.array(recovery_q, dtype=np.float32).copy()
                             boom_idx = CTRL.name_to_idx.get("boom", 1)
@@ -23852,6 +25351,10 @@ PRE_DIG_ROUTE_ARC_SWING_FRACTIONS = (0.50, 0.35, 0.65)
 PRE_DIG_ROUTE_RRT_TIME_RATIO_TRIGGER = max(
     1.0,
     env_float("EXCAVATOR_PRE_DIG_ROUTE_RRT_TIME_RATIO_TRIGGER", 1.25),
+)
+MULTI_SCOOP_RETURN_ROUTE_MIN_SWING_DEG = max(
+    0.0,
+    env_float("EXCAVATOR_MULTI_SCOOP_RETURN_ROUTE_MIN_SWING_DEG", 55.0),
 )
 LOADED_ROUTE_CANDIDATE_LIMIT = max(
     6,
@@ -29289,6 +30792,27 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
         if planning_deadline_exceeded(deadline):
             return None, "planning budget exceeded"
         pre_dig_primary_route = str(label).lower() == "pre_dig"
+        multi_scoop_return_route = False
+        if (
+            pre_dig_primary_route
+            and multi_scoop_mode_enabled()
+            and active_multi_scoop_index_for_planning() > 0
+        ):
+            try:
+                swing_idx = CTRL.name_to_idx["swing"]
+                return_swing_deg = abs(
+                    rad_to_deg(
+                        swing_delta(
+                            float(np.array(q_goal, dtype=np.float32).reshape(-1)[swing_idx]),
+                            float(np.array(q_seed, dtype=np.float32).reshape(-1)[swing_idx]),
+                        )
+                    )
+                )
+                multi_scoop_return_route = bool(
+                    return_swing_deg >= float(MULTI_SCOOP_RETURN_ROUTE_MIN_SWING_DEG)
+                )
+            except Exception:
+                multi_scoop_return_route = False
         pre_dig_obstacle_context = False
         pre_dig_route_deadline = deadline
         if pre_dig_primary_route:
@@ -29317,9 +30841,15 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                 max(0.35, min(1.10, 0.45 * remaining)),
                 min_seconds=0.12,
             )
-        route_required = not (direct_phase_ok and direct_obstacle_ok)
+        route_required = bool(
+            multi_scoop_return_route or not (direct_phase_ok and direct_obstacle_ok)
+        )
         route_waypoints = []
-        route_reason = "direct_ok"
+        route_reason = (
+            "multi_scoop_return_from_unload"
+            if multi_scoop_return_route
+            else "direct_ok"
+        )
         if route_required:
             route_waypoints, route_reason = find_clearance_route(
                 q_seed,
@@ -29473,6 +31003,7 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
             path_detail["direct_obstacle_reason"] = str(direct_obstacle_reason)
             path_detail["direct_obstacle_sample"] = int(direct_obstacle_sample)
             path_detail["direct_obstacle_report"] = compact_path_obstacle_report(direct_obstacle_report)
+            path_detail["multi_scoop_return_route"] = bool(multi_scoop_return_route)
         if not bool(path_detail.get("obstacle_ok", True)):
             return None, f"{label}: final segment still hits rigid obstacle: {path_detail.get('obstacle_reason')}"
         if strict_path_precheck_phase(label) and not bool(path_detail.get("phase_ok", True)):
@@ -37338,6 +38869,7 @@ async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"
             if not success or not task_alive(task_id):
                 update_status(execution_failure_status_text("pre_dig"), force=True)
                 return False
+            multi_scoop_complete_controlled_recovery_if_active("pre_dig")
             stage_index = int(pre_dig_route_next_index)
             continue
 
@@ -37458,6 +38990,7 @@ async def execute_dig_target_ball(rebuild_plan=True, task_name="dig_target_ball"
                 include_sand=is_sand_contact_phase(stage_name),
             )
             return False
+        multi_scoop_complete_controlled_recovery_if_active(stage_name)
         if (
             loaded_route_diag
             and bool(LOADED_ROUTE_STAGE_PARTICLE_DIAGNOSTICS)

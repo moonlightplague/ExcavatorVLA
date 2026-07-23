@@ -107,7 +107,7 @@ def _is_route_budget_signature(signature):
     return "planning_budget_exceeded" in str(signature)
 
 
-async def find_plan(rt, attempt_index):
+async def find_plan(rt, attempt_index, ranked_targets=None):
     plan_attempts = []
     target = rt.auto_collect_sample_target(attempt_index, 0)
 
@@ -120,12 +120,45 @@ async def find_plan(rt, attempt_index):
         rt.STATE["last_auto_unload_scores"] = unload_scores
         rt.info_print("[WARN] [AUTO UNLOAD SELECT] failed:", type(e).__name__, e)
 
-    try:
-        ranked_targets = rt.auto_collect_rank_dig_targets(attempt_index)
-    except Exception as e:
-        ranked_targets = []
-        rt.STATE["last_auto_dig_target_scores"] = []
-        rt.info_print("[WARN] [AUTO DIG TARGET SELECT] failed:", type(e).__name__, e)
+    if ranked_targets is None:
+        try:
+            ranked_targets = rt.auto_collect_rank_dig_targets(attempt_index)
+        except Exception as e:
+            ranked_targets = []
+            rt.STATE["last_auto_dig_target_scores"] = []
+            rt.info_print("[WARN] [AUTO DIG TARGET SELECT] failed:", type(e).__name__, e)
+    else:
+        ranked_targets = list(ranked_targets)
+
+    target_history = list(rt.STATE.get("dataset_scoop_target_history", []) or [])
+    if bool(getattr(rt, "multi_scoop_mode_enabled", lambda: False)()) and target_history:
+        minimum_spacing_m = max(
+            0.0,
+            float(getattr(rt, "MULTI_SCOOP_TARGET_MIN_SPACING_M", 0.28)),
+        )
+        spaced_targets = []
+        for row in ranked_targets:
+            candidate = rt.np.array(row.get("target_xyz"), dtype=rt.np.float32).reshape(-1)[:3]
+            nearest_xy = min(
+                float(
+                    rt.np.linalg.norm(
+                        candidate[:2]
+                        - rt.np.array(previous, dtype=rt.np.float32).reshape(-1)[:3][:2]
+                    )
+                )
+                for previous in target_history
+            )
+            row["previous_scoop_nearest_xy_m"] = nearest_xy
+            if nearest_xy >= minimum_spacing_m:
+                spaced_targets.append(row)
+        if spaced_targets:
+            ranked_targets = spaced_targets
+            rt.info_print(
+                "[AUTO DIG TARGET MULTI]",
+                f"history={len(target_history)}",
+                f"remaining={len(ranked_targets)}",
+                f"min_spacing={minimum_spacing_m:.3f}m",
+            )
 
     try:
         # Static scene obstacles such as /World/truck are expensive to traverse.
@@ -164,6 +197,15 @@ async def find_plan(rt, attempt_index):
     global_failure_signature = None
     global_failure_count = 0
     global_failure_limit = max(2, int(getattr(rt, "AUTO_COLLECT_GLOBAL_PLAN_FAILURE_LIMIT", 4)))
+    later_multi_scoop = bool(
+        getattr(rt, "multi_scoop_mode_enabled", lambda: False)()
+        and getattr(
+            rt,
+            "active_multi_scoop_index_for_planning",
+            lambda: 0,
+        )()
+        > 0
+    )
     for ring_index, ring_rows_all in _group_targets_by_ring(ranked_targets):
         ring_rows = ring_rows_all[:per_ring_limit]
         ring_successes = []
@@ -436,10 +478,15 @@ async def find_plan(rt, attempt_index):
                     f"wall_ms={plan_elapsed_ms:.1f}",
                     f"budget={budget_s:.2f}s",
                     f"grace={hard_grace_s:.2f}s",
-                    "reason=single_candidate_over_budget_stop_more_planning",
+                    (
+                        "reason=later_multi_candidate_over_budget_try_remaining"
+                        if later_multi_scoop
+                        else "reason=single_candidate_over_budget_stop_more_planning"
+                    ),
                 )
-                _clear_executable_plan_state(rt)
-                return target, None, plan_attempts
+                if not later_multi_scoop:
+                    _clear_executable_plan_state(rt)
+                    return target, None, plan_attempts
             if not seq:
                 signature = _planning_failure_signature(row)
                 if signature == global_failure_signature:
@@ -464,6 +511,12 @@ async def find_plan(rt, attempt_index):
                 elif _is_route_budget_signature(signature):
                     signature_global_limit = 2
                     signature_ring_limit = 1
+                if later_multi_scoop:
+                    # A loaded return pose makes later-scoop route failures more
+                    # target-specific than the initial-pose case. Do not let two
+                    # equal signatures discard the remaining fresh sand targets.
+                    signature_global_limit = max(signature_global_limit, 4)
+                    signature_ring_limit = max(signature_ring_limit, 2)
                 if global_failure_count >= signature_global_limit:
                     rt.info_print(
                         "[AUTO DIG TARGET GLOBAL PRUNE]",

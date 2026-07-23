@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_PATH = ROOT / "scripts" / "excavator_app" / "excavator_runtime.py"
 CAMERA_PATH = ROOT / "scripts" / "excavator_app" / "excavator_dataset_camera.py"
+AUTO_COLLECT_PATH = ROOT / "scripts" / "excavator_app" / "auto_dataset_collect.py"
 
 
 def function_node(path, name):
@@ -131,6 +132,72 @@ class CameraTimelineContractTests(unittest.TestCase):
         self.assertIn("dataset_record_sample_due", RUNTIME_PATH.read_text(encoding="utf-8-sig"))
         self.assertIn("submit_viewport_capture_triplet", prepare_source)
 
+    def test_strict_samples_are_owned_by_the_single_update_clock(self):
+        step_node = function_node(RUNTIME_PATH, "step_updates")
+        recorder_node = function_node(RUNTIME_PATH, "dataset_record_scheduled_update_sample_async")
+        boundary_node = function_node(RUNTIME_PATH, "dataset_record_stage_boundary_sample")
+        step_source = ast.unparse(step_node)
+        recorder_source = ast.unparse(recorder_node)
+        boundary_source = ast.unparse(boundary_node)
+
+        self.assertIn("dataset_record_scheduled_update_sample_async", step_source)
+        self.assertIn("dataset_record_sample_due", recorder_source)
+        self.assertIn("dataset_record_sample_async", recorder_source)
+        self.assertIn("dataset_camera_pose_sync_active", recorder_source)
+        self.assertIn("dataset_global_sample_active", recorder_source)
+        self.assertIn("DATASET_STRICT_SAMPLE_WAIT", boundary_source)
+        self.assertIn("auto_collect_active", boundary_source)
+
+    def test_next_scoop_index_changes_only_after_replanning_succeeds(self):
+        replan_node = function_node(RUNTIME_PATH, "auto_collect_plan_next_scoop")
+        reset_node = function_node(RUNTIME_PATH, "multi_scoop_reset_cycle_trackers")
+        replan_source = ast.unparse(replan_node)
+        self.assertNotIn("STATE['dataset_scoop_index']", replan_source)
+        self.assertIn("STATE['multi_scoop_planning_index']", replan_source)
+        self.assertIn("finally:", replan_source)
+        reset_source = ast.unparse(reset_node)
+        self.assertIn("STATE['dataset_scoop_index']", reset_source)
+        self.assertIn("STATE['last_action_mode'] = 'pre_dig'", reset_source)
+
+    def test_adaptive_stop_requires_material_exhaustion_evidence(self):
+        viability_node = function_node(
+            RUNTIME_PATH,
+            "multi_scoop_dig_viability_report",
+        )
+        episode_node = function_node(RUNTIME_PATH, "auto_collect_one_episode")
+        viability_source = ast.unparse(viability_node)
+        episode_source = ast.unparse(episode_node)
+
+        self.assertIn("low_swept_sand_density", viability_source)
+        self.assertIn("low_local_sand_density", viability_source)
+        self.assertIn("no_real_surface_near_target", viability_source)
+        self.assertIn("blocking_reasons", viability_source)
+        self.assertIn("natural_exhaustion", viability_source)
+        spatial_node = function_node(
+            RUNTIME_PATH,
+            "multi_scoop_filter_new_spatial_targets",
+        )
+        spatial_source = ast.unparse(spatial_node)
+        self.assertIn("previous_scoop_nearest_xy_m", spatial_source)
+        self.assertIn("spatially_exhausted", spatial_source)
+        self.assertIn("completed >= scoops_target", episode_source)
+        self.assertIn("no_plannable_new_dig_target", episode_source)
+        self.assertIn("multi_scoop_repeat_target_candidates", episode_source)
+        self.assertIn("technical_safety_cap_reached", episode_source)
+        self.assertIn("multi_scoop_exhausted_before_minimum", episode_source)
+
+    def test_target_topk_prefers_distinct_xy_before_depth_variants(self):
+        rank_node = function_node(RUNTIME_PATH, "auto_collect_rank_dig_targets")
+        rank_source = ast.unparse(rank_node)
+        self.assertIn("seen_angle_indices", rank_source)
+        self.assertIn("unique_xy_rows + alternate_depth_rows", rank_source)
+
+    def test_later_scoop_planning_does_not_prune_after_two_route_failures(self):
+        find_plan_node = function_node(AUTO_COLLECT_PATH, "find_plan")
+        find_plan_source = ast.unparse(find_plan_node)
+        self.assertIn("later_multi_scoop", find_plan_source)
+        self.assertIn("max(signature_global_limit, 4)", find_plan_source)
+
     def test_dataset_row_uses_capture_pose_and_simulation_time(self):
         node = function_node(RUNTIME_PATH, "dataset_record_sample_async")
         source = ast.unparse(node)
@@ -138,6 +205,23 @@ class CameraTimelineContractTests(unittest.TestCase):
         self.assertIn("capture_q_cmd", source)
         self.assertIn("capture_pose_sim_time", source)
         self.assertIn("camera_simulation", source)
+
+    def test_controlled_recovery_is_path_validated_and_loss_masked(self):
+        inject_node = function_node(
+            RUNTIME_PATH,
+            "multi_scoop_inject_controlled_recovery",
+        )
+        inject_source = ast.unparse(inject_node)
+        self.assertIn("path_segment_check", inject_source)
+        self.assertIn("action_is_expert=False", inject_source)
+        self.assertIn("action_loss_weight=0.0", inject_source)
+        self.assertIn("planner_restarts_from_actual_pose", inject_source)
+
+    def test_recovery_mode_keeps_clean_multi_scoop_mode_separate(self):
+        source = RUNTIME_PATH.read_text(encoding="utf-8-sig")
+        self.assertIn('"data_multi_recovery"', source)
+        self.assertIn("MULTI_SCOOP_RECOVERY_ENABLED", source)
+        self.assertIn("quality_rejected/recovery_supervision_incomplete", source)
 
 
 if __name__ == "__main__":

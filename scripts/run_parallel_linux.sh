@@ -20,6 +20,8 @@ LOG_MODE="${LOG_MODE:-data}"
 FAST_SAMPLED_REPLAY="${FAST_SAMPLED_REPLAY:-0}"
 ATTEMPT_MOTION_SPEED="${ATTEMPT_MOTION_SPEED:-}"
 DATASET_HZ="${DATASET_HZ:-10}"
+SCOOPS_PER_EPISODE="${SCOOPS_PER_EPISODE:-1}"
+MAX_SCOOPS_PER_EPISODE="${MAX_SCOOPS_PER_EPISODE:-64}"
 SHUTDOWN_ON_COMPLETE="${SHUTDOWN_ON_COMPLETE:-0}"
 SHUTDOWN_DELAY_MINUTES="${SHUTDOWN_DELAY_MINUTES:-1}"
 WORKER_RESTART_LIMIT="${WORKER_RESTART_LIMIT:-3}"
@@ -63,6 +65,17 @@ for value_name in WORKER_RESTART_LIMIT WORKER_RESTART_DELAY_SECONDS WORKER_START
         exit 2
     fi
 done
+for value_name in SCOOPS_PER_EPISODE MAX_SCOOPS_PER_EPISODE; do
+    value="${!value_name}"
+    if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "${value_name} must be a positive integer" >&2
+        exit 2
+    fi
+done
+if (( MAX_SCOOPS_PER_EPISODE <= SCOOPS_PER_EPISODE )); then
+    echo "MAX_SCOOPS_PER_EPISODE must be greater than SCOOPS_PER_EPISODE" >&2
+    exit 2
+fi
 
 LOG_DIR="${DATASET_BASE}/.parallel_logs/${BATCH_ID}"
 mkdir -p "${LOG_DIR}"
@@ -86,6 +99,7 @@ echo "Dataset: ${DATASET_BASE}"
 echo "Batch:   ${BATCH_ID}"
 echo "GPUs:    ${GPU_IDS}"
 echo "Dashboard --root must be: ${DATASET_BASE}"
+echo "Adaptive scoops: minimum=${SCOOPS_PER_EPISODE} max_guard=${MAX_SCOOPS_PER_EPISODE}"
 echo "Shutdown after verified completion: ${SHUTDOWN_ON_COMPLETE}"
 echo "Worker restart limit: ${WORKER_RESTART_LIMIT}"
 
@@ -175,6 +189,8 @@ run_worker_supervisor() {
             --max-attempts "${MAX_ATTEMPTS}"
             --dataset-root "${DATASET_BASE}"
             --log-mode "${LOG_MODE}"
+            --scoops-per-episode "${SCOOPS_PER_EPISODE}"
+            --max-scoops-per-episode "${MAX_SCOOPS_PER_EPISODE}"
             --graphics-api vulkan
             --active-gpu "${gpu}"
             --physics-gpu "${gpu}"

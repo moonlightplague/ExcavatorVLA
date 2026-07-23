@@ -34,6 +34,15 @@ Pre-transfer inventory:
 - File count: 4,279
 - Exact remote byte count: 15,955,271,812
 
+Verified handover archive:
+
+- Archive byte count: 15,956,165,712
+- Uncompressed byte count: 15,955,271,812
+- ZIP entry count: 4,279
+- SHA-256:
+  `e0ba4a34e1e1785ef35cfcb42bc154f9c314a9df64d6049594d5b915dcb4ea04`
+- CRC verification: passed for every ZIP entry
+
 The ZIP is deliberately excluded from the Git release and delivered separately
 because of its size. It contains the top-level `lerobot_v3/` directory so the
 LeRobot directory structure is preserved.

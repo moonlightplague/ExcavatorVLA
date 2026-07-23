@@ -33,6 +33,10 @@ Source dataset inventory:
 
 - 4,279 files
 - 15,955,271,812 uncompressed bytes
+- 15,956,165,712 archive bytes
+- SHA-256:
+  `e0ba4a34e1e1785ef35cfcb42bc154f9c314a9df64d6049594d5b915dcb4ea04`
+- CRC verification passed for every ZIP entry
 
 See the [main handover guide](https://github.com/jxbb824/ExcavatorVLA)
 and

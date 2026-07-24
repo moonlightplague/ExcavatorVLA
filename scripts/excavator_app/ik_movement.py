@@ -85,6 +85,24 @@ async def move_planned_stage(rt, stage_name, q_goal, duration, task_id=None):
                     )
                 detail_text = "; ".join(detail)
                 if rt.strict_path_precheck_phase(stage_name):
+                    if str(stage_name).lower() == "pre_dig":
+                        rt.info_print(
+                            "[PLAN EXEC PRECHECK RECOVERY]",
+                            f"stage={stage_name}",
+                            detail_text,
+                            "fallback=coordinated_clearance_route",
+                            force_log=True,
+                        )
+                        recovered = await rt.move_to_profile_with_clearance(
+                            q_goal,
+                            seconds=duration,
+                            label=stage_name,
+                            task_id=task_id,
+                            mode=stage_name,
+                            q_start_override=q_start,
+                        )
+                        if recovered:
+                            return True
                     reason_text = f"execution_failed/path_precheck_failed:{stage_name}:{detail_text}"
                     rt.set_execution_failure_reason(reason_text)
                     rt.info_print(

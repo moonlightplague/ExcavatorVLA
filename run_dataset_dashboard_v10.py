@@ -4933,14 +4933,38 @@ def normalize_parallel_collect_config(config: object) -> Dict[str, object]:
     if max_attempts < success_count:
         raise ValueError("max_attempts per worker must be >= success_count per worker")
     log_mode = str(raw.get("log_mode") or "data").strip().lower()
-    if log_mode not in {"data", "debug", "profile"}:
-        raise ValueError("log_mode must be data, debug, or profile")
+    supported_log_modes = {
+        "data",
+        "data_multi",
+        "data_multi_recovery",
+        "debug",
+        "profile",
+    }
+    if log_mode not in supported_log_modes:
+        raise ValueError(
+            "log_mode must be data, data_multi, data_multi_recovery, debug, or profile"
+        )
+    multi_scoop_mode = log_mode in {"data_multi", "data_multi_recovery"}
+    scoops_per_episode = bounded_int(
+        "scoops_per_episode",
+        2 if multi_scoop_mode else 1,
+        1,
+        63,
+    )
+    max_scoops_per_episode = bounded_int("max_scoops_per_episode", 64, 2, 256)
+    if multi_scoop_mode and max_scoops_per_episode <= scoops_per_episode:
+        raise ValueError("max_scoops_per_episode must be greater than scoops_per_episode")
+    if not multi_scoop_mode:
+        scoops_per_episode = 1
+        max_scoops_per_episode = 1
     return {
         "gpu_ids": ",".join(str(value) for value in gpu_values),
         "workers": workers,
         "success_count": success_count,
         "max_attempts": max_attempts,
         "log_mode": log_mode,
+        "scoops_per_episode": scoops_per_episode,
+        "max_scoops_per_episode": max_scoops_per_episode,
         "fast_sampled_replay": bool(raw.get("fast_sampled_replay", False)),
         "shutdown_on_complete": bool(raw.get("shutdown_on_complete", False)),
         "expected_total_successes": int(workers * success_count),
@@ -5207,6 +5231,8 @@ def dashboard_start_parallel_collect(
                 "SUCCESS_COUNT": str(normalized["success_count"]),
                 "MAX_ATTEMPTS": str(normalized["max_attempts"]),
                 "LOG_MODE": str(normalized["log_mode"]),
+                "SCOOPS_PER_EPISODE": str(normalized["scoops_per_episode"]),
+                "MAX_SCOOPS_PER_EPISODE": str(normalized["max_scoops_per_episode"]),
                 "FAST_SAMPLED_REPLAY": "1" if normalized["fast_sampled_replay"] else "0",
                 "SHUTDOWN_ON_COMPLETE": "1" if normalized["shutdown_on_complete"] else "0",
                 "SHUTDOWN_DELAY_MINUTES": "1",
@@ -7250,7 +7276,9 @@ body main details>summary:after,.managerPanel>summary:after,.detailsPanel>summar
       <label class="parallelCollectField number"><span>Workers</span><input id="parallelWorkers" type="number" min="1" max="32" value="2"></label>
       <label class="parallelCollectField number"><span>Success / worker</span><input id="parallelSuccessCount" type="number" min="1" max="10000" value="60"></label>
       <label class="parallelCollectField number"><span>Attempts / worker</span><input id="parallelMaxAttempts" type="number" min="1" max="100000" value="500"></label>
-      <label class="parallelCollectField"><span>Log mode</span><select id="parallelLogMode"><option value="data">data</option><option value="debug">debug</option><option value="profile">profile</option></select></label>
+      <label class="parallelCollectField"><span>Log mode</span><select id="parallelLogMode"><option value="data">data</option><option value="data_multi">data_multi</option><option value="data_multi_recovery">data_multi_recovery</option><option value="debug">debug</option><option value="profile">profile</option></select></label>
+      <label class="parallelCollectField number" id="parallelMinScoopsLabel"><span>Min scoops</span><input id="parallelMinScoops" type="number" min="1" max="63" value="2"></label>
+      <label class="parallelCollectField number" id="parallelMaxScoopsLabel"><span>Max guard</span><input id="parallelMaxScoops" type="number" min="2" max="256" value="64"></label>
       <label class="parallelCollectToggle"><input id="parallelFastReplay" type="checkbox">Fast pre-dig</label>
       <label class="parallelCollectToggle" id="parallelShutdownLabel" title="Requires EXCAVATOR_DASHBOARD_ALLOW_SHUTDOWN=1"><input id="parallelShutdownOnComplete" type="checkbox" disabled>Shutdown when complete</label>
       <button type="button" id="startParallelCollectBtn">Start parallel</button>
@@ -7435,9 +7463,17 @@ function parallelCollectConfig(){
     success_count:Number($("parallelSuccessCount")?.value||1),
     max_attempts:Number($("parallelMaxAttempts")?.value||1),
     log_mode:String($("parallelLogMode")?.value||"data"),
+    scoops_per_episode:Number($("parallelMinScoops")?.value||2),
+    max_scoops_per_episode:Number($("parallelMaxScoops")?.value||64),
     fast_sampled_replay:!!$("parallelFastReplay")?.checked,
     shutdown_on_complete:!!$("parallelShutdownOnComplete")?.checked,
   };
+}
+function syncParallelMultiControls(){
+  const mode=String($("parallelLogMode")?.value||"data");
+  const enabled=mode==="data_multi"||mode==="data_multi_recovery";
+  for(const id of ["parallelMinScoops","parallelMaxScoops"]){const el=$(id); if(el) el.disabled=!enabled;}
+  for(const id of ["parallelMinScoopsLabel","parallelMaxScoopsLabel"]){const el=$(id); if(el) el.title=enabled?"Adaptive multi-scoop episode limits.":"Used only by data_multi modes.";}
 }
 function renderParallelCollectStatus(state, announce=false){
   const statusEl=$("parallelCollectStatus"), startBtn=$("startParallelCollectBtn"), stopBtn=$("stopParallelCollectBtn"), shutdownToggle=$("parallelShutdownOnComplete"), shutdownLabel=$("parallelShutdownLabel");
@@ -7484,7 +7520,8 @@ async function startParallelCollect(){
   const config=parallelCollectConfig();
   if(config.shutdown_on_complete&&!window.confirm("Power off this Linux host one minute after every worker reaches its success target? Manual Stop, worker failure, or incomplete targets will not shut it down.")) return;
   const total=Number(config.workers||0)*Number(config.success_count||0);
-  terminalWrite(`Starting parallel collect: GPUs=${config.gpu_ids} workers=${config.workers} success/worker=${config.success_count} total=${total} shutdown=${config.shutdown_on_complete?"armed":"off"}`,"muted");
+  const scoopText=config.log_mode.startsWith("data_multi")?` min_scoops=${config.scoops_per_episode} max_guard=${config.max_scoops_per_episode}`:"";
+  terminalWrite(`Starting parallel collect: GPUs=${config.gpu_ids} workers=${config.workers} success/worker=${config.success_count} total=${total} mode=${config.log_mode}${scoopText} shutdown=${config.shutdown_on_complete?"armed":"off"}`,"muted");
   const state=await postJSON("/api/manage/parallel_collect_start",{root:$("rootInput").value,config});
   renderParallelCollectStatus(state,true);
   await loadRuns({silent:true});
@@ -8887,6 +8924,7 @@ bindStaticControl("copyPathBtn","click",()=>navigator.clipboard&&navigator.clipb
 bindStaticControl("clearTerminalBtn","click",()=>{const box=$("terminalBox"); if(box) box.textContent=""; terminalWrite("terminal cleared","muted");});
 bindStaticControl("startParallelCollectBtn","click",()=>startParallelCollect().catch(e=>setStatus(e.message,"error")));
 bindStaticControl("stopParallelCollectBtn","click",()=>stopParallelCollect().catch(e=>setStatus(e.message,"error")));
+bindStaticControl("parallelLogMode","change",()=>syncParallelMultiControls());
 bindStaticControl("copyRawAttemptBtn","click",()=>{
   const text=$("rawBox")?.textContent||"";
   if(!navigator.clipboard){setStatus("Clipboard unavailable","error");return;}
@@ -8904,6 +8942,7 @@ bindStaticControl("moveSuccessBtn","click",()=>transferSuccessRecords("move", fa
 bindStaticControl("trashEpisodeBtn","click",()=>trashSelectedEpisode().catch(e=>setStatus(e.message,"error")));
 bindStaticControl("darkModeToggle","click",()=>toggleDarkMode());
 initDarkMode();
+syncParallelMultiControls();
 const episodeSortSelect=$("episodeSortSelect"); if(episodeSortSelect) episodeSortSelect.addEventListener("change",()=>refreshFilteredViews());
 $("rootInput").addEventListener("input", ()=>{syncSuccessPoolPath(); parallelCollectFingerprint="";});
 $("rootInput").addEventListener("keydown", e=>{if(e.key==="Enter") loadRuns().then(()=>loadRun()).catch(err=>setStatus(err.message,"error"))});

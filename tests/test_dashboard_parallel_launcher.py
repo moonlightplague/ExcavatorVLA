@@ -29,7 +29,9 @@ class DashboardParallelLauncherTests(unittest.TestCase):
                 "workers": 5,
                 "success_count": 60,
                 "max_attempts": 500,
-                "log_mode": "data",
+                "log_mode": "data_multi",
+                "scoops_per_episode": 2,
+                "max_scoops_per_episode": 64,
                 "fast_sampled_replay": True,
                 "shutdown_on_complete": True,
             }
@@ -38,6 +40,9 @@ class DashboardParallelLauncherTests(unittest.TestCase):
         self.assertEqual(config["workers"], 5)
         self.assertEqual(config["success_count"], 60)
         self.assertEqual(config["expected_total_successes"], 300)
+        self.assertEqual(config["log_mode"], "data_multi")
+        self.assertEqual(config["scoops_per_episode"], 2)
+        self.assertEqual(config["max_scoops_per_episode"], 64)
         self.assertTrue(config["fast_sampled_replay"])
         self.assertTrue(config["shutdown_on_complete"])
 
@@ -53,6 +58,16 @@ class DashboardParallelLauncherTests(unittest.TestCase):
                     "workers": 1,
                     "success_count": 100,
                     "max_attempts": 50,
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "log_mode"):
+            dashboard.normalize_parallel_collect_config({"log_mode": "multi"})
+        with self.assertRaisesRegex(ValueError, "max_scoops_per_episode"):
+            dashboard.normalize_parallel_collect_config(
+                {
+                    "log_mode": "data_multi",
+                    "scoops_per_episode": 4,
+                    "max_scoops_per_episode": 4,
                 }
             )
 

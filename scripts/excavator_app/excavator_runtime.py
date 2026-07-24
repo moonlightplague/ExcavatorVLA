@@ -116,6 +116,22 @@ MULTI_SCOOP_ADAPTIVE_STOP_ENABLED = env_bool(
     "EXCAVATOR_MULTI_SCOOP_ADAPTIVE_STOP",
     MULTI_SCOOP_ENABLED,
 )
+MULTI_SCOOP_TRUCK_TARGET_PARTICLES = max(
+    0,
+    env_int("EXCAVATOR_MULTI_SCOOP_TRUCK_TARGET_PARTICLES", 0),
+)
+MULTI_SCOOP_TRUCK_TARGET_INITIAL_PILE_FRACTION = max(
+    0.0,
+    env_float("EXCAVATOR_MULTI_SCOOP_TRUCK_TARGET_INITIAL_PILE_FRACTION", 0.02),
+)
+MULTI_SCOOP_TRUCK_TARGET_MIN_PARTICLES = max(
+    1,
+    env_int("EXCAVATOR_MULTI_SCOOP_TRUCK_TARGET_MIN_PARTICLES", 5000),
+)
+MULTI_SCOOP_TRUCK_TARGET_MAX_PARTICLES = max(
+    MULTI_SCOOP_TRUCK_TARGET_MIN_PARTICLES,
+    env_int("EXCAVATOR_MULTI_SCOOP_TRUCK_TARGET_MAX_PARTICLES", 8000),
+)
 # Compatibility alias: older metadata/export code treats this as the required count.
 MULTI_SCOOPS_PER_EPISODE = MULTI_SCOOPS_MIN_PER_EPISODE
 MULTI_SCOOP_DATASET_RELEASE = "v2.0"
@@ -552,6 +568,8 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "auto_scene_sand_amount_max": 15.00,
     "auto_scene_last_randomization": {},
     "auto_scene_truck_baseline": None,
+    "dynamic_reach_radius_high_water": 0.0,
+    "dynamic_reach_radius_last_observed": 0.0,
     "timeline_stop_candidate_since": 0.0,
     "last_dig_plan_candidates": [],
     "dig_plan_candidate": None,
@@ -581,6 +599,7 @@ builtins._EXCAVATOR_MOUSE_SLIDER_STATE = {
     "dataset_scoop_stop_reason": "",
     "dataset_scoop_stop_natural": False,
     "dataset_scoop_stop_detail": {},
+    "dataset_truck_target_particles": 0,
     "multi_scoop_last_viability": {},
     "multi_scoop_ranked_targets_all": [],
     "multi_scoop_new_target_planning_exhausted": False,
@@ -8251,6 +8270,18 @@ def auto_dataset_config_snapshot():
         "scoops_min_per_episode": int(multi_scoop_target_count()),
         "scoops_max_per_episode": int(multi_scoop_max_count()),
         "adaptive_scoop_stop": bool(multi_scoop_adaptive_stop_enabled()),
+        "truck_load_stop_policy": {
+            "fixed_target_particles": int(MULTI_SCOOP_TRUCK_TARGET_PARTICLES),
+            "initial_pile_fraction": float(
+                MULTI_SCOOP_TRUCK_TARGET_INITIAL_PILE_FRACTION
+            ),
+            "min_target_particles": int(
+                MULTI_SCOOP_TRUCK_TARGET_MIN_PARTICLES
+            ),
+            "max_target_particles": int(
+                MULTI_SCOOP_TRUCK_TARGET_MAX_PARTICLES
+            ),
+        },
         "trajectory_format": DATASET_TRAJECTORY_FORMAT,
         "dataset_root": AUTO_COLLECT_DATASET_ROOT,
         "default_count": AUTO_COLLECT_DEFAULT_COUNT,
@@ -12660,6 +12691,9 @@ def dataset_record_sample(
             "observation.scoops_min": int(STATE.get("dataset_scoops_min", 1) or 1),
             "observation.scoops_max": int(STATE.get("dataset_scoops_max", 1) or 1),
             "observation.scoops_completed": int(STATE.get("dataset_scoops_completed", 0) or 0),
+            "observation.truck_target_particles": int(
+                STATE.get("dataset_truck_target_particles", 0) or 0
+            ),
             "phase": str(phase),
             "phase.index": phase_features["index"],
             "observation.stage_current_id": int(phase_features["index"]),
@@ -15316,6 +15350,7 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
     STATE["dataset_scoop_stop_reason"] = ""
     STATE["dataset_scoop_stop_natural"] = False
     STATE["dataset_scoop_stop_detail"] = {}
+    STATE["dataset_truck_target_particles"] = 0
     STATE["multi_scoop_last_viability"] = {}
     STATE["multi_scoop_ranked_targets_all"] = []
     STATE["multi_scoop_new_target_planning_exhausted"] = False
@@ -15369,6 +15404,11 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
     if bool(STATE.get("dataset_camera_enabled", True)):
         os.makedirs(STATE["dataset_image_dir"], exist_ok=True)
     initial_ids = capture_initial_pile_particle_ids()
+    STATE["dataset_truck_target_particles"] = int(
+        multi_scoop_truck_target_particles(len(initial_ids))
+        if multi_scoop
+        else 0
+    )
     STATE["dataset_episode_sample_start"] = int(STATE.get("dataset_samples", 0))
     STATE["dataset_recording"] = True
 
@@ -15473,6 +15513,10 @@ def auto_collect_begin_episode(attempt_index, target, plan_attempts, seq, initia
         "adaptive_scoop_stop": bool(
             multi_scoop and MULTI_SCOOP_ADAPTIVE_STOP_ENABLED
         ),
+        "truck_target_particles": int(
+            STATE.get("dataset_truck_target_particles", 0) or 0
+        ),
+        "initial_pile_particles": int(len(initial_ids)),
         "scoops_completed": 0,
         "scoop_results": [],
         "state_schema_version": vla_observation_contract.SCHEMA_VERSION,
@@ -16902,17 +16946,14 @@ def auto_scene_sand_polygon_for_candidate(sand_xy=None, ctx=None):
 
 
 def auto_scene_current_truck_polygon_xy():
-    prim = get_prim(AUTO_SCENE_TRUCK_ROOT_PATH)
-    if prim and prim.IsValid():
-        pts = mesh_world_xy_points_under(prim)
-        hull = convex_hull_xy(pts)
-        if hull is not None:
-            return hull
-    center, size, _mn, _mx = bbox_center_size(AUTO_SCENE_TRUCK_ROOT_PATH)
-    if center is None or size is None:
+    truck_obb = auto_scene_current_truck_obb_xy()
+    if not isinstance(truck_obb, dict):
         return None
-    yaw = get_prim_local_yaw_z_deg(AUTO_SCENE_TRUCK_ROOT_PATH, default=0.0)
-    return obb_polygon_xy(center[:2], size[:2], yaw)
+    return obb_polygon_xy(
+        truck_obb.get("center"),
+        truck_obb.get("size"),
+        truck_obb.get("yaw_deg", 0.0),
+    )
 
 
 def auto_scene_candidate_truck_polygon_xy(candidate):
@@ -17262,7 +17303,7 @@ def auto_scene_current_robot_truck_overlap_detail():
     truck_poly = None
     try:
         truck_poly = auto_scene_current_truck_polygon_xy()
-        detail["truck_footprint_source"] = "mesh_world_hull_or_obb"
+        detail["truck_footprint_source"] = "truck_local_obb"
         detail["truck_polygon_vertices"] = 0 if truck_poly is None else int(len(truck_poly))
     except Exception as exc:
         detail["truck_footprint_exception"] = f"{type(exc).__name__}: {exc}"
@@ -17326,7 +17367,9 @@ def auto_scene_current_robot_truck_overlap_detail():
                     "z_overlap": bool(z_overlap),
                 })
         detail["robot_link_footprint_hits"] = link_hits
-        detail["robot_link_footprint_gate"] = "mesh_world_hull_zero_margin"
+        detail["robot_link_footprint_gate"] = (
+            "robot_link_hull_vs_truck_obb_zero_margin"
+        )
 
     mesh_overlap = bool(link_hits)
     detail["aabb_overlap_diagnostic_only"] = bool(bbox_overlap)
@@ -19444,6 +19487,31 @@ def multi_scoop_adaptive_stop_enabled():
     )
 
 
+def multi_scoop_truck_target_particles(initial_pile_particles=None):
+    if not multi_scoop_mode_enabled():
+        return 0
+    if int(MULTI_SCOOP_TRUCK_TARGET_PARTICLES) > 0:
+        return int(MULTI_SCOOP_TRUCK_TARGET_PARTICLES)
+    if initial_pile_particles is None:
+        initial_pile_particles = STATE.get(
+            "dataset_initial_pile_particle_count",
+            0,
+        )
+    proportional_target = int(
+        round(
+            max(0, int(initial_pile_particles or 0))
+            * float(MULTI_SCOOP_TRUCK_TARGET_INITIAL_PILE_FRACTION)
+        )
+    )
+    return int(
+        clamp(
+            proportional_target,
+            MULTI_SCOOP_TRUCK_TARGET_MIN_PARTICLES,
+            MULTI_SCOOP_TRUCK_TARGET_MAX_PARTICLES,
+        )
+    )
+
+
 def active_multi_scoop_index_for_planning():
     planning_index = STATE.get("multi_scoop_planning_index")
     if planning_index is not None:
@@ -19458,7 +19526,8 @@ def multi_scoop_generic_task_text(count=None):
     count = multi_scoop_target_count() if count is None else max(1, int(count))
     text = (
         "Continue excavating and dumping sand from the visible sand pile into the visible "
-        "truck bed without resetting the scene until no effective dig target remains."
+        "truck bed without resetting the scene until no effective dig target remains or "
+        "the truck reaches its assigned load target."
     )
     if count > 1:
         text = text[:-1] + f", completing at least {count} successful scoops."
@@ -20713,6 +20782,42 @@ async def auto_collect_one_episode():
                 f"bin_gain={scoop_report.get('bin_gain_from_pile_particles', 0)}",
                 f"spill={scoop_report.get('spill_from_lift_particles', 0)}",
             )
+            completed = int(STATE.get("dataset_scoops_completed", 0) or 0)
+            truck_target = int(
+                STATE.get("dataset_truck_target_particles", 0) or 0
+            )
+            truck_particles = int(
+                scoop_report.get("bin_from_pile_end", 0) or 0
+            )
+            if (
+                adaptive_stop
+                and completed >= scoops_target
+                and truck_target > 0
+                and truck_particles >= truck_target
+            ):
+                stop_detail = {
+                    "completed": completed,
+                    "minimum": int(scoops_target),
+                    "truck_particles": truck_particles,
+                    "truck_target_particles": truck_target,
+                    "initial_pile_particles": int(
+                        STATE.get("dataset_initial_pile_particle_count", 0) or 0
+                    ),
+                }
+                multi_scoop_set_stop(
+                    "truck_target_load_reached",
+                    True,
+                    stop_detail,
+                )
+                info_print(
+                    "[AUTO DATASET V2.0 STOP]",
+                    f"attempt={attempt}",
+                    f"completed={completed}",
+                    f"minimum={scoops_target}",
+                    f"truck={truck_particles}/{truck_target}",
+                    "reason=truck_target_load_reached",
+                )
+                break
 
     if adaptive_stop and not str(STATE.get("dataset_scoop_stop_reason", "") or ""):
         multi_scoop_set_stop(
@@ -25674,9 +25779,34 @@ def estimate_dynamic_reach_radius():
         tip = transform_local_point_to_world(BUCKET_LINK, BUCKET_TIP_LOCAL)
 
         r_now = float(np.linalg.norm(tip[:2] - center[:2]))
-        r_max = clamp(r_now * DIG_REACH_MARGIN, 4.0, DIG_MAX_RADIUS_FALLBACK)
-
-        return r_max
+        upper_bound = min(
+            float(DIG_MAX_RADIUS_FALLBACK),
+            float(AUTO_SCENE_UNLOAD_MAX_REACH_RADIUS),
+        )
+        observed = clamp(
+            r_now * DIG_REACH_MARGIN,
+            4.0,
+            upper_bound,
+        )
+        previous = max(
+            0.0,
+            float(STATE.get("dynamic_reach_radius_high_water", 0.0) or 0.0),
+        )
+        physical_floor = min(
+            upper_bound,
+            max(
+                float(AUTO_SCENE_SAND_MAX_REACH_RADIUS) + 0.25,
+                float(AUTO_SCENE_UNLOAD_MIN_REACH_RADIUS) + 0.25,
+            ),
+        )
+        stable_reach = clamp(
+            max(observed, previous, physical_floor),
+            physical_floor,
+            upper_bound,
+        )
+        STATE["dynamic_reach_radius_last_observed"] = float(observed)
+        STATE["dynamic_reach_radius_high_water"] = float(stable_reach)
+        return float(stable_reach)
 
     except Exception:
         return DIG_MAX_RADIUS_FALLBACK

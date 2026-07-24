@@ -186,6 +186,44 @@ class CameraTimelineContractTests(unittest.TestCase):
         self.assertIn("technical_safety_cap_reached", episode_source)
         self.assertIn("multi_scoop_exhausted_before_minimum", episode_source)
 
+    def test_adaptive_stop_accepts_a_completed_truck_load_task(self):
+        target_node = function_node(
+            RUNTIME_PATH,
+            "multi_scoop_truck_target_particles",
+        )
+        episode_node = function_node(RUNTIME_PATH, "auto_collect_one_episode")
+        target_source = ast.unparse(target_node)
+        episode_source = ast.unparse(episode_node)
+
+        self.assertIn(
+            "MULTI_SCOOP_TRUCK_TARGET_INITIAL_PILE_FRACTION",
+            target_source,
+        )
+        self.assertIn("MULTI_SCOOP_TRUCK_TARGET_MIN_PARTICLES", target_source)
+        self.assertIn("MULTI_SCOOP_TRUCK_TARGET_MAX_PARTICLES", target_source)
+        self.assertIn("completed >= scoops_target", episode_source)
+        self.assertIn("truck_particles >= truck_target", episode_source)
+        self.assertIn("truck_target_load_reached", episode_source)
+
+    def test_dynamic_workspace_reach_does_not_shrink_with_current_pose(self):
+        reach_node = function_node(RUNTIME_PATH, "estimate_dynamic_reach_radius")
+        reach_source = ast.unparse(reach_node)
+
+        self.assertIn("dynamic_reach_radius_high_water", reach_source)
+        self.assertIn("max(observed, previous, physical_floor)", reach_source)
+        self.assertIn("AUTO_SCENE_UNLOAD_MIN_REACH_RADIUS", reach_source)
+
+    def test_truck_overlap_footprint_uses_constant_memory_obb(self):
+        polygon_node = function_node(
+            RUNTIME_PATH,
+            "auto_scene_current_truck_polygon_xy",
+        )
+        polygon_source = ast.unparse(polygon_node)
+
+        self.assertIn("auto_scene_current_truck_obb_xy", polygon_source)
+        self.assertIn("obb_polygon_xy", polygon_source)
+        self.assertNotIn("mesh_world_xy_points_under", polygon_source)
+
     def test_target_topk_prefers_distinct_xy_before_depth_variants(self):
         rank_node = function_node(RUNTIME_PATH, "auto_collect_rank_dig_targets")
         rank_source = ast.unparse(rank_node)

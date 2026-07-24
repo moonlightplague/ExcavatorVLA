@@ -7014,6 +7014,12 @@ def compact_dig_primitive_params(candidate):
         "computed_cut_depth",
         "computed_load_mid_depth",
         "computed_load_exit_depth",
+        "computed_floor_safe_insert_z",
+        "computed_floor_safe_mid_z",
+        "computed_floor_limited_insert",
+        "computed_floor_limited_mid",
+        "computed_effective_insert_depth",
+        "computed_effective_load_mid_depth",
         "computed_bucket_cut_joint_deg",
         "computed_bucket_mid_joint_deg",
         "computed_bucket_exit_joint_deg",
@@ -29300,6 +29306,38 @@ def offset_xy(point, direction_xy, amount, z=None):
     return p
 
 
+def dig_floor_safe_target_z(end_effector, bucket_world_deg):
+    floor_limits = {
+        "tip": float(GROUND_TOP_Z) - float(DIG_MAX_TIP_DEPTH),
+        "load": float(GROUND_TOP_Z) - float(DIG_MAX_BUCKET_BODY_DEPTH),
+        "mid": float(GROUND_TOP_Z) - (float(DIG_MAX_TIP_DEPTH) + 0.12),
+        "pour": float(GROUND_TOP_Z) - (float(DIG_MAX_TIP_DEPTH) + 0.12),
+        "bucket_joint": float(GROUND_TOP_Z) - (float(DIG_MAX_TIP_DEPTH) + 0.12),
+    }
+    min_z, detail = ik_calculation.floor_safe_effector_target_z(
+        IK_MODEL,
+        end_effector=end_effector,
+        world_angle_rad=deg_to_rad(bucket_world_deg),
+        point_min_z=floor_limits,
+        margin=0.015,
+    )
+    if min_z is None:
+        fallback = (
+            float(GROUND_TOP_Z) + 0.16
+            if str(end_effector) == "load"
+            else float(GROUND_TOP_Z) + 0.035
+        )
+        detail = dict(detail or {})
+        detail.update(
+            {
+                "reason": f"fallback:{detail.get('reason', 'unavailable')}",
+                "required_target_z": float(fallback),
+            }
+        )
+        return float(fallback), detail
+    return float(min_z), detail
+
+
 def adaptive_dig_plan_candidates(target_xyz):
     return ik_calculation.adaptive_dig_plan_candidates(runtime_module(), target_xyz)
 
@@ -29374,6 +29412,17 @@ def solve_dig_pose(
                         force=True,
                     )
                 info["world_angle_err_deg"] = float(rad_to_deg(level_err_rad))
+
+    fresh_ground_report = predicted_phase_ground_report(q_goal, label, reference_q=q_seed)
+    fresh_ground_ok, fresh_ground_reason = phase_ground_ok(label, fresh_ground_report)
+    if not fresh_ground_ok:
+        set_target_color(TARGET_COLOR_UNREACHABLE)
+        update_status(
+            f"[DIG PLAN WARN] {label}: reconstructed pose violates ground guard: {fresh_ground_reason}",
+            force=True,
+        )
+        return None
+    info["phase_report"] = fresh_ground_report
 
     raw_swing_goal = info.get("raw_swing_goal")
     swing_goal = info.get("swing_goal")
@@ -29468,6 +29517,7 @@ def solve_dig_pose_candidates(
         return [], str(reason)
 
     rows = []
+    reconstructed_rejects = {}
     for q_goal, info in candidate_rows:
         q_goal = np.array(q_goal, dtype=np.float32).copy()
         level_calc = None
@@ -29484,6 +29534,14 @@ def solve_dig_pose_candidates(
                 level_err_rad = abs(wrap_angle(float(actual_angles[2]) - deg_to_rad(bucket_world_deg)))
                 info["world_angle_err_deg"] = float(rad_to_deg(level_err_rad))
 
+        fresh_ground_report = predicted_phase_ground_report(q_goal, label, reference_q=q_seed)
+        fresh_ground_ok, fresh_ground_reason = phase_ground_ok(label, fresh_ground_report)
+        if not fresh_ground_ok:
+            key = str(fresh_ground_reason)
+            reconstructed_rejects[key] = int(reconstructed_rejects.get(key, 0)) + 1
+            continue
+        info = dict(info)
+        info["phase_report"] = fresh_ground_report
         rows.append(
             {
                 "phase": label,
@@ -29500,7 +29558,15 @@ def solve_dig_pose_candidates(
         )
 
     if not rows:
-        return [], f"{label} no usable IK candidates after bucket world-angle reconstruction"
+        detail = ", ".join(
+            f"{reason}:{count}"
+            for reason, count in sorted(
+                reconstructed_rejects.items(),
+                key=lambda item: -int(item[1]),
+            )[:3]
+        )
+        suffix = "" if not detail else f"; rejects={detail}"
+        return [], f"{label} no usable IK candidates after bucket world-angle reconstruction{suffix}"
     return rows, "ok"
 
 
@@ -30686,6 +30752,21 @@ def dig_plan_specs_from_candidate(target_xyz, candidate):
         inward = np.array([-1.0, 0.0], dtype=np.float32)
     outward = -inward
 
+    try:
+        surface_angle_deg = float((surface_report or {}).get("surface_angle_deg", 0.0) or 0.0)
+    except Exception:
+        surface_angle_deg = 0.0
+    max_surface_angle = max(0.0, float(BUCKET_DIG_SURFACE_ANGLE_MAX_DEG))
+    surface_angle_deg = max(-max_surface_angle, min(max_surface_angle, surface_angle_deg))
+
+    def relative_bucket_world(key, fallback):
+        return float(candidate.get(key, fallback)) + float(surface_angle_deg)
+
+    bucket_approach_world = relative_bucket_world("bucket_attack_world", BUCKET_DIG_APPROACH_WORLD_DEG)
+    bucket_insert_world = relative_bucket_world("bucket_cut_world", BUCKET_DIG_INSERT_WORLD_DEG)
+    bucket_mid_world = relative_bucket_world("bucket_mid_cut_world", BUCKET_DIG_PULL_WORLD_DEG)
+    bucket_exit_world = relative_bucket_world("bucket_exit_world", BUCKET_DIG_EXIT_WORLD_DEG)
+
     def cut_z(depth, min_clearance=0.035):
         depth = max(0.0, float(depth))
         return max(GROUND_TOP_Z + float(min_clearance), float(surface_z) - depth)
@@ -30712,10 +30793,14 @@ def dig_plan_specs_from_candidate(target_xyz, candidate):
     contact_clearance = max(0.015, min(0.08, float(candidate.get("contact_z", 0.03))))
     pre = offset_xy(target, outward, float(candidate.get("approach_offset", 0.25)), float(surface_z) + pre_clearance)
     contact = offset_xy(target, outward, max(0.16, float(candidate.get("approach_offset", 0.25)) * 0.70), float(surface_z) + contact_clearance)
-    insert = offset_xy(target, outward, max(0.10, float(candidate.get("approach_offset", 0.25)) * 0.42), cut_z(insert_depth))
+    floor_safe_insert_z, floor_safe_insert_detail = dig_floor_safe_target_z("tip", bucket_insert_world)
+    insert_z = max(cut_z(insert_depth), float(floor_safe_insert_z))
+    insert = offset_xy(target, outward, max(0.10, float(candidate.get("approach_offset", 0.25)) * 0.42), insert_z)
     mid_pull = float(candidate.get("mid_pull", 0.35))
     exit_pull = float(candidate.get("exit_pull", 0.55))
-    mid_cut = offset_xy(target, inward, mid_pull, cut_z(load_mid_depth))
+    floor_safe_mid_z, floor_safe_mid_detail = dig_floor_safe_target_z("load", bucket_mid_world)
+    mid_cut_z = max(cut_z(load_mid_depth), float(floor_safe_mid_z))
+    mid_cut = offset_xy(target, inward, mid_pull, mid_cut_z)
     exit_lift_z = max(0.03, float(candidate.get("exit_lift_z", 0.08)))
     # Curl before exiting. The current failure mode is a deep pull-mid followed
     # by an exit pose whose bucket body is still buried. Seal the bucket near the
@@ -30738,20 +30823,6 @@ def dig_plan_specs_from_candidate(target_xyz, candidate):
     bucket_mid_cut_deg = max(-118.0, min(bucket_cut_deg - 18.0, float(candidate.get("bucket_mid_cut", BUCKET_DIG_PULL_JOINT_DEG))))
     bucket_exit_cut_deg = max(-118.0, min(bucket_mid_cut_deg - 4.0, float(candidate.get("bucket_exit", BUCKET_DIG_EXIT_JOINT_DEG))))
     try:
-        surface_angle_deg = float((surface_report or {}).get("surface_angle_deg", 0.0) or 0.0)
-    except Exception:
-        surface_angle_deg = 0.0
-    max_surface_angle = max(0.0, float(BUCKET_DIG_SURFACE_ANGLE_MAX_DEG))
-    surface_angle_deg = max(-max_surface_angle, min(max_surface_angle, surface_angle_deg))
-
-    def relative_bucket_world(key, fallback):
-        return float(candidate.get(key, fallback)) + float(surface_angle_deg)
-
-    bucket_approach_world = relative_bucket_world("bucket_attack_world", BUCKET_DIG_APPROACH_WORLD_DEG)
-    bucket_insert_world = relative_bucket_world("bucket_cut_world", BUCKET_DIG_INSERT_WORLD_DEG)
-    bucket_mid_world = relative_bucket_world("bucket_mid_cut_world", BUCKET_DIG_PULL_WORLD_DEG)
-    bucket_exit_world = relative_bucket_world("bucket_exit_world", BUCKET_DIG_EXIT_WORLD_DEG)
-    try:
         candidate["dig_stage_profile"] = "load_volume_continuous"
         candidate["computed_center_surface_z"] = center_surface_z
         candidate["computed_plan_surface_z"] = float(surface_z)
@@ -30766,6 +30837,14 @@ def dig_plan_specs_from_candidate(target_xyz, candidate):
         candidate["computed_exit_depth"] = float(exit_depth)
         candidate["computed_load_mid_depth"] = float(load_mid_depth)
         candidate["computed_load_exit_depth"] = float(load_exit_depth)
+        candidate["computed_floor_safe_insert_z"] = float(floor_safe_insert_z)
+        candidate["computed_floor_safe_mid_z"] = float(floor_safe_mid_z)
+        candidate["computed_floor_limited_insert"] = bool(float(insert_z) > float(cut_z(insert_depth)) + 1.0e-6)
+        candidate["computed_floor_limited_mid"] = bool(float(mid_cut_z) > float(cut_z(load_mid_depth)) + 1.0e-6)
+        candidate["computed_effective_insert_depth"] = float(max(0.0, float(surface_z) - float(insert_z)))
+        candidate["computed_effective_load_mid_depth"] = float(max(0.0, float(surface_z) - float(mid_cut_z)))
+        candidate["computed_floor_safe_insert_detail"] = floor_safe_insert_detail
+        candidate["computed_floor_safe_mid_detail"] = floor_safe_mid_detail
         candidate["computed_curl_z"] = float(curl[2])
         candidate["computed_exit_cut_z"] = float(exit_cut_z)
         candidate["computed_low_curl_before_exit"] = True

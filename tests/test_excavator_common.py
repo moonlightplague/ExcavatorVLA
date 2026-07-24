@@ -7,7 +7,7 @@ from pathlib import Path
 
 import excavator_dataset_tools
 from excavator_common import bridge_protocol, geometry, paths, planning, scene_randomization, vla_observation_contract
-from scripts.excavator_app import auto_dataset_collect
+from scripts.excavator_app import auto_dataset_collect, ik_calculation
 
 try:
     import numpy as np
@@ -117,6 +117,36 @@ class PlanningTests(unittest.TestCase):
         self.assertTrue(report["ok"])
         self.assertTrue(report["within_tolerance"])
         self.assertEqual(report["warning"], "loaded_carry_height_near_floor")
+
+
+class DigDepthPlanningTests(unittest.TestCase):
+    def test_load_target_z_accounts_for_lower_bucket_tip(self):
+        if np is None:
+            self.skipTest("numpy is required for dig depth planning tests.")
+        model = {
+            "effectors": {
+                "load": {"lengths": [1.0, 1.0, 0.3], "offsets": [0.0, 0.0, 0.0]},
+                "tip": {"lengths": [1.0, 1.0, 0.7], "offsets": [0.0, 0.0, 0.0]},
+                "mid": {"lengths": [1.0, 1.0, 0.5], "offsets": [0.0, 0.0, 0.0]},
+                "pour": {"lengths": [1.0, 1.0, 0.6], "offsets": [0.0, 0.0, 0.0]},
+            }
+        }
+        min_target_z, detail = ik_calculation.floor_safe_effector_target_z(
+            model,
+            end_effector="load",
+            world_angle_rad=-0.5 * math.pi,
+            point_min_z={
+                "tip": -0.28,
+                "load": -0.10,
+                "mid": -0.40,
+                "pour": -0.40,
+                "bucket_joint": -0.40,
+            },
+            margin=0.015,
+        )
+        self.assertAlmostEqual(min_target_z, 0.135, places=6)
+        self.assertEqual(detail["limiting_point"], "tip")
+        self.assertGreater(min_target_z, 0.035)
 
     def test_height_floor_rejects_drop_beyond_tolerance(self):
         report = planning.height_floor_report(0.038, -0.021, tolerance_m=0.02)

@@ -2,6 +2,67 @@ import math
 import numpy as np
 
 
+def floor_safe_effector_target_z(
+    model,
+    end_effector,
+    world_angle_rad,
+    point_min_z,
+    margin=0.0,
+):
+    """Return the lowest target Z that keeps bucket geometry above its limits."""
+    effectors = (model or {}).get("effectors", {})
+    target_part = effectors.get(str(end_effector))
+    if not isinstance(target_part, dict):
+        return None, {"reason": f"missing_effector:{end_effector}"}
+
+    target_lengths = np.asarray(target_part.get("lengths", []), dtype=np.float64).reshape(-1)
+    target_offsets = np.asarray(target_part.get("offsets", []), dtype=np.float64).reshape(-1)
+    if len(target_lengths) != 3 or len(target_offsets) != 3:
+        return None, {"reason": f"invalid_effector_model:{end_effector}"}
+
+    target_angle = float(world_angle_rad)
+    target_terminal_z = float(target_lengths[2]) * math.sin(target_angle)
+    requirements = []
+
+    for name, min_z in dict(point_min_z or {}).items():
+        if min_z is None:
+            continue
+        if str(name) == "bucket_joint":
+            delta_z = -target_terminal_z
+        else:
+            part = effectors.get(str(name))
+            if not isinstance(part, dict):
+                continue
+            lengths = np.asarray(part.get("lengths", []), dtype=np.float64).reshape(-1)
+            offsets = np.asarray(part.get("offsets", []), dtype=np.float64).reshape(-1)
+            if len(lengths) != 3 or len(offsets) != 3:
+                continue
+            point_angle = target_angle + float(offsets[2] - target_offsets[2])
+            point_terminal_z = float(lengths[2]) * math.sin(point_angle)
+            delta_z = point_terminal_z - target_terminal_z
+        requirements.append(
+            {
+                "point": str(name),
+                "min_z": float(min_z),
+                "delta_from_target_z": float(delta_z),
+                "required_target_z": float(min_z) - float(delta_z) + float(margin),
+            }
+        )
+
+    if not requirements:
+        return None, {"reason": "no_usable_floor_limits"}
+    limiting = max(requirements, key=lambda row: float(row["required_target_z"]))
+    return float(limiting["required_target_z"]), {
+        "reason": "ok",
+        "end_effector": str(end_effector),
+        "world_angle_deg": math.degrees(target_angle),
+        "margin": float(margin),
+        "limiting_point": str(limiting["point"]),
+        "required_target_z": float(limiting["required_target_z"]),
+        "requirements": requirements,
+    }
+
+
 def joint_motion_metrics(rt, q_to, q_from, duration=0.0):
     deltas = np.array(rt.q_delta_abs_deg(q_to, q_from), dtype=np.float32)
     weighted_angle = float(np.sum(rt.DIG_PLAN_MOTION_WEIGHTS * deltas))

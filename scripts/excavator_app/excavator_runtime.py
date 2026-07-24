@@ -19610,7 +19610,13 @@ def multi_scoop_cycle_report(execution_success, reason=""):
     dig_load_score = clamp01(max_bucket / max(1.0, float(QUALITY_TARGET_BUCKET_PARTICLES)))
     dump_transfer_score = clamp01(bin_gain / max(1.0, float(max(lift_bucket, max_bucket))))
     retention_score = clamp01(lift_bucket / max(1.0, float(max_bucket)))
-    smoothness_score = clamp01(1.0 - max(0.0, max_joint_err - 8.0) / 35.0)
+    # max_joint_err is an instantaneous command-following diagnostic. During
+    # the intentional unload dump, the requested bucket angle can be more than
+    # 100 degrees ahead of the physically moving joint while the real motion
+    # remains smooth. It is not a trajectory jerk metric and must not zero the
+    # scoop quality score. Keep a neutral contribution until a real-q
+    # velocity/acceleration smoothness aggregate is available.
+    smoothness_score = 0.5
     score = (
         35.0 * dig_load_score
         + 30.0 * dump_transfer_score
@@ -19671,6 +19677,8 @@ def multi_scoop_cycle_report(execution_success, reason=""):
             - float(baseline.get("started_at_simulation", dataset_simulation_time_seconds())),
         ),
         "max_joint_error_deg": max_joint_err,
+        "smoothness_score": float(smoothness_score),
+        "smoothness_source": "neutral_until_real_q_jerk_metric",
         "max_action_speed": float(metrics.get("max_action_speed", 0.0) or 0.0),
         "phase_metrics": copy.deepcopy(STATE.get("dataset_phase_metrics", {}) or {}),
         "target_xyz": vec_list(get_target_pos() if TARGET_PATH else None, 3),

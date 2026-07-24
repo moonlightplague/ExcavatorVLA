@@ -63,6 +63,42 @@ def floor_safe_effector_target_z(
     }
 
 
+def floor_safe_vertical_correction(point_z, point_min_z, margin=0.0):
+    """Return the upward correction required by a fresh FK floor report."""
+    requirements = []
+    measured = dict(point_z or {})
+    for name, min_z in dict(point_min_z or {}).items():
+        value = measured.get(str(name))
+        if value is None or min_z is None:
+            continue
+        deficit = float(min_z) - float(value)
+        if deficit <= 0.0:
+            continue
+        requirements.append(
+            {
+                "point": str(name),
+                "actual_z": float(value),
+                "min_z": float(min_z),
+                "deficit": float(deficit),
+            }
+        )
+    if not requirements:
+        return 0.0, {
+            "reason": "already_safe",
+            "margin": float(margin),
+            "requirements": [],
+        }
+    limiting = max(requirements, key=lambda row: float(row["deficit"]))
+    correction = float(limiting["deficit"]) + max(0.0, float(margin))
+    return correction, {
+        "reason": "correction_required",
+        "margin": float(margin),
+        "limiting_point": str(limiting["point"]),
+        "correction_z": float(correction),
+        "requirements": requirements,
+    }
+
+
 def joint_motion_metrics(rt, q_to, q_from, duration=0.0):
     deltas = np.array(rt.q_delta_abs_deg(q_to, q_from), dtype=np.float32)
     weighted_angle = float(np.sum(rt.DIG_PLAN_MOTION_WEIGHTS * deltas))

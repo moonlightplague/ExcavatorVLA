@@ -148,6 +148,32 @@ class DigDepthPlanningTests(unittest.TestCase):
         self.assertEqual(detail["limiting_point"], "tip")
         self.assertGreater(min_target_z, 0.035)
 
+    def test_fk_floor_correction_uses_largest_point_deficit(self):
+        correction, detail = ik_calculation.floor_safe_vertical_correction(
+            {
+                "tip_z": -0.31,
+                "load_z": -0.18,
+                "bucket_min": -0.44,
+            },
+            {
+                "tip_z": -0.28,
+                "load_z": -0.10,
+                "bucket_min": -0.40,
+            },
+            margin=0.02,
+        )
+        self.assertAlmostEqual(correction, 0.10, places=6)
+        self.assertEqual(detail["limiting_point"], "load_z")
+
+    def test_fk_floor_correction_is_zero_when_pose_is_safe(self):
+        correction, detail = ik_calculation.floor_safe_vertical_correction(
+            {"tip_z": -0.20, "load_z": -0.05},
+            {"tip_z": -0.28, "load_z": -0.10},
+            margin=0.02,
+        )
+        self.assertEqual(correction, 0.0)
+        self.assertEqual(detail["reason"], "already_safe")
+
     def test_height_floor_rejects_drop_beyond_tolerance(self):
         report = planning.height_floor_report(0.038, -0.021, tolerance_m=0.02)
         self.assertFalse(report["ok"])

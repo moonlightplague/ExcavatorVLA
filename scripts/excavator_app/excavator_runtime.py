@@ -10900,8 +10900,12 @@ def sand_carry_runtime_recovery_target(stage_name, q_real, q_goal, recovery_coun
     best_closing_score = -1.0e9
     for boom_step_deg, arm_step_deg, bucket_step_deg, source in candidates:
         q = q_real.copy()
-        q[boom_idx] = float(q[boom_idx]) + deg_to_rad(float(boom_step_deg) * scale)
-        q[arm_idx] = float(q[arm_idx]) + deg_to_rad(float(arm_step_deg) * scale)
+        # Accumulate a true stall recovery. Starting every attempt from the
+        # unchanged real pose repeatedly requested the same one-degree lift.
+        boom_base = max(float(q_real[boom_idx]), float(q_goal[boom_idx]))
+        arm_base = min(float(q_real[arm_idx]), float(q_goal[arm_idx]))
+        q[boom_idx] = boom_base + deg_to_rad(float(boom_step_deg) * scale)
+        q[arm_idx] = arm_base + deg_to_rad(float(arm_step_deg) * scale)
         if close_goal_deg < bucket_real_deg:
             next_bucket_deg = max(
                 float(close_goal_deg),
@@ -26007,6 +26011,44 @@ def phase_ground_ok(mode, report):
     return True, "ok"
 
 
+def predicted_phase_ground_vertical_correction(mode, report, margin=0.02):
+    if not isinstance(report, dict):
+        return 0.0, {"reason": "missing_report"}
+
+    arm_clearance = -0.02 if (is_cutting_phase(mode) or is_curl_phase(mode)) else DIG_ARM_MIN_CLEARANCE
+    point_min_z = {
+        "arm_min": float(GROUND_TOP_Z) + float(arm_clearance),
+    }
+    if is_cutting_phase(mode):
+        point_min_z.update(
+            {
+                "tip_z": float(GROUND_TOP_Z) - float(DIG_MAX_TIP_DEPTH),
+                "load_z": float(GROUND_TOP_Z) - float(DIG_MAX_BUCKET_BODY_DEPTH),
+                "bucket_min": float(GROUND_TOP_Z) - (float(DIG_MAX_TIP_DEPTH) + 0.12),
+            }
+        )
+    elif is_curl_phase(mode):
+        point_min_z.update(
+            {
+                "tip_z": float(GROUND_TOP_Z) - float(DIG_MAX_CURL_DEPTH),
+                "load_z": float(GROUND_TOP_Z) - float(DIG_MAX_BUCKET_BODY_DEPTH),
+            }
+        )
+    else:
+        point_min_z.update(
+            {
+                "tip_z": float(GROUND_TOP_Z) - 0.03,
+                "bucket_min": float(GROUND_TOP_Z) - 0.08,
+            }
+        )
+    point_z = {name: report.get(name) for name in point_min_z}
+    return ik_calculation.floor_safe_vertical_correction(
+        point_z,
+        point_min_z,
+        margin=margin,
+    )
+
+
 def cut_front_edge_quality(mode, report):
     if not is_cutting_phase(mode):
         return True, "ok", 0.0
@@ -29354,6 +29396,7 @@ def solve_dig_pose(
     bucket_motion_weight=0.45,
     bucket_preference_weight=None,
     deadline=None,
+    _ground_retry=0,
 ):
     if planning_deadline_exceeded(deadline):
         return None
@@ -29416,6 +29459,39 @@ def solve_dig_pose(
     fresh_ground_report = predicted_phase_ground_report(q_goal, label, reference_q=q_seed)
     fresh_ground_ok, fresh_ground_reason = phase_ground_ok(label, fresh_ground_report)
     if not fresh_ground_ok:
+        correction_z, correction_detail = predicted_phase_ground_vertical_correction(
+            label,
+            fresh_ground_report,
+        )
+        if (
+            correction_z > 1.0e-4
+            and int(_ground_retry) < 3
+            and not planning_deadline_exceeded(deadline)
+        ):
+            corrected_point = np.array(point, dtype=np.float32).reshape(-1)[:3].copy()
+            corrected_point[2] += min(0.65, float(correction_z))
+            info_print(
+                "[DIG TARGET FLOOR REFINE]",
+                f"stage={label}",
+                f"retry={int(_ground_retry) + 1}/3",
+                f"raise_z={float(correction_z):.3f}m",
+                f"target_z={float(point[2]):.3f}->{float(corrected_point[2]):.3f}",
+                f"limiting={correction_detail.get('limiting_point', 'unknown')}",
+            )
+            return solve_dig_pose(
+                label,
+                corrected_point,
+                bucket_deg,
+                duration,
+                q_seed,
+                bucket_world_deg=bucket_world_deg,
+                ik_effector=ik_effector,
+                accept_err=accept_err,
+                bucket_motion_weight=bucket_motion_weight,
+                bucket_preference_weight=bucket_preference_weight,
+                deadline=deadline,
+                _ground_retry=int(_ground_retry) + 1,
+            )
         set_target_color(TARGET_COLOR_UNREACHABLE)
         update_status(
             f"[DIG PLAN WARN] {label}: reconstructed pose violates ground guard: {fresh_ground_reason}",
@@ -29470,6 +29546,7 @@ def solve_dig_pose_candidates(
     bucket_preference_weight=None,
     max_solutions=DIG_PLAN_TOPK_IK,
     deadline=None,
+    _ground_retry=0,
 ):
     if planning_deadline_exceeded(deadline):
         return [], "planning budget exceeded"
@@ -29518,6 +29595,8 @@ def solve_dig_pose_candidates(
 
     rows = []
     reconstructed_rejects = {}
+    best_ground_correction = None
+    best_ground_correction_detail = {}
     for q_goal, info in candidate_rows:
         q_goal = np.array(q_goal, dtype=np.float32).copy()
         level_calc = None
@@ -29539,6 +29618,19 @@ def solve_dig_pose_candidates(
         if not fresh_ground_ok:
             key = str(fresh_ground_reason)
             reconstructed_rejects[key] = int(reconstructed_rejects.get(key, 0)) + 1
+            correction_z, correction_detail = predicted_phase_ground_vertical_correction(
+                label,
+                fresh_ground_report,
+            )
+            if (
+                float(correction_z) > 1.0e-4
+                and (
+                    best_ground_correction is None
+                    or float(correction_z) < float(best_ground_correction)
+                )
+            ):
+                best_ground_correction = float(correction_z)
+                best_ground_correction_detail = dict(correction_detail or {})
             continue
         info = dict(info)
         info["phase_report"] = fresh_ground_report
@@ -29558,6 +29650,38 @@ def solve_dig_pose_candidates(
         )
 
     if not rows:
+        if (
+            best_ground_correction is not None
+            and float(best_ground_correction) > 1.0e-4
+            and int(_ground_retry) < 3
+            and not planning_deadline_exceeded(deadline)
+        ):
+            corrected_point = np.array(point, dtype=np.float32).reshape(-1)[:3].copy()
+            corrected_point[2] += min(0.65, float(best_ground_correction))
+            info_print(
+                "[DIG TARGET FLOOR REFINE]",
+                f"stage={label}",
+                f"retry={int(_ground_retry) + 1}/3",
+                f"raise_z={float(best_ground_correction):.3f}m",
+                f"target_z={float(point[2]):.3f}->{float(corrected_point[2]):.3f}",
+                f"limiting={best_ground_correction_detail.get('limiting_point', 'unknown')}",
+            )
+            return solve_dig_pose_candidates(
+                label,
+                corrected_point,
+                bucket_deg,
+                duration,
+                q_seed,
+                bucket_world_deg=bucket_world_deg,
+                ik_effector=ik_effector,
+                accept_err=accept_err,
+                soft_accept_err=soft_accept_err,
+                bucket_motion_weight=bucket_motion_weight,
+                bucket_preference_weight=bucket_preference_weight,
+                max_solutions=max_solutions,
+                deadline=deadline,
+                _ground_retry=int(_ground_retry) + 1,
+            )
         detail = ", ".join(
             f"{reason}:{count}"
             for reason, count in sorted(

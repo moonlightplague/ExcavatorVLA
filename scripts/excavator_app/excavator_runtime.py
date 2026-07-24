@@ -944,6 +944,7 @@ AUTO_SCENE_MIN_SAND_UNLOAD_DIST = 6.00
 AUTO_SCENE_MIN_ROBOT_TRUCK_DIST = 3.50
 AUTO_SCENE_MIN_SAND_PARTICLE_ESTIMATE = 3000
 AUTO_SCENE_ROBOT_SAFETY_RADIUS = 2.35
+AUTO_SCENE_SWING_CONSTRAINT_EFFORT_THRESHOLD = 250000.0
 AUTO_SCENE_TRUCK_SAFETY_MARGIN = 0.35
 AUTO_SCENE_SAND_SAFETY_MARGIN = 0.25
 AUTO_SCENE_UNLOAD_MESH_MIN_RADIUS = 7.80
@@ -17199,8 +17200,57 @@ def auto_scene_current_robot_truck_obb_gate():
         return None, detail
 
 
+def auto_scene_robot_truck_constraint_effort_detail():
+    detail = {
+        "gate": "robot_truck_overlap_constraint_effort",
+        "threshold": float(AUTO_SCENE_SWING_CONSTRAINT_EFFORT_THRESHOLD),
+    }
+    record = STATE.get("auto_scene_last_randomization", {})
+    record = record if isinstance(record, dict) else {}
+    applied = record.get("applied", {})
+    applied = applied if isinstance(applied, dict) else {}
+    applied_geometry = applied.get("geometry_legal_detail", {})
+    applied_geometry = applied_geometry if isinstance(applied_geometry, dict) else {}
+    candidate = record.get("candidate", {})
+    candidate = candidate if isinstance(candidate, dict) else {}
+    candidate_geometry = candidate.get("geometry_legal_detail", {})
+    candidate_geometry = candidate_geometry if isinstance(candidate_geometry, dict) else {}
+    footprint_hint = bool(
+        applied_geometry.get("robot_truck_footprint_overlap", False)
+        or candidate_geometry.get("robot_truck_footprint_overlap", False)
+    )
+    detail["footprint_overlap_hint"] = bool(footprint_hint)
+
+    effort_report = dataset_joint_effort_observation()
+    detail["effort_available"] = bool((effort_report or {}).get("available", False))
+    detail["effort_reason"] = str((effort_report or {}).get("reason", ""))
+    effort_values = (effort_report or {}).get("value", [])
+    try:
+        swing_idx = int(CTRL.name_to_idx.get("swing", 0))
+        swing_effort = abs(float(np.array(effort_values, dtype=np.float32).reshape(-1)[swing_idx]))
+    except Exception:
+        swing_effort = None
+    detail["swing_effort"] = swing_effort
+    constrained = bool(
+        footprint_hint
+        and swing_effort is not None
+        and swing_effort >= float(AUTO_SCENE_SWING_CONSTRAINT_EFFORT_THRESHOLD)
+    )
+    detail["constrained"] = bool(constrained)
+    detail["decision"] = "fail_fast_physical_constraint" if constrained else "continue_geometry_gate"
+    return constrained, detail
+
+
 def auto_scene_current_robot_truck_overlap_detail():
     detail = {"gate": "current_robot_truck_overlap"}
+    effort_constrained, effort_detail = auto_scene_robot_truck_constraint_effort_detail()
+    detail["constraint_effort"] = effort_detail
+    if effort_constrained:
+        detail["overlap"] = True
+        detail["overlap_source"] = "measured_swing_constraint_with_footprint_hint"
+        detail["decision"] = "fail_fast_before_sand_reset"
+        return True, detail
+
     obb_separated, obb_detail = auto_scene_current_robot_truck_obb_gate()
     detail["obb_broadphase"] = obb_detail
     if obb_separated is True:

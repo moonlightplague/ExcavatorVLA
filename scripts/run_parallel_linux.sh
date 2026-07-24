@@ -15,6 +15,7 @@ IFS=',' read -r -a GPU_LIST <<< "${GPU_IDS}"
 WORKERS="${WORKERS:-${#GPU_LIST[@]}}"
 
 SUCCESS_COUNT="${SUCCESS_COUNT:-100}"
+SUCCESS_COUNTS="${SUCCESS_COUNTS:-}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-300}"
 LOG_MODE="${LOG_MODE:-data}"
 FAST_SAMPLED_REPLAY="${FAST_SAMPLED_REPLAY:-0}"
@@ -44,6 +45,24 @@ if (( ${#GPU_LIST[@]} < 1 )); then
     echo "GPU_IDS must contain at least one GPU index" >&2
     exit 2
 fi
+declare -a WORKER_SUCCESS_TARGETS=()
+if [[ -n "${SUCCESS_COUNTS}" ]]; then
+    IFS=',' read -r -a WORKER_SUCCESS_TARGETS <<< "${SUCCESS_COUNTS}"
+    if (( ${#WORKER_SUCCESS_TARGETS[@]} != WORKERS )); then
+        echo "SUCCESS_COUNTS must contain exactly ${WORKERS} comma-separated targets" >&2
+        exit 2
+    fi
+else
+    for (( worker = 0; worker < WORKERS; worker++ )); do
+        WORKER_SUCCESS_TARGETS+=("${SUCCESS_COUNT}")
+    done
+fi
+for target in "${WORKER_SUCCESS_TARGETS[@]}"; do
+    if [[ ! "${target}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Worker success targets must be positive integers: ${SUCCESS_COUNTS:-${SUCCESS_COUNT}}" >&2
+        exit 2
+    fi
+done
 for gpu in "${GPU_LIST[@]}"; do
     if [[ ! "${gpu}" =~ ^[0-9]+$ ]]; then
         echo "Invalid GPU index in GPU_IDS=${GPU_IDS}: ${gpu}" >&2
@@ -98,6 +117,7 @@ echo "Project: ${PROJECT_ROOT}"
 echo "Dataset: ${DATASET_BASE}"
 echo "Batch:   ${BATCH_ID}"
 echo "GPUs:    ${GPU_IDS}"
+echo "Worker success targets: ${WORKER_SUCCESS_TARGETS[*]}"
 echo "Dashboard --root must be: ${DATASET_BASE}"
 echo "Adaptive scoops: minimum=${SCOOPS_PER_EPISODE} max_guard=${MAX_SCOOPS_PER_EPISODE}"
 echo "Shutdown after verified completion: ${SHUTDOWN_ON_COMPLETE}"
@@ -139,6 +159,7 @@ run_worker_supervisor() {
     local worker_name="$3"
     local log_path="$4"
     local result_path="$5"
+    local success_target="$6"
     local aggregate_successes=0
     local restart_index=0
     local child_pid=0
@@ -173,8 +194,8 @@ run_worker_supervisor() {
     }
     trap stop_supervised_child INT TERM
 
-    while (( aggregate_successes < SUCCESS_COUNT )); do
-        local remaining=$((SUCCESS_COUNT - aggregate_successes))
+    while (( aggregate_successes < success_target )); do
+        local remaining=$((success_target - aggregate_successes))
         local run_suffix="${BATCH_ID}_${worker_name}"
         if (( restart_index > 0 )); then
             run_suffix="${run_suffix}_retry_$(printf '%02d' "${restart_index}")"
@@ -235,14 +256,14 @@ run_worker_supervisor() {
         local gained
         gained="$(result_successes "${result_path}")"
         aggregate_successes=$((aggregate_successes + gained))
-        if (( aggregate_successes > SUCCESS_COUNT )); then
-            aggregate_successes="${SUCCESS_COUNT}"
+        if (( aggregate_successes > success_target )); then
+            aggregate_successes="${success_target}"
         fi
         local reason
         reason="$(result_exit_reason "${result_path}")"
-        echo "[${worker_name}] exit=${status} reason=${reason} gained=${gained} aggregate=${aggregate_successes}/${SUCCESS_COUNT}"
+        echo "[${worker_name}] exit=${status} reason=${reason} gained=${gained} aggregate=${aggregate_successes}/${success_target}"
 
-        if (( aggregate_successes >= SUCCESS_COUNT )); then
+        if (( aggregate_successes >= success_target )); then
             trap - INT TERM
             return 0
         fi
@@ -266,13 +287,15 @@ for (( worker = 0; worker < WORKERS; worker++ )); do
     worker_name="worker_$(printf '%02d' "${worker}")"
     log_path="${LOG_DIR}/${worker_name}.log"
     result_path="${LOG_DIR}/${worker_name}.result.json"
+    success_target="${WORKER_SUCCESS_TARGETS[$worker]}"
 
     run_worker_supervisor \
         "${worker}" \
         "${gpu}" \
         "${worker_name}" \
         "${log_path}" \
-        "${result_path}" &
+        "${result_path}" \
+        "${success_target}" &
     PIDS+=("$!")
     LABELS+=("${worker_name}")
     if (( WORKER_START_STAGGER_SECONDS > 0 && worker + 1 < WORKERS )); then

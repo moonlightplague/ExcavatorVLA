@@ -24210,7 +24210,7 @@ async def wait_for_motion_reached(
                                 warning_loaded = int(contact_report.get("bucket", 0) or 0)
                             except Exception:
                                 warning_loaded = 0
-                        if warning_loaded >= int(LIFT_CARRY_MIN_ABSOLUTE_BUCKET_PARTICLES):
+                        if warning_loaded >= int(CURL_HOLD_MIN_BUCKET_PARTICLES):
                             warning = (
                                 f"warning/gravity_carry_margin_loaded_continue:{label}:"
                                 f"bucket_particles={warning_loaded};"
@@ -24227,7 +24227,7 @@ async def wait_for_motion_reached(
                                 f"{label}:{mode}:{warning}",
                                 data={
                                     "bucket_particles": int(warning_loaded),
-                                    "min_absolute_bucket_particles": int(LIFT_CARRY_MIN_ABSOLUTE_BUCKET_PARTICLES),
+                                    "min_warning_bucket_particles": int(CURL_HOLD_MIN_BUCKET_PARTICLES),
                                     "carry_report": carry_report,
                                 },
                             )
@@ -24240,7 +24240,7 @@ async def wait_for_motion_reached(
                                 q_real=q_check,
                                 data={
                                     "bucket_particles": int(warning_loaded),
-                                    "min_absolute_bucket_particles": int(LIFT_CARRY_MIN_ABSOLUTE_BUCKET_PARTICLES),
+                                    "min_warning_bucket_particles": int(CURL_HOLD_MIN_BUCKET_PARTICLES),
                                     "carry_report": carry_report,
                                 },
                                 include_sand=True,
@@ -24381,7 +24381,13 @@ async def wait_for_motion_reached(
                 carry_loaded = int(contact_report.get("bucket", 0) or 0)
             except Exception:
                 carry_loaded = 0
-        if carry_loaded >= int(LIFT_CARRY_MIN_ABSOLUTE_BUCKET_PARTICLES):
+        carry_warning_ok = bool((carry_report or {}).get("gravity_carry_warning_ok", False))
+        carry_loaded_threshold = (
+            int(CURL_HOLD_MIN_BUCKET_PARTICLES)
+            if carry_warning_ok
+            else int(LIFT_CARRY_MIN_ABSOLUTE_BUCKET_PARTICLES)
+        )
+        if carry_loaded >= carry_loaded_threshold:
             warning = (
                 f"warning/gravity_carry_not_closed_loaded_continue:{label}:"
                 f"bucket_particles={carry_loaded};"
@@ -24397,7 +24403,8 @@ async def wait_for_motion_reached(
                 f"{label}:{mode}:{warning}",
                 data={
                     "bucket_particles": int(carry_loaded),
-                    "min_absolute_bucket_particles": int(LIFT_CARRY_MIN_ABSOLUTE_BUCKET_PARTICLES),
+                    "minimum_bucket_particles": int(carry_loaded_threshold),
+                    "gravity_carry_warning_ok": bool(carry_warning_ok),
                     "carry_report": carry_report,
                     "last_reach_detail": str(last_detail),
                 },
@@ -24411,7 +24418,8 @@ async def wait_for_motion_reached(
                 q_real=q_real,
                 data={
                     "bucket_particles": int(carry_loaded),
-                    "min_absolute_bucket_particles": int(LIFT_CARRY_MIN_ABSOLUTE_BUCKET_PARTICLES),
+                    "minimum_bucket_particles": int(carry_loaded_threshold),
+                    "gravity_carry_warning_ok": bool(carry_warning_ok),
                     "carry_report": carry_report,
                     "last_reach_detail": str(last_detail),
                 },

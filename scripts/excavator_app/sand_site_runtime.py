@@ -2916,6 +2916,7 @@ def apply_auto_scene_parameters(
     sand_amount_multiplier=None,
     unload_center_xy=None,
     rebuild=False,
+    create_retaining_walls=True,
 ):
     global SAND_CENTER_X, SAND_CENTER_Y, PILE_CENTER_X, PILE_CENTER_Y
     global SANDBOX_FILL_HEIGHT
@@ -2975,11 +2976,20 @@ def apply_auto_scene_parameters(
     update_particle_runtime_state()
 
     if rebuild:
-        build_sand_site()
+        build_sand_site(
+            create_retaining_walls=create_retaining_walls
+        )
     else:
         if sand_center_xy is not None:
-            make_sand_retaining_walls(root_path())
-            apply_default_sand_source_mesh()
+            if bool(create_retaining_walls):
+                make_sand_retaining_walls(root_path())
+                apply_default_sand_source_mesh()
+            else:
+                clean_sand_retaining_walls(root_path())
+                rebuild_sand_reference_grid("auto_scene_parameters_no_walls")
+                set_sand_generation_range_box(
+                    "auto_scene_parameters_no_walls"
+                )
         else:
             rebuild_sand_reference_grid("auto_scene_parameters")
             set_sand_generation_range_box("auto_scene_parameters")
@@ -2997,6 +3007,7 @@ def apply_auto_scene_parameters(
         "estimated_particle_count": int(STATE.get("estimated_particle_count", 0)),
         "unload_bin_center": [float(UNLOAD_BIN_CENTER[0]), float(UNLOAD_BIN_CENTER[1])],
         "rebuild": bool(rebuild),
+        "retaining_walls_created": bool(create_retaining_walls),
     }
 
 
@@ -3450,13 +3461,17 @@ def notify_excavator_obstacle_cache_dirty(reason):
         info("[WARN] obstacle cache invalidate failed:", type(exc).__name__, exc)
 
 
-def build_sand_site():
+def build_sand_site(create_retaining_walls=True):
     root = root_path()
     clear_previous_site(root)
     ensure_physics_scene()
     UsdGeom.Xform.Define(get_stage(), root)
-    make_sand_retaining_walls(root)
-    apply_default_sand_source_mesh()
+    if bool(create_retaining_walls):
+        make_sand_retaining_walls(root)
+        apply_default_sand_source_mesh()
+    else:
+        clean_sand_retaining_walls(root)
+        rebuild_sand_reference_grid("build_sand_site_no_walls")
     initialize_sand_reference_grid(root)
     set_sand_generation_range_box("build_sand_site")
     if AUTO_CREATE_INITIAL_SAND:

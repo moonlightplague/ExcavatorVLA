@@ -2106,8 +2106,23 @@ def main(args):
         sand_amount_multiplier=(sand_amount if sand_enabled else None),
         unload_center_xy=None,
         rebuild=False,
+        create_retaining_walls=False,
     )
     sand_api = getattr(builtins, "_SAND_SITE", sand_api)
+    sand_root_path = str(
+        sand_api.get("root_path") or "/World/SandSite"
+    ).rstrip("/")
+    sand_wall_path = f"{sand_root_path}/SandRetainingWalls"
+    if stage.GetPrimAtPath(sand_wall_path).IsValid():
+        raise RuntimeError(
+            "Sand retaining walls were created despite being disabled: "
+            f"{sand_wall_path}"
+        )
+    print(
+        "[SAND] Retaining-wall generation disabled:",
+        sand_wall_path,
+        flush=True,
+    )
 
     actual_sand_center = (
         float(getattr(sand_module, "SAND_CENTER_X", float("nan"))),

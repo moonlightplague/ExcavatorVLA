@@ -1476,6 +1476,10 @@ def main(args):
     canonical_to_raw = resolve_canonical_dof_indices(raw_dof_names)
     canonical_joint_indices = np.asarray(canonical_to_raw, dtype=np.int32)
 
+    raw_dof_names = [str(name) for name in robot.dof_names]
+    canonical_to_raw = resolve_canonical_dof_indices(raw_dof_names)
+    canonical_joint_indices = np.asarray(canonical_to_raw, dtype=np.int32)
+
     # Sand center is around (0.0, 6.7).
     ROBOT_INITIAL_POS = np.array(
         [-9.2, 6.7, 1.243],
@@ -1486,11 +1490,31 @@ def main(args):
         dtype=np.float32,
     )
     recorded_raw_initial_q = None
+    recorded_raw_initial_q = None
 
     try:
         robot.set_world_pose(
             position=ROBOT_INITIAL_POS,
             orientation=ROBOT_INITIAL_ORI,
+        )
+        if args.robot_initial_joints_deg is not None:
+            canonical_initial_q = np.radians(
+                np.asarray(
+                    args.robot_initial_joints_deg,
+                    dtype=np.float32,
+                )
+            ).astype(np.float32)
+            recorded_raw_initial_q = np.asarray(
+                robot.get_joint_positions(),
+                dtype=np.float32,
+            ).reshape(-1)
+            recorded_raw_initial_q[
+                canonical_joint_indices
+            ] = canonical_initial_q
+            robot.set_joint_positions(recorded_raw_initial_q)
+            robot.set_joint_velocities(
+                np.zeros_like(recorded_raw_initial_q)
+            )
         )
         if args.robot_initial_joints_deg is not None:
             canonical_initial_q = np.radians(
@@ -1524,7 +1548,24 @@ def main(args):
             )
             simulation_app.update()
 
+        # Physics warmup can move an uncommanded articulation.  Reapply the
+        # recorded episode pose immediately before scene construction so the
+        # first policy observation uses the exact training initialization.
+        if args.robot_initial_joints_deg is not None:
+            robot.set_joint_positions(recorded_raw_initial_q)
+            robot.set_joint_velocities(
+                np.zeros_like(recorded_raw_initial_q)
+            )
+            simulation_app.update()
+
         print("[INFO] Robot world pose:", robot.get_world_pose(), flush=True)
+        if args.robot_initial_joints_deg is not None:
+            print(
+                "[INFO] Recorded initial joint pose applied:",
+                f"degrees={list(args.robot_initial_joints_deg)}",
+                f"radians={canonical_initial_q.tolist()}",
+                flush=True,
+            )
         if args.robot_initial_joints_deg is not None:
             print(
                 "[INFO] Recorded initial joint pose applied:",
@@ -1534,6 +1575,11 @@ def main(args):
             )
     except Exception as e:
         print("[ERROR] Failed to set robot pose:", repr(e), flush=True)
+        if args.robot_initial_joints_deg is not None:
+            raise RuntimeError(
+                "Failed to apply the explicitly requested recorded initial "
+                "joint pose"
+            ) from e
         if args.robot_initial_joints_deg is not None:
             raise RuntimeError(
                 "Failed to apply the explicitly requested recorded initial "
@@ -2475,6 +2521,46 @@ def main(args):
             flush=True,
         )
 
+    if recorded_raw_initial_q is not None:
+        # Sand creation and settling advance physics for several seconds.
+        # Reapply the episode's recorded initial articulation at the last safe
+        # point before observations and bridge commands are enabled.
+        robot.set_joint_positions(recorded_raw_initial_q)
+        robot.set_joint_velocities(
+            np.zeros_like(recorded_raw_initial_q)
+        )
+        for _ in range(3):
+            simulation_app.update()
+        verified_raw_initial_q = np.asarray(
+            robot.get_joint_positions(),
+            dtype=np.float32,
+        ).reshape(-1)
+        verified_initial_q = np.asarray(
+            canonical_values(
+                verified_raw_initial_q,
+                canonical_to_raw,
+            ),
+            dtype=np.float32,
+        )
+        initial_joint_tolerance_rad = 5.0e-4
+        if not np.allclose(
+            verified_initial_q,
+            np.radians(args.robot_initial_joints_deg),
+            rtol=0.0,
+            atol=initial_joint_tolerance_rad,
+        ):
+            raise RuntimeError(
+                "Recorded initial joint pose did not survive sand setup: "
+                f"actual={verified_initial_q.tolist()}, "
+                f"expected_deg={list(args.robot_initial_joints_deg)}, "
+                f"tolerance_rad={initial_joint_tolerance_rad}"
+            )
+        print(
+            "[STATE27] Recorded initial articulation verified after sand setup:",
+            verified_initial_q.tolist(),
+            flush=True,
+        )
+
 
     # Hide sand BBox/range/debug visuals after particle settling.
     hidden_sand_visuals = hide_sand_source_guides()
@@ -3089,17 +3175,209 @@ def main(args):
         finally:
             result["elapsed_ms"] = (time.perf_counter() - start) * 1000.0
 
-    def quaternion_yaw_wxyz(orientation):
-        qw = float(orientation[0])
-        qx = float(orientation[1])
-        qy = float(orientation[2])
-        qz = float(orientation[3])
-        return math.atan2(
-            2.0 * (qw * qz + qx * qy),
-            1.0 - 2.0 * (qy * qy + qz * qz),
+    def estimate_truck_bed_load_particles():
+        start = time.perf_counter()
+        result = {
+            "available": bool(truck_bed_counting_volume["available"]),
+            "method": "world_aabb_excluding_bucket_v2",
+            "count": 0,
+            "particle_count": 0,
+            "candidate_count": 0,
+            "local_box_count": 0,
+            "bucket_overlap_count": 0,
+            "source": str(truck_bed_counting_volume["source"]),
+            "reason": str(truck_bed_counting_volume["reason"]),
+            "source_tracking": "initial_pile_mask",
+            "source_tracking_valid": False,
+            "source_count": int(
+                bucket_source_tracker.get("source_count", 0)
+            ),
+            "horizontal_margin": float(
+                truck_bed_counting_volume["horizontal_margin"]
+            ),
+            "lower_margin": float(
+                truck_bed_counting_volume["lower_margin"]
+            ),
+            "upper_extra": float(
+                truck_bed_counting_volume["upper_extra"]
+            ),
+            "elapsed_ms": 0.0,
+        }
+        try:
+            if not truck_bed_counting_volume["available"]:
+                return result
+
+            runtime_api = getattr(builtins, "_SAND_SITE", sand_api)
+            positions_fn = (
+                runtime_api.get("particle_positions_fn")
+                if isinstance(runtime_api, dict)
+                else None
+            )
+            if not callable(positions_fn):
+                result["available"] = False
+                result["reason"] = "particle_positions_unavailable"
+                return result
+
+            points = np.asarray(
+                positions_fn(),
+                dtype=np.float32,
+            ).reshape(-1, 3)
+            result["particle_count"] = int(len(points))
+            if len(points) == 0:
+                result["reason"] = "missing_particles"
+                return result
+
+            initial_mask = bucket_source_tracker.get("mask")
+            if (
+                not bool(bucket_source_tracker.get("available", False))
+                or not isinstance(initial_mask, np.ndarray)
+                or len(initial_mask) != len(points)
+            ):
+                result["reason"] = str(
+                    bucket_source_tracker.get(
+                        "reason",
+                        "initial_pile_mask_unavailable",
+                    )
+                )
+                return result
+
+            world_min = truck_bed_counting_volume["world_min"]
+            world_max = truck_bed_counting_volume["world_max"]
+            candidate_mask = (
+                initial_mask
+                & np.all(points >= world_min, axis=1)
+                & np.all(points <= world_max, axis=1)
+            )
+            candidates = points[candidate_mask]
+            result["candidate_count"] = int(len(candidates))
+            result["source_tracking_valid"] = True
+            result["reason"] = "ok"
+            if len(candidates) == 0:
+                return result
+
+            local = np.empty_like(candidates)
+            local_from_world = truck_bed_counting_volume[
+                "local_from_world"
+            ]
+            for index, point in enumerate(candidates):
+                transformed = local_from_world.Transform(
+                    Gf.Vec3d(
+                        float(point[0]),
+                        float(point[1]),
+                        float(point[2]),
+                    )
+                )
+                local[index] = [
+                    float(transformed[0]),
+                    float(transformed[1]),
+                    float(transformed[2]),
+                ]
+
+            local_min = truck_bed_counting_volume["local_min"]
+            local_max = truck_bed_counting_volume["local_max"]
+            inside_local_box = np.all(
+                local >= local_min,
+                axis=1,
+            ) & np.all(
+                local <= local_max,
+                axis=1,
+            )
+            result["local_box_count"] = int(
+                np.count_nonzero(inside_local_box)
+            )
+
+            # A broad bed load region must not mistake material still carried
+            # inside the excavator bucket for deposited material. Exclude all
+            # candidates that remain inside the current bucket volume.
+            bucket_overlap = np.zeros(len(candidates), dtype=bool)
+            bucket_prim = stage.GetPrimAtPath(
+                "/World/URDF_real3/bucket_link"
+            )
+            if bucket_prim.IsValid():
+                bucket_world_xf = UsdGeom.Xformable(
+                    bucket_prim
+                ).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+                bucket_inverse_xf = bucket_world_xf.GetInverse()
+                bucket_local = np.empty_like(candidates)
+                for index, point in enumerate(candidates):
+                    transformed = bucket_inverse_xf.Transform(
+                        Gf.Vec3d(
+                            float(point[0]),
+                            float(point[1]),
+                            float(point[2]),
+                        )
+                    )
+                    bucket_local[index] = [
+                        float(transformed[0]),
+                        float(transformed[1]),
+                        float(transformed[2]),
+                    ]
+                if bucket_volume_topology["available"]:
+                    bucket_overlap = points_in_closed_bucket_mesh(
+                        bucket_local
+                    )
+                else:
+                    inside_bucket_y = (
+                        (bucket_local[:, 1] >= bucket_load_y_min)
+                        & (bucket_local[:, 1] <= bucket_load_y_max)
+                    )
+                    inside_bucket_xz = points_in_polygon_2d(
+                        bucket_local[:, [0, 2]],
+                        bucket_load_profile_xz,
+                    )
+                    bucket_overlap = (
+                        inside_bucket_y & inside_bucket_xz
+                    )
+
+            result["bucket_overlap_count"] = int(
+                np.count_nonzero(bucket_overlap)
+            )
+            result["count"] = int(
+                np.count_nonzero(~bucket_overlap)
+            )
+            return result
+        except Exception as exc:
+            result["available"] = False
+            result["reason"] = f"{type(exc).__name__}:{exc}"
+            return result
+        finally:
+            result["elapsed_ms"] = (
+                time.perf_counter() - start
+            ) * 1000.0
+
+    def resolve_dataset_legacy_base_prim():
+        """Resolve the same base reference used by dataset collection.
+
+        The collector stores the world transform of the parent of the first
+        ArticulationRootAPI prim.  That is not necessarily the transform
+        returned by SingleArticulation.get_world_pose().
+        """
+        for candidate in stage.Traverse():
+            candidate_path = str(candidate.GetPath())
+            if (
+                candidate_path.startswith(ROBOT_PRIM_PATH)
+                and candidate.HasAPI(UsdPhysics.ArticulationRootAPI)
+            ):
+                parent = candidate.GetParent()
+                if parent is not None and parent.IsValid():
+                    return parent
+        raise RuntimeError(
+            "Could not resolve the dataset legacy base prim from "
+            "ArticulationRootAPI"
         )
 
+    dataset_legacy_base_prim = resolve_dataset_legacy_base_prim()
+    print(
+        "[STATE27] Dataset legacy base prim:",
+        str(dataset_legacy_base_prim.GetPath()),
+        flush=True,
+    )
+
     def read_robot_base_pose():
+        matrix = UsdGeom.Xformable(
+            dataset_legacy_base_prim
+        ).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+        position = matrix.ExtractTranslation()
         matrix = UsdGeom.Xformable(
             dataset_legacy_base_prim
         ).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
@@ -3107,6 +3385,9 @@ def main(args):
         return (
             float(position[0]),
             float(position[1]),
+            # Collection's get_base_yaw_rad() records zero for this fixed-base
+            # dataset.  Do not substitute the articulation-root orientation.
+            0.0,
             # Collection's get_base_yaw_rad() records zero for this fixed-base
             # dataset.  Do not substitute the articulation-root orientation.
             0.0,
@@ -3121,6 +3402,14 @@ def main(args):
         return math.radians(prim_local_yaw_z_deg(truck_prim))
 
     def resolve_state27_dig_target():
+        if args.state27_dig_target_world is not None:
+            return (
+                np.asarray(
+                    args.state27_dig_target_world,
+                    dtype=np.float32,
+                ),
+                "cli_recorded_dig_target",
+            )
         if args.state27_dig_target_world is not None:
             return (
                 np.asarray(
@@ -3227,6 +3516,20 @@ def main(args):
             landing_source = (
                 "randomized_landing_validated_against_dump_bed"
             )
+        if args.state27_unload_target_world is not None:
+            landing = np.asarray(
+                args.state27_unload_target_world,
+                dtype=np.float64,
+            )
+            landing_source = "cli_recorded_unload_target"
+        else:
+            landing = np.asarray(
+                random_scene_profile["unload_landing_xyz"],
+                dtype=np.float64,
+            )
+            landing_source = (
+                "randomized_landing_validated_against_dump_bed"
+            )
         xy_inside = bool(
             np.all(landing[:2] >= minimum[:2] - 0.05)
             and np.all(landing[:2] <= maximum[:2] + 0.05)
@@ -3241,6 +3544,7 @@ def main(args):
         return (
             landing.astype(np.float32),
             landing_source,
+            landing_source,
         )
 
     state27_dig_target_world, state27_dig_target_source = (
@@ -3253,6 +3557,31 @@ def main(args):
     startup_base_x, startup_base_y, startup_base_yaw = (
         read_robot_base_pose()
     )
+    if args.expected_state27_initial_base is not None:
+        expected_initial_base = np.asarray(
+            args.expected_state27_initial_base,
+            dtype=np.float64,
+        )
+        actual_initial_base = np.asarray(
+            [startup_base_x, startup_base_y, startup_base_yaw],
+            dtype=np.float64,
+        )
+        if not np.allclose(
+            actual_initial_base,
+            expected_initial_base,
+            rtol=0.0,
+            atol=1.0e-4,
+        ):
+            raise RuntimeError(
+                "Dataset legacy base feature does not match the recorded "
+                "episode: "
+                f"actual={actual_initial_base.tolist()}, "
+                f"expected={expected_initial_base.tolist()}, "
+                f"prim={dataset_legacy_base_prim.GetPath()}"
+            )
+    # The reconstructed legacy 27D contract uses the episode's initial fixed
+    # body heading (legacy14[2]), not the rotating upper/swing heading.
+    startup_heading = startup_base_yaw
     if args.expected_state27_initial_base is not None:
         expected_initial_base = np.asarray(
             args.expected_state27_initial_base,
@@ -3305,7 +3634,13 @@ def main(args):
         args.state27_dig_target_world is not None
         or 7.313 <= startup_dig_radius <= 9.146
     )
+    dig_local_in_training_range = (
+        args.state27_dig_target_world is not None
+        or 7.313 <= startup_dig_radius <= 9.146
+    )
     unload_local_in_training_range = (
+        args.state27_unload_target_world is not None
+        or 3.953 <= startup_unload_radius <= 10.518
         args.state27_unload_target_world is not None
         or 3.953 <= startup_unload_radius <= 10.518
     )
@@ -3451,6 +3786,8 @@ def main(args):
     deployment_previous_load = None
     deployment_previous_fill_fraction = None
     deployment_previous_fill_rate = None
+    deployment_previous_fill_fraction = None
+    deployment_previous_fill_rate = None
     deployment_elapsed_seconds = 0.0
     last_idle_ui_update = 0.0
     idle_ui_interval = 1.0 / max(0.1, float(args.idle_ui_hz))
@@ -3471,10 +3808,13 @@ def main(args):
                     deployment_previous_load = None
                     deployment_previous_fill_fraction = None
                     deployment_previous_fill_rate = None
+                    deployment_previous_fill_fraction = None
+                    deployment_previous_fill_rate = None
                     deployment_elapsed_seconds = 0.0
                     if active_contract["observation_schema"] in (
                         OBSERVATION_SCHEMA_27D_PLUS_EFFORT,
                         OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
+                        OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
                         OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
                     ):
                         base_x, base_y, base_yaw = read_robot_base_pose()
@@ -3485,20 +3825,12 @@ def main(args):
                         active_observation_context.setdefault(
                             "initial_heading_rad",
                             float(base_yaw),
+                            float(base_yaw),
                         )
                         active_observation_context.setdefault(
                             "truck_yaw_rad",
                             read_truck_yaw_rad(),
                         )
-                    if (
-                        active_contract["observation_schema"]
-                        == OBSERVATION_SCHEMA_28D_PLUS_EFFORT
-                    ):
-                        if not bucket_volume_topology["available"]:
-                            raise ValueError(
-                                "28D deployment requires the authored bucket_cut "
-                                f"closed mesh: {bucket_volume_topology['reason']}"
-                            )
                         bucket_source_tracker.clear()
                         bucket_source_tracker.update(
                             capture_initial_pile_source_mask()
@@ -3714,6 +4046,10 @@ def main(args):
                     OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
                     OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
                 )
+                in (
+                    OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
+                    OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
+                )
             )
             bucket_load_metrics = estimate_bucket_load_particles(
                 source_tracking_required=use_dataset_bucket_source_tracking,
@@ -3722,6 +4058,7 @@ def main(args):
 
             tip_xyz = [0.0, 0.0, 0.0]
             load_xyz = [0.0, 0.0, 0.0]
+            pour_xyz = [0.0, 0.0, 0.0]
             pour_xyz = [0.0, 0.0, 0.0]
             try:
                 bucket_prim = stage.GetPrimAtPath(
@@ -3742,6 +4079,9 @@ def main(args):
                     pour_world = world_xf.Transform(
                         Gf.Vec3d(0.85, 0.0, 0.30)
                     )
+                    pour_world = world_xf.Transform(
+                        Gf.Vec3d(0.85, 0.0, 0.30)
+                    )
                     tip_xyz = [
                         float(tip_world[0]),
                         float(tip_world[1]),
@@ -3751,6 +4091,11 @@ def main(args):
                         float(load_world[0]),
                         float(load_world[1]),
                         float(load_world[2]),
+                    ]
+                    pour_xyz = [
+                        float(pour_world[0]),
+                        float(pour_world[1]),
+                        float(pour_world[2]),
                     ]
                     pour_xyz = [
                         float(pour_world[0]),
@@ -3805,6 +4150,21 @@ def main(args):
                     current_bucket_load - float(deployment_previous_load)
                 ) / max(1.0e-6, bridge_step_seconds)
             deployment_previous_load = current_bucket_load
+            deployment_fill_fraction = (
+                vla_observation_contract.bucket_fill_fraction(
+                    current_bucket_load
+                )
+            )
+            deployment_fill_rate = (
+                vla_observation_contract.causal_bucket_fill_rate(
+                    deployment_fill_fraction,
+                    deployment_previous_fill_fraction,
+                    deployment_previous_fill_rate,
+                    bridge_step_seconds,
+                )
+            )
+            deployment_previous_fill_fraction = deployment_fill_fraction
+            deployment_previous_fill_rate = deployment_fill_rate
             deployment_fill_fraction = (
                 vla_observation_contract.bucket_fill_fraction(
                     current_bucket_load
@@ -3935,6 +4295,11 @@ def main(args):
                 # This intentionally overrides geometry-derived paraphrases.
                 task_text = str(args.task_text)
 
+            if args.task_text:
+                # Exact text from the converted dataset's meta/tasks.parquet.
+                # This intentionally overrides geometry-derived paraphrases.
+                task_text = str(args.task_text)
+
             observation_state_28d = None
             observation_32d_ready = False
             observation_32d_error = ""
@@ -3942,6 +4307,10 @@ def main(args):
             observation_phase_source = ""
             if (
                 active_contract["observation_schema"]
+                in (
+                    OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
+                    OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
+                )
                 in (
                     OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
                     OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
@@ -4073,9 +4442,63 @@ def main(args):
                                 bucket_load_rate=deployment_bucket_load_rate,
                             )
                         )
+                    if (
+                        active_contract["observation_schema"]
+                        == OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT
+                    ):
+                        q_tracking_error = (
+                            np.asarray(q_target, dtype=np.float32)
+                            - joint_positions
+                        )
+                        q_tracking_error[0] = math.atan2(
+                            math.sin(float(q_tracking_error[0])),
+                            math.cos(float(q_tracking_error[0])),
+                        )
+                        observation_state_28d = (
+                            vla_observation_contract.build_state_28d(
+                                joint_positions_4d=joint_positions,
+                                joint_velocity_4d=deployment_joint_velocity,
+                                joint_tracking_error_4d=q_tracking_error,
+                                previous_action_4d=vel,
+                                bucket_tip_world_xyz=tip_xyz,
+                                bucket_load_world_xyz=load_xyz,
+                                bucket_pour_world_xyz=pour_xyz,
+                                dig_target_world_xyz=dig_target_xyz,
+                                unload_landing_world_xyz=unload_landing_xyz,
+                                upper_heading_rad=float(base_yaw)
+                                + float(joint_positions[0]),
+                                truck_yaw_rad=active_observation_context.get(
+                                    "truck_yaw_rad"
+                                ),
+                                bucket_fill_fraction_value=deployment_fill_fraction,
+                                bucket_fill_rate_fraction_per_s=deployment_fill_rate,
+                            )
+                        )
+                    else:
+                        observation_state_28d = (
+                            vla_observation_contract.build_legacy_state_28d_v3(
+                                base_state_14d=base_state_14d,
+                                joint_velocity_4d=deployment_joint_velocity,
+                                phase=phase,
+                                dig_target_world_xyz=dig_target_xyz,
+                                unload_landing_world_xyz=unload_landing_xyz,
+                                initial_origin_xy=active_observation_context.get(
+                                    "initial_origin_xy"
+                                ),
+                                initial_heading_rad=active_observation_context.get(
+                                    "initial_heading_rad"
+                                ),
+                                truck_yaw_rad=active_observation_context.get(
+                                    "truck_yaw_rad"
+                                ),
+                                bucket_load_rate=deployment_bucket_load_rate,
+                            )
+                        )
                     observation_32d_ready = True
                 except Exception as exc:
                     observation_32d_error = f"{type(exc).__name__}: {exc}"
+            if observation_state_28d is not None:
+                observation_state = list(observation_state_28d)
             if observation_state_28d is not None:
                 observation_state = list(observation_state_28d)
 
@@ -4113,12 +4536,18 @@ def main(args):
                     if observation_phase_report
                     else None
                 ),
+                "observation_stage_current_id": (
+                    int(observation_phase_report["phase_index"])
+                    if observation_phase_report
+                    else None
+                ),
                 "observation_state_28d": observation_state_28d,
                 "observation_32d_ready": observation_32d_ready,
                 "observation_32d_error": observation_32d_error,
                 "observation_contract": (
                     vla_observation_contract.schema_payload()
                     if active_contract["observation_schema"]
+                    == OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT
                     == OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT
                     else {
                         "schema_version": active_contract[
@@ -4266,6 +4695,59 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--robot-initial-joints-deg",
+        type=float,
+        nargs=4,
+        metavar=("SWING", "BOOM", "ARM", "BUCKET"),
+        default=None,
+        help=(
+            "Recorded canonical initial joint pose in degrees. When set, the "
+            "pose is applied after articulation initialization and reapplied "
+            "after physics warmup."
+        ),
+    )
+    parser.add_argument(
+        "--state27-dig-target-world",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=None,
+        help=(
+            "Recorded planned dig target for the legacy 27D observation. "
+            "This is a below-surface planning target, not sand surface height."
+        ),
+    )
+    parser.add_argument(
+        "--expected-state27-initial-base",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "YAW"),
+        default=None,
+        help=(
+            "Fail startup unless the collection-compatible legacy base "
+            "feature equals this recorded [x, y, yaw] value."
+        ),
+    )
+    parser.add_argument(
+        "--state27-unload-target-world",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=None,
+        help=(
+            "Recorded planned unload landing point for the legacy 27D "
+            "observation."
+        ),
+    )
+    parser.add_argument(
+        "--task-text",
+        default="",
+        help=(
+            "Exact task string sent to the policy. A non-empty value overrides "
+            "the simulator's geometry-derived description."
+        ),
+    )
+    parser.add_argument(
         "--sand-settle-frames",
         type=int,
         default=240,
@@ -4294,6 +4776,20 @@ if __name__ == "__main__":
         parser.error("--sand-settle-frames must be at least 1")
     if args.idle_ui_hz <= 0.0:
         parser.error("--idle-ui-hz must be positive")
+    for option_name in (
+        "robot_initial_joints_deg",
+        "expected_state27_initial_base",
+        "state27_dig_target_world",
+        "state27_unload_target_world",
+    ):
+        option_value = getattr(args, option_name)
+        if option_value is not None and not all(
+            math.isfinite(float(value)) for value in option_value
+        ):
+            parser.error(
+                f"--{option_name.replace('_', '-')} must contain only "
+                "finite values"
+            )
     for option_name in (
         "robot_initial_joints_deg",
         "expected_state27_initial_base",

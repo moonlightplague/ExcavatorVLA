@@ -2387,6 +2387,15 @@ def main() -> None:
         "--record-video-codec",
         default="mp4v",
     )
+    parser.add_argument(
+        "--record-overview-camera",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Record the simulator's fixed overview viewport as a separate "
+            "native-resolution video without adding it to model inputs."
+        ),
+    )
 
     parser.add_argument(
         "--dump-dir",
@@ -2778,6 +2787,11 @@ def main() -> None:
             args.record_video_dir,
             fps=output_fps,
             codec=args.record_video_codec,
+            camera_ids=(
+                CAMERA_IDS + ("overview",)
+                if args.record_overview_camera
+                else CAMERA_IDS
+            ),
         )
 
     dump_dir = Path(args.dump_dir).expanduser()
@@ -2806,8 +2820,12 @@ def main() -> None:
         )
         print(f"[TRACE LOG] {trace_log_path}")
 
-    cmd: dict[str, list[float]] = {
-        "joint_velocities": [0.0] * EXPECTED_ACTION_DIM
+    record_overview_camera = bool(
+        video_recorder is not None and args.record_overview_camera
+    )
+    cmd: dict[str, Any] = {
+        "joint_velocities": [0.0] * EXPECTED_ACTION_DIM,
+        "record_overview_camera": record_overview_camera,
     }
     task_text: str | None = None
     language_tokens: torch.Tensor | None = None
@@ -3057,8 +3075,29 @@ def main() -> None:
             rgb2 = camera_rgbs.get("2", fallback_rgb)
 
             if video_recorder is not None and not is_warmup:
+                video_frames = {"0": rgb0, "1": rgb1, "2": rgb2}
+                recording_camera_payloads = reply.get(
+                    "recording_cameras",
+                    {},
+                )
+                if args.record_overview_camera:
+                    if not isinstance(recording_camera_payloads, dict):
+                        raise RuntimeError(
+                            "Bridge reply has invalid recording_cameras"
+                        )
+                    overview_payload = recording_camera_payloads.get(
+                        "overview"
+                    )
+                    if not isinstance(overview_payload, dict):
+                        raise RuntimeError(
+                            "Bridge reply is missing the requested "
+                            "overview recording camera"
+                        )
+                    video_frames["overview"] = decode_rgb(
+                        overview_payload
+                    )
                 video_recorder.write(
-                    {"0": rgb0, "1": rgb1, "2": rgb2},
+                    video_frames,
                     policy_step,
                 )
 
@@ -3497,7 +3536,8 @@ def main() -> None:
 
             if is_warmup:
                 cmd = {
-                    "joint_velocities": [0.0] * num_joints
+                    "joint_velocities": [0.0] * num_joints,
+                    "record_overview_camera": record_overview_camera,
                 }
                 print(
                     f"[WARMUP {loop_step + 1:03d}/"
@@ -3527,7 +3567,8 @@ def main() -> None:
             else:
                 # This is the only deployed-action assignment.
                 cmd = {
-                    "joint_velocities": velocities.tolist()
+                    "joint_velocities": velocities.tolist(),
+                    "record_overview_camera": record_overview_camera,
                 }
 
                 if trace_log_handle is not None:

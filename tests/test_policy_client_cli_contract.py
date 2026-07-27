@@ -147,6 +147,22 @@ class PolicyClientCliContractTests(unittest.TestCase):
             source,
         )
 
+    def test_overview_recording_is_separate_from_model_cameras(self):
+        source = self.client_path.read_text(encoding="utf-8")
+        self.assertIn("--record-overview-camera", self.option_names)
+        self.assertIn(
+            'CAMERA_IDS + ("overview",)',
+            source,
+        )
+        self.assertIn(
+            'video_frames["overview"] = decode_rgb(',
+            source,
+        )
+        self.assertIn(
+            '"record_overview_camera": record_overview_camera',
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

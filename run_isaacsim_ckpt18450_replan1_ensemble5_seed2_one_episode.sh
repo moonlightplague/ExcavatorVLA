@@ -29,6 +29,11 @@ SAND_WALL_ENABLED=1
 SAND_WALL_RADIUS_SCALE=1.5
 SAND_SETTLE_FRAMES=60
 
+# Video settings. The overview stream is native viewport resolution; the
+# camera 0/1/2 streams remain the exact 256x256 model observations.
+RECORD_OVERVIEW_CAMERA=1
+RECORD_VIDEO_CODEC=mp4v
+
 # Policy and execution settings.
 POLICY_STEPS=300
 REPLAN_INTERVAL=3
@@ -67,6 +72,15 @@ case "$SAND_WALL_ENABLED" in
   0) SAND_WALL_OPTION=--no-sand-wall ;;
   *)
     echo "[ERROR] SAND_WALL_ENABLED must be 0 or 1." >&2
+    exit 2
+    ;;
+esac
+
+case "$RECORD_OVERVIEW_CAMERA" in
+  1) RECORD_OVERVIEW_OPTION=--record-overview-camera ;;
+  0) RECORD_OVERVIEW_OPTION=--no-record-overview-camera ;;
+  *)
+    echo "[ERROR] RECORD_OVERVIEW_CAMERA must be 0 or 1." >&2
     exit 2
     ;;
 esac
@@ -448,6 +462,8 @@ set +e
   --trace-log "$TRACE_LOG" \
   --record-video-dir "$VIDEO_DIR" \
   --record-video-fps 0 \
+  --record-video-codec "$RECORD_VIDEO_CODEC" \
+  "$RECORD_OVERVIEW_OPTION" \
   --dump-dir "$INPUT_DUMP_DIR" \
   --dump-input-steps 10 \
   > "$CLIENT_LOG" 2>&1

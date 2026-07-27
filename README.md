@@ -373,7 +373,7 @@ The current deployment launcher is deliberately pinned to checkpoint step
 
 ```bash
 cd /root/isaacsim/ExcavatorVLA
-bash run_isaacsim_ckpt18450_seed2_one_episode.sh
+bash run_isaacsim_ckpt18450_replan1_ensemble5_seed2_one_episode.sh
 ```
 
 It requires an idle GPU, no existing training/simulator/policy process, and a
@@ -385,7 +385,7 @@ The current deployment settings are:
 
 | Setting | Value |
 | --- | ---: |
-| Policy steps | 500 |
+| Policy steps | 300 |
 | Model output chunk size | 50 |
 | Replan interval | 3 |
 | Temporal ensemble width | 1 |
@@ -404,9 +404,17 @@ pure-model rollout; every modified step is recorded in the trace metadata.
 
 The launcher writes simulator and client logs, the action/stage chunk log, the
 executed policy trace, input dumps, video, analysis plots, and
-`rollout_validation.json`. Validation checks all 500 step IDs, chunk origins,
+`rollout_validation.json`. Validation checks all 300 step IDs, chunk origins,
 chunk indices, ensemble weights/actions, checkpoint identity, and monotonic
 supervisor phase progression.
+
+The video directory contains the three exact `256x256` model-observation
+streams as `camera_0.mp4`, `camera_1.mp4`, and `camera_2.mp4`. With
+`RECORD_OVERVIEW_CAMERA=1`, the launcher also records the fixed elevated
+visible viewport at native viewport resolution as `camera_overview.mp4`.
+The overview stream is recording-only and is never added to the SmolVLA input
+contract. `RECORD_VIDEO_CODEC` selects the OpenCV four-character codec;
+`mp4v` is the portable default.
 
 The stable archive is:
 

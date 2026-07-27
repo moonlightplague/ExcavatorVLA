@@ -365,6 +365,7 @@ def capture_rgb_from_persistent_viewports(
     capture_viewport_to_buffer,
     np_module,
     wait_frames=CAPTURE_WAIT_FRAMES,
+    return_raw=False,
 ):
     """Capture all fixed-camera viewports in one render window.
 
@@ -460,6 +461,8 @@ def capture_rgb_from_persistent_viewports(
         "camera_resize": (resize_done - capture_done) * 1000.0,
         "camera_render_updates": int(render_updates),
     }
+    if return_raw:
+        return resized, raw_frames
     return resized
 
 
@@ -3992,19 +3995,41 @@ def main(args):
 
             lock_visible_viewport_to_overview()
 
-            rgb_by_camera = capture_rgb_from_persistent_viewports(
-                capture_views=capture_views,
+            record_overview_camera = bool(
+                cmd.get("record_overview_camera", False)
+            )
+            step_capture_views = capture_views
+            if record_overview_camera:
+                step_capture_views = dict(capture_views)
+                step_capture_views["overview"] = {
+                    "window": None,
+                    "viewport": viewport,
+                    "camera_path": overview_camera_path,
+                }
+
+            capture_result = capture_rgb_from_persistent_viewports(
+                capture_views=step_capture_views,
                 simulation_app=simulation_app,
                 capture_viewport_to_buffer=capture_viewport_to_buffer,
                 np_module=np,
                 wait_frames=CAPTURE_WAIT_FRAMES,
+                return_raw=record_overview_camera,
             )
+            recording_rgb_by_camera = {}
+            if record_overview_camera:
+                rgb_by_camera, raw_rgb_by_camera = capture_result
+                recording_rgb_by_camera["overview"] = (
+                    raw_rgb_by_camera["overview"]
+                )
+            else:
+                rgb_by_camera = capture_result
 
             lock_visible_viewport_to_overview()
 
             encode_start = time.perf_counter()
             encoded_cameras = {}
-            for camera_name, rgb in rgb_by_camera.items():
+            for camera_name in active_camera_paths:
+                rgb = rgb_by_camera[camera_name]
                 rgb = np.asarray(rgb)
 
                 if rgb.dtype != np.uint8:
@@ -4019,6 +4044,22 @@ def main(args):
                     "rgb_shape": list(rgb.shape),
                     "rgb_dtype": str(rgb.dtype),
                     "rgb_zlib_b64": base64.b64encode(rgb_compressed).decode("ascii"),
+                }
+            encoded_recording_cameras = {}
+            for camera_name, rgb in recording_rgb_by_camera.items():
+                rgb = np.asarray(rgb)
+                if rgb.dtype != np.uint8:
+                    rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+                if rgb.ndim == 3 and rgb.shape[-1] == 4:
+                    rgb = rgb[:, :, :3]
+                rgb_compressed = zlib.compress(rgb.tobytes(), level=1)
+                encoded_recording_cameras[camera_name] = {
+                    "camera_path": overview_camera_path,
+                    "rgb_shape": list(rgb.shape),
+                    "rgb_dtype": str(rgb.dtype),
+                    "rgb_zlib_b64": base64.b64encode(
+                        rgb_compressed
+                    ).decode("ascii"),
                 }
             encode_done = time.perf_counter()
 
@@ -4476,6 +4517,7 @@ def main(args):
                 "rgb_dtype": primary_rgb["rgb_dtype"],
                 "rgb_zlib_b64": primary_rgb["rgb_zlib_b64"],
                 "cameras": encoded_cameras,
+                "recording_cameras": encoded_recording_cameras,
                 "bridge_timing": {
                     "physics_ms": (physics_done - physics_start) * 1000.0,
                     **dict(LAST_CAPTURE_TIMING_MS),

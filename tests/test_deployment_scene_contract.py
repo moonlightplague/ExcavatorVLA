@@ -165,6 +165,8 @@ class DeploymentSceneContractTests(unittest.TestCase):
             "SAND_WALL_ENABLED=1",
             "SAND_WALL_RADIUS_SCALE=1.5",
             "SAND_SETTLE_FRAMES=60",
+            "RECORD_OVERVIEW_CAMERA=1",
+            "RECORD_VIDEO_CODEC=mp4v",
         )
         for setting in expected_settings:
             self.assertIn(setting, launcher)
@@ -174,6 +176,8 @@ class DeploymentSceneContractTests(unittest.TestCase):
             '"$SAND_WALL_OPTION"',
             '--sand-wall-radius-scale "$SAND_WALL_RADIUS_SCALE"',
             '--sand-settle-frames "$SAND_SETTLE_FRAMES"',
+            '--record-video-codec "$RECORD_VIDEO_CODEC"',
+            '"$RECORD_OVERVIEW_OPTION"',
         )
         for argument in expected_arguments:
             self.assertIn(argument, launcher)
@@ -275,6 +279,22 @@ class DeploymentSceneContractTests(unittest.TestCase):
         )
         self.assertIn("lock_visible_viewport_to_overview()", source)
         self.assertNotIn("DISPLAY_CAMERA_NAME", source)
+        self.assertIn(
+            'step_capture_views["overview"] = {',
+            source,
+        )
+        self.assertIn(
+            '"viewport": viewport',
+            source,
+        )
+        self.assertIn(
+            '"recording_cameras": encoded_recording_cameras',
+            source,
+        )
+        self.assertIn(
+            "return_raw=record_overview_camera",
+            source,
+        )
         self.assertIn("CAPTURE_STARTUP_WAIT_FRAMES = 60", source)
         self.assertIn(
             "wait_frames=CAPTURE_STARTUP_WAIT_FRAMES",

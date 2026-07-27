@@ -1195,6 +1195,239 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--temporal-ensemble-width",
+        type=int,
+        default=1,
+        help=(
+            "Blend predictions for the current step from this many newest "
+            "overlapping chunks. Default: 1 (disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--temporal-ensemble-decay",
+        type=float,
+        default=0.35,
+        help=(
+            "Exponential age decay for overlapping action predictions; "
+            "larger values favor the newest chunk. Default: 0.35."
+        ),
+    )
+    parser.add_argument(
+        "--enable-excavation-sequence-supervisor",
+        action="store_true",
+        help=(
+            "Opt in to the monotonic dig, curl, lift, transfer, position, "
+            "and dump execution sequence. Disabled by default."
+        ),
+    )
+    parser.add_argument("--supervisor-load-trigger", type=float, default=50.0)
+    parser.add_argument("--supervisor-load-rise", type=float, default=40.0)
+    parser.add_argument(
+        "--supervisor-dig-descent-height-trigger",
+        type=float,
+        default=1.50,
+    )
+    parser.add_argument(
+        "--supervisor-dig-descent-stage-trigger",
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        "--supervisor-dig-descent-velocity",
+        type=float,
+        default=0.08,
+    )
+    parser.add_argument(
+        "--supervisor-dig-bucket-half-scale-distance",
+        type=float,
+        default=0.20,
+    )
+    parser.add_argument(
+        "--supervisor-dig-depth-tolerance",
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument(
+        "--supervisor-dig-rebound-height",
+        type=float,
+        default=0.01,
+    )
+    parser.add_argument(
+        "--supervisor-dig-rebound-dwell-steps",
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        "--supervisor-dig-rebound-min-load",
+        type=float,
+        default=500.0,
+    )
+    parser.add_argument("--supervisor-curl-target", type=float, default=-2.04)
+    parser.add_argument("--supervisor-curl-velocity", type=float, default=0.85)
+    parser.add_argument(
+        "--supervisor-lift-boom-target",
+        type=float,
+        default=0.28,
+    )
+    parser.add_argument(
+        "--supervisor-lift-load-z-target",
+        type=float,
+        default=1.90,
+    )
+    parser.add_argument(
+        "--supervisor-max-lift-steps",
+        type=int,
+        default=30,
+    )
+    parser.add_argument(
+        "--supervisor-turn-entry-boom-target",
+        type=float,
+        default=0.18,
+    )
+    parser.add_argument(
+        "--supervisor-turn-entry-velocity",
+        type=float,
+        default=0.22,
+    )
+    parser.add_argument(
+        "--supervisor-turn-entry-steps",
+        type=int,
+        default=5,
+    )
+    parser.add_argument(
+        "--supervisor-turn-handoff-angle",
+        type=float,
+        default=0.20,
+    )
+    parser.add_argument(
+        "--supervisor-phase-sync-bucket-closed",
+        type=float,
+        default=-1.90,
+    )
+    parser.add_argument(
+        "--supervisor-phase-sync-boom-lifted",
+        type=float,
+        default=0.28,
+    )
+    parser.add_argument(
+        "--supervisor-unload-swing-target",
+        type=float,
+        default=-1.615,
+    )
+    parser.add_argument(
+        "--supervisor-unload-boom-target",
+        type=float,
+        default=0.85,
+    )
+    parser.add_argument(
+        "--supervisor-unload-arm-target",
+        type=float,
+        default=-1.017,
+    )
+    parser.add_argument(
+        "--supervisor-unload-bucket-hold-target",
+        type=float,
+        default=-2.04,
+    )
+    parser.add_argument(
+        "--supervisor-swing-tolerance",
+        type=float,
+        default=0.08,
+    )
+    parser.add_argument(
+        "--supervisor-unload-xy-tolerance",
+        type=float,
+        default=1.25,
+    )
+    parser.add_argument(
+        "--supervisor-unload-height-margin",
+        type=float,
+        default=0.50,
+    )
+    parser.add_argument(
+        "--supervisor-unload-height-velocity",
+        type=float,
+        default=0.12,
+    )
+    parser.add_argument(
+        "--supervisor-position-max-steps",
+        type=int,
+        default=15,
+    )
+    parser.add_argument(
+        "--supervisor-dump-min-steps",
+        type=int,
+        default=3,
+    )
+    parser.add_argument(
+        "--supervisor-dump-bucket-target",
+        type=float,
+        default=-0.80,
+    )
+    parser.add_argument(
+        "--supervisor-dump-velocity",
+        type=float,
+        default=1.20,
+    )
+    parser.add_argument(
+        "--supervisor-empty-load-threshold",
+        type=float,
+        default=25.0,
+    )
+    parser.add_argument(
+        "--enable-load-retention-constraint",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--retention-min-load",
+        type=float,
+        default=50.0,
+    )
+    parser.add_argument(
+        "--retention-min-rise",
+        type=float,
+        default=40.0,
+    )
+    parser.add_argument(
+        "--retention-bucket-target",
+        type=float,
+        default=-1.95,
+    )
+    parser.add_argument(
+        "--retention-curl-velocity",
+        type=float,
+        default=0.8,
+    )
+    parser.add_argument(
+        "--enable-unload-geometry-gate",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--unload-swing-target",
+        type=float,
+        default=-1.60,
+    )
+    parser.add_argument(
+        "--unload-swing-tolerance",
+        type=float,
+        default=0.12,
+    )
+    parser.add_argument(
+        "--unload-swing-velocity",
+        type=float,
+        default=0.25,
+    )
+    parser.add_argument(
+        "--unload-xy-tolerance",
+        type=float,
+        default=1.25,
+    )
+    parser.add_argument(
+        "--unload-min-height",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
         "--chunk-log",
         default=(
             "/root/gpufree-data/excavator_logs/"
@@ -1225,6 +1458,56 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--sleep", type=float, default=0.0)
     parser.add_argument("--print-every", type=int, default=1)
+    parser.add_argument(
+        "--episode-status-json",
+        default="",
+        help="Write a machine-readable final episode success record.",
+    )
+    parser.add_argument(
+        "--simulation-launch-unix-ns",
+        type=int,
+        default=0,
+        help="Simulation launch timestamp used for completion timing.",
+    )
+    parser.add_argument(
+        "--truck-success-min-particles",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--truck-success-no-growth-steps",
+        "--truck-success-dwell-steps",
+        dest="truck_success_no_growth_steps",
+        type=int,
+        default=3,
+    )
+    parser.add_argument(
+        "--bucket-open-threshold",
+        type=float,
+        default=-0.80,
+    )
+    parser.add_argument(
+        "--early-stop-on-success",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--max-input-abs-sigma",
+        type=float,
+        default=8.0,
+        help=(
+            "Clip normalized state inputs to this absolute value. "
+            "Set to 0 or a negative value to disable clipping."
+        ),
+    )
+    parser.add_argument(
+        "--max-effort-abs-sigma",
+        type=float,
+        default=8.0,
+        help=(
+            "Clip normalized effort inputs to this absolute value. "
+            "Set to 0 or a negative value to disable clipping."
+        ),
+    )
 
     parser.add_argument(
         "--record-video-dir",
@@ -1291,6 +1574,172 @@ def main() -> None:
         raise SystemExit(
             "--record-video-codec must contain exactly four characters"
         )
+    if not np.isfinite(args.max_input_abs_sigma):
+        raise SystemExit("--max-input-abs-sigma must be finite")
+    if not np.isfinite(args.max_effort_abs_sigma):
+        raise SystemExit("--max-effort-abs-sigma must be finite")
+    finite_constraint_values = {
+        "--supervisor-load-trigger": args.supervisor_load_trigger,
+        "--supervisor-load-rise": args.supervisor_load_rise,
+        "--supervisor-dig-descent-height-trigger": (
+            args.supervisor_dig_descent_height_trigger
+        ),
+        "--supervisor-dig-descent-velocity": (
+            args.supervisor_dig_descent_velocity
+        ),
+        "--supervisor-dig-bucket-half-scale-distance": (
+            args.supervisor_dig_bucket_half_scale_distance
+        ),
+        "--supervisor-dig-depth-tolerance": (
+            args.supervisor_dig_depth_tolerance
+        ),
+        "--supervisor-dig-rebound-height": (
+            args.supervisor_dig_rebound_height
+        ),
+        "--supervisor-dig-rebound-min-load": (
+            args.supervisor_dig_rebound_min_load
+        ),
+        "--supervisor-curl-target": args.supervisor_curl_target,
+        "--supervisor-curl-velocity": args.supervisor_curl_velocity,
+        "--supervisor-lift-boom-target": args.supervisor_lift_boom_target,
+        "--supervisor-lift-load-z-target": (
+            args.supervisor_lift_load_z_target
+        ),
+        "--supervisor-turn-entry-boom-target": (
+            args.supervisor_turn_entry_boom_target
+        ),
+        "--supervisor-turn-entry-velocity": (
+            args.supervisor_turn_entry_velocity
+        ),
+        "--supervisor-turn-handoff-angle": (
+            args.supervisor_turn_handoff_angle
+        ),
+        "--supervisor-phase-sync-bucket-closed": (
+            args.supervisor_phase_sync_bucket_closed
+        ),
+        "--supervisor-phase-sync-boom-lifted": (
+            args.supervisor_phase_sync_boom_lifted
+        ),
+        "--supervisor-unload-swing-target": (
+            args.supervisor_unload_swing_target
+        ),
+        "--supervisor-unload-boom-target": (
+            args.supervisor_unload_boom_target
+        ),
+        "--supervisor-unload-arm-target": args.supervisor_unload_arm_target,
+        "--supervisor-unload-bucket-hold-target": (
+            args.supervisor_unload_bucket_hold_target
+        ),
+        "--supervisor-swing-tolerance": args.supervisor_swing_tolerance,
+        "--supervisor-unload-xy-tolerance": (
+            args.supervisor_unload_xy_tolerance
+        ),
+        "--supervisor-unload-height-margin": (
+            args.supervisor_unload_height_margin
+        ),
+        "--supervisor-unload-height-velocity": (
+            args.supervisor_unload_height_velocity
+        ),
+        "--supervisor-dump-bucket-target": (
+            args.supervisor_dump_bucket_target
+        ),
+        "--supervisor-dump-velocity": args.supervisor_dump_velocity,
+        "--supervisor-empty-load-threshold": (
+            args.supervisor_empty_load_threshold
+        ),
+        "--retention-min-load": args.retention_min_load,
+        "--retention-min-rise": args.retention_min_rise,
+        "--retention-bucket-target": args.retention_bucket_target,
+        "--retention-curl-velocity": args.retention_curl_velocity,
+        "--unload-swing-target": args.unload_swing_target,
+        "--unload-swing-tolerance": args.unload_swing_tolerance,
+        "--unload-swing-velocity": args.unload_swing_velocity,
+        "--unload-xy-tolerance": args.unload_xy_tolerance,
+        "--unload-min-height": args.unload_min_height,
+    }
+    for option, value in finite_constraint_values.items():
+        if not np.isfinite(value):
+            raise SystemExit(f"{option} must be finite")
+    for option, value in (
+        ("--supervisor-load-trigger", args.supervisor_load_trigger),
+        ("--supervisor-load-rise", args.supervisor_load_rise),
+        (
+            "--supervisor-dig-descent-velocity",
+            args.supervisor_dig_descent_velocity,
+        ),
+        (
+            "--supervisor-dig-bucket-half-scale-distance",
+            args.supervisor_dig_bucket_half_scale_distance,
+        ),
+        (
+            "--supervisor-dig-depth-tolerance",
+            args.supervisor_dig_depth_tolerance,
+        ),
+        (
+            "--supervisor-dig-rebound-height",
+            args.supervisor_dig_rebound_height,
+        ),
+        (
+            "--supervisor-dig-rebound-min-load",
+            args.supervisor_dig_rebound_min_load,
+        ),
+        ("--supervisor-curl-velocity", args.supervisor_curl_velocity),
+        (
+            "--supervisor-lift-load-z-target",
+            args.supervisor_lift_load_z_target,
+        ),
+        (
+            "--supervisor-swing-tolerance",
+            args.supervisor_swing_tolerance,
+        ),
+        (
+            "--supervisor-unload-xy-tolerance",
+            args.supervisor_unload_xy_tolerance,
+        ),
+        (
+            "--supervisor-unload-height-margin",
+            args.supervisor_unload_height_margin,
+        ),
+        (
+            "--supervisor-unload-height-velocity",
+            args.supervisor_unload_height_velocity,
+        ),
+        ("--supervisor-dump-velocity", args.supervisor_dump_velocity),
+        (
+            "--supervisor-turn-entry-velocity",
+            args.supervisor_turn_entry_velocity,
+        ),
+        (
+            "--supervisor-empty-load-threshold",
+            args.supervisor_empty_load_threshold,
+        ),
+        ("--retention-min-load", args.retention_min_load),
+        ("--retention-min-rise", args.retention_min_rise),
+        ("--retention-curl-velocity", args.retention_curl_velocity),
+        ("--unload-swing-tolerance", args.unload_swing_tolerance),
+        ("--unload-swing-velocity", args.unload_swing_velocity),
+        ("--unload-xy-tolerance", args.unload_xy_tolerance),
+    ):
+        if value < 0:
+            raise SystemExit(f"{option} must be non-negative")
+    if args.supervisor_dig_rebound_dwell_steps <= 0:
+        raise SystemExit(
+            "--supervisor-dig-rebound-dwell-steps must be positive"
+        )
+    if not 0 <= args.supervisor_dig_descent_stage_trigger <= 5:
+        raise SystemExit(
+            "--supervisor-dig-descent-stage-trigger must be in [0, 5]"
+        )
+    if args.supervisor_max_lift_steps <= 0:
+        raise SystemExit("--supervisor-max-lift-steps must be positive")
+    if args.supervisor_turn_entry_steps <= 0:
+        raise SystemExit("--supervisor-turn-entry-steps must be positive")
+    if args.supervisor_position_max_steps <= 0:
+        raise SystemExit(
+            "--supervisor-position-max-steps must be positive"
+        )
+    if args.supervisor_dump_min_steps <= 0:
+        raise SystemExit("--supervisor-dump-min-steps must be positive")
 
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("HF_DATASETS_OFFLINE", "1")

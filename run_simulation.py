@@ -1011,6 +1011,15 @@ def main(args):
             truck_dump_center_xy=bed_center[:2],
             truck_yaw_deg=baseline_yaw_deg,
         )
+        dataset_sampled_sand_amount = float(
+            profile["sand_amount_multiplier"]
+        )
+        manual_sand_amount = float(args.sand_amount)
+        profile["dataset_sampled_sand_amount_multiplier"] = (
+            dataset_sampled_sand_amount
+        )
+        profile["sand_amount_multiplier"] = manual_sand_amount
+        profile["sand_amount_source"] = "manual_cli"
 
         set_prim_translation_and_yaw(
             truck_prim,
@@ -1084,7 +1093,12 @@ def main(args):
             f"seed={profile['seed']}",
             f"sample_try={profile['sample_try']}",
             f"sand_xy={list(profile['sand_xy'])}",
-            f"sand_amount={profile['sand_amount_multiplier']:.6f}",
+            f"sand_amount={manual_sand_amount:.6f}",
+            f"sand_amount_source={profile['sand_amount_source']}",
+            (
+                "dataset_sampled_sand_amount="
+                f"{dataset_sampled_sand_amount:.6f}"
+            ),
             f"root={TRUCK_ROOT_PATH}",
             f"bed={TRUCK_BED_COLLISION_PATH}",
             f"truck_position={actual_position.tolist()}",
@@ -1245,8 +1259,8 @@ def main(args):
     print(f"TCP Server: {HOST}:{PORT}")
     print(
         "Sand:",
-        "disabled" if args.sand_amount == 0 else "dataset-randomized",
-        f"enable_value={args.sand_amount}",
+        "disabled" if args.sand_amount == 0 else "manual amount",
+        f"amount_multiplier={args.sand_amount}",
     )
     print(
         "Scene seed:",
@@ -2047,7 +2061,7 @@ def main(args):
     # IMPORTANT: this is intentionally the final scene-creation stage.
     # Do not add or reference any USD scene objects after this block.
     # -----------------------------------------------------------------
-    sand_enabled = int(args.sand_amount) > 0
+    sand_enabled = float(args.sand_amount) > 0.0
     sand_amount = (
         float(random_scene_profile["sand_amount_multiplier"])
         if sand_enabled
@@ -4508,13 +4522,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--sand-amount",
-        type=int,
-        default=1,
-        choices=range(0, 11),
-        metavar="0-10",
+        type=float,
+        default=1.0,
+        metavar="AMOUNT",
         help=(
-            "0 disables sand; any nonzero value enables dataset-compatible "
-            "random sand amount and placement."
+            "Manual sand amount multiplier. 0 disables sand; enabled values "
+            "must be between 1 and 30. Sand/truck placement remains randomized."
         ),
     )
     parser.add_argument(
@@ -4633,6 +4646,16 @@ if __name__ == "__main__":
 
     if args.sand_settle_frames < 1:
         parser.error("--sand-settle-frames must be at least 1")
+    if (
+        not math.isfinite(args.sand_amount)
+        or (
+            args.sand_amount != 0.0
+            and not 1.0 <= args.sand_amount <= 30.0
+        )
+    ):
+        parser.error(
+            "--sand-amount must be 0 (disabled) or between 1 and 30"
+        )
     if (
         not math.isfinite(args.sand_radius_scale)
         or args.sand_radius_scale <= 0.0

@@ -159,6 +159,7 @@ class DeploymentSceneContractTests(unittest.TestCase):
             / "run_isaacsim_ckpt18450_replan1_ensemble5_seed2_one_episode.sh"
         ).read_text(encoding="utf-8")
         expected_settings = (
+            "SAND_AMOUNT=1.0",
             "SAND_PARAMETER_MODE=soft_dig",
             "SAND_RADIUS_SCALE=0.2",
             "SAND_WALL_ENABLED=1",
@@ -176,6 +177,26 @@ class DeploymentSceneContractTests(unittest.TestCase):
         )
         for argument in expected_arguments:
             self.assertIn(argument, launcher)
+
+        simulator = (repo_root / "run_simulation.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'profile["sand_amount_multiplier"] = manual_sand_amount',
+            simulator,
+        )
+        self.assertIn(
+            'profile["sand_amount_source"] = "manual_cli"',
+            simulator,
+        )
+        self.assertIn(
+            "sand_enabled = float(args.sand_amount) > 0.0",
+            simulator,
+        )
+        self.assertNotIn(
+            '"dataset-randomized",\n        f"enable_value=',
+            simulator,
+        )
 
     def test_sand_runtime_supports_configurable_circular_wall(self):
         runtime = (

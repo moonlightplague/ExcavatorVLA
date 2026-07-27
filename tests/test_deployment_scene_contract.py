@@ -1,3 +1,4 @@
+import ast
 import math
 import unittest
 from pathlib import Path
@@ -138,6 +139,27 @@ class DeploymentSceneContractTests(unittest.TestCase):
         )
         self.assertNotIn("suspend_excavator_collisions_for_sand_init", source)
         self.assertIn("target_min_z", source)
+
+    def test_run_simulation_syntax_and_video_camera_contract(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "run_simulation.py"
+        ).read_text(encoding="utf-8")
+        ast.parse(source)
+        self.assertIn(
+            'VIDEO_OVERVIEW_CAMERA_PATH = "/World/VideoOverviewCamera"',
+            source,
+        )
+        self.assertIn("def create_video_overview_camera():", source)
+        self.assertIn(
+            "overview_camera_path = create_video_overview_camera()",
+            source,
+        )
+        self.assertIn(
+            "display_camera_path = overview_camera_path",
+            source,
+        )
+        self.assertIn("lock_visible_viewport_to_overview()", source)
+        self.assertNotIn("DISPLAY_CAMERA_NAME", source)
 
 
 if __name__ == "__main__":

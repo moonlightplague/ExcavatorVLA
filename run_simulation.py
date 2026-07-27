@@ -235,10 +235,14 @@ CAMERA_PRIM_PATHS = {
     "2": "/World/URDF_real3/swing_link/Camera_2",
 }
 
-# The visible Isaac Sim viewport remains on this camera while a separate
-# off-screen capture viewport cycles through all three model cameras.
-DISPLAY_CAMERA_NAME = "0"
-CAMERA_PRIM_PATH = CAMERA_PRIM_PATHS[DISPLAY_CAMERA_NAME]
+# Fixed elevated camera used only by the visible Isaac Sim viewport for
+# full-process screen recording. Model observations continue to use the three
+# excavator-mounted cameras above through separate hidden viewports.
+VIDEO_OVERVIEW_CAMERA_PATH = "/World/VideoOverviewCamera"
+VIDEO_OVERVIEW_CAMERA_EYE = (5.45, -13.6, 17.175)
+VIDEO_OVERVIEW_CAMERA_TARGET = (-4.0, -1.0, 3.0)
+VIDEO_OVERVIEW_CAMERA_FOCAL_LENGTH_MM = 17.0
+VIDEO_OVERVIEW_CAMERA_APERTURE_MM = 20.955
 
 
 # TCP Bridge settings
@@ -745,6 +749,45 @@ def main(args):
         capture_viewport_to_buffer,
         create_viewport_window,
     )
+
+    def create_video_overview_camera():
+        """Create the fixed elevated camera used by the visible viewport."""
+        camera = UsdGeom.Camera.Define(
+            stage,
+            Sdf.Path(VIDEO_OVERVIEW_CAMERA_PATH),
+        )
+        camera.CreateFocalLengthAttr(
+            float(VIDEO_OVERVIEW_CAMERA_FOCAL_LENGTH_MM)
+        )
+        camera.CreateHorizontalApertureAttr(
+            float(VIDEO_OVERVIEW_CAMERA_APERTURE_MM)
+        )
+        camera.CreateVerticalApertureAttr(
+            float(VIDEO_OVERVIEW_CAMERA_APERTURE_MM)
+        )
+        camera.CreateClippingRangeAttr(Gf.Vec2f(0.1, 1000.0))
+        camera.CreateFStopAttr(0.0)
+
+        eye = Gf.Vec3d(*VIDEO_OVERVIEW_CAMERA_EYE)
+        target = Gf.Vec3d(*VIDEO_OVERVIEW_CAMERA_TARGET)
+        camera_to_world = Gf.Matrix4d().SetLookAt(
+            eye,
+            target,
+            Gf.Vec3d(0.0, 0.0, 1.0),
+        ).GetInverse()
+        camera_xform = UsdGeom.Xformable(camera.GetPrim())
+        camera_xform.ClearXformOpOrder()
+        camera_xform.AddTransformOp().Set(camera_to_world)
+
+        print(
+            "[VIDEO CAMERA] Created fixed overview camera:",
+            VIDEO_OVERVIEW_CAMERA_PATH,
+            f"eye={VIDEO_OVERVIEW_CAMERA_EYE}",
+            f"target={VIDEO_OVERVIEW_CAMERA_TARGET}",
+            f"focal_length_mm={VIDEO_OVERVIEW_CAMERA_FOCAL_LENGTH_MM}",
+            flush=True,
+        )
+        return VIDEO_OVERVIEW_CAMERA_PATH
 
     def set_prim_translation_and_yaw(
         prim,
@@ -1476,10 +1519,6 @@ def main(args):
     canonical_to_raw = resolve_canonical_dof_indices(raw_dof_names)
     canonical_joint_indices = np.asarray(canonical_to_raw, dtype=np.int32)
 
-    raw_dof_names = [str(name) for name in robot.dof_names]
-    canonical_to_raw = resolve_canonical_dof_indices(raw_dof_names)
-    canonical_joint_indices = np.asarray(canonical_to_raw, dtype=np.int32)
-
     # Sand center is around (0.0, 6.7).
     ROBOT_INITIAL_POS = np.array(
         [-9.2, 6.7, 1.243],
@@ -1490,31 +1529,11 @@ def main(args):
         dtype=np.float32,
     )
     recorded_raw_initial_q = None
-    recorded_raw_initial_q = None
 
     try:
         robot.set_world_pose(
             position=ROBOT_INITIAL_POS,
             orientation=ROBOT_INITIAL_ORI,
-        )
-        if args.robot_initial_joints_deg is not None:
-            canonical_initial_q = np.radians(
-                np.asarray(
-                    args.robot_initial_joints_deg,
-                    dtype=np.float32,
-                )
-            ).astype(np.float32)
-            recorded_raw_initial_q = np.asarray(
-                robot.get_joint_positions(),
-                dtype=np.float32,
-            ).reshape(-1)
-            recorded_raw_initial_q[
-                canonical_joint_indices
-            ] = canonical_initial_q
-            robot.set_joint_positions(recorded_raw_initial_q)
-            robot.set_joint_velocities(
-                np.zeros_like(recorded_raw_initial_q)
-            )
         )
         if args.robot_initial_joints_deg is not None:
             canonical_initial_q = np.radians(
@@ -1548,24 +1567,7 @@ def main(args):
             )
             simulation_app.update()
 
-        # Physics warmup can move an uncommanded articulation.  Reapply the
-        # recorded episode pose immediately before scene construction so the
-        # first policy observation uses the exact training initialization.
-        if args.robot_initial_joints_deg is not None:
-            robot.set_joint_positions(recorded_raw_initial_q)
-            robot.set_joint_velocities(
-                np.zeros_like(recorded_raw_initial_q)
-            )
-            simulation_app.update()
-
         print("[INFO] Robot world pose:", robot.get_world_pose(), flush=True)
-        if args.robot_initial_joints_deg is not None:
-            print(
-                "[INFO] Recorded initial joint pose applied:",
-                f"degrees={list(args.robot_initial_joints_deg)}",
-                f"radians={canonical_initial_q.tolist()}",
-                flush=True,
-            )
         if args.robot_initial_joints_deg is not None:
             print(
                 "[INFO] Recorded initial joint pose applied:",
@@ -1575,11 +1577,6 @@ def main(args):
             )
     except Exception as e:
         print("[ERROR] Failed to set robot pose:", repr(e), flush=True)
-        if args.robot_initial_joints_deg is not None:
-            raise RuntimeError(
-                "Failed to apply the explicitly requested recorded initial "
-                "joint pose"
-            ) from e
         if args.robot_initial_joints_deg is not None:
             raise RuntimeError(
                 "Failed to apply the explicitly requested recorded initial "
@@ -1639,8 +1636,8 @@ def main(args):
     # -----------------------------------------------------------------
     # Viewport setup
     #
-    # The visible viewport stays on one fixed camera. A second off-screen
-    # viewport is used only for the three-camera model input capture.
+    # The visible viewport stays on the fixed elevated video camera. Separate
+    # off-screen viewports are used only for the three-camera model input.
     # -----------------------------------------------------------------
     viewport = get_active_viewport()
     if viewport is None:
@@ -1648,7 +1645,13 @@ def main(args):
         simulation_app.close()
         return
 
-    # Use only the three excavator-mounted USD cameras.
+    overview_camera_path = create_video_overview_camera()
+
+    def lock_visible_viewport_to_overview():
+        """Restore the recording view if another operation changes it."""
+        viewport.camera_path = overview_camera_path
+
+    # Use only the three excavator-mounted USD cameras for model input.
     active_camera_paths = {}
     for camera_name, camera_path in CAMERA_PRIM_PATHS.items():
         if stage.GetPrimAtPath(camera_path).IsValid():
@@ -1665,13 +1668,8 @@ def main(args):
         simulation_app.close()
         return
 
-    display_camera_name = (
-        DISPLAY_CAMERA_NAME
-        if DISPLAY_CAMERA_NAME in active_camera_paths
-        else next(iter(active_camera_paths))
-    )
-    display_camera_path = active_camera_paths[display_camera_name]
-    viewport.camera_path = display_camera_path
+    display_camera_path = overview_camera_path
+    lock_visible_viewport_to_overview()
 
     capture_views = {}
     for capture_index, (camera_name, camera_path) in enumerate(active_camera_paths.items()):
@@ -1706,7 +1704,7 @@ def main(args):
 
     print(
         "[INFO] Visible viewport fixed to:",
-        f"{display_camera_name}: {display_camera_path}",
+        display_camera_path,
         flush=True,
     )
     print(
@@ -1744,7 +1742,7 @@ def main(args):
         wait_frames=CAPTURE_WAIT_FRAMES,
     )
 
-    viewport.camera_path = display_camera_path
+    lock_visible_viewport_to_overview()
 
     for _ in range(2):
         world.step(render=True)
@@ -2520,47 +2518,6 @@ def main(args):
             verified_initial_q.tolist(),
             flush=True,
         )
-
-    if recorded_raw_initial_q is not None:
-        # Sand creation and settling advance physics for several seconds.
-        # Reapply the episode's recorded initial articulation at the last safe
-        # point before observations and bridge commands are enabled.
-        robot.set_joint_positions(recorded_raw_initial_q)
-        robot.set_joint_velocities(
-            np.zeros_like(recorded_raw_initial_q)
-        )
-        for _ in range(3):
-            simulation_app.update()
-        verified_raw_initial_q = np.asarray(
-            robot.get_joint_positions(),
-            dtype=np.float32,
-        ).reshape(-1)
-        verified_initial_q = np.asarray(
-            canonical_values(
-                verified_raw_initial_q,
-                canonical_to_raw,
-            ),
-            dtype=np.float32,
-        )
-        initial_joint_tolerance_rad = 5.0e-4
-        if not np.allclose(
-            verified_initial_q,
-            np.radians(args.robot_initial_joints_deg),
-            rtol=0.0,
-            atol=initial_joint_tolerance_rad,
-        ):
-            raise RuntimeError(
-                "Recorded initial joint pose did not survive sand setup: "
-                f"actual={verified_initial_q.tolist()}, "
-                f"expected_deg={list(args.robot_initial_joints_deg)}, "
-                f"tolerance_rad={initial_joint_tolerance_rad}"
-            )
-        print(
-            "[STATE27] Recorded initial articulation verified after sand setup:",
-            verified_initial_q.tolist(),
-            flush=True,
-        )
-
 
     # Hide sand BBox/range/debug visuals after particle settling.
     hidden_sand_visuals = hide_sand_source_guides()
@@ -3378,16 +3335,9 @@ def main(args):
             dataset_legacy_base_prim
         ).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
         position = matrix.ExtractTranslation()
-        matrix = UsdGeom.Xformable(
-            dataset_legacy_base_prim
-        ).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
-        position = matrix.ExtractTranslation()
         return (
             float(position[0]),
             float(position[1]),
-            # Collection's get_base_yaw_rad() records zero for this fixed-base
-            # dataset.  Do not substitute the articulation-root orientation.
-            0.0,
             # Collection's get_base_yaw_rad() records zero for this fixed-base
             # dataset.  Do not substitute the articulation-root orientation.
             0.0,
@@ -3402,14 +3352,6 @@ def main(args):
         return math.radians(prim_local_yaw_z_deg(truck_prim))
 
     def resolve_state27_dig_target():
-        if args.state27_dig_target_world is not None:
-            return (
-                np.asarray(
-                    args.state27_dig_target_world,
-                    dtype=np.float32,
-                ),
-                "cli_recorded_dig_target",
-            )
         if args.state27_dig_target_world is not None:
             return (
                 np.asarray(
@@ -3516,20 +3458,6 @@ def main(args):
             landing_source = (
                 "randomized_landing_validated_against_dump_bed"
             )
-        if args.state27_unload_target_world is not None:
-            landing = np.asarray(
-                args.state27_unload_target_world,
-                dtype=np.float64,
-            )
-            landing_source = "cli_recorded_unload_target"
-        else:
-            landing = np.asarray(
-                random_scene_profile["unload_landing_xyz"],
-                dtype=np.float64,
-            )
-            landing_source = (
-                "randomized_landing_validated_against_dump_bed"
-            )
         xy_inside = bool(
             np.all(landing[:2] >= minimum[:2] - 0.05)
             and np.all(landing[:2] <= maximum[:2] + 0.05)
@@ -3544,7 +3472,6 @@ def main(args):
         return (
             landing.astype(np.float32),
             landing_source,
-            landing_source,
         )
 
     state27_dig_target_world, state27_dig_target_source = (
@@ -3557,31 +3484,6 @@ def main(args):
     startup_base_x, startup_base_y, startup_base_yaw = (
         read_robot_base_pose()
     )
-    if args.expected_state27_initial_base is not None:
-        expected_initial_base = np.asarray(
-            args.expected_state27_initial_base,
-            dtype=np.float64,
-        )
-        actual_initial_base = np.asarray(
-            [startup_base_x, startup_base_y, startup_base_yaw],
-            dtype=np.float64,
-        )
-        if not np.allclose(
-            actual_initial_base,
-            expected_initial_base,
-            rtol=0.0,
-            atol=1.0e-4,
-        ):
-            raise RuntimeError(
-                "Dataset legacy base feature does not match the recorded "
-                "episode: "
-                f"actual={actual_initial_base.tolist()}, "
-                f"expected={expected_initial_base.tolist()}, "
-                f"prim={dataset_legacy_base_prim.GetPath()}"
-            )
-    # The reconstructed legacy 27D contract uses the episode's initial fixed
-    # body heading (legacy14[2]), not the rotating upper/swing heading.
-    startup_heading = startup_base_yaw
     if args.expected_state27_initial_base is not None:
         expected_initial_base = np.asarray(
             args.expected_state27_initial_base,
@@ -3634,13 +3536,7 @@ def main(args):
         args.state27_dig_target_world is not None
         or 7.313 <= startup_dig_radius <= 9.146
     )
-    dig_local_in_training_range = (
-        args.state27_dig_target_world is not None
-        or 7.313 <= startup_dig_radius <= 9.146
-    )
     unload_local_in_training_range = (
-        args.state27_unload_target_world is not None
-        or 3.953 <= startup_unload_radius <= 10.518
         args.state27_unload_target_world is not None
         or 3.953 <= startup_unload_radius <= 10.518
     )
@@ -3786,12 +3682,12 @@ def main(args):
     deployment_previous_load = None
     deployment_previous_fill_fraction = None
     deployment_previous_fill_rate = None
-    deployment_previous_fill_fraction = None
-    deployment_previous_fill_rate = None
     deployment_elapsed_seconds = 0.0
     last_idle_ui_update = 0.0
     idle_ui_interval = 1.0 / max(0.1, float(args.idle_ui_hz))
     while simulation_app.is_running():
+        lock_visible_viewport_to_overview()
+
         if not command_queue.empty():
             cmd = command_queue.get()
 
@@ -3808,13 +3704,10 @@ def main(args):
                     deployment_previous_load = None
                     deployment_previous_fill_fraction = None
                     deployment_previous_fill_rate = None
-                    deployment_previous_fill_fraction = None
-                    deployment_previous_fill_rate = None
                     deployment_elapsed_seconds = 0.0
                     if active_contract["observation_schema"] in (
                         OBSERVATION_SCHEMA_27D_PLUS_EFFORT,
                         OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
-                        OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
                         OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
                     ):
                         base_x, base_y, base_yaw = read_robot_base_pose()
@@ -3824,7 +3717,6 @@ def main(args):
                         )
                         active_observation_context.setdefault(
                             "initial_heading_rad",
-                            float(base_yaw),
                             float(base_yaw),
                         )
                         active_observation_context.setdefault(
@@ -3994,7 +3886,7 @@ def main(args):
             q_raw, q = read_canonical_joint_positions()
             qd_raw, qd = read_canonical_joint_velocities()
 
-            viewport.camera_path = display_camera_path
+            lock_visible_viewport_to_overview()
 
             rgb_by_camera = capture_rgb_from_persistent_viewports(
                 capture_views=capture_views,
@@ -4004,7 +3896,7 @@ def main(args):
                 wait_frames=CAPTURE_WAIT_FRAMES,
             )
 
-            viewport.camera_path = display_camera_path
+            lock_visible_viewport_to_overview()
 
             encode_start = time.perf_counter()
             encoded_cameras = {}
@@ -4046,10 +3938,6 @@ def main(args):
                     OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
                     OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
                 )
-                in (
-                    OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
-                    OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
-                )
             )
             bucket_load_metrics = estimate_bucket_load_particles(
                 source_tracking_required=use_dataset_bucket_source_tracking,
@@ -4058,7 +3946,6 @@ def main(args):
 
             tip_xyz = [0.0, 0.0, 0.0]
             load_xyz = [0.0, 0.0, 0.0]
-            pour_xyz = [0.0, 0.0, 0.0]
             pour_xyz = [0.0, 0.0, 0.0]
             try:
                 bucket_prim = stage.GetPrimAtPath(
@@ -4079,9 +3966,6 @@ def main(args):
                     pour_world = world_xf.Transform(
                         Gf.Vec3d(0.85, 0.0, 0.30)
                     )
-                    pour_world = world_xf.Transform(
-                        Gf.Vec3d(0.85, 0.0, 0.30)
-                    )
                     tip_xyz = [
                         float(tip_world[0]),
                         float(tip_world[1]),
@@ -4091,11 +3975,6 @@ def main(args):
                         float(load_world[0]),
                         float(load_world[1]),
                         float(load_world[2]),
-                    ]
-                    pour_xyz = [
-                        float(pour_world[0]),
-                        float(pour_world[1]),
-                        float(pour_world[2]),
                     ]
                     pour_xyz = [
                         float(pour_world[0]),
@@ -4150,21 +4029,6 @@ def main(args):
                     current_bucket_load - float(deployment_previous_load)
                 ) / max(1.0e-6, bridge_step_seconds)
             deployment_previous_load = current_bucket_load
-            deployment_fill_fraction = (
-                vla_observation_contract.bucket_fill_fraction(
-                    current_bucket_load
-                )
-            )
-            deployment_fill_rate = (
-                vla_observation_contract.causal_bucket_fill_rate(
-                    deployment_fill_fraction,
-                    deployment_previous_fill_fraction,
-                    deployment_previous_fill_rate,
-                    bridge_step_seconds,
-                )
-            )
-            deployment_previous_fill_fraction = deployment_fill_fraction
-            deployment_previous_fill_rate = deployment_fill_rate
             deployment_fill_fraction = (
                 vla_observation_contract.bucket_fill_fraction(
                     current_bucket_load
@@ -4295,11 +4159,6 @@ def main(args):
                 # This intentionally overrides geometry-derived paraphrases.
                 task_text = str(args.task_text)
 
-            if args.task_text:
-                # Exact text from the converted dataset's meta/tasks.parquet.
-                # This intentionally overrides geometry-derived paraphrases.
-                task_text = str(args.task_text)
-
             observation_state_28d = None
             observation_32d_ready = False
             observation_32d_error = ""
@@ -4307,10 +4166,6 @@ def main(args):
             observation_phase_source = ""
             if (
                 active_contract["observation_schema"]
-                in (
-                    OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
-                    OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
-                )
                 in (
                     OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
                     OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
@@ -4442,66 +4297,11 @@ def main(args):
                                 bucket_load_rate=deployment_bucket_load_rate,
                             )
                         )
-                    if (
-                        active_contract["observation_schema"]
-                        == OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT
-                    ):
-                        q_tracking_error = (
-                            np.asarray(q_target, dtype=np.float32)
-                            - joint_positions
-                        )
-                        q_tracking_error[0] = math.atan2(
-                            math.sin(float(q_tracking_error[0])),
-                            math.cos(float(q_tracking_error[0])),
-                        )
-                        observation_state_28d = (
-                            vla_observation_contract.build_state_28d(
-                                joint_positions_4d=joint_positions,
-                                joint_velocity_4d=deployment_joint_velocity,
-                                joint_tracking_error_4d=q_tracking_error,
-                                previous_action_4d=vel,
-                                bucket_tip_world_xyz=tip_xyz,
-                                bucket_load_world_xyz=load_xyz,
-                                bucket_pour_world_xyz=pour_xyz,
-                                dig_target_world_xyz=dig_target_xyz,
-                                unload_landing_world_xyz=unload_landing_xyz,
-                                upper_heading_rad=float(base_yaw)
-                                + float(joint_positions[0]),
-                                truck_yaw_rad=active_observation_context.get(
-                                    "truck_yaw_rad"
-                                ),
-                                bucket_fill_fraction_value=deployment_fill_fraction,
-                                bucket_fill_rate_fraction_per_s=deployment_fill_rate,
-                            )
-                        )
-                    else:
-                        observation_state_28d = (
-                            vla_observation_contract.build_legacy_state_28d_v3(
-                                base_state_14d=base_state_14d,
-                                joint_velocity_4d=deployment_joint_velocity,
-                                phase=phase,
-                                dig_target_world_xyz=dig_target_xyz,
-                                unload_landing_world_xyz=unload_landing_xyz,
-                                initial_origin_xy=active_observation_context.get(
-                                    "initial_origin_xy"
-                                ),
-                                initial_heading_rad=active_observation_context.get(
-                                    "initial_heading_rad"
-                                ),
-                                truck_yaw_rad=active_observation_context.get(
-                                    "truck_yaw_rad"
-                                ),
-                                bucket_load_rate=deployment_bucket_load_rate,
-                            )
-                        )
                     observation_32d_ready = True
                 except Exception as exc:
                     observation_32d_error = f"{type(exc).__name__}: {exc}"
             if observation_state_28d is not None:
                 observation_state = list(observation_state_28d)
-            if observation_state_28d is not None:
-                observation_state = list(observation_state_28d)
-
             reply_observation_context = dict(active_observation_context)
             if observation_phase_report:
                 reply_observation_context.update(
@@ -4536,18 +4336,12 @@ def main(args):
                     if observation_phase_report
                     else None
                 ),
-                "observation_stage_current_id": (
-                    int(observation_phase_report["phase_index"])
-                    if observation_phase_report
-                    else None
-                ),
                 "observation_state_28d": observation_state_28d,
                 "observation_32d_ready": observation_32d_ready,
                 "observation_32d_error": observation_32d_error,
                 "observation_contract": (
                     vla_observation_contract.schema_payload()
                     if active_contract["observation_schema"]
-                    == OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT
                     == OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT
                     else {
                         "schema_version": active_contract[
@@ -4601,6 +4395,7 @@ def main(args):
             # the policy uses the GPU.
             now = time.perf_counter()
             if now - last_idle_ui_update >= idle_ui_interval:
+                lock_visible_viewport_to_overview()
                 simulation_app.update()
                 last_idle_ui_update = now
             else:
@@ -4639,59 +4434,6 @@ if __name__ == "__main__":
         help=(
             "Replay a randomized sand/truck scene. By default a new seed is "
             "generated on each launch."
-        ),
-    )
-    parser.add_argument(
-        "--robot-initial-joints-deg",
-        type=float,
-        nargs=4,
-        metavar=("SWING", "BOOM", "ARM", "BUCKET"),
-        default=None,
-        help=(
-            "Recorded canonical initial joint pose in degrees. When set, the "
-            "pose is applied after articulation initialization and reapplied "
-            "after physics warmup."
-        ),
-    )
-    parser.add_argument(
-        "--state27-dig-target-world",
-        type=float,
-        nargs=3,
-        metavar=("X", "Y", "Z"),
-        default=None,
-        help=(
-            "Recorded planned dig target for the legacy 27D observation. "
-            "This is a below-surface planning target, not sand surface height."
-        ),
-    )
-    parser.add_argument(
-        "--expected-state27-initial-base",
-        type=float,
-        nargs=3,
-        metavar=("X", "Y", "YAW"),
-        default=None,
-        help=(
-            "Fail startup unless the collection-compatible legacy base "
-            "feature equals this recorded [x, y, yaw] value."
-        ),
-    )
-    parser.add_argument(
-        "--state27-unload-target-world",
-        type=float,
-        nargs=3,
-        metavar=("X", "Y", "Z"),
-        default=None,
-        help=(
-            "Recorded planned unload landing point for the legacy 27D "
-            "observation."
-        ),
-    )
-    parser.add_argument(
-        "--task-text",
-        default="",
-        help=(
-            "Exact task string sent to the policy. A non-empty value overrides "
-            "the simulator's geometry-derived description."
         ),
     )
     parser.add_argument(
@@ -4790,21 +4532,6 @@ if __name__ == "__main__":
                 f"--{option_name.replace('_', '-')} must contain only "
                 "finite values"
             )
-    for option_name in (
-        "robot_initial_joints_deg",
-        "expected_state27_initial_base",
-        "state27_dig_target_world",
-        "state27_unload_target_world",
-    ):
-        option_value = getattr(args, option_name)
-        if option_value is not None and not all(
-            math.isfinite(float(value)) for value in option_value
-        ):
-            parser.error(
-                f"--{option_name.replace('_', '-')} must contain only "
-                "finite values"
-            )
-
     try:
         main(args)
     finally:

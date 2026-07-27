@@ -253,7 +253,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Create detailed figures for the median representative episode "
-            "selected by evaluate_smolvla_random50_episodes.py."
+            "selected by evaluate_smolvla_episodes.py."
         )
     )
     parser.add_argument(
@@ -617,7 +617,7 @@ def main() -> None:
         (
             "The episode was chosen as the sampled episode whose composite "
             "representative score was closest to the median score among the "
-            "50 randomly selected episodes."
+            "the evaluated episode set."
         ),
         "",
         "## Generated outputs",

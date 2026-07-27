@@ -498,7 +498,7 @@ def main() -> None:
     if "stage_action_prior_direction" not in modeling_text:
         raise RuntimeError(
             "The existing stage-action direction patch is not present. "
-            "Apply patch_smolvla_stage_action_direction_loss.py first."
+            "Apply scripts/training/patch_smolvla_stage_action_direction_loss.py first."
         )
 
     patched_config = patch_configuration(config_text)

@@ -2106,8 +2106,23 @@ def main(args):
         sand_amount_multiplier=(sand_amount if sand_enabled else None),
         unload_center_xy=None,
         rebuild=False,
+        create_retaining_walls=False,
     )
     sand_api = getattr(builtins, "_SAND_SITE", sand_api)
+    sand_root_path = str(
+        sand_api.get("root_path") or "/World/SandSite"
+    ).rstrip("/")
+    sand_wall_path = f"{sand_root_path}/SandRetainingWalls"
+    if stage.GetPrimAtPath(sand_wall_path).IsValid():
+        raise RuntimeError(
+            "Sand retaining walls were created despite being disabled: "
+            f"{sand_wall_path}"
+        )
+    print(
+        "[SAND] Retaining-wall generation disabled:",
+        sand_wall_path,
+        flush=True,
+    )
 
     actual_sand_center = (
         float(getattr(sand_module, "SAND_CENTER_X", float("nan"))),
@@ -3074,203 +3089,15 @@ def main(args):
         finally:
             result["elapsed_ms"] = (time.perf_counter() - start) * 1000.0
 
-    def estimate_truck_bed_load_particles():
-        start = time.perf_counter()
-        result = {
-            "available": bool(truck_bed_counting_volume["available"]),
-            "method": "world_aabb_excluding_bucket_v2",
-            "count": 0,
-            "particle_count": 0,
-            "candidate_count": 0,
-            "local_box_count": 0,
-            "bucket_overlap_count": 0,
-            "source": str(truck_bed_counting_volume["source"]),
-            "reason": str(truck_bed_counting_volume["reason"]),
-            "source_tracking": "initial_pile_mask",
-            "source_tracking_valid": False,
-            "source_count": int(
-                bucket_source_tracker.get("source_count", 0)
-            ),
-            "horizontal_margin": float(
-                truck_bed_counting_volume["horizontal_margin"]
-            ),
-            "lower_margin": float(
-                truck_bed_counting_volume["lower_margin"]
-            ),
-            "upper_extra": float(
-                truck_bed_counting_volume["upper_extra"]
-            ),
-            "elapsed_ms": 0.0,
-        }
-        try:
-            if not truck_bed_counting_volume["available"]:
-                return result
-
-            runtime_api = getattr(builtins, "_SAND_SITE", sand_api)
-            positions_fn = (
-                runtime_api.get("particle_positions_fn")
-                if isinstance(runtime_api, dict)
-                else None
-            )
-            if not callable(positions_fn):
-                result["available"] = False
-                result["reason"] = "particle_positions_unavailable"
-                return result
-
-            points = np.asarray(
-                positions_fn(),
-                dtype=np.float32,
-            ).reshape(-1, 3)
-            result["particle_count"] = int(len(points))
-            if len(points) == 0:
-                result["reason"] = "missing_particles"
-                return result
-
-            initial_mask = bucket_source_tracker.get("mask")
-            if (
-                not bool(bucket_source_tracker.get("available", False))
-                or not isinstance(initial_mask, np.ndarray)
-                or len(initial_mask) != len(points)
-            ):
-                result["reason"] = str(
-                    bucket_source_tracker.get(
-                        "reason",
-                        "initial_pile_mask_unavailable",
-                    )
-                )
-                return result
-
-            world_min = truck_bed_counting_volume["world_min"]
-            world_max = truck_bed_counting_volume["world_max"]
-            candidate_mask = (
-                initial_mask
-                & np.all(points >= world_min, axis=1)
-                & np.all(points <= world_max, axis=1)
-            )
-            candidates = points[candidate_mask]
-            result["candidate_count"] = int(len(candidates))
-            result["source_tracking_valid"] = True
-            result["reason"] = "ok"
-            if len(candidates) == 0:
-                return result
-
-            local = np.empty_like(candidates)
-            local_from_world = truck_bed_counting_volume[
-                "local_from_world"
-            ]
-            for index, point in enumerate(candidates):
-                transformed = local_from_world.Transform(
-                    Gf.Vec3d(
-                        float(point[0]),
-                        float(point[1]),
-                        float(point[2]),
-                    )
-                )
-                local[index] = [
-                    float(transformed[0]),
-                    float(transformed[1]),
-                    float(transformed[2]),
-                ]
-
-            local_min = truck_bed_counting_volume["local_min"]
-            local_max = truck_bed_counting_volume["local_max"]
-            inside_local_box = np.all(
-                local >= local_min,
-                axis=1,
-            ) & np.all(
-                local <= local_max,
-                axis=1,
-            )
-            result["local_box_count"] = int(
-                np.count_nonzero(inside_local_box)
-            )
-
-            # A broad bed load region must not mistake material still carried
-            # inside the excavator bucket for deposited material. Exclude all
-            # candidates that remain inside the current bucket volume.
-            bucket_overlap = np.zeros(len(candidates), dtype=bool)
-            bucket_prim = stage.GetPrimAtPath(
-                "/World/URDF_real3/bucket_link"
-            )
-            if bucket_prim.IsValid():
-                bucket_world_xf = UsdGeom.Xformable(
-                    bucket_prim
-                ).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
-                bucket_inverse_xf = bucket_world_xf.GetInverse()
-                bucket_local = np.empty_like(candidates)
-                for index, point in enumerate(candidates):
-                    transformed = bucket_inverse_xf.Transform(
-                        Gf.Vec3d(
-                            float(point[0]),
-                            float(point[1]),
-                            float(point[2]),
-                        )
-                    )
-                    bucket_local[index] = [
-                        float(transformed[0]),
-                        float(transformed[1]),
-                        float(transformed[2]),
-                    ]
-                if bucket_volume_topology["available"]:
-                    bucket_overlap = points_in_closed_bucket_mesh(
-                        bucket_local
-                    )
-                else:
-                    inside_bucket_y = (
-                        (bucket_local[:, 1] >= bucket_load_y_min)
-                        & (bucket_local[:, 1] <= bucket_load_y_max)
-                    )
-                    inside_bucket_xz = points_in_polygon_2d(
-                        bucket_local[:, [0, 2]],
-                        bucket_load_profile_xz,
-                    )
-                    bucket_overlap = (
-                        inside_bucket_y & inside_bucket_xz
-                    )
-
-            result["bucket_overlap_count"] = int(
-                np.count_nonzero(bucket_overlap)
-            )
-            result["count"] = int(
-                np.count_nonzero(~bucket_overlap)
-            )
-            return result
-        except Exception as exc:
-            result["available"] = False
-            result["reason"] = f"{type(exc).__name__}:{exc}"
-            return result
-        finally:
-            result["elapsed_ms"] = (
-                time.perf_counter() - start
-            ) * 1000.0
-
-    def resolve_dataset_legacy_base_prim():
-        """Resolve the same base reference used by dataset collection.
-
-        The collector stores the world transform of the parent of the first
-        ArticulationRootAPI prim.  That is not necessarily the transform
-        returned by SingleArticulation.get_world_pose().
-        """
-        for candidate in stage.Traverse():
-            candidate_path = str(candidate.GetPath())
-            if (
-                candidate_path.startswith(ROBOT_PRIM_PATH)
-                and candidate.HasAPI(UsdPhysics.ArticulationRootAPI)
-            ):
-                parent = candidate.GetParent()
-                if parent is not None and parent.IsValid():
-                    return parent
-        raise RuntimeError(
-            "Could not resolve the dataset legacy base prim from "
-            "ArticulationRootAPI"
+    def quaternion_yaw_wxyz(orientation):
+        qw = float(orientation[0])
+        qx = float(orientation[1])
+        qy = float(orientation[2])
+        qz = float(orientation[3])
+        return math.atan2(
+            2.0 * (qw * qz + qx * qy),
+            1.0 - 2.0 * (qy * qy + qz * qz),
         )
-
-    dataset_legacy_base_prim = resolve_dataset_legacy_base_prim()
-    print(
-        "[STATE27] Dataset legacy base prim:",
-        str(dataset_legacy_base_prim.GetPath()),
-        flush=True,
-    )
 
     def read_robot_base_pose():
         matrix = UsdGeom.Xformable(
@@ -3663,6 +3490,15 @@ def main(args):
                             "truck_yaw_rad",
                             read_truck_yaw_rad(),
                         )
+                    if (
+                        active_contract["observation_schema"]
+                        == OBSERVATION_SCHEMA_28D_PLUS_EFFORT
+                    ):
+                        if not bucket_volume_topology["available"]:
+                            raise ValueError(
+                                "28D deployment requires the authored bucket_cut "
+                                f"closed mesh: {bucket_volume_topology['reason']}"
+                            )
                         bucket_source_tracker.clear()
                         bucket_source_tracker.update(
                             capture_initial_pile_source_mask()

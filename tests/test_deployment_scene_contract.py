@@ -129,6 +129,9 @@ class DeploymentSceneContractTests(unittest.TestCase):
         )
         self.assertLess(elevate_call, settle_loop)
         self.assertLess(settle_loop, restore_call)
+        self.assertIn("create_retaining_walls=False", source)
+        self.assertIn("Retaining-wall generation disabled", source)
+        self.assertNotIn("Removed temporary retaining walls", source)
         self.assertIn(
             "pending_pose_restore = _ACTIVE_SAND_POSE_RESTORE",
             source,

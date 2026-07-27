@@ -226,6 +226,12 @@ log/
 
 # Local generated packages and old working copies
 *.zip
+*.bak
+*.bak_*
+*.before_*
+*.orig
+*.rej
+*~
 excavator_code_package_*.zip
 source_backup_*.zip
 source_backup_before_git_*.zip
@@ -233,6 +239,7 @@ source_backup_before_repo_sync_*.zip
 _ExcavatorVLA_sync/
 /excavator_app/
 /excavator_app_*/
+/.rollout_analysis_*/
 
 # Local assistant/editor state
 .vscode/

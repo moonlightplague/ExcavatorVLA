@@ -177,6 +177,18 @@ class DeploymentSceneContractTests(unittest.TestCase):
         )
         for argument in expected_arguments:
             self.assertIn(argument, launcher)
+        self.assertIn(
+            'scp -P 30105 root@120.209.70.195:$ARCHIVE .',
+            launcher,
+        )
+        self.assertIn(
+            'scp -P 30105 -r root@120.209.70.195:$OUTPUT_DIR .',
+            launcher,
+        )
+        self.assertIn(
+            'scp -P 30105 -r root@120.209.70.195:$VIDEO_DIR .',
+            launcher,
+        )
 
         simulator = (repo_root / "run_simulation.py").read_text(
             encoding="utf-8"

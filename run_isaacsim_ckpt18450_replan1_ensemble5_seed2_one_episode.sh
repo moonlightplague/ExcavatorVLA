@@ -760,5 +760,13 @@ echo "Videos: $VIDEO_DIR"
 echo "Archive: $ARCHIVE"
 echo "Latest archive link: $LATEST_ARCHIVE_LINK"
 echo
-echo "Download command:"
-echo "scp -P 30105 root@120.209.70.195:$LATEST_ARCHIVE_LINK ."
+echo "Run one of these commands from your local computer:"
+echo
+echo "Download everything as one archive (videos, logs, traces, and analysis):"
+echo "scp -P 30105 root@120.209.70.195:$ARCHIVE ."
+echo
+echo "Download the complete uncompressed output directory:"
+echo "scp -P 30105 -r root@120.209.70.195:$OUTPUT_DIR ."
+echo
+echo "Download videos only:"
+echo "scp -P 30105 -r root@120.209.70.195:$VIDEO_DIR ."

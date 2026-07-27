@@ -257,6 +257,7 @@ CAPTURE_HEIGHT = 1024
 MODEL_IMAGE_WIDTH = 256
 MODEL_IMAGE_HEIGHT = 256
 CAPTURE_WAIT_FRAMES = 5
+CAPTURE_STARTUP_WAIT_FRAMES = 60
 PENDING_VIEWPORT_CAPTURE_HELPERS = []
 LAST_CAPTURE_TIMING_MS = {}
 CAPTURE_RESIZE_EXECUTOR = ThreadPoolExecutor(max_workers=3)
@@ -1689,7 +1690,10 @@ def main(args):
         capture_api = capture_window.viewport_api
         capture_api.camera_path = camera_path
         try:
-            capture_window.visible = False
+            # Keep new off-screen viewports active through the startup warmup.
+            # Hiding them here leaves their render pipelines cold, making the
+            # first five-frame capture window unreliable with ray tracing.
+            capture_window.visible = True
         except Exception:
             pass
         capture_views[camera_name] = {
@@ -1739,7 +1743,7 @@ def main(args):
         simulation_app=simulation_app,
         capture_viewport_to_buffer=capture_viewport_to_buffer,
         np_module=np,
-        wait_frames=CAPTURE_WAIT_FRAMES,
+        wait_frames=CAPTURE_STARTUP_WAIT_FRAMES,
     )
 
     lock_visible_viewport_to_overview()

@@ -224,6 +224,15 @@ class DeploymentSceneContractTests(unittest.TestCase):
         )
         self.assertIn("lock_visible_viewport_to_overview()", source)
         self.assertNotIn("DISPLAY_CAMERA_NAME", source)
+        self.assertIn("CAPTURE_STARTUP_WAIT_FRAMES = 60", source)
+        self.assertIn(
+            "wait_frames=CAPTURE_STARTUP_WAIT_FRAMES",
+            source,
+        )
+        self.assertIn(
+            "capture_window.visible = True",
+            source,
+        )
 
 
 if __name__ == "__main__":

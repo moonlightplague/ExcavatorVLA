@@ -2,6 +2,9 @@ import ast
 import re
 import unittest
 from pathlib import Path
+from typing import Any
+
+import numpy as np
 
 
 class PolicyClientCliContractTests(unittest.TestCase):
@@ -90,6 +93,58 @@ class PolicyClientCliContractTests(unittest.TestCase):
         self.assertEqual(
             sorted(used_options - self.option_names),
             [],
+        )
+
+    def test_temporal_ensemble_helper_is_defined_and_blends_chunks(self):
+        helper = next(
+            (
+                node
+                for node in self.tree.body
+                if (
+                    isinstance(node, ast.FunctionDef)
+                    and node.name == "temporal_ensemble_action"
+                )
+            ),
+            None,
+        )
+        self.assertIsNotNone(helper)
+        namespace = {
+            "Any": Any,
+            "EXPECTED_ACTION_DIM": 4,
+            "np": np,
+        }
+        exec(
+            compile(
+                ast.Module(body=[helper], type_ignores=[]),
+                str(self.client_path),
+                "exec",
+            ),
+            namespace,
+        )
+        ensemble, metadata = namespace["temporal_ensemble_action"](
+            [
+                (0, np.full((3, 4), 1.0, dtype=np.float32)),
+                (1, np.full((2, 4), 3.0, dtype=np.float32)),
+            ],
+            target_step=1,
+            width=2,
+            decay=0.0,
+        )
+        np.testing.assert_allclose(ensemble, np.full(4, 2.0))
+        self.assertEqual(metadata["num_predictions"], 2)
+        self.assertEqual(metadata["source_chunk_origins"], [1, 0])
+
+    def test_execution_constraints_assign_executed_action(self):
+        source = self.client_path.read_text(encoding="utf-8")
+        self.assertIn(
+            "executed_action, execution_constraints = (\n"
+            "                    apply_excavation_sequence_supervisor(",
+            source,
+        )
+        self.assertIn(
+            "executed_action, execution_constraints = (\n"
+            "                    apply_optional_execution_constraints(",
+            source,
         )
 
 

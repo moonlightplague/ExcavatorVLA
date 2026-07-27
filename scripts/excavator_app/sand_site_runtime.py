@@ -1710,12 +1710,25 @@ def fmt_bbox(mn, mx):
     return f"min={np.round(mn, 3)} max={np.round(mx, 3)}"
 
 
-def sand_make_cube(path, translate, scale, color, collision=False, opacity=None):
+def sand_make_cube(
+    path,
+    translate,
+    scale,
+    color,
+    collision=False,
+    opacity=None,
+    rotate_xyz=None,
+):
     stage = get_stage()
     cube = UsdGeom.Cube.Define(stage, path)
     cube.CreateSizeAttr(1.0)
     prim = cube.GetPrim()
-    sand_set_xform(prim, translate=translate, scale=scale)
+    sand_set_xform(
+        prim,
+        translate=translate,
+        scale=scale,
+        rotate_xyz=rotate_xyz,
+    )
     sand_set_color(prim, color, opacity)
     if collision:
         UsdPhysics.CollisionAPI.Apply(prim)
@@ -2917,9 +2930,12 @@ def apply_auto_scene_parameters(
     unload_center_xy=None,
     rebuild=False,
     create_retaining_walls=True,
+    sand_radius_scale=1.0,
 ):
     global SAND_CENTER_X, SAND_CENTER_Y, PILE_CENTER_X, PILE_CENTER_Y
-    global SANDBOX_FILL_HEIGHT
+    global SANDBOX_FILL_HEIGHT, SANDBOX_INNER_SIZE_X, SANDBOX_INNER_SIZE_Y
+    global SAND_POINT_RADIUS, DIGGABLE_RADIUS_X, DIGGABLE_RADIUS_Y
+    global PILE_SIGMA_X, PILE_SIGMA_Y
     global WALL_CENTER_X, WALL_CENTER_Y, SAND_SOURCE_SELECTED_PATH, SAND_SOURCE_SELECTED_FACE_COUNT
     global SAND_SOURCE_TOTAL_PROJECTED_FACE_COUNT, SAND_SOURCE_RAW_FACE_POLYGONS_XY, SAND_SOURCE_FACE_POLYGONS_XY
     global SAND_SOURCE_SELECTED_HULL_XY, SAND_SOURCE_POLYGON_XY, SAND_AMOUNT_MULTIPLIER
@@ -2947,6 +2963,48 @@ def apply_auto_scene_parameters(
             SAND_SOURCE_FACE_POLYGONS_XY = None
             SAND_SOURCE_SELECTED_HULL_XY = None
             SAND_SOURCE_POLYGON_XY = None
+
+    radius_scale = float(sand_radius_scale)
+    if not math.isfinite(radius_scale) or radius_scale <= 0.0:
+        raise ValueError(
+            "sand_radius_scale must be finite and positive, "
+            f"got {sand_radius_scale!r}"
+        )
+    if not math.isclose(
+        radius_scale,
+        1.0,
+        rel_tol=0.0,
+        abs_tol=1.0e-9,
+    ):
+        changed = True
+        SANDBOX_INNER_SIZE_X = max(
+            0.10,
+            float(SANDBOX_INNER_SIZE_X) * radius_scale,
+        )
+        SANDBOX_INNER_SIZE_Y = max(
+            0.10,
+            float(SANDBOX_INNER_SIZE_Y) * radius_scale,
+        )
+        SAND_POINT_RADIUS = max(
+            0.05,
+            float(SAND_POINT_RADIUS) * radius_scale,
+        )
+        DIGGABLE_RADIUS_X = max(
+            0.05,
+            float(DIGGABLE_RADIUS_X) * radius_scale,
+        )
+        DIGGABLE_RADIUS_Y = max(
+            0.05,
+            float(DIGGABLE_RADIUS_Y) * radius_scale,
+        )
+        PILE_SIGMA_X = max(
+            0.05,
+            float(PILE_SIGMA_X) * radius_scale,
+        )
+        PILE_SIGMA_Y = max(
+            0.05,
+            float(PILE_SIGMA_Y) * radius_scale,
+        )
 
     if sand_amount_multiplier is not None:
         amount = clamp_sand_amount(float(sand_amount_multiplier))
@@ -3008,6 +3066,11 @@ def apply_auto_scene_parameters(
         "unload_bin_center": [float(UNLOAD_BIN_CENTER[0]), float(UNLOAD_BIN_CENTER[1])],
         "rebuild": bool(rebuild),
         "retaining_walls_created": bool(create_retaining_walls),
+        "sand_radius_scale": float(radius_scale),
+        "diggable_radius": [
+            float(DIGGABLE_RADIUS_X),
+            float(DIGGABLE_RADIUS_Y),
+        ],
     }
 
 
@@ -3079,12 +3142,86 @@ def create_sand_retaining_walls_for_generation(root=None):
     return bool(ok)
 
 
-def clean_sand_retaining_walls(root=None):
+def create_circular_sand_retaining_wall(
+    root=None,
+    radius_scale=1.5,
+    segments=48,
+):
+    """Create a segmented collision ring outside the sand footprint."""
     root = root_path() if root is None else str(root)
-    wall_root = f"{root}/SandRetainingWalls"
+    radius_scale = float(radius_scale)
+    if not math.isfinite(radius_scale) or radius_scale <= 1.0:
+        raise ValueError(
+            "Circular sand wall radius_scale must be finite and greater "
+            f"than 1.0, got {radius_scale!r}"
+        )
+    segments = max(12, int(segments))
+    wall_root = f"{root}/CircularSandRetainingWall"
     try:
         get_stage().RemovePrim(Sdf.Path(wall_root))
-        info("Cleaned sand retaining walls:", wall_root)
+    except Exception:
+        pass
+    UsdGeom.Xform.Define(get_stage(), wall_root)
+
+    sand_radius = max(
+        float(DIGGABLE_RADIUS_X),
+        float(DIGGABLE_RADIUS_Y),
+    )
+    inner_radius = sand_radius * radius_scale
+    thickness = float(SANDBOX_WALL_THICKNESS)
+    height = float(SANDBOX_WALL_HEIGHT)
+    center_radius = inner_radius + 0.5 * thickness
+    segment_length = (
+        2.0
+        * center_radius
+        * math.tan(math.pi / float(segments))
+        * 1.02
+    )
+    center_x = float(PILE_CENTER_X)
+    center_y = float(PILE_CENTER_Y)
+    center_z = float(WALL_BASE_Z) + 0.5 * height
+
+    for index in range(segments):
+        angle_rad = (
+            2.0 * math.pi * float(index) / float(segments)
+        )
+        angle_deg = math.degrees(angle_rad)
+        segment_x = center_x + center_radius * math.cos(angle_rad)
+        segment_y = center_y + center_radius * math.sin(angle_rad)
+        sand_make_cube(
+            f"{wall_root}/Segment_{index:03d}",
+            (segment_x, segment_y, center_z),
+            (thickness, segment_length, height),
+            SANDBOX_WALL_COLOR,
+            collision=True,
+            rotate_xyz=(0.0, 0.0, angle_deg),
+        )
+
+    result = {
+        "path": wall_root,
+        "sand_radius": float(sand_radius),
+        "radius_scale": float(radius_scale),
+        "inner_radius": float(inner_radius),
+        "outer_radius": float(inner_radius + thickness),
+        "height": float(height),
+        "thickness": float(thickness),
+        "segments": int(segments),
+    }
+    info("Created circular sand retaining wall:", result)
+    update_status("Circular sand retaining wall ready")
+    return result
+
+
+def clean_sand_retaining_walls(root=None):
+    root = root_path() if root is None else str(root)
+    wall_paths = (
+        f"{root}/SandRetainingWalls",
+        f"{root}/CircularSandRetainingWall",
+    )
+    try:
+        for wall_path in wall_paths:
+            get_stage().RemovePrim(Sdf.Path(wall_path))
+        info("Cleaned sand retaining walls:", wall_paths)
         update_status("Sand walls cleaned")
         return True
     except Exception as e:
@@ -3390,6 +3527,9 @@ def store_runtime_api():
         "request_reset": request_sand_reset,
         "reset_stably": reset_sand_surface_stably,
         "create_sand_retaining_walls": create_sand_retaining_walls_for_generation,
+        "create_circular_sand_retaining_wall": (
+            create_circular_sand_retaining_wall
+        ),
         "clean_sand_retaining_walls": clean_sand_retaining_walls,
         "reset_health_stats": sand_reset_health_stats,
         "last_reset_healthy": bool(STATE.get("last_reset_healthy", False)),
@@ -4107,20 +4247,9 @@ if isinstance(_startup_config, dict):
         )
     ).strip().lower()
 
-    if parameter_mode != "soft_dig":
+    if parameter_mode not in SAND_PARAMETER_MODES:
         raise RuntimeError(
-            f"External startup requires soft_dig, got "
-            f"{parameter_mode!r}"
-        )
-
-    apply_sand_parameter_mode(
-        "soft_dig",
-        announce=True,
-    )
-
-    if current_sand_parameter_mode() != "soft_dig":
-        raise RuntimeError(
-            "Failed to apply soft_dig mode"
+            f"Invalid external sand mode: {parameter_mode!r}"
         )
 
     _startup_result = configure_startup_sand(
@@ -4131,7 +4260,13 @@ if isinstance(_startup_config, dict):
             True,
         ),
         rebuild=False,
+        parameter_mode=parameter_mode,
     )
+
+    if current_sand_parameter_mode() != parameter_mode:
+        raise RuntimeError(
+            f"Failed to apply {parameter_mode} mode"
+        )
 
     print(
         "[INFO] External sand startup config:",

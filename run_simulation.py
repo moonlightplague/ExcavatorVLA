@@ -2070,7 +2070,7 @@ def main(args):
         "amount": int(round(sand_amount)),
         "show_ui": False,
         "auto_create": False,
-        "parameter_mode": "soft_dig",
+        "parameter_mode": args.sand_parameter_mode,
     }
 
     for stale_name in (
@@ -2109,7 +2109,7 @@ def main(args):
         )
 
     mode_result = set_parameter_mode(
-        "soft_dig",
+        args.sand_parameter_mode,
         announce=True,
     )
 
@@ -2128,9 +2128,10 @@ def main(args):
         )
     ).strip().lower()
 
-    if actual_sand_mode != "soft_dig":
+    if actual_sand_mode != args.sand_parameter_mode:
         raise RuntimeError(
-            f"Expected sand mode soft_dig, got {actual_sand_mode!r}"
+            f"Expected sand mode {args.sand_parameter_mode}, "
+            f"got {actual_sand_mode!r}"
         )
 
     print(
@@ -2151,6 +2152,7 @@ def main(args):
         unload_center_xy=None,
         rebuild=False,
         create_retaining_walls=False,
+        sand_radius_scale=args.sand_radius_scale,
     )
     sand_api = getattr(builtins, "_SAND_SITE", sand_api)
     sand_root_path = str(
@@ -2167,6 +2169,90 @@ def main(args):
         sand_wall_path,
         flush=True,
     )
+
+    actual_sand_radius = np.asarray(
+        [
+            float(getattr(sand_module, "DIGGABLE_RADIUS_X")),
+            float(getattr(sand_module, "DIGGABLE_RADIUS_Y")),
+        ],
+        dtype=np.float64,
+    )
+    if (
+        actual_sand_radius.shape != (2,)
+        or not np.all(np.isfinite(actual_sand_radius))
+        or np.any(actual_sand_radius <= 0.0)
+    ):
+        raise RuntimeError(
+            "Sand runtime produced an invalid generation radius: "
+            f"{actual_sand_radius.tolist()}"
+        )
+    print(
+        "[SAND] Generation radius configured:",
+        f"requested_scale={args.sand_radius_scale:.6f}",
+        f"actual={actual_sand_radius.tolist()}",
+        flush=True,
+    )
+
+    circular_wall_path = (
+        f"{sand_root_path}/CircularSandRetainingWall"
+    )
+    if sand_enabled and args.sand_wall:
+        create_circular_wall = sand_api.get(
+            "create_circular_sand_retaining_wall"
+        )
+        if not callable(create_circular_wall):
+            raise RuntimeError(
+                "Sand runtime does not expose "
+                "create_circular_sand_retaining_wall"
+            )
+        circular_wall_result = create_circular_wall(
+            radius_scale=args.sand_wall_radius_scale
+        )
+        expected_wall_inner_radius = (
+            float(np.max(actual_sand_radius))
+            * float(args.sand_wall_radius_scale)
+        )
+        actual_wall_inner_radius = float(
+            circular_wall_result.get("inner_radius", float("nan"))
+        )
+        if (
+            not stage.GetPrimAtPath(circular_wall_path).IsValid()
+            or not math.isclose(
+                actual_wall_inner_radius,
+                expected_wall_inner_radius,
+                rel_tol=0.0,
+                abs_tol=1.0e-4,
+            )
+        ):
+            raise RuntimeError(
+                "Circular sand wall does not match the configured radius: "
+                f"result={circular_wall_result}, "
+                f"expected_inner_radius={expected_wall_inner_radius:.6f}"
+            )
+        print(
+            "[SAND] Circular retaining wall verified:",
+            f"path={circular_wall_path}",
+            f"radius_scale={args.sand_wall_radius_scale:.6f}",
+            f"inner_radius={actual_wall_inner_radius:.6f}",
+            flush=True,
+        )
+    else:
+        clean_retaining_walls = sand_api.get(
+            "clean_sand_retaining_walls"
+        )
+        if callable(clean_retaining_walls):
+            clean_retaining_walls()
+        if stage.GetPrimAtPath(circular_wall_path).IsValid():
+            raise RuntimeError(
+                "Circular sand wall remained after it was disabled: "
+                f"{circular_wall_path}"
+            )
+        print(
+            "[SAND] Circular retaining wall disabled:",
+            f"sand_enabled={sand_enabled}",
+            f"sand_wall={bool(args.sand_wall)}",
+            flush=True,
+        )
 
     actual_sand_center = (
         float(getattr(sand_module, "SAND_CENTER_X", float("nan"))),
@@ -4490,6 +4576,33 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--sand-parameter-mode",
+        choices=("legacy", "soft_dig"),
+        default="soft_dig",
+        help="Particle material/solver preset used during sand creation.",
+    )
+    parser.add_argument(
+        "--sand-radius-scale",
+        type=float,
+        default=1.0,
+        help="Positive scale applied to the generated sand footprint.",
+    )
+    parser.add_argument(
+        "--sand-wall",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable the circular collision wall around generated sand.",
+    )
+    parser.add_argument(
+        "--sand-wall-radius-scale",
+        type=float,
+        default=1.5,
+        help=(
+            "Circular wall inner radius divided by generated sand radius; "
+            "must be greater than 1."
+        ),
+    )
+    parser.add_argument(
         "--sand-settle-frames",
         type=int,
         default=240,
@@ -4516,6 +4629,18 @@ if __name__ == "__main__":
 
     if args.sand_settle_frames < 1:
         parser.error("--sand-settle-frames must be at least 1")
+    if (
+        not math.isfinite(args.sand_radius_scale)
+        or args.sand_radius_scale <= 0.0
+    ):
+        parser.error("--sand-radius-scale must be finite and positive")
+    if (
+        not math.isfinite(args.sand_wall_radius_scale)
+        or args.sand_wall_radius_scale <= 1.0
+    ):
+        parser.error(
+            "--sand-wall-radius-scale must be finite and greater than 1"
+        )
     if args.idle_ui_hz <= 0.0:
         parser.error("--idle-ui-hz must be positive")
     for option_name in (

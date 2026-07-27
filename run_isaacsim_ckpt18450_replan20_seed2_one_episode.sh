@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Checkpoint-18450 evaluation with a 20-step replan interval.
 PROJECT=/root/isaacsim/ExcavatorVLA
 ISAAC_PYTHON=/root/isaacsim/python.sh
 POLICY_PYTHON=/opt/conda/envs/smolvla/bin/python
@@ -8,8 +9,6 @@ POLICY_PYTHON=/opt/conda/envs/smolvla/bin/python
 SIMULATOR="$PROJECT/run_simulation.py"
 CLIENT="$PROJECT/scripts/bridge_test/smolvla_policy_client.py"
 ANALYZER="$PROJECT/analyze_smolvla_200step_trace.py"
-DEPLOYMENT_CONTRACT="$PROJECT/excavator_common/deployment_contract.py"
-OBSERVATION_CONTRACT="$PROJECT/excavator_common/vla_observation_contract.py"
 
 CHECKPOINT=/root/gpufree-data/outputs/train/excavator_smolvla_seed2_fixed5ep_canonical300_from16650_b144/checkpoints/018450/pretrained_model
 DATASET=/root/gpufree-data/excavator_route_compare/seed_2_fixed_scene_pose_exact/run_20260720_194053/lerobot_v3_eval27_stage10_h30_obslabels
@@ -22,7 +21,7 @@ LOG_ROOT=/root/gpufree-data/excavator_logs
 SCENE_SEED=2
 SAND_AMOUNT=1
 POLICY_STEPS=200
-REPLAN_INTERVAL=1
+REPLAN_INTERVAL=20
 MAX_INPUT_ABS_SIGMA=8
 TASK_TEXT="Excavate one scoop of sand from the sand pile in front of the excavator's initial base pose, then carry and dump the collected material into the truck bed to the right of the excavator's initial base pose."
 
@@ -88,8 +87,6 @@ for required in \
   "$SIMULATOR" \
   "$CLIENT" \
   "$ANALYZER" \
-  "$DEPLOYMENT_CONTRACT" \
-  "$OBSERVATION_CONTRACT" \
   "$CHECKPOINT/model.safetensors" \
   "$CHECKPOINT/config.json" \
   "$CHECKPOINT/train_config.json" \
@@ -159,47 +156,11 @@ import json
 import sys
 
 import pandas as pd
-from excavator_common import deployment_contract
-from excavator_common import vla_observation_contract
 
 checkpoint = Path(sys.argv[1]).resolve()
 dataset_meta = Path(sys.argv[2]).resolve()
 replan_interval = int(sys.argv[3])
 task_text = sys.argv[4]
-
-required_deployment_symbols = (
-    "OBSERVATION_SCHEMA_27D_PLUS_EFFORT",
-    "OBSERVATION_SCHEMA_28D_PLUS_EFFORT",
-    "OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT",
-    "STATE_NAMES_27D",
-    "STATE_NAMES_28D",
-    "validate_client_contract",
-)
-missing_deployment_symbols = [
-    name
-    for name in required_deployment_symbols
-    if not hasattr(deployment_contract, name)
-]
-if missing_deployment_symbols:
-    raise RuntimeError(
-        "excavator_common/deployment_contract.py is out of date; "
-        f"missing={missing_deployment_symbols!r}"
-    )
-required_observation_symbols = (
-    "STATE_NAMES_28D",
-    "LEGACY_STATE_NAMES_28D_V3",
-    "EFFORT_NAMES_4D",
-)
-missing_observation_symbols = [
-    name
-    for name in required_observation_symbols
-    if not hasattr(vla_observation_contract, name)
-]
-if missing_observation_symbols:
-    raise RuntimeError(
-        "excavator_common/vla_observation_contract.py is out of date; "
-        f"missing={missing_observation_symbols!r}"
-    )
 
 config = json.loads((checkpoint / "config.json").read_text(encoding="utf-8"))
 train_config = json.loads(

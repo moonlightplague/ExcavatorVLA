@@ -19,8 +19,17 @@ PRIOR=/root/gpufree-data/excavator_stage_action_analysis/stage_action_prior_trai
 
 RESULT_ROOT=/root/gpufree-data/excavator_isaacsim_eval
 LOG_ROOT=/root/gpufree-data/excavator_logs
+
+# Simulation scene and sand settings.
 SCENE_SEED=2
 SAND_AMOUNT=1
+SAND_PARAMETER_MODE=soft_dig
+SAND_RADIUS_SCALE=0.2
+SAND_WALL_ENABLED=1
+SAND_WALL_RADIUS_SCALE=1.5
+SAND_SETTLE_FRAMES=60
+
+# Policy and execution settings.
 POLICY_STEPS=300
 REPLAN_INTERVAL=3
 TEMPORAL_ENSEMBLE_WIDTH=1
@@ -52,6 +61,15 @@ SUPERVISOR_UNLOAD_HEIGHT_VELOCITY=0.12
 MAX_INPUT_ABS_SIGMA=8
 MAX_EFFORT_ABS_SIGMA=8
 TASK_TEXT="Excavate one scoop of sand from the sand pile in front of the excavator's initial base pose, then carry and dump the collected material into the truck bed to the right of the excavator's initial base pose."
+
+case "$SAND_WALL_ENABLED" in
+  1) SAND_WALL_OPTION=--sand-wall ;;
+  0) SAND_WALL_OPTION=--no-sand-wall ;;
+  *)
+    echo "[ERROR] SAND_WALL_ENABLED must be 0 or 1." >&2
+    exit 2
+    ;;
+esac
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 RUN_NAME="isaacsim_seed2_ckpt18450_replan${REPLAN_INTERVAL}_ensemble${TEMPORAL_ENSEMBLE_WIDTH}_supervisor${ENABLE_EXCAVATION_SEQUENCE_SUPERVISOR}_${POLICY_STEPS}steps_${TIMESTAMP}"
@@ -323,6 +341,11 @@ echo "======================================================================"
 setsid "$ISAAC_PYTHON" "$SIMULATOR" \
   --scene-seed "$SCENE_SEED" \
   --sand-amount "$SAND_AMOUNT" \
+  --sand-parameter-mode "$SAND_PARAMETER_MODE" \
+  --sand-radius-scale "$SAND_RADIUS_SCALE" \
+  "$SAND_WALL_OPTION" \
+  --sand-wall-radius-scale "$SAND_WALL_RADIUS_SCALE" \
+  --sand-settle-frames "$SAND_SETTLE_FRAMES" \
   --robot-initial-joints-deg 40 46 -62 -20 \
   --expected-state27-initial-base \
     -6.950658321380615 2.2325551509857178 0 \

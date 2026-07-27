@@ -132,6 +132,18 @@ class DeploymentSceneContractTests(unittest.TestCase):
         self.assertLess(settle_loop, restore_call)
         self.assertIn("create_retaining_walls=False", source)
         self.assertIn("Retaining-wall generation disabled", source)
+        self.assertIn(
+            '"create_circular_sand_retaining_wall"',
+            source,
+        )
+        self.assertIn(
+            "if sand_enabled and args.sand_wall:",
+            source,
+        )
+        self.assertIn(
+            "expected_wall_inner_radius = (",
+            source,
+        )
         self.assertNotIn("Removed temporary retaining walls", source)
         self.assertIn(
             "pending_pose_restore = _ACTIVE_SAND_POSE_RESTORE",
@@ -139,6 +151,58 @@ class DeploymentSceneContractTests(unittest.TestCase):
         )
         self.assertNotIn("suspend_excavator_collisions_for_sand_init", source)
         self.assertIn("target_min_z", source)
+
+    def test_one_episode_launcher_exposes_sand_and_wall_settings(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        launcher = (
+            repo_root
+            / "run_isaacsim_ckpt18450_replan1_ensemble5_seed2_one_episode.sh"
+        ).read_text(encoding="utf-8")
+        expected_settings = (
+            "SAND_PARAMETER_MODE=soft_dig",
+            "SAND_RADIUS_SCALE=0.2",
+            "SAND_WALL_ENABLED=1",
+            "SAND_WALL_RADIUS_SCALE=1.5",
+            "SAND_SETTLE_FRAMES=60",
+        )
+        for setting in expected_settings:
+            self.assertIn(setting, launcher)
+        expected_arguments = (
+            '--sand-parameter-mode "$SAND_PARAMETER_MODE"',
+            '--sand-radius-scale "$SAND_RADIUS_SCALE"',
+            '"$SAND_WALL_OPTION"',
+            '--sand-wall-radius-scale "$SAND_WALL_RADIUS_SCALE"',
+            '--sand-settle-frames "$SAND_SETTLE_FRAMES"',
+        )
+        for argument in expected_arguments:
+            self.assertIn(argument, launcher)
+
+    def test_sand_runtime_supports_configurable_circular_wall(self):
+        runtime = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "excavator_app"
+            / "sand_site_runtime.py"
+        ).read_text(encoding="utf-8")
+        ast.parse(runtime)
+        self.assertIn(
+            "def create_circular_sand_retaining_wall(",
+            runtime,
+        )
+        self.assertIn(
+            "inner_radius = sand_radius * radius_scale",
+            runtime,
+        )
+        self.assertIn(
+            'f"{root}/CircularSandRetainingWall"',
+            runtime,
+        )
+        self.assertIn(
+            '"create_circular_sand_retaining_wall": (',
+            runtime,
+        )
+        self.assertNotIn("External startup requires soft_dig", runtime)
+        self.assertIn("parameter_mode=parameter_mode", runtime)
 
     def test_run_simulation_syntax_and_video_camera_contract(self):
         source = (

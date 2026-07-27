@@ -13,6 +13,7 @@ VLM=/root/gpufree-data/checkpoints/SmolVLM2-500M-Video-Instruct
 PRIOR=/root/gpufree-data/excavator_stage_action_analysis/stage_action_prior_training.json
 
 OUTPUT=/root/gpufree-data/excavator_offline_eval/seed2_fixed_scene_pose_exact_ckpt16650_one_episode
+RESULT_ARCHIVE="${OUTPUT}.tar.gz"
 SIM_LOG=/root/gpufree-data/excavator_logs/simulation_dynamic_prompt_seed2.log
 EVAL_LOG=/root/gpufree-data/excavator_logs/offline_eval_seed2_fixed_scene_pose_exact_ckpt16650_one_episode.log
 
@@ -207,6 +208,8 @@ rm -rf "$DATA27"
 "$PYTHON" "$CONVERTER" \
   --src "$EXPORT28" \
   --dst "$DATA27" \
+  --raw-run "$RUN" \
+  --raw-split trainable \
   --horizon 30 \
   --minimum-purity 0.70 \
   --video-mode hardlink \
@@ -217,7 +220,7 @@ echo "======================================================================"
 echo "5. Validate the converted dataset contract"
 echo "======================================================================"
 
-"$PYTHON" - "$DATA27" "$EXACT_TASK" <<'PY'
+"$PYTHON" - "$DATA27" "$EXACT_TASK" "$CHECKPOINT/config.json" <<'PY'
 from pathlib import Path
 import json
 import sys
@@ -227,8 +230,34 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 root = Path(sys.argv[1])
 expected_task = sys.argv[2]
+checkpoint_config = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
+stage_source_key = str(checkpoint_config.get("stage_source_key", "")).strip()
+if not stage_source_key:
+    raise RuntimeError("Checkpoint config has no non-empty stage_source_key")
 
 info = json.loads((root / "meta" / "info.json").read_text(encoding="utf-8"))
+stage_schema = json.loads(
+    (root / "meta" / "stage_schema.json").read_text(encoding="utf-8")
+)
+expected_stage_names = {
+    "0": "pre_dig",
+    "1": "approach_contact",
+    "2": "insert_cut",
+    "3": "pull_mid_cut",
+    "4": "curl_to_hold_material",
+    "5": "pull_exit_cut",
+    "6": "secure_load",
+    "7": "lift_carry",
+    "8": "loaded_transit",
+    "9": "unload_to_bin",
+}
+actual_stage_names = stage_schema.get("classes")
+print("stage names:", actual_stage_names)
+if actual_stage_names != expected_stage_names:
+    raise RuntimeError(
+        "Converted dataset does not use the canonical v4 stage order:\n"
+        f"actual={actual_stage_names!r}\nexpected={expected_stage_names!r}"
+    )
 print("total_frames:", info.get("total_frames"))
 print("total_episodes:", info.get("total_episodes"))
 print("fps:", info.get("fps"))
@@ -265,7 +294,14 @@ if sample_task != expected_task:
         f"dataset={sample_task!r}\nexpected={expected_task!r}"
     )
 
+print("checkpoint stage_source_key:", stage_source_key)
+if stage_source_key not in sample:
+    raise RuntimeError(
+        f"Converted dataset is missing checkpoint stage key {stage_source_key!r}"
+    )
+
 for key in (
+    stage_source_key,
     "stage_current_id",
     "stage_target_30",
     "stage_purity_30",
@@ -282,6 +318,7 @@ echo "6. Run checkpoint 016650 on one expert episode"
 echo "======================================================================"
 
 rm -rf "$OUTPUT"
+rm -f -- "$RESULT_ARCHIVE"
 mkdir -p "$OUTPUT"
 
 "$PYTHON" "$EVALUATOR" \
@@ -310,6 +347,9 @@ else
   echo "[WARN] Plotter not found; skipped: $PLOTTER"
 fi
 
+rm -f -- "$RESULT_ARCHIVE"
+tar -C "$(dirname "$OUTPUT")" -czf "$RESULT_ARCHIVE" "$(basename "$OUTPUT")"
+
 echo
 echo "======================================================================"
 echo "DONE"
@@ -319,6 +359,7 @@ echo "Summary: $OUTPUT/summary.json"
 echo "Per-episode metrics: $OUTPUT/episode_metrics.csv"
 echo "Stage confusion: $OUTPUT/micro_stage_confusion.npy"
 echo "Per-stage metrics: $OUTPUT/micro_per_stage_metrics.csv"
+echo "Result archive: $RESULT_ARCHIVE"
 echo "Log: $EVAL_LOG"
 
 "$PYTHON" - "$OUTPUT/summary.json" <<'PY'

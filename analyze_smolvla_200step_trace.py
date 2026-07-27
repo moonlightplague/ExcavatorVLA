@@ -16,16 +16,16 @@ import numpy as np
 
 ACTION_NAMES = ("swing", "boom", "arm", "bucket")
 STAGE_NAMES = (
-    "pre_dig_align",
+    "pre_dig",
     "approach_contact",
-    "insert",
-    "pull_mid",
-    "pull_exit",
-    "curl",
+    "insert_cut",
+    "pull_mid_cut",
+    "curl_to_hold_material",
+    "pull_exit_cut",
     "secure_load",
     "lift_carry",
+    "loaded_transit",
     "unload_to_bin",
-    "unload_dump",
 )
 DIRECTION_LABELS = (
     "front",
@@ -224,12 +224,40 @@ def stage_progression_summary(stage_ids: np.ndarray) -> dict[str, Any]:
     }
 
 
-def load_prior(path: Path) -> dict[str, np.ndarray] | None:
+def load_prior(path: Path) -> dict[str, Any] | None:
     if not path.is_file():
         print(f"[WARN] prior file not found: {path}")
         return None
 
     payload = json.loads(path.read_text(encoding="utf-8"))
+
+    raw_stage_names = payload.get("stage_names")
+    source_stage_names: tuple[str, ...] | None = None
+    if isinstance(raw_stage_names, dict):
+        try:
+            source_stage_names = tuple(
+                str(raw_stage_names[str(stage_id)])
+                if str(stage_id) in raw_stage_names
+                else str(raw_stage_names[stage_id])
+                for stage_id in range(len(STAGE_NAMES))
+            )
+        except (KeyError, TypeError):
+            source_stage_names = None
+    elif isinstance(raw_stage_names, (list, tuple)):
+        source_stage_names = tuple(str(name) for name in raw_stage_names)
+
+    labels_match_canonical = source_stage_names == STAGE_NAMES
+    if source_stage_names is None:
+        print(
+            "[WARN] prior has no complete stage_names metadata; "
+            "interpreting its rows by canonical v4 stage ID"
+        )
+    elif not labels_match_canonical:
+        print(
+            "[WARN] prior stage_names metadata is not canonical v4; "
+            "interpreting its rows by numeric stage ID and reporting "
+            "canonical v4 names"
+        )
 
     direction = np.asarray(
         payload.get("direction", []),
@@ -248,7 +276,7 @@ def load_prior(path: Path) -> dict[str, np.ndarray] | None:
         dtype=np.float64,
     ).reshape(-1)
 
-    if direction.shape[:2] != (len(STAGE_NAMES), len(ACTION_NAMES)):
+    if direction.shape != (len(STAGE_NAMES), len(ACTION_NAMES)):
         print(
             "[WARN] unexpected prior direction shape:",
             direction.shape,
@@ -266,13 +294,15 @@ def load_prior(path: Path) -> dict[str, np.ndarray] | None:
         "direction": direction[:, : len(ACTION_NAMES)],
         "strong": strong[:, : len(ACTION_NAMES)],
         "scale": np.maximum(scale[: len(ACTION_NAMES)], 1e-8),
+        "source_stage_labels_present": source_stage_names is not None,
+        "source_stage_labels_match_canonical": labels_match_canonical,
     }
 
 
 def prior_action_diagnostics(
     stages: np.ndarray,
     actions: np.ndarray,
-    prior: dict[str, np.ndarray] | None,
+    prior: dict[str, Any] | None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if prior is None:
         return {
@@ -280,8 +310,8 @@ def prior_action_diagnostics(
         }, []
 
     rows = []
-    all_correct = []
-    low_motion_correct = []
+    all_nonviolating = []
+    low_swing_motion = []
 
     for step, (stage_id, action) in enumerate(
         zip(stages.tolist(), actions, strict=True)
@@ -298,8 +328,8 @@ def prior_action_diagnostics(
                 prior["direction"][stage_id, action_index]
             )
             value = float(action[action_index])
-            correct = direction * value >= 0.0
-            all_correct.append(float(correct))
+            nonviolating = direction * value >= 0.0
+            all_nonviolating.append(float(nonviolating))
             rows.append(
                 {
                     "policy_step": step,
@@ -308,7 +338,7 @@ def prior_action_diagnostics(
                     "action_name": action_name,
                     "expected_direction": direction,
                     "action_value": value,
-                    "direction_correct": int(correct),
+                    "direction_nonviolating": int(nonviolating),
                 }
             )
 
@@ -317,7 +347,7 @@ def prior_action_diagnostics(
                 abs(float(action[0]))
                 / float(prior["scale"][0])
             )
-            low_motion_correct.append(
+            low_swing_motion.append(
                 float(normalized_abs_swing <= 0.10)
             )
 
@@ -331,17 +361,26 @@ def prior_action_diagnostics(
             continue
         by_stage[STAGE_NAMES[stage_id]] = {
             "num_checked_stage_action_pairs": len(stage_rows),
-            "direction_accuracy": finite_mean(
-                [row["direction_correct"] for row in stage_rows]
+            "direction_nonviolation_rate": finite_mean(
+                [row["direction_nonviolating"] for row in stage_rows]
             ),
         }
 
     return {
         "available": True,
-        "num_checked_stage_action_pairs": len(all_correct),
-        "overall_direction_accuracy": finite_mean(all_correct),
-        "low_motion_stage_1_to_7_satisfaction": finite_mean(
-            low_motion_correct
+        "source_stage_labels_present": prior[
+            "source_stage_labels_present"
+        ],
+        "source_stage_labels_match_canonical": prior[
+            "source_stage_labels_match_canonical"
+        ],
+        "stage_row_interpretation": "canonical_v4_numeric_stage_id",
+        "num_checked_stage_action_pairs": len(all_nonviolating),
+        "overall_direction_nonviolation_rate": finite_mean(
+            all_nonviolating
+        ),
+        "low_swing_motion_stage_1_to_7_rate": finite_mean(
+            low_swing_motion
         ),
         "by_stage": by_stage,
     }, rows
@@ -419,6 +458,81 @@ def action_summary_rows(
             )
 
     return rows
+
+
+def temporal_ensemble_summary(
+    step_rows: list[dict[str, Any]],
+    executed_actions: np.ndarray,
+) -> dict[str, Any]:
+    """Summarize continuity changes from logged overlapping predictions."""
+    if not step_rows or not all(
+        isinstance(row.get("latest_action"), dict)
+        and isinstance(row.get("temporal_ensemble"), dict)
+        for row in step_rows
+    ):
+        return {"available": False}
+
+    latest_actions = np.asarray(
+        [
+            [
+                float(row["latest_action"][action_name])
+                for action_name in ACTION_NAMES
+            ]
+            for row in step_rows
+        ],
+        dtype=np.float64,
+    )
+    metadata = [row["temporal_ensemble"] for row in step_rows]
+    widths = [int(row.get("configured_width", 1)) for row in metadata]
+    decays = [float(row.get("decay", 0.0)) for row in metadata]
+    prediction_counts = [
+        int(row.get("num_predictions", 0)) for row in metadata
+    ]
+    configured_width = widths[0]
+    full_width_steps = [
+        int(step_rows[index]["policy_step"])
+        for index, count in enumerate(prediction_counts)
+        if count == configured_width
+    ]
+
+    by_action = {}
+    for action_index, action_name in enumerate(ACTION_NAMES):
+        latest = latest_actions[:, action_index]
+        executed = executed_actions[:, action_index]
+        latest_delta = float(np.mean(np.abs(np.diff(latest))))
+        executed_delta = float(np.mean(np.abs(np.diff(executed))))
+        latest_flips = int(np.sum(np.sign(latest[1:]) != np.sign(latest[:-1])))
+        executed_flips = int(
+            np.sum(np.sign(executed[1:]) != np.sign(executed[:-1]))
+        )
+        by_action[action_name] = {
+            "latest_prediction_sign_flips": latest_flips,
+            "executed_ensemble_sign_flips": executed_flips,
+            "sign_flip_reduction": latest_flips - executed_flips,
+            "latest_prediction_mean_abs_step_delta": latest_delta,
+            "executed_ensemble_mean_abs_step_delta": executed_delta,
+            "mean_abs_step_delta_reduction_fraction": (
+                (latest_delta - executed_delta) / latest_delta
+                if latest_delta > 0.0
+                else 0.0
+            ),
+        }
+
+    return {
+        "available": True,
+        "configured_width": configured_width,
+        "decay": decays[0],
+        "configuration_consistent": (
+            len(set(widths)) == 1 and len(set(decays)) == 1
+        ),
+        "minimum_predictions": min(prediction_counts),
+        "maximum_predictions": max(prediction_counts),
+        "num_full_width_steps": len(full_width_steps),
+        "first_full_width_step": (
+            full_width_steps[0] if full_width_steps else None
+        ),
+        "by_action": by_action,
+    }
 
 
 def build_prompt_diagnostics(
@@ -721,9 +835,9 @@ def plot_stage_and_action(
         )
         plt.axhline(0.0, linestyle="--")
         plt.xlabel("policy step")
-        plt.ylabel("raw model action")
+        plt.ylabel("executed joint velocity action")
         plt.title(
-            f"Executed model action: {action_name}"
+            f"Executed action: {action_name}"
         )
         plt.grid(True, alpha=0.3)
         plt.legend()
@@ -959,7 +1073,7 @@ def nullable(value: Any) -> Any:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Analyze a 200-step SmolVLA rollout: prompt targets, predicted "
+            "Analyze a SmolVLA rollout: prompt targets, predicted "
             "stage flow, complete 50-step chunks, and executed actions."
         )
     )
@@ -1021,7 +1135,7 @@ def main() -> None:
         [float(row["stage_confidence"]) for row in step_rows],
         dtype=np.float64,
     )
-    actions = np.asarray(
+    model_actions = np.asarray(
         [
             [
                 float(row["action"][action_name])
@@ -1031,6 +1145,53 @@ def main() -> None:
         ],
         dtype=np.float64,
     )
+    actions = np.asarray(
+        [
+            [
+                float(
+                    row.get("executed_action", row["action"])[action_name]
+                )
+                for action_name in ACTION_NAMES
+            ]
+            for row in step_rows
+        ],
+        dtype=np.float64,
+    )
+    temporal_ensemble = temporal_ensemble_summary(step_rows, model_actions)
+
+    constraint_rows = [
+        row.get("execution_constraints") or {}
+        for row in step_rows
+    ]
+    supervisor_rows = [
+        row
+        for row in constraint_rows
+        if row.get("mode") == "excavation_sequence_supervisor_v1"
+    ]
+    supervisor_summary = {
+        "available": bool(supervisor_rows),
+        "mode": (
+            "excavation_sequence_supervisor_v1"
+            if supervisor_rows
+            else None
+        ),
+        "modified_steps": int(
+            sum(bool(row.get("modified", False)) for row in supervisor_rows)
+        ),
+        "phase_sequence": list(
+            dict.fromkeys(str(row.get("phase")) for row in supervisor_rows)
+        ),
+        "transitions": [
+            {
+                "policy_step": int(step_rows[index]["policy_step"]),
+                "from": row.get("phase_before"),
+                "to": row.get("phase"),
+                "reason": row.get("transition_reason"),
+            }
+            for index, row in enumerate(constraint_rows)
+            if bool(row.get("transition", False))
+        ],
+    }
 
     prompt_rows = build_prompt_diagnostics(step_rows)
     prompt_result = prompt_summary(prompt_rows)
@@ -1039,12 +1200,14 @@ def main() -> None:
     prior = load_prior(args.prior.expanduser().resolve())
     prior_summary, prior_rows = prior_action_diagnostics(
         stages,
-        actions,
+        model_actions,
         prior,
     )
 
     stage_counts = Counter(int(value) for value in stages.tolist())
     stage_summary = {
+        "schema": "canonical_v4",
+        "stage_names": list(STAGE_NAMES),
         "mean_confidence": float(np.mean(confidence)),
         "median_confidence": float(np.median(confidence)),
         "minimum_confidence": float(np.min(confidence)),
@@ -1088,12 +1251,14 @@ def main() -> None:
         "step_max": int(steps.max()),
         "prompt": prompt_result,
         "stage": stage_summary,
+        "temporal_ensemble": temporal_ensemble,
+        "excavation_sequence_supervisor": supervisor_summary,
         "stage_action_prior": prior_summary,
         "important_limit": (
             "This rollout has no expert ground-truth action or true stage. "
             "The analysis checks internal workflow consistency, confidence, "
             "stage progression, prompt/State27 target consistency, and action "
-            "direction agreement with the training prior; it does not by "
+            "direction non-violation against the training prior; it does not by "
             "itself prove task success."
         ),
     }
@@ -1108,9 +1273,10 @@ def main() -> None:
     )
 
     report_lines = [
-        "# SmolVLA 200-step rollout analysis",
+        "# SmolVLA rollout analysis",
         "",
         f"- Steps analyzed: {len(step_rows)}",
+        "- Stage schema: canonical v4",
         f"- Stage mean confidence: {stage_summary['mean_confidence']:.4f}",
         f"- Stage minimum confidence: {stage_summary['minimum_confidence']:.4f}",
         (
@@ -1138,17 +1304,66 @@ def main() -> None:
             f"{prompt_result.get('prompt_unload_vs_state_target_error_m_mean', float('nan')):.4f} m"
         ),
     ]
+    if temporal_ensemble.get("available"):
+        report_lines.extend(
+            [
+                (
+                    "- Temporal ensemble: "
+                    f"width={temporal_ensemble['configured_width']}, "
+                    f"decay={temporal_ensemble['decay']:g}, "
+                    "first full-width step="
+                    f"{temporal_ensemble['first_full_width_step']}"
+                ),
+                "- Temporal-ensemble continuity changes:",
+            ]
+        )
+        for action_name in ACTION_NAMES:
+            action_result = temporal_ensemble["by_action"][action_name]
+            report_lines.append(
+                f"  - {action_name}: sign flips "
+                f"{action_result['latest_prediction_sign_flips']} -> "
+                f"{action_result['executed_ensemble_sign_flips']}; "
+                "mean absolute step delta reduction="
+                f"{action_result['mean_abs_step_delta_reduction_fraction']:.1%}"
+            )
+
+    if supervisor_summary.get("available"):
+        report_lines.extend(
+            [
+                (
+                    "- Excavation sequence supervisor phases: "
+                    + " -> ".join(supervisor_summary["phase_sequence"])
+                ),
+                (
+                    "- Supervisor-modified steps: "
+                    f"{supervisor_summary['modified_steps']}"
+                ),
+                "- Supervisor transitions:",
+            ]
+        )
+        for transition in supervisor_summary["transitions"]:
+            report_lines.append(
+                f"  - step {transition['policy_step']}: "
+                f"{transition['from']} -> {transition['to']} "
+                f"({transition['reason']})"
+            )
 
     if prior_summary.get("available"):
         report_lines.extend(
             [
                 (
-                    "- Stage-action prior direction accuracy: "
-                    f"{prior_summary['overall_direction_accuracy']:.4f}"
+                    "- Stage-action prior direction non-violation rate: "
+                    f"{prior_summary['overall_direction_nonviolation_rate']:.4f}"
                 ),
                 (
-                    "- Stage 1–7 low-motion satisfaction: "
-                    f"{prior_summary['low_motion_stage_1_to_7_satisfaction']:.4f}"
+                    "- Low-swing-motion rate for canonical stages 1-7 "
+                    "(|swing| / prior scale <= 0.10): "
+                    f"{prior_summary['low_swing_motion_stage_1_to_7_rate']:.4f}"
+                ),
+                (
+                    "- Prior rows interpreted by canonical v4 numeric stage ID; "
+                    "source labels match canonical v4: "
+                    f"{prior_summary['source_stage_labels_match_canonical']}"
                 ),
             ]
         )
@@ -1160,8 +1375,10 @@ def main() -> None:
             "",
             (
                 "There is no expert ground-truth stage/action in this online "
-                "rollout. These checks establish consistency with the learned "
-                "workflow and training prior, not final physical task success."
+                "rollout. The prior metric only checks whether an action violates "
+                "a reliable sign constraint; zero-valued actions count as "
+                "non-violating. These checks do not measure action accuracy or "
+                "establish final physical task success."
             ),
             "",
             f"All figures and CSV files are in `{output_dir}`.",
@@ -1173,7 +1390,7 @@ def main() -> None:
     )
 
     print("=" * 78)
-    print("SMOLVLA 200-STEP ANALYSIS")
+    print("SMOLVLA ROLLOUT ANALYSIS")
     print("=" * 78)
     print(f"steps: {len(step_rows)}")
     print(
@@ -1193,6 +1410,12 @@ def main() -> None:
         f"forward skips: "
         f"{stage_summary['num_forward_skips']}"
     )
+    if temporal_ensemble.get("available"):
+        print(
+            "temporal ensemble: "
+            f"width={temporal_ensemble['configured_width']} "
+            f"decay={temporal_ensemble['decay']:g}"
+        )
     print(
         f"prompt parse rate: "
         f"{prompt_result['prompt_parse_rate']:.4f}"
@@ -1211,13 +1434,13 @@ def main() -> None:
     )
     if prior_summary.get("available"):
         print(
-            "stage-action prior direction accuracy:",
-            prior_summary["overall_direction_accuracy"],
+            "stage-action prior direction non-violation rate:",
+            prior_summary["overall_direction_nonviolation_rate"],
         )
         print(
-            "stage 1-7 low-motion satisfaction:",
+            "canonical stages 1-7 low-swing-motion rate:",
             prior_summary[
-                "low_motion_stage_1_to_7_satisfaction"
+                "low_swing_motion_stage_1_to_7_rate"
             ],
         )
     print(f"outputs: {output_dir}")

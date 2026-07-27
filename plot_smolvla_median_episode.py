@@ -16,16 +16,16 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 
 STAGE_NAMES = [
-    "pre_dig_align",
+    "pre_dig",
     "approach_contact",
-    "insert",
-    "pull_mid",
-    "pull_exit",
-    "curl",
+    "insert_cut",
+    "pull_mid_cut",
+    "curl_to_hold_material",
+    "pull_exit_cut",
     "secure_load",
     "lift_carry",
+    "loaded_transit",
     "unload_to_bin",
-    "unload_dump",
 ]
 ACTION_NAMES = ["swing", "boom", "arm", "bucket"]
 

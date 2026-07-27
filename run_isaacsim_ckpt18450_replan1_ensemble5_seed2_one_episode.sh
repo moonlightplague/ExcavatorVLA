@@ -22,11 +22,11 @@ LOG_ROOT=/root/gpufree-data/excavator_logs
 
 # Simulation scene and sand settings.
 SCENE_SEED=2
-SAND_AMOUNT=1.0
-SAND_PARAMETER_MODE=soft_dig
-SAND_RADIUS_SCALE=0.2
+SAND_AMOUNT=10.0
+SAND_PARAMETER_MODE=legacy
+SAND_RADIUS_SCALE=1
 SAND_WALL_ENABLED=1
-SAND_WALL_RADIUS_SCALE=1.5
+SAND_WALL_RADIUS_SCALE=1.01
 SAND_SETTLE_FRAMES=60
 
 # Video settings. The overview stream is native viewport resolution; the

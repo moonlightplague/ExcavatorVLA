@@ -734,6 +734,7 @@ output_path.write_text(
 print(json.dumps(payload, indent=2))
 PY
 
+set +e
 "$POLICY_PYTHON" "$ANALYZER" \
   --trace-log "$TRACE_LOG" \
   --chunk-log "$CHUNK_LOG" \
@@ -741,6 +742,17 @@ PY
   --output-dir "$ANALYSIS_DIR" \
   --steps "$POLICY_STEPS" \
   > "$ANALYSIS_LOG" 2>&1
+ANALYZER_STATUS=$?
+set -e
+
+printf 'analyzer_exit_status=%s\n' "$ANALYZER_STATUS" \
+  > "$OUTPUT_DIR/trace_analysis_status.txt"
+
+if [[ "$ANALYZER_STATUS" -ne 0 ]]; then
+  echo "[WARN] Trace analyzer failed with exit code $ANALYZER_STATUS." >&2
+  echo "[WARN] Packaging will continue; details: $ANALYSIS_LOG" >&2
+  tail -n 80 "$ANALYSIS_LOG" >&2 || true
+fi
 
 echo
 echo "======================================================================"
@@ -770,3 +782,9 @@ echo "scp -P 30105 -r root@120.209.70.195:$OUTPUT_DIR ."
 echo
 echo "Download videos only:"
 echo "scp -P 30105 -r root@120.209.70.195:$VIDEO_DIR ."
+
+if [[ "$ANALYZER_STATUS" -ne 0 ]]; then
+  echo
+  echo "[ERROR] Rollout was packaged, but trace analysis failed." >&2
+  exit "$ANALYZER_STATUS"
+fi

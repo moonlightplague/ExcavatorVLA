@@ -189,6 +189,24 @@ class DeploymentSceneContractTests(unittest.TestCase):
             'scp -P 30105 -r root@120.209.70.195:$VIDEO_DIR .',
             launcher,
         )
+        analyzer_status = launcher.index("ANALYZER_STATUS=$?")
+        package_section = launcher.index(
+            'echo "5. Package the complete rollout"'
+        )
+        final_analyzer_exit = launcher.index(
+            'exit "$ANALYZER_STATUS"',
+            package_section,
+        )
+        self.assertLess(analyzer_status, package_section)
+        self.assertLess(package_section, final_analyzer_exit)
+        self.assertIn(
+            'trace_analysis_status.txt"',
+            launcher,
+        )
+        self.assertIn(
+            "Packaging will continue",
+            launcher,
+        )
 
         simulator = (repo_root / "run_simulation.py").read_text(
             encoding="utf-8"

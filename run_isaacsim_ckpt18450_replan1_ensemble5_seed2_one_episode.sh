@@ -22,11 +22,11 @@ LOG_ROOT=/root/gpufree-data/excavator_logs
 
 # Simulation scene and sand settings.
 SCENE_SEED=2
-SAND_AMOUNT=1.0
-SAND_PARAMETER_MODE=soft_dig
-SAND_RADIUS_SCALE=0.2
+SAND_AMOUNT=8
+SAND_PARAMETER_MODE=legacy
+SAND_RADIUS_SCALE=1
 SAND_WALL_ENABLED=1
-SAND_WALL_RADIUS_SCALE=1.5
+SAND_WALL_RADIUS_SCALE=1.01
 SAND_SETTLE_FRAMES=60
 
 # Policy and execution settings.
@@ -775,13 +775,13 @@ echo
 echo "Run one of these commands from your local computer:"
 echo
 echo "Download everything as one archive (videos, logs, traces, and analysis):"
-echo "scp -P 30105 root@120.209.70.195:$ARCHIVE ."
+echo "scp -P 30652 root@120.209.70.195:$ARCHIVE ."
 echo
 echo "Download the complete uncompressed output directory:"
-echo "scp -P 30105 -r root@120.209.70.195:$OUTPUT_DIR ."
+echo "scp -P 30652 -r root@120.209.70.195:$OUTPUT_DIR ."
 echo
 echo "Download videos only:"
-echo "scp -P 30105 -r root@120.209.70.195:$VIDEO_DIR ."
+echo "scp -P 30652 -r root@120.209.70.195:$VIDEO_DIR ."
 
 if [[ "$ANALYZER_STATUS" -ne 0 ]]; then
   echo

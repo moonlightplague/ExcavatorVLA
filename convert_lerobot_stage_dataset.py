@@ -1057,6 +1057,20 @@ def main() -> None:
         row for row in new_states
     ]
 
+    # Current exports already contain stage supervision. Replace the fields
+    # computed here so their values match this conversion's horizon and purity.
+    all_data.drop(
+        columns=[
+            "observation.stage_current_id",
+            "stage_current_id",
+            target_name,
+            purity_name,
+            valid_name,
+        ],
+        errors="ignore",
+        inplace=True,
+    )
+
     insert_at = list(all_data.columns).index(
         "observation.state"
     ) + 1

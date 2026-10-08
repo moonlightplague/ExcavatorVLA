@@ -92,6 +92,10 @@ def parse_args():
     parser.add_argument("--active-gpu", type=int, default=0, help="Renderer GPU index for Isaac SimulationApp.")
     parser.add_argument("--physics-gpu", type=int, default=0, help="Physics CUDA device index for Isaac SimulationApp.")
     parser.add_argument("--multi-gpu", action="store_true", help="Enable Isaac multi-GPU rendering.")
+    parser.add_argument("--rtx-descriptor-sets", type=int, default=360000,
+                        help="RTX descriptor-set capacity, allocated before renderer startup.")
+    parser.add_argument("--rtx-reserved-descriptors", type=int, default=900000,
+                        help="RTX resource-descriptor capacity for scene and camera rendering.")
 
     bridge_group = parser.add_mutually_exclusive_group()
     bridge_group.add_argument("--bridge", dest="bridge", action="store_true", help="Start TCP bridge for SmolVLA clients.")
@@ -590,7 +594,7 @@ def run_auto_collect(simulation_app, rt, success_count, max_attempts, wait_expor
 
     started = False
     last_status_key = None
-    heartbeat_interval = float(os.environ.get("EXCAVATOR_AUTO_COLLECT_HEARTBEAT_SECONDS", "0") or 0)
+    heartbeat_interval = float(os.environ.get("EXCAVATOR_AUTO_COLLECT_HEARTBEAT_SECONDS", "15") or 0)
     last_heartbeat = time.time()
     while simulation_app.is_running():
         profiled_simulation_update(simulation_app, rt, "auto_collect")
@@ -600,6 +604,7 @@ def run_auto_collect(simulation_app, rt, success_count, max_attempts, wait_expor
             started = True
 
         now = time.time()
+        progress = rt.STATE.get("auto_collect_progress", {}) or {}
         status_key = (
             bool(active),
             int(rt.STATE.get("auto_collect_successes", 0) or 0),
@@ -615,6 +620,8 @@ def run_auto_collect(simulation_app, rt, success_count, max_attempts, wait_expor
             print(
                 "[AUTO COLLECT]",
                 f"active={active}",
+                f"stage={progress.get('stage', '')}",
+                f"stage_result={progress.get('result', '')}",
                 f"attempts={rt.STATE.get('auto_collect_attempts', 0)}",
                 f"success={rt.STATE.get('auto_collect_successes', 0)}",
                 f"rejected={rt.STATE.get('auto_collect_rejections', 0)}",
@@ -723,6 +730,8 @@ def run_auto_collect(simulation_app, rt, success_count, max_attempts, wait_expor
 
 def main():
     args = parse_args()
+    if args.rtx_descriptor_sets <= 0 or args.rtx_reserved_descriptors <= 0:
+        raise SystemExit("RTX descriptor capacities must be positive.")
     add_import_roots(PROJECT_ROOT)
     rt = None
     stable_render_enabled = stable_camera_render_requested(args)
@@ -886,7 +895,13 @@ def main():
     from isaacsim import SimulationApp
 
     graphics_api = str(args.graphics_api or "auto").lower()
-    extra_args = ["--/renderer/multiGpu/autoEnable=0"]
+    # Match the larger pools used by this Isaac installation's sensor/debug
+    # extension tests. These settings must be supplied before GPU creation.
+    extra_args = [
+        "--/renderer/multiGpu/autoEnable=0",
+        f"--/rtx/descriptorSets={args.rtx_descriptor_sets}",
+        f"--/rtx/reservedDescriptors={args.rtx_reserved_descriptors}",
+    ]
     if graphics_api == "auto" and platform.system().lower().startswith("win") and args.headless and args.auto_collect:
         graphics_api = "d3d12"
     if graphics_api == "d3d12":

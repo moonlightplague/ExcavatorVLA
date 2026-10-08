@@ -18,7 +18,7 @@ except Exception:
     Image = None
 
 
-CAMERA_MODULE_VERSION = "dataset_camera_viewport_capture_v30_submit_before_pause"
+CAMERA_MODULE_VERSION = "dataset_camera_viewport_capture_v32_persistent_headless_windows"
 SYNC_STEP_ERROR_TEXT = "Synchronous call to `step`"
 
 
@@ -69,7 +69,9 @@ def dataset_viewport_keep_visible(rt):
     state_value = rt.STATE.get("dataset_camera_viewport_keep_visible", None)
     if state_value is not None:
         return bool(state_value)
-    return False
+    # Headless capture windows have no desktop presence. Keep their rendering
+    # resources alive instead of cycling UI visibility for every sampled frame.
+    return os.environ.get("EXCAVATOR_HEADLESS", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def camera_allow_frame_reuse(rt):
@@ -95,7 +97,8 @@ def set_dataset_viewports_visible(rt, visible):
         if window is None:
             continue
         try:
-            window.visible = bool(visible)
+            if bool(window.visible) != bool(visible):
+                window.visible = bool(visible)
             count += 1
         except Exception:
             pass
@@ -650,9 +653,15 @@ async def capture_viewport_rgb_async(rt, viewport_api, camera_path, wait_frames=
     if update_camera:
         set_viewport_camera_path(viewport_api, camera_path)
 
+    deadline = time.monotonic() + float(timeout_s)
     for _ in range(max(0, int(wait_frames))):
         try:
-            await next_viewport_frame_async(viewport_api)
+            await asyncio.wait_for(
+                next_viewport_frame_async(viewport_api),
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
+        except asyncio.TimeoutError:
+            return None, "viewport_frame_timeout", compact_capture_meta(result)
         except Exception:
             await rt.step_updates(1)
 
@@ -678,14 +687,18 @@ async def capture_viewport_rgb_async(rt, viewport_api, camera_path, wait_frames=
 
     try:
         if hasattr(helper, "__await__"):
-            await asyncio.wait_for(helper, timeout=float(timeout_s))
+            await asyncio.wait_for(helper, timeout=max(0.0, deadline - time.monotonic()))
     except Exception:
         pass
 
-    deadline = time.time() + float(timeout_s)
-    while not bool(result["done"]) and time.time() < deadline:
+    while not bool(result["done"]) and time.monotonic() < deadline:
         try:
-            await next_viewport_frame_async(viewport_api)
+            await asyncio.wait_for(
+                next_viewport_frame_async(viewport_api),
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
+        except asyncio.TimeoutError:
+            break
         except Exception:
             await rt.step_updates(1)
 
@@ -2329,6 +2342,11 @@ def _finalize_pending_triplet(rt, triplet):
         if bool(triplet.get("done", False)):
             return True
         triplet["done"] = True
+        # Capture delegates contain callbacks closing over this triplet. Break
+        # that ownership cycle once every readback/postprocess has completed.
+        helpers = triplet.get("helpers")
+        if isinstance(helpers, list):
+            helpers.clear()
         capture_finished = time.time()
         capture_finished_sim, _clock_source = background_clock_seconds(rt)
         frames = triplet.get("frames", {})
@@ -2831,6 +2849,17 @@ async def warmup_for_episode(rt, label="episode"):
                 return False
 
             prime_status = await prime_dataset_viewports_async(rt, frame_count=2)
+            if not bool(prime_status.get("ok", False)):
+                rt.STATE["dataset_camera_warmup_status"] = {
+                    "ok": False,
+                    "reason": str(prime_status.get("reason", "viewport_prime_failed")),
+                    "label": str(label),
+                    "frames": 0,
+                    "ready_streak": 0,
+                    "backend": "viewport_capture",
+                    "viewport_prime": dict(prime_status),
+                }
+                return False
             max_frames = max(1, int(rt.STATE.get("dataset_camera_warmup_max_frames", 12) or 12))
             min_frames = max(0, int(rt.STATE.get("dataset_camera_warmup_frames", 3) or 3))
             ready_required = max(1, int(rt.STATE.get("dataset_camera_warmup_ready_frames", 2) or 2))

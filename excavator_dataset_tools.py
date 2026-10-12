@@ -6,6 +6,8 @@ import re
 import shutil
 import threading
 import time
+import tempfile
+from pathlib import Path
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from statistics import mean, median
@@ -3264,7 +3266,7 @@ def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Di
         try:
             import pandas as pd  # type: ignore
 
-            episodes_df = pd.read_parquet(episodes_path)
+            episodes_df = pd.concat([pd.read_parquet(path) for path in _lerobot_parquet_paths(Path(export_dir, "meta", "episodes"))], ignore_index=True)
             if len(episodes_df) <= 0:
                 reasons.append("episodes/no_rows")
             for key in image_keys:
@@ -3306,7 +3308,38 @@ def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Di
             ]:
                 if key in features:
                     requested_columns.append(key)
-            action_df = pd.read_parquet(data_path, columns=requested_columns)
+            action_df = pd.concat([pd.read_parquet(path, columns=requested_columns)
+                for path in _lerobot_parquet_paths(Path(export_dir, "data"))
+            ], ignore_index=True)
+            all_data = pd.concat([pd.read_parquet(path, columns=["index", "episode_index", "task_index"])
+                for path in _lerobot_parquet_paths(Path(export_dir, "data"))
+            ], ignore_index=True)
+            if all_data["index"].tolist() != list(range(int(info.get("total_frames", 0)))):
+                reasons.append("data/global_indexes_or_total_frames_mismatch")
+            expected_episodes = list(range(int(info.get("total_episodes", 0))))
+            if episodes_df["episode_index"].tolist() != expected_episodes:
+                reasons.append("episodes/indexes_or_total_episodes_mismatch")
+            tasks_df = pd.read_parquet(os.path.join(export_dir, "meta", "tasks.parquet"))
+            if sorted(tasks_df["task_index"].tolist()) != list(range(int(info.get("total_tasks", 0)))):
+                reasons.append("tasks/total_tasks_mismatch")
+            if not set(all_data["task_index"]).issubset(set(tasks_df["task_index"])):
+                reasons.append("tasks/unknown_task_index")
+            for _, episode in episodes_df.iterrows():
+                referenced = Path(export_dir, "data", f"chunk-{int(episode['data/chunk_index']):03d}",
+                                  f"file-{int(episode['data/file_index']):03d}.parquet")
+                if not referenced.is_file():
+                    reasons.append(f"episodes/missing_data:{referenced.name}")
+                else:
+                    referenced_data = pd.read_parquet(referenced, columns=["index", "episode_index"])
+                    referenced_indexes = referenced_data[
+                        referenced_data["episode_index"] == int(episode["episode_index"])
+                    ]["index"].tolist()
+                    if referenced_indexes != list(range(int(episode["dataset_from_index"]), int(episode["dataset_to_index"]))):
+                        reasons.append(f"episodes/wrong_data_reference:{int(episode['episode_index'])}")
+                actual = all_data[all_data["episode_index"] == int(episode["episode_index"])]["index"].tolist()
+                expected = list(range(int(episode["dataset_from_index"]), int(episode["dataset_to_index"])))
+                if actual != expected or len(actual) != int(episode["length"]):
+                    reasons.append(f"episodes/frame_range_mismatch:{int(episode['episode_index'])}")
             for value in action_df["action"].tolist():
                 action = vector_or_none(value)
                 if action is None or not action:
@@ -3503,6 +3536,7 @@ def collect_lerobot_rows(
     state_schema: object = None,
     effort_policy: object = None,
     quality_policy: object = None,
+    episode_offset: int = 0,
 ) -> Dict[str, object]:
     run_dir = str(run_dir)
     state_schema_spec = lerobot_state_schema_spec(state_schema)
@@ -3513,7 +3547,9 @@ def collect_lerobot_rows(
     quality_policy_name = normalize_lerobot_quality_policy(quality_policy)
     include_effort = effort_policy_name == LEROBOT_EFFORT_POLICY_RAW
     hydrate_success_pool_indexes_from_transfer_cache(run_dir)
-    episode_rows = load_index(run_dir, split)
+    if episode_offset < 0:
+        raise ValueError("episode_offset must be nonnegative")
+    episode_rows = load_index(run_dir, split)[episode_offset:]
     run_meta = read_json(os.path.join(run_dir, "run_meta.json"), default={}) or {}
     raw_state_names = run_meta.get("state_names") or [
         "base_x",
@@ -3584,7 +3620,7 @@ def collect_lerobot_rows(
         "corrected_examples": [],
     }
     global_frame = 0
-    for source_episode_index, episode in enumerate(episode_rows):
+    for source_episode_index, episode in enumerate(episode_rows, start=episode_offset):
         if limit_episodes is not None and len(episodes) >= max(0, int(limit_episodes)):
             break
         pre_decision = lerobot_episode_quality_decision(
@@ -4023,6 +4059,144 @@ def collect_lerobot_rows(
     }
 
 
+def _copy_export_file(source, destination):
+    # Existing chunk files are immutable. Link large media/parquet files when
+    # possible, but copy shared metadata because it will be rewritten.
+    if Path(source).suffix in (".mp4", ".parquet") and Path(source).name != "tasks.parquet":
+        try:
+            os.link(source, destination)
+            return destination
+        except OSError:
+            pass
+    return shutil.copy2(source, destination)
+
+
+def _merge_lerobot_export_chunks(export_dir, batch_dir):
+    """Merge a validated batch into a private copy of an existing export."""
+    import pandas as pd
+
+    root, batch = Path(export_dir), Path(batch_dir)
+    info = read_json(root / "meta/info.json")
+    incoming_info = read_json(batch / "meta/info.json")
+    for key in ("features", "fps", "codebase_version", "state_schema_version",
+                "effort_policy", "quality_policy", "action_policy_version",
+                "stage_policy_version", "recovery_supervision_version"):
+        if info.get(key) != incoming_info.get(key):
+            raise ValueError(f"cannot append incompatible export: {key}")
+    chunk_numbers = [int(path.name[6:]) for path in root.rglob("chunk-*")
+                     if path.is_dir() and re.fullmatch(r"chunk-\d+", path.name)]
+    chunk = max(chunk_numbers, default=-1) + 1
+    chunk_name = f"chunk-{chunk:03d}"
+    episode_offset, frame_offset = int(info["total_episodes"]), int(info["total_frames"])
+    tasks = pd.read_parquet(root / "meta/tasks.parquet")
+    new_tasks = pd.read_parquet(batch / "meta/tasks.parquet")
+    task_ids = {str(text): int(row["task_index"]) for text, row in tasks.iterrows()}
+    task_map = {}
+    for text, row in new_tasks.iterrows():
+        text = str(text)
+        if text not in task_ids:
+            task_ids[text] = max(task_ids.values(), default=-1) + 1
+        task_map[int(row["task_index"])] = task_ids[text]
+
+    data = pd.read_parquet(batch / "data/chunk-000/file-000.parquet")
+    data["episode_index"] += episode_offset
+    data["index"] += frame_offset
+    data["task_index"] = data["task_index"].map(task_map)
+    if data["task_index"].isna().any():
+        raise ValueError("incoming export contains unknown task indexes")
+    data["task_index"] = data["task_index"].astype("int64")
+    data_dir = root / "data" / chunk_name
+    data_dir.mkdir()
+    data.to_parquet(data_dir / "file-000.parquet", index=False)
+
+    episodes = pd.read_parquet(batch / "meta/episodes/chunk-000/file-000.parquet")
+    episodes["episode_index"] += episode_offset
+    episodes["dataset_from_index"] += frame_offset
+    episodes["dataset_to_index"] += frame_offset
+    for column in episodes.columns:
+        if column.endswith("/chunk_index"):
+            episodes[column] = chunk
+    episode_dir = root / "meta/episodes" / chunk_name
+    episode_dir.mkdir()
+    episodes.to_parquet(episode_dir / "file-000.parquet", index=False)
+    for key in LEROBOT_IMAGE_KEYS:
+        shutil.copytree(batch / "videos" / key / "chunk-000",
+                        root / "videos" / key / chunk_name, copy_function=_copy_export_file)
+
+    tasks = pd.DataFrame({"task_index": list(task_ids.values())}, index=pd.Index(list(task_ids)))
+    tasks.to_parquet(root / "meta/tasks.parquet", index=True)
+    info["total_frames"] += int(incoming_info["total_frames"])
+    info["total_episodes"] += int(incoming_info["total_episodes"])
+    info["total_tasks"] = len(task_ids)
+    info["splits"] = {"train": f"0:{info['total_episodes']}"}
+    write_json(root / "meta/info.json", info)
+    # Recompute from actual rows: the stored standard deviation uses a floor
+    # of 1.0 for constant features, so pooled stds would be inaccurate.
+    all_rows = pd.concat([pd.read_parquet(path) for path in
+                          _lerobot_parquet_paths(root / "data")], ignore_index=True).to_dict("records")
+    stats = build_lerobot_v3_stats(all_rows, int(info["state_dim"]),
+                                 len(info["features"]["action"]["names"]),
+                                 int(info.get("effort_dim", 0)), LEROBOT_IMAGE_KEYS)
+    write_json(root / "meta/stats.json", stats)
+
+    validation = validate_lerobot_v3_export(str(root), LEROBOT_IMAGE_KEYS)
+    if not validation["ok"]:
+        raise ValueError(f"appended dataset failed validation: {validation['reasons']}")
+    return {"export_dir": str(root), "total_episodes": info["total_episodes"],
+            "total_frames": info["total_frames"], "total_tasks": info["total_tasks"],
+            "last_appended_chunk": chunk, "vla_training_ready": True,
+            "validation": validation}
+
+
+def _lerobot_parquet_paths(directory):
+    return sorted(Path(directory).glob("chunk-*/file-*.parquet"),
+                  key=lambda path: (int(path.parent.name[6:]), int(path.stem[5:])))
+
+
+def append_lerobot_dataset(run_dir, export_dir, **options):
+    """Stage and validate all changes before replacing the destination."""
+    destination = Path(os.path.abspath(str(export_dir)))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = destination.parent / f".{destination.name}.append.lock"
+    try:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        raise RuntimeError(f"another append is in progress (lock: {lock_path})") from exc
+    os.close(lock_fd)
+    try:
+        with tempfile.TemporaryDirectory(prefix=f".{destination.name}.append-", dir=destination.parent) as work:
+            batch = Path(work) / "batch"
+            if destination.exists():
+                if destination.is_symlink() or not destination.is_dir():
+                    raise ValueError("append destination must be a real dataset directory")
+                validation = validate_lerobot_v3_export(str(destination), LEROBOT_IMAGE_KEYS)
+                if not validation["ok"]:
+                    raise ValueError(f"existing dataset failed validation: {validation['reasons']}")
+            # Even without --require flags, never commit an incomplete batch.
+            options["require_standard"] = True
+            options["require_vla"] = True
+            result = export_lerobot_dataset(run_dir, output_dir=batch, **options)
+            assembled = batch
+            if destination.exists():
+                assembled = Path(work) / "assembled"
+                shutil.copytree(destination, assembled, copy_function=_copy_export_file)
+                result = _merge_lerobot_export_chunks(assembled, batch)
+            result["export_dir"] = str(destination)
+            backup = Path(work) / "previous"
+            had_destination = destination.exists()
+            if had_destination:
+                os.rename(destination, backup)
+            try:
+                os.rename(assembled, destination)
+            except BaseException:
+                if had_destination:
+                    os.rename(backup, destination)
+                raise
+            return result
+    finally:
+        lock_path.unlink()
+
+
 def export_lerobot_dataset(
     run_dir: Union[str, os.PathLike],
     output_dir: Optional[Union[str, os.PathLike]] = None,
@@ -4038,6 +4212,8 @@ def export_lerobot_dataset(
     state_schema: object = None,
     effort_policy: object = None,
     quality_policy: object = None,
+    append: bool = False,
+    episode_offset: int = 0,
 ) -> Dict[str, object]:
     def progress(percent: float, message: str, current: Optional[int] = None, total: Optional[int] = None) -> None:
         if not progress_callback:
@@ -4052,6 +4228,17 @@ def export_lerobot_dataset(
     if not os.path.isdir(run_dir):
         raise FileNotFoundError(run_dir)
     export_dir = os.path.abspath(str(output_dir or os.path.join(run_dir, LEROBOT_DEFAULT_EXPORT_DIRNAME)))
+    if append and overwrite:
+        raise ValueError("append and overwrite are mutually exclusive")
+    if append:
+        return append_lerobot_dataset(
+            run_dir, export_dir, split=split, fps=fps, limit_episodes=limit_episodes,
+            require_standard=require_standard, require_vla=require_vla,
+            reuse_from_dir=reuse_from_dir, time_policy=time_policy,
+            progress_callback=progress_callback, state_schema=state_schema,
+            effort_policy=effort_policy, quality_policy=quality_policy,
+            episode_offset=episode_offset,
+        )
     reuse_dir = os.path.abspath(str(reuse_from_dir or ""))
     if not reuse_dir or not os.path.isdir(reuse_dir):
         reuse_dir = ""
@@ -4090,6 +4277,7 @@ def export_lerobot_dataset(
         run_dir,
         split=split,
         limit_episodes=limit_episodes,
+        episode_offset=episode_offset,
         time_policy=normalized_time_policy,
         base_fps=base_export_fps,
         state_schema=state_schema_spec["key"],
@@ -4152,9 +4340,6 @@ def export_lerobot_dataset(
         export_fps = 10.0
     video_results = {}
     image_features = list(LEROBOT_IMAGE_KEYS)
-    export_config = dict(export_config_info.get("export_config") or {})
-    export_config_hash = str(export_config_info.get("export_config_hash") or "")
-    media_config = dict(export_config_info.get("media_config") or {})
     media_config_hash = str(export_config_info.get("media_config_hash") or "")
     reusable_episodes = lerobot_manifest_reuse_entries(reuse_dir, media_config_hash)
     if reuse_dir:
@@ -4162,10 +4347,6 @@ def export_lerobot_dataset(
     image_paths: Dict[str, List[str]] = collected["image_paths"]  # type: ignore[assignment]
     episode_image_paths: List[Dict[str, List[str]]] = list(collected.get("episode_image_paths", []))  # type: ignore[arg-type]
     image_frame_counts = {key: len(image_paths.get(key, []) or []) for key in image_features}
-    image_missing_file_counts = {
-        key: len([path for path in (image_paths.get(key, []) or []) if not path or not os.path.isfile(path)])
-        for key in image_features
-    }
     progress(12.0, "camera preflight: " + ", ".join(f"{key}={image_frame_counts.get(key, 0)}" for key in image_features))
     episodes = collected["episodes"]
     tasks = collected["tasks"]
@@ -4178,22 +4359,15 @@ def export_lerobot_dataset(
             "keyframe_interval": int(LEROBOT_VIDEO_KEYFRAME_INTERVAL),
             "episode_files": [],
         }
-    episode_video_manifest: List[dict] = [
-        {"episode_index": int(episode_i), "videos": {}}
-        for episode_i in range(len(episode_image_paths))
-    ]
     total_video_jobs = max(1, len(episode_image_paths) * len(image_features))
     completed_video_jobs = 0
     reused_video_jobs = 0
-    reused_video_hardlink_jobs = 0
-    reused_video_copy_jobs = 0
     encoded_video_jobs = 0
     video_start_percent = 15.0
     video_end_percent = 75.0
     encode_jobs: List[dict] = []
     for episode_i, episode_paths_by_key in enumerate(episode_image_paths):
         current_episode = episodes[episode_i] if 0 <= episode_i < len(episodes) else {"episode_index": episode_i, "length": 0}
-        episode_video = episode_video_manifest[episode_i]
         for key in image_features:
             paths = list(episode_paths_by_key.get(key, []) or [])
             episode_duration_s = float(
@@ -4202,7 +4376,6 @@ def export_lerobot_dataset(
             )
             if not paths or not any(paths):
                 entry = {"available": False, "reason": "no_images", "frames": 0, "chunk_index": 0, "file_index": int(episode_i)}
-                episode_video["videos"][key] = entry
                 video_results[key]["available"] = False
                 video_results[key].setdefault("failed_episodes", []).append(entry)
                 completed_video_jobs += 1
@@ -4233,13 +4406,8 @@ def export_lerobot_dataset(
                 }
                 video_results[key]["frames"] = int(video_results[key].get("frames", 0) or 0) + len(paths)
                 video_results[key]["episode_files"].append(entry)
-                episode_video["videos"][key] = entry
                 completed_video_jobs += 1
                 reused_video_jobs += 1
-                if reuse_method == "hardlink":
-                    reused_video_hardlink_jobs += 1
-                else:
-                    reused_video_copy_jobs += 1
                 progress(
                     video_start_percent,
                     f"reused {key} episode {episode_i} via {reuse_method}: {len(paths)} frames",
@@ -4302,7 +4470,6 @@ def export_lerobot_dataset(
         episode_i = int(result["episode_i"])
         key = str(result["key"])
         paths = list(result["paths"])
-        episode_video = episode_video_manifest[episode_i]
         ok = bool(result.get("ok"))
         encoder = str(result.get("encoder") or "none")
         reason = str(result.get("reason") or "")
@@ -4325,7 +4492,6 @@ def export_lerobot_dataset(
             }
             video_results[key]["frames"] = int(video_results[key].get("frames", 0) or 0) + len(paths)
             video_results[key]["episode_files"].append(entry)
-            episode_video["videos"][key] = entry
         else:
             entry = {
                 "available": False,
@@ -4335,7 +4501,6 @@ def export_lerobot_dataset(
                 "chunk_index": 0,
                 "file_index": int(episode_i),
             }
-            episode_video["videos"][key] = entry
             video_results[key]["available"] = False
             video_results[key].setdefault("failed_episodes", []).append(entry)
         completed_video_jobs += 1
@@ -4647,166 +4812,25 @@ def export_lerobot_dataset(
     write_json(os.path.join(meta_dir, "stats.json"), stats)
     progress(93.0, "wrote stats.json")
 
-    episode_export_manifest = []
-    for episode in episodes:  # type: ignore[assignment]
-        episode_index = int(episode.get("episode_index", 0))
-        task_indices = [int(value) for value in episode.get("tasks", [])]
-        episode_task_texts = [task_text_by_index.get(index, "") for index in task_indices]
-        video_entry = episode_video_manifest[episode_index] if 0 <= episode_index < len(episode_video_manifest) else {"videos": {}}
-        missing_or_failed = []
-        for key in image_features:
-            key_video = video_entry.get("videos", {}).get(key, {}) if isinstance(video_entry.get("videos", {}), dict) else {}
-            if key_video.get("available") is not True:
-                missing_or_failed.append(f"{key}:{key_video.get('reason', 'not_available')}")
-        episode_export_manifest.append(
-            {
-                "episode_index": episode_index,
-                "raw_episode_index": episode.get("raw_episode_index"),
-                "raw_episode_id": episode.get("raw_episode_id", ""),
-                "source_episode_index": episode.get("source_episode_index"),
-                "source_episode_dir": episode.get("source_episode_dir", ""),
-                "source_signature_hash": episode.get("source_signature_hash", ""),
-                "source_key": episode.get("source_key", ""),
-                "task_texts": episode_task_texts,
-                "length": int(episode.get("length", 0)),
-                "from_frame": int(episode.get("from_frame", 0)),
-                "to_frame": int(episode.get("to_frame", 0)),
-                "video_layout": "per_episode",
-                "videos": video_entry.get("videos", {}),
-                "export_ready": not missing_or_failed,
-                "export_status": "ready" if not missing_or_failed else "not_ready",
-                "not_ready_reasons": missing_or_failed,
-                "export_config_hash": export_config_hash,
-                "media_config_hash": media_config_hash,
-                "time_policy": normalized_time_policy,
-                "time_policy_hash": str(time_policy_info.get("hash") or export_time_policy_hash(normalized_time_policy)),
-                "source_sampling_hz": float(episode.get("source_sampling_hz", 0.0) or 0.0),
-                "export_sampling_hz": float(episode.get("export_sampling_hz", export_fps) or export_fps),
-                "source_time_scale": float(episode.get("source_time_scale", 1.0) or 1.0),
-                "action_semantic_audit": dict(episode.get("action_semantic_audit") or {}),
-                "timeline_duration_s": float(episode.get("duration_s", 0.0) or 0.0),
-                "media_duration_s": float(episode.get("media_duration_s", 0.0) or 0.0),
-            }
-        )
-
     video_ready = all(video_results.get(key, {}).get("available") is True for key in image_features)
     parquet_ready = bool(parquet_ok and tasks_ok and episodes_ok)
     progress(95.0, "validating LeRobot/VLA export")
     validation = validate_lerobot_v3_export(export_dir, image_features)
     vla_training_ready = bool(parquet_ready and video_ready and validation["ok"])
-    manifest = {
-        "schema": LEROBOT_EXPORT_SCHEMA,
-        "codebase_version": LEROBOT_CODEBASE_VERSION,
+    result = {
         "export_dir": export_dir,
-        "source_run_dir": run_dir,
-        "source_split": split,
-        "created_at": time.time(),
-        "export_config": export_config,
-        "export_config_hash": export_config_hash,
-        "media_config": media_config,
-        "media_config_hash": media_config_hash,
-        "task_prompt_version": LEROBOT_TASK_PROMPT_VERSION,
-        "action_policy_version": LEROBOT_ACTION_POLICY_VERSION,
-        "action_limits_rad_s": list(vla_observation_contract.ACTION_LIMITS_RAD_S_4D),
-        "action_semantic_audit": dict(collected.get("action_semantic_audit") or {}),
-        "effort_policy": effort_policy_name,
-        "quality_policy": str(collected.get("quality_policy") or LEROBOT_QUALITY_POLICY_ALL),
-        "quality_filter_audit": dict(collected.get("quality_filter_audit") or {}),
-        "stage_policy_version": LEROBOT_STAGE_POLICY_VERSION,
-        "stage_policy_audit": dict(collected.get("stage_policy_audit") or {}),
-        "state_schema": str(state_schema_spec["key"]),
-        "state_schema_version": state_schema_version,
-        "state_names": list(state_names),
-        "action_names": list(action_names),
-        "effort_names": list(effort_names),
-        "effective_robot_observation_dim": len(state_names) + (effort_dim if effort_available else 0),
-        "canonical_phase_names": list(LEROBOT_CANONICAL_PHASE_NAMES),
-        "time_policy": normalized_time_policy,
-        "time_policy_hash": str(time_policy_info.get("hash") or export_time_policy_hash(normalized_time_policy)),
-        "base_fps": float(base_export_fps),
-        "effective_fps": float(export_fps),
-        "video_keyframe_interval": int(LEROBOT_VIDEO_KEYFRAME_INTERVAL),
-        "video_parallel_config": dict(video_parallel_config),
-        "reuse_from_dir": reuse_dir,
-        "reused_video_jobs": int(reused_video_jobs),
-        "reused_video_hardlink_jobs": int(reused_video_hardlink_jobs),
-        "reused_video_copy_jobs": int(reused_video_copy_jobs),
-        "encoded_video_jobs": int(encoded_video_jobs),
-        "total_video_jobs": int(total_video_jobs),
-        "standard_lerobot_ready": vla_training_ready,
-        "state_action_ready": bool(parquet_ok),
-        "effort_available": bool(effort_available),
-        "vla_training_ready": vla_training_ready,
-        "parquet": {
-            "data_available": parquet_ok,
-            "tasks_available": tasks_ok,
-            "episodes_available": episodes_ok,
-            "path": relpath_posix(parquet_path, export_dir) if parquet_ok else None,
-            "data_reason": parquet_reason,
-            "tasks_reason": tasks_reason,
-            "episodes_reason": episodes_reason,
-        },
-        "video_layout": "per_episode",
-        "videos": video_results,
-        "episodes": episode_export_manifest,
-        "image_frame_counts": image_frame_counts,
-        "image_missing_file_counts": image_missing_file_counts,
-        "validation": validation,
         "fps": export_fps,
         "total_frames": len(data_rows),
         "total_episodes": len(episodes),
         "total_tasks": len(tasks),
-        "skipped_frames": collected["skipped_frames"],
-        "skipped_state_action_frames": collected.get("skipped_state_action_frames", 0),
-        "skipped_missing_camera_frames": collected.get("skipped_missing_camera_frames", 0),
-        "missing_camera_by_key": collected.get("missing_camera_by_key", {}),
-        "missing_camera_examples": collected.get("missing_camera_examples", []),
-        "notes": [
-            "Original auto-collection debug data remains outside this subfolder.",
-            "This folder follows the LeRobot v3.0 offline layout for VLA/SmolVLA training.",
-            "Camera streams are observation.images.0, observation.images.1, observation.images.2.",
-            "Camera media is segmented per episode so training can open the relevant episode video directly.",
-            "Rows missing any camera frame are skipped during export so state/action/video stay aligned.",
-            "If vla_training_ready is false, install pandas/pyarrow plus a video encoder, then rerun the exporter.",
-        ],
+        "vla_training_ready": vla_training_ready,
+        "standard_lerobot_ready": vla_training_ready,
+        "validation": validation,
     }
-    write_json(os.path.join(export_dir, "manifest.json"), manifest)
-    readme = [
-        "# Excavator LeRobot v3 Export",
-        "",
-        f"Source run: `{run_dir}`",
-        f"Split: `{split}`",
-        f"Frames: `{len(data_rows)}`",
-        f"Episodes: `{len(episodes)}`",
-        f"Uniform timeline/video rate: `{export_fps}`",
-        f"LeRobot v3 / VLA ready: `{vla_training_ready}`",
-        "",
-        "This subfolder is generated from the raw auto-collection run and keeps trainable data separate from debug logs.",
-        "",
-        "Files:",
-        "- `meta/info.json`: feature schema and dataset totals",
-        "- `meta/tasks.parquet`: task text index to task_index mapping",
-        "- `meta/episodes/chunk-000/file-000.parquet`: episode metadata and video/data chunk indices",
-        "- `meta/stats.json`: state/action/effort/scalar statistics plus video normalization entries",
-        "- `data/chunk-000/file-000.parquet`: frame table",
-        (
-            "- `observation.effort` is excluded from policy input because raw Isaac efforts contain solver outliers."
-            if effort_policy_name == LEROBOT_EFFORT_POLICY_EXCLUDE
-            else "- `observation.effort` is included only when Isaac measured joint efforts were available for every exported frame."
-        ),
-        "- `videos/observation.images.0/chunk-000/file-XYZ.mp4`: camera 0 stream for episode file_index XYZ",
-        "- `videos/observation.images.1/chunk-000/file-XYZ.mp4`: camera 1 stream for episode file_index XYZ",
-        "- `videos/observation.images.2/chunk-000/file-XYZ.mp4`: camera 2 stream for episode file_index XYZ",
-        "- `manifest.json`: export status per episode, including source signature and segmented video paths",
-        "",
-    ]
-    write_text(os.path.join(export_dir, "README.md"), "\n".join(readme))
-    progress(98.0, "VLA export ready" if vla_training_ready else "VLA export incomplete; see manifest.validation")
-    if require_standard and not vla_training_ready:
-        raise RuntimeError(f"LeRobot export incomplete: {json.dumps(manifest, ensure_ascii=True)}")
-    if require_vla and not vla_training_ready:
-        raise RuntimeError(f"VLA export incomplete: {json.dumps(manifest, ensure_ascii=True)}")
-    return manifest
+    progress(98.0, "VLA export ready" if vla_training_ready else "VLA export incomplete")
+    if (require_standard or require_vla) and not vla_training_ready:
+        raise RuntimeError(f"LeRobot export incomplete: {json.dumps(result, ensure_ascii=True)}")
+    return result
 
 
 def print_lerobot_export(
@@ -4822,13 +4846,17 @@ def print_lerobot_export(
     effort_policy: object = None,
     quality_policy: object = None,
     reuse_from_dir: Optional[Union[str, os.PathLike]] = None,
+    append: bool = False,
+    episode_offset: int = 0,
 ) -> None:
     result = export_lerobot_dataset(
         run_dir,
         output_dir=output_dir,
         split=split,
         limit_episodes=limit_episodes,
+        episode_offset=episode_offset,
         overwrite=overwrite,
+        append=append,
         require_standard=require_standard,
         require_vla=require_vla,
         time_policy=time_policy,
@@ -4837,10 +4865,6 @@ def print_lerobot_export(
         quality_policy=quality_policy,
         reuse_from_dir=reuse_from_dir,
     )
-    try:
-        write_json(os.path.join(os.path.abspath(str(run_dir)), "lerobot_v3_export.json"), result)
-    except Exception:
-        pass
     print("[LEROBOT EXPORT]", json.dumps(result, ensure_ascii=True, indent=2))
 
 
@@ -5669,7 +5693,7 @@ if __name__ == "__main__":
     parser.add_argument("--plot-dir", default=None, help="Output directory for --plots. Defaults to run_dir/analysis_plots.")
     parser.add_argument("--export-lerobot", action="store_true", help="Create run_dir/lerobot_v3 with clean LeRobot v3 VLA training data.")
     parser.add_argument("--export-lerobot-v3", action="store_true", help="Alias for --export-lerobot.")
-    parser.add_argument("--export-dir", default=None, help="Output directory for --export-lerobot. Defaults to run_dir/lerobot_v3.")
+    parser.add_argument("--export-dir", default=None, help="Dataset root for --export-lerobot; existing exports append by default. Defaults to run_dir/lerobot_v3.")
     parser.add_argument(
         "--export-reuse-from-dir",
         default=None,
@@ -5683,6 +5707,7 @@ if __name__ == "__main__":
         help="Deprecated compatibility option. Only 1.0 is accepted; export never retimes recorded motion.",
     )
     parser.add_argument("--export-limit", type=int, default=None, help="Limit exported episodes for smoke tests.")
+    parser.add_argument("--export-offset", type=int, default=0, help="Skip this many episodes in the selected source split before exporting.")
     parser.add_argument(
         "--export-state-schema",
         default="current-v4",
@@ -5704,7 +5729,9 @@ if __name__ == "__main__":
         choices=[LEROBOT_QUALITY_POLICY_ALL, LEROBOT_QUALITY_POLICY_GOLD_V1],
         help="Export all trainable episodes or the gold score/spill/joint-limit subset.",
     )
-    parser.add_argument("--export-overwrite", action="store_true", help="Delete and rebuild the export directory if it already exists.")
+    export_mode = parser.add_mutually_exclusive_group()
+    export_mode.add_argument("--export-append", action="store_true", help="Append to the next chunk (default unless --export-overwrite is set).")
+    export_mode.add_argument("--export-overwrite", action="store_true", help="Delete and rebuild the export directory if it already exists.")
     parser.add_argument("--export-require-standard", action="store_true", help="Fail if parquet/mp4 standard export cannot be produced.")
     parser.add_argument("--export-require-vla", action="store_true", help="Fail unless image + state + action + task VLA export is ready.")
     parser.add_argument("--dashboard", action="store_true", help="Serve a local web dashboard for browsing run folders.")
@@ -5739,7 +5766,9 @@ if __name__ == "__main__":
             output_dir=args.export_dir,
             split=args.export_split,
             limit_episodes=args.export_limit,
+            episode_offset=args.export_offset,
             overwrite=args.export_overwrite,
+            append=not args.export_overwrite,
             require_standard=args.export_require_standard,
             require_vla=args.export_require_vla,
             time_policy=export_time_policy,

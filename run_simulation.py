@@ -247,7 +247,7 @@ VIDEO_OVERVIEW_CAMERA_APERTURE_MM = 20.955
 
 # TCP Bridge settings
 HOST = "0.0.0.0"
-PORT = 5555
+PORT = int(os.environ.get("EXCAVATOR_BRIDGE_PORT", "5555"))
 
 # Viewport capture settings.
 # Render at the same 1024x1024 resolution used during dataset collection,
@@ -3794,6 +3794,22 @@ def main(args):
 
         if not command_queue.empty():
             cmd = command_queue.get()
+
+            if cmd.get("type") == "scene_context":
+                response_queue.put({
+                    "type": "scene_context",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "observation_context": {
+                        "dig_target_xyz": state27_dig_target_world.tolist(),
+                        "unload_landing_xyz": state27_unload_target_world.tolist(),
+                        "task_text": args.task_text or (
+                            "Excavate one scoop of sand from the sand pile, "
+                            "then carry and dump the collected material into the truck bed."
+                        ),
+                        "phase_mode": "auto",
+                    },
+                })
+                continue
 
             if cmd.get("type") == "handshake":
                 try:

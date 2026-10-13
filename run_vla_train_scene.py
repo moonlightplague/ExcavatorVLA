@@ -201,10 +201,18 @@ def open_stage(simulation_app, scene_path):
     if not os.path.isfile(scene_path):
         raise FileNotFoundError(f"Scene USD not found: {scene_path}")
 
+    started = time.perf_counter()
+    print(f"[STARTUP] Opening scene: {scene_path}", flush=True)
     opened = omni.usd.get_context().open_stage(scene_path)
     print(f"[INFO] Opened stage: {scene_path} result={opened}", flush=True)
-    for _ in range(10):
+    print("[STARTUP] Warming scene/RTX (10 updates); shader compilation can take several minutes on the CPU.", flush=True)
+    for index in range(10):
+        update_started = time.perf_counter()
         simulation_app.update()
+        elapsed = time.perf_counter() - update_started
+        if elapsed >= 5.0:
+            print(f"[STARTUP] Scene update {index + 1}/10 completed in {elapsed:.1f}s.", flush=True)
+    print(f"[STARTUP] Scene ready after {time.perf_counter() - started:.1f}s.", flush=True)
     return scene_path
 
 
@@ -902,6 +910,11 @@ def main():
         f"--/rtx/descriptorSets={args.rtx_descriptor_sets}",
         f"--/rtx/reservedDescriptors={args.rtx_reserved_descriptors}",
     ]
+    # Kit's default filename has second resolution; parallel workers otherwise
+    # write into the same file and corrupt each other's startup diagnostics.
+    kit_log_file = os.environ.get("EXCAVATOR_KIT_LOG_FILE", "").strip()
+    if kit_log_file:
+        extra_args.append(f"--/log/file={os.path.abspath(kit_log_file)}")
     if graphics_api == "auto" and platform.system().lower().startswith("win") and args.headless and args.auto_collect:
         graphics_api = "d3d12"
     if graphics_api == "d3d12":
@@ -946,12 +959,15 @@ def main():
 
         from excavator_app.bootstrap import run_excavator_with_sand
 
+        runtime_started = time.perf_counter()
+        print("[STARTUP] Initializing sand and excavator runtime...", flush=True)
         rt = run_excavator_with_sand()
         try:
             rt.set_log_mode(selected_log_mode, announce=bool(args.log_mode))
         except Exception:
             pass
         wait_runtime_ready(simulation_app, rt, args.wait_runtime_seconds)
+        print(f"[STARTUP] Runtime ready after {time.perf_counter() - runtime_started:.1f}s.", flush=True)
         stable_settings = apply_stable_dataset_render_settings(reason="runtime_ready", enabled=stable_render_enabled)
         try:
             rt.STATE["dataset_stable_render_settings"] = stable_settings

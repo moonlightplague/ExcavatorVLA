@@ -16,6 +16,7 @@ import argparse
 import sys
 import os
 import math
+import json
 import ctypes
 import importlib
 import importlib.util
@@ -157,6 +158,7 @@ from excavator_common.deployment_contract import (
 )
 from excavator_common import vla_observation_contract
 from excavator_common import deployment_scene_contract
+from excavator_common.mesh_topology import closed_mesh_boundary_edge_count
 
 print(
     "[INFO] Run simulation project root:",
@@ -171,6 +173,9 @@ print(
 
 # Scene and robot paths
 SCENE_USD_PATH = os.path.join(PROJECT_DIR, "assets/usd/excavator_scene.usd")
+collection_scene = os.path.join(os.path.dirname(PROJECT_DIR), 'ExcavatorVLA-isaac', 'assets/usd/excavator_scene.usd')
+SCENE_USD_PATH = os.environ.get('EXCAVATOR_COLLECTION_SCENE',
+                               collection_scene if os.path.isfile(collection_scene) else SCENE_USD_PATH)
 ROBOT_PRIM_PATH = "/World/URDF_real3"
 SAND_RUNTIME_PATH = os.path.join(PROJECT_DIR, "scripts", "excavator_app", "sand_site_runtime.py")
 
@@ -258,6 +263,8 @@ MODEL_IMAGE_WIDTH = 256
 MODEL_IMAGE_HEIGHT = 256
 CAPTURE_WAIT_FRAMES = 5
 CAPTURE_STARTUP_WAIT_FRAMES = 60
+CAPTURE_TIMEOUT_SECONDS = 5.0
+CAPTURE_MAX_RENDER_UPDATES = 120
 PENDING_VIEWPORT_CAPTURE_HELPERS = []
 LAST_CAPTURE_TIMING_MS = {}
 CAPTURE_RESIZE_EXECUTOR = ThreadPoolExecutor(max_workers=3)
@@ -313,7 +320,7 @@ def cleanup_viewport_capture_helpers(force=False):
 
 
 
-def resize_rgb_for_model(rgb, np_module):
+def resize_rgb_for_model(rgb, np_module, width=MODEL_IMAGE_WIDTH, height=MODEL_IMAGE_HEIGHT):
     """Downsample a rendered RGB frame to the SmolVLA input resolution."""
     arr = np_module.asarray(rgb)
 
@@ -323,8 +330,8 @@ def resize_rgb_for_model(rgb, np_module):
     arr = np_module.ascontiguousarray(arr[:, :, :3])
 
     if (
-        int(arr.shape[1]) == MODEL_IMAGE_WIDTH
-        and int(arr.shape[0]) == MODEL_IMAGE_HEIGHT
+        int(arr.shape[1]) == width
+        and int(arr.shape[0]) == height
     ):
         return arr
 
@@ -336,7 +343,7 @@ def resize_rgb_for_model(rgb, np_module):
             1,
         )
         image = image.resize(
-            (MODEL_IMAGE_WIDTH, MODEL_IMAGE_HEIGHT),
+            (width, height),
             resampling,
         )
         return np_module.ascontiguousarray(
@@ -346,12 +353,12 @@ def resize_rgb_for_model(rgb, np_module):
     y_idx = np_module.linspace(
         0,
         max(0, arr.shape[0] - 1),
-        MODEL_IMAGE_HEIGHT,
+        height,
     ).astype(np_module.int32)
     x_idx = np_module.linspace(
         0,
         max(0, arr.shape[1] - 1),
-        MODEL_IMAGE_WIDTH,
+        width,
     ).astype(np_module.int32)
 
     return np_module.ascontiguousarray(
@@ -365,6 +372,7 @@ def capture_rgb_from_persistent_viewports(
     capture_viewport_to_buffer,
     np_module,
     wait_frames=CAPTURE_WAIT_FRAMES,
+    black_frame_retries=2,
 ):
     """Capture all fixed-camera viewports in one render window.
 
@@ -375,7 +383,7 @@ def capture_rgb_from_persistent_viewports(
 
     capture_start = time.perf_counter()
     results = {}
-    holders = []
+    cleanup_viewport_capture_helpers(force=False)
 
     for camera_name, entry in capture_views.items():
         result = {"done": False, "rgb": None, "error": ""}
@@ -383,11 +391,14 @@ def capture_rgb_from_persistent_viewports(
         window = entry.get("window")
         if window is not None:
             try:
-                window.visible = True
+                if not window.visible:
+                    window.visible = True
             except Exception:
                 pass
 
-        def on_capture(capsule, buffer_size, width, height, fmt, _result=result):
+        holder = {"done": False}
+
+        def on_capture(capsule, buffer_size, width, height, fmt, _result=result, _holder=holder):
             try:
                 rgba = capsule_to_numpy_rgba(
                     capsule,
@@ -397,44 +408,43 @@ def capture_rgb_from_persistent_viewports(
                     np_module,
                 )
                 _result["rgb"] = np_module.ascontiguousarray(rgba[:, :, :3])
+                _result["opaque"] = bool(
+                    rgba.shape[2] >= 4 and np_module.all(rgba[:, :, 3] == 255)
+                )
             except Exception as exc:
                 _result["error"] = f"{type(exc).__name__}: {exc}"
             finally:
                 _result["done"] = True
+                _holder["done"] = True
 
-        holder = {
-            "done": False,
-            "helper": capture_viewport_to_buffer(entry["viewport"], on_capture),
-        }
-        holders.append(holder)
+        holder["helper"] = capture_viewport_to_buffer(entry["viewport"], on_capture)
         PENDING_VIEWPORT_CAPTURE_HELPERS.append(holder)
 
     render_updates = 0
-    for _ in range(max(1, int(wait_frames))):
+    deadline = time.perf_counter() + CAPTURE_TIMEOUT_SECONDS
+    for _ in range(max(1, int(wait_frames), CAPTURE_MAX_RENDER_UPDATES)):
         # The bridge pauses the timeline before deployment capture, so this
         # renders all persistent viewports without advancing simulation time.
         simulation_app.update()
         render_updates += 1
         if all(result["done"] for result in results.values()):
             break
+        if time.perf_counter() >= deadline:
+            break
 
-    for holder in holders:
-        holder["done"] = True
+    # A pending helper still owns its GPU readback callback. Keep it alive until
+    # that callback completes, including after a timeout, and release completed
+    # helpers promptly to avoid retaining renderer resources.
     cleanup_viewport_capture_helpers(force=False)
 
     raw_frames = {}
     for camera_name, result in results.items():
-        entry = capture_views[camera_name]
-        window = entry.get("window")
-        if window is not None:
-            try:
-                window.visible = False
-            except Exception:
-                pass
         if result["rgb"] is None:
             raise RuntimeError(
                 f"Persistent viewport capture failed [{camera_name}]: "
-                f"{result.get('error') or 'timeout'}"
+                f"{result.get('error') or 'timeout'} "
+                f"after {render_updates} render updates / "
+                f"{time.perf_counter() - capture_start:.2f}s"
             )
         rgb = np_module.asarray(result["rgb"], dtype=np_module.uint8)
         if rgb.ndim != 3 or rgb.shape[2] < 3 or rgb.shape[0] < 2 or rgb.shape[1] < 2:
@@ -442,14 +452,34 @@ def capture_rgb_from_persistent_viewports(
                 f"Persistent viewport [{camera_name}] returned invalid RGB shape {rgb.shape}"
             )
         if not np_module.any(rgb[:, :, :3]):
-            raise RuntimeError(
-                f"Persistent viewport [{camera_name}] returned an all-zero RGB frame"
+            if black_frame_retries > 0:
+                print(
+                    f"[BRIDGE CAMERA] All-zero readback [{camera_name}]; "
+                    f"requesting fresh frames at the same physics state "
+                    f"({black_frame_retries} retries left).",
+                    flush=True,
+                )
+                return capture_rgb_from_persistent_viewports(
+                    capture_views, simulation_app, capture_viewport_to_buffer,
+                    np_module, wait_frames, black_frame_retries - 1,
+                )
+            if not result.get("opaque", False):
+                raise RuntimeError(
+                    f"Persistent viewport [{camera_name}] returned an all-zero RGB frame "
+                    "without valid opaque alpha"
+                )
+            print(
+                f"[BRIDGE CAMERA] [{camera_name}] has opaque black pixels after fresh "
+                "readbacks; delivering the rendered view.",
+                flush=True,
             )
         raw_frames[camera_name] = rgb[:, :, :3]
 
     capture_done = time.perf_counter()
     futures = {
-        name: CAPTURE_RESIZE_EXECUTOR.submit(resize_rgb_for_model, rgb, np_module)
+        name: (CAPTURE_RESIZE_EXECUTOR.submit(resize_rgb_for_model, rgb, np_module, 768, 768)
+               if name == 'overview' else
+               CAPTURE_RESIZE_EXECUTOR.submit(resize_rgb_for_model, rgb, np_module))
         for name, rgb in raw_frames.items()
     }
     resized = {name: future.result() for name, future in futures.items()}
@@ -996,6 +1026,18 @@ def main(args):
         baseline_translation = prim_world_position(truck_prim)
         baseline_yaw_deg = prim_local_yaw_z_deg(truck_prim)
         robot_position, _ = robot.get_world_pose()
+        if args.scene_profile is not None:
+            profile = json.loads(open(args.scene_profile, encoding='utf-8').read())
+            for name, size in (('sand_xy', 2), ('truck_translation_xyz', 3), ('unload_landing_xyz', 3)):
+                profile[name] = deployment_scene_contract._finite_vector(profile[name], size, name)
+            yaw = float(profile['truck_yaw_deg'])
+            if not math.isfinite(yaw):
+                raise ValueError('scene profile truck_yaw_deg must be finite')
+            set_prim_translation_and_yaw(truck_prim, profile['truck_translation_xyz'], yaw)
+            simulation_app.update()
+            profile.update(seed=args.scene_seed, sample_try=0, sand_amount_multiplier=float(args.sand_amount))
+            print('[SCENE REPLAY] Exact recorded truck/sand profile:', profile, flush=True)
+            return profile
         scene_seed = (
             int(args.scene_seed)
             if args.scene_seed is not None
@@ -1004,12 +1046,29 @@ def main(args):
                 & ((1 << 63) - 1)
             )
         )
+
+        def truck_placement_is_clear(candidate):
+            set_prim_translation_and_yaw(truck_prim, baseline_translation, candidate['truck_yaw_deg'])
+            simulation_app.update()
+            bed_min, bed_max = prim_world_bbox_min_max(bed_prim)
+            translation = prim_world_position(truck_prim)
+            translation[:2] += np.asarray(candidate['unload_xy']) - .5 * (bed_min[:2] + bed_max[:2])
+            set_prim_translation_and_yaw(truck_prim, translation, candidate['truck_yaw_deg'])
+            simulation_app.update()
+            truck_min, truck_max = prim_world_bbox_min_max(truck_prim)
+            clear = deployment_scene_contract.truck_clears_robot_body(robot_position[:2], truck_min, truck_max)
+            if not clear:
+                print('[SCENE REJECT] Truck overlaps excavator body:', candidate['sample_try'],
+                      'truck_bounds=', truck_min.tolist(), truck_max.tolist(), flush=True)
+            return clear
+
         profile = deployment_scene_contract.sample_random_scene_profile(
             seed=scene_seed,
             robot_xy=(float(robot_position[0]), float(robot_position[1])),
             truck_center_xy=truck_center[:2],
             truck_dump_center_xy=bed_center[:2],
             truck_yaw_deg=baseline_yaw_deg,
+            placement_validator=truck_placement_is_clear,
         )
         dataset_sampled_sand_amount = float(
             profile["sand_amount_multiplier"]
@@ -1413,8 +1472,12 @@ def main(args):
         simulation_app.close()
         return
 
-    # Load the USD scene.
-    add_reference_to_stage(usd_path=SCENE_USD_PATH, prim_path="/World")
+    # Open the collection stage itself: referencing only its default prim loses
+    # root-level lighting/environment metadata and changes the camera domain.
+    import omni.usd
+    if not omni.usd.get_context().open_stage(SCENE_USD_PATH):
+        raise RuntimeError(f'Could not open collection scene: {SCENE_USD_PATH}')
+    stage = get_current_stage()
     print(f"[INFO] Loaded scene from: {SCENE_USD_PATH}")
 
     # Check if robot prim exists.
@@ -1431,32 +1494,8 @@ def main(args):
 
     enable_gpu_particle_physics()
 
-    # Add ground plane.
-    world.scene.add_default_ground_plane(
-        z_position=0,
-        name="ground_plane",
-        prim_path="/World/GroundPlane",
-        static_friction=0.5,
-        dynamic_friction=0.5,
-    )
-    print("[INFO] Added ground plane")
-
-    # Add lighting.
-    light_path = "/World/MainLight"
-    if not stage.GetPrimAtPath(light_path).IsValid():
-        light = UsdLux.DistantLight.Define(stage, light_path)
-        light.CreateIntensityAttr(1000.0)
-        light.CreateAngleAttr(0.53)
-        light.CreateColorAttr(Gf.Vec3f(1.0, 1.0, 1.0))
-        print(f"[INFO] Added light at: {light_path}")
-
-    # Add a dome light as extra illumination.
-    dome_light_path = "/World/DomeLight"
-    if not stage.GetPrimAtPath(dome_light_path).IsValid():
-        dome = UsdLux.DomeLight.Define(stage, dome_light_path)
-        dome.CreateIntensityAttr(500.0)
-        dome.CreateColorAttr(Gf.Vec3f(1.0, 1.0, 1.0))
-        print(f"[INFO] Added dome light at: {dome_light_path}")
+    # Preserve the collection ground, lights and environment. Adding a second
+    # untextured DomeLight hides the training sky and changes every RGB image.
 
     # Initialize robot articulation.
     robot = SingleArticulation(
@@ -1534,15 +1573,12 @@ def main(args):
     canonical_to_raw = resolve_canonical_dof_indices(raw_dof_names)
     canonical_joint_indices = np.asarray(canonical_to_raw, dtype=np.int32)
 
-    # Sand center is around (0.0, 6.7).
-    ROBOT_INITIAL_POS = np.array(
-        [-9.2, 6.7, 1.243],
-        dtype=np.float32,
-    )
-    ROBOT_INITIAL_ORI = np.array(
-        [1.0, 0.0, 0.0, 0.0],
-        dtype=np.float32,
-    )
+    # Collection keeps the authored articulation base pose. The old deployment
+    # translation (-9.2, 6.7, 1.243) moved the tool about 5 m while the legacy
+    # base prim still reported its authored pose, silently corrupting geometry.
+    authored_position, authored_orientation = robot.get_world_pose()
+    ROBOT_INITIAL_POS = np.asarray(authored_position, dtype=np.float32).copy()
+    ROBOT_INITIAL_ORI = np.asarray(authored_orientation, dtype=np.float32).copy()
     recorded_raw_initial_q = None
 
     try:
@@ -1767,6 +1803,8 @@ def main(args):
         simulation_app.update()
 
     for camera_name, test_rgb in test_rgbs.items():
+        if not np.any(test_rgb):
+            raise RuntimeError(f"Initial viewport [{camera_name}] returned an all-zero RGB frame")
         print(
             f"[INFO] Initial viewport capture [{camera_name}]:",
             "shape=", test_rgb.shape,
@@ -1783,6 +1821,13 @@ def main(args):
                 "The capture pipeline works, but the selected camera may be looking at a dark/empty view.",
                 flush=True,
             )
+
+    # Capture the existing display viewport alongside model cameras while the
+    # timeline is paused. Its frame travels separately from model observations.
+    if os.environ.get('EXCAVATOR_EVAL_VIDEO') == '1':
+        capture_views['overview'] = {
+            'window': None, 'viewport': viewport, 'camera_path': overview_camera_path,
+        }
 
     # All non-sand scene work is complete at this point.
     wait_for_stage_loading_complete(
@@ -1915,12 +1960,16 @@ def main(args):
 
     def restore_excavator_pose_after_sand_init(snapshot):
         """Restore the exact base and articulation state saved before lifting."""
+        # Settling is complete. Rendering updates must not advance the robot
+        # between restoration and verification (or before the first command).
+        timeline.pause()
         robot.set_world_pose(
             position=snapshot["position"],
             orientation=snapshot["orientation"],
         )
         robot.set_joint_positions(snapshot["joint_positions"])
         robot.set_joint_velocities(snapshot["joint_velocities"])
+        robot.apply_action(ArticulationAction(joint_positions=snapshot['joint_positions']))
         for _ in range(3):
             simulation_app.update()
 
@@ -2169,7 +2218,7 @@ def main(args):
         sand_amount_multiplier=(sand_amount if sand_enabled else None),
         unload_center_xy=None,
         rebuild=False,
-        create_retaining_walls=False,
+        create_retaining_walls=args.retaining_walls,
         sand_radius_scale=args.sand_radius_scale,
     )
     sand_api = getattr(builtins, "_SAND_SITE", sand_api)
@@ -2177,13 +2226,13 @@ def main(args):
         sand_api.get("root_path") or "/World/SandSite"
     ).rstrip("/")
     sand_wall_path = f"{sand_root_path}/SandRetainingWalls"
-    if stage.GetPrimAtPath(sand_wall_path).IsValid():
+    if stage.GetPrimAtPath(sand_wall_path).IsValid() != bool(args.retaining_walls):
         raise RuntimeError(
-            "Sand retaining walls were created despite being disabled: "
+            "Sand retaining-wall configuration was not applied: "
             f"{sand_wall_path}"
         )
     print(
-        "[SAND] Retaining-wall generation disabled:",
+        f"[SAND] Retaining-wall generation enabled={args.retaining_walls}:",
         sand_wall_path,
         flush=True,
     )
@@ -2583,6 +2632,7 @@ def main(args):
         _ACTIVE_SAND_POSE_RESTORE = None
         excavator_pose_snapshot = None
 
+    timeline.pause()
     if recorded_raw_initial_q is not None:
         # Sand creation and settling advance physics for several seconds.
         # Reapply the episode's recorded initial articulation at the last safe
@@ -2676,15 +2726,6 @@ def main(args):
                 triangles.append([face[0], face[index], face[index + 1]])
         return np.asarray(triangles, dtype=np.int32).reshape(-1, 3)
 
-    def closed_mesh_boundary_edge_count(faces):
-        counts = {}
-        for face in faces:
-            for index, first in enumerate(face):
-                second = face[(index + 1) % len(face)]
-                key = tuple(sorted((int(first), int(second))))
-                counts[key] = int(counts.get(key, 0)) + 1
-        return sum(1 for count in counts.values() if count != 2)
-
     def authored_bucket_volume_topology():
         result = {
             "available": False,
@@ -2712,7 +2753,7 @@ def main(args):
                     f"invalid_topology:vertices={len(raw_points)};faces={len(faces)}"
                 )
                 return result
-            boundary_edges = closed_mesh_boundary_edge_count(faces)
+            boundary_edges = closed_mesh_boundary_edge_count(raw_points, faces)
             if boundary_edges:
                 result["reason"] = f"mesh_not_closed:boundary_edges={boundary_edges}"
                 return result
@@ -3151,6 +3192,23 @@ def main(args):
             candidate_indices = np.nonzero(candidate_mask)[0]
             candidates = points[candidate_mask]
             result["candidate_count"] = int(len(candidates))
+            # An empty bucket is a valid initial observation. Validate the
+            # tracker before the zero-candidate return, independently of load.
+            if source_tracking_required:
+                initial_mask = bucket_source_tracker.get("mask")
+                if (
+                    not bool(bucket_source_tracker.get("available", False))
+                    or not isinstance(initial_mask, np.ndarray)
+                    or len(initial_mask) != len(points)
+                ):
+                    result["source_tracking"] = "initial_mask_unavailable"
+                    result["source_tracking_reason"] = (
+                        "particle_count_changed"
+                        if bucket_source_tracker.get("available", False)
+                        else str(bucket_source_tracker.get("reason", "initial_mask_unavailable"))
+                    )
+                    return result
+                result["source_tracking_valid"] = True
             if len(candidates) == 0:
                 return result
 
@@ -3179,21 +3237,6 @@ def main(args):
             bucket_count = int(np.count_nonzero(inside))
             result["bucket_count"] = bucket_count
             if source_tracking_required:
-                initial_mask = bucket_source_tracker.get("mask")
-                if (
-                    not bool(bucket_source_tracker.get("available", False))
-                    or not isinstance(initial_mask, np.ndarray)
-                    or len(initial_mask) != len(points)
-                ):
-                    result["source_tracking"] = "initial_mask_unavailable"
-                    result["source_tracking_valid"] = False
-                    result["source_tracking_reason"] = str(
-                        bucket_source_tracker.get(
-                            "reason",
-                            "particle_count_changed",
-                        )
-                    )
-                    return result
                 inside_candidate_indices = candidate_indices[
                     np.nonzero(inside)[0]
                 ]
@@ -3232,6 +3275,8 @@ def main(args):
             return result
         except Exception as exc:
             result["source"] = f"error:{type(exc).__name__}:{exc}"
+            result["source_tracking_valid"] = False
+            result["source_tracking_reason"] = result["source"]
             return result
         finally:
             result["elapsed_ms"] = (time.perf_counter() - start) * 1000.0
@@ -3787,6 +3832,7 @@ def main(args):
     deployment_previous_fill_fraction = None
     deployment_previous_fill_rate = None
     deployment_elapsed_seconds = 0.0
+    q_target = None
     last_idle_ui_update = 0.0
     idle_ui_interval = 1.0 / max(0.1, float(args.idle_ui_hz))
     while simulation_app.is_running():
@@ -3802,9 +3848,10 @@ def main(args):
                     "observation_context": {
                         "dig_target_xyz": state27_dig_target_world.tolist(),
                         "unload_landing_xyz": state27_unload_target_world.tolist(),
-                        "task_text": args.task_text or (
-                            "Excavate one scoop of sand from the sand pile, "
-                            "then carry and dump the collected material into the truck bed."
+                        "task_text": args.task_text or deployment_scene_contract.relative_task_text(
+                            state27_dig_target_world, state27_unload_target_world,
+                            (startup_base_x, startup_base_y),
+                            startup_base_yaw + float(read_canonical_joint_positions()[1][0]),
                         ),
                         "phase_mode": "auto",
                     },
@@ -3825,6 +3872,10 @@ def main(args):
                     deployment_previous_fill_fraction = None
                     deployment_previous_fill_rate = None
                     deployment_elapsed_seconds = 0.0
+                    # Actions are derivatives of the commanded position in the
+                    # dataset. Preserve that target across bridge commands.
+                    _, q_target = read_canonical_joint_positions()
+                    q_target = q_target.copy()
                     if active_contract["observation_schema"] in (
                         OBSERVATION_SCHEMA_27D_PLUS_EFFORT,
                         OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
@@ -3965,7 +4016,6 @@ def main(args):
             deployment_elapsed_seconds += bridge_step_seconds
 
             if cmd.get("joint_velocities") is not None and cmd.get("joint_positions") is None:
-                _, q_target = read_canonical_joint_positions()
                 vel = np.asarray(cmd["joint_velocities"], dtype=np.float32).reshape(-1)
                 if vel.shape != (4,) or not np.all(np.isfinite(vel)):
                     response_queue.put({
@@ -4008,13 +4058,19 @@ def main(args):
 
             lock_visible_viewport_to_overview()
 
-            rgb_by_camera = capture_rgb_from_persistent_viewports(
-                capture_views=capture_views,
-                simulation_app=simulation_app,
-                capture_viewport_to_buffer=capture_viewport_to_buffer,
-                np_module=np,
-                wait_frames=CAPTURE_WAIT_FRAMES,
-            )
+            try:
+                rgb_by_camera = capture_rgb_from_persistent_viewports(
+                    capture_views=capture_views,
+                    simulation_app=simulation_app,
+                    capture_viewport_to_buffer=capture_viewport_to_buffer,
+                    np_module=np,
+                    wait_frames=CAPTURE_WAIT_FRAMES,
+                )
+            except Exception as exc:
+                error = f"CameraCaptureError: {type(exc).__name__}: {exc}"
+                print(f"[BRIDGE CAMERA] {error}", flush=True)
+                response_queue.put({"type": "error", "error": error})
+                continue
 
             lock_visible_viewport_to_overview()
 
@@ -4031,11 +4087,13 @@ def main(args):
 
                 rgb_compressed = zlib.compress(rgb.tobytes(), level=1)
                 encoded_cameras[camera_name] = {
-                    "camera_path": active_camera_paths[camera_name],
+                    "camera_path": (overview_camera_path if camera_name == 'overview'
+                                    else active_camera_paths[camera_name]),
                     "rgb_shape": list(rgb.shape),
                     "rgb_dtype": str(rgb.dtype),
                     "rgb_zlib_b64": base64.b64encode(rgb_compressed).decode("ascii"),
                 }
+            evaluation_video_frame = encoded_cameras.pop('overview', None)
             encode_done = time.perf_counter()
 
             primary_camera = (
@@ -4440,6 +4498,7 @@ def main(args):
             reply = {
                 "joint_positions": q.tolist(),
                 "joint_velocities": qd.tolist(),
+                "joint_command_positions": q_target.tolist(),
                 "raw_joint_positions": q_raw.tolist(),
                 "raw_joint_velocities": qd_raw.tolist(),
                 "observation_state": observation_state,
@@ -4492,6 +4551,7 @@ def main(args):
                 "rgb_dtype": primary_rgb["rgb_dtype"],
                 "rgb_zlib_b64": primary_rgb["rgb_zlib_b64"],
                 "cameras": encoded_cameras,
+                "evaluation_video_frame": evaluation_video_frame,
                 "bridge_timing": {
                     "physics_ms": (physics_done - physics_start) * 1000.0,
                     **dict(LAST_CAPTURE_TIMING_MS),
@@ -4554,6 +4614,14 @@ if __name__ == "__main__":
             "Replay a randomized sand/truck scene. By default a new seed is "
             "generated on each launch."
         ),
+    )
+    parser.add_argument(
+        '--scene-profile', default=None,
+        help='JSON with exact recorded sand_xy, truck_translation_xyz, truck_yaw_deg and unload_landing_xyz.',
+    )
+    parser.add_argument(
+        '--retaining-walls', action=argparse.BooleanOptionalAction, default=True,
+        help='Use the rectangular retaining walls present during dataset collection.',
     )
     parser.add_argument(
         "--robot-initial-joints-deg",

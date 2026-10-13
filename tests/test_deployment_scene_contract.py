@@ -130,8 +130,8 @@ class DeploymentSceneContractTests(unittest.TestCase):
         )
         self.assertLess(elevate_call, settle_loop)
         self.assertLess(settle_loop, restore_call)
-        self.assertIn("create_retaining_walls=False", source)
-        self.assertIn("Retaining-wall generation disabled", source)
+        self.assertIn("create_retaining_walls=args.retaining_walls", source)
+        self.assertIn("Retaining-wall generation enabled=", source)
         self.assertIn(
             '"create_circular_sand_retaining_wall"',
             source,

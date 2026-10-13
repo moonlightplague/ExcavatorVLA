@@ -38,6 +38,34 @@ TRAINING_MIN_SAND_UNLOAD_DISTANCE_M = 6.0
 TRAINING_MIN_ROBOT_TRUCK_DISTANCE_M = 3.5
 TRAINING_TRUCK_SIDE_YAW_RANGE_DEG = 90.0
 RANDOM_SCENE_MAX_TRIES = 96
+ROBOT_BODY_CLEARANCE_RADIUS_M = 2.35
+
+
+def truck_clears_robot_body(robot_xy, truck_minimum, truck_maximum,
+                           radius=ROBOT_BODY_CLEARANCE_RADIUS_M):
+    """Conservative clearance from the rotated truck's world XY bounds.
+
+    Center distance alone permits the long truck bed/cab to intersect the
+    excavator body and physically lock its swing joint.
+    """
+    distances = [max(float(truck_minimum[i]) - float(robot_xy[i]),
+                     float(robot_xy[i]) - float(truck_maximum[i]), 0.) for i in range(2)]
+    return math.hypot(*distances) >= radius
+
+
+def relative_task_text(dig_xyz, unload_xyz, origin_xy, initial_heading_rad):
+    """Use the same directional language and heading as the v4 exporter."""
+    relations = ('in front of', 'at the front-left of', 'to the left of',
+                 'at the rear-left of', 'behind', 'at the rear-right of',
+                 'to the right of', 'at the front-right of')
+
+    def phrase(name, point):
+        angle = math.atan2(point[1] - origin_xy[1], point[0] - origin_xy[0]) - initial_heading_rad
+        index = int(math.floor((math.degrees(angle) + 22.5) % 360 / 45))
+        return f"the {name} {relations[index]} the excavator's initial base pose"
+
+    return (f"Excavate one scoop of sand from {phrase('sand pile', dig_xyz)}, then carry and dump "
+            f"the collected material into {phrase('truck bed', unload_xyz)}.")
 
 
 def _finite_vector(value: Sequence[float], size: int, label: str) -> tuple:
@@ -91,6 +119,7 @@ def sample_random_scene_profile(
     truck_center_xy: Sequence[float],
     truck_dump_center_xy: Sequence[float],
     truck_yaw_deg: float,
+    placement_validator=None,
 ) -> dict:
     """Sample the deployment scene from dataset-collection distributions."""
     robot_xy = _finite_vector(robot_xy, 2, "robot_xy")
@@ -172,7 +201,7 @@ def sample_random_scene_profile(
             last_reason = "robot_truck_distance"
             continue
 
-        return {
+        candidate = {
             "seed": int(seed),
             "sample_try": sample_try,
             "sand_xy": sand_xy,
@@ -188,6 +217,10 @@ def sample_random_scene_profile(
             "sand_unload_distance_m": sand_unload_distance,
             "robot_truck_distance_m": robot_truck_distance,
         }
+        if placement_validator is not None and not placement_validator(candidate):
+            last_reason = 'truck_body_overlap'
+            continue
+        return candidate
 
     raise ValueError(
         "could not sample a legal randomized scene after "

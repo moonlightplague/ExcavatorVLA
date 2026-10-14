@@ -3074,6 +3074,45 @@ def apply_auto_scene_parameters(
     }
 
 
+def relocate_sand_source(center_xy):
+    """Move the existing evaluation footprint and walls, retaining PhysX prims.
+
+    Sand amount, radii, material and solver settings stay fixed. Preserve the
+    existing wall topology, including scenes where wall generation was used
+    only to select a footprint and the walls were subsequently removed.
+    """
+    global SAND_CENTER_X, SAND_CENTER_Y, PILE_CENTER_X, PILE_CENTER_Y
+    global WALL_CENTER_X, WALL_CENTER_Y
+    global SAND_SOURCE_SELECTED_HULL_XY, SAND_SOURCE_POLYGON_XY
+    global SAND_SOURCE_RAW_FACE_POLYGONS_XY, SAND_SOURCE_FACE_POLYGONS_XY
+    center = np.asarray(center_xy, dtype=np.float64)
+    if center.shape != (2,) or not np.isfinite(center).all():
+        raise ValueError('Sand center must contain two finite coordinates')
+    delta = center - np.asarray([SAND_CENTER_X, SAND_CENTER_Y])
+    for name in ('SAND_SOURCE_SELECTED_HULL_XY', 'SAND_SOURCE_POLYGON_XY',
+                 'SAND_SOURCE_RAW_FACE_POLYGONS_XY', 'SAND_SOURCE_FACE_POLYGONS_XY'):
+        value = globals()[name]
+        if value is not None:
+            globals()[name] = np.asarray(np.asarray(value) + delta, dtype=np.float32)
+    SAND_CENTER_X, SAND_CENTER_Y = map(float, center)
+    PILE_CENTER_X, PILE_CENTER_Y = map(float, center)
+    WALL_CENTER_X += float(delta[0])
+    WALL_CENTER_Y += float(delta[1])
+    for suffix in ('SandRetainingWalls', 'CircularSandRetainingWall'):
+        prim = get_stage().GetPrimAtPath(f'{root_path()}/{suffix}')
+        if prim.IsValid():
+            xform = UsdGeom.Xformable(prim)
+            ops = [op for op in xform.GetOrderedXformOps()
+                   if op.GetOpType() == UsdGeom.XformOp.TypeTranslate]
+            op = ops[0] if ops else xform.AddTranslateOp()
+            offset = op.Get() or Gf.Vec3d(0.0)
+            op.Set(Gf.Vec3d(float(offset[0]) + delta[0],
+                           float(offset[1]) + delta[1], float(offset[2])))
+    rebuild_sand_reference_grid('evaluation_relocation')
+    set_sand_generation_range_box('evaluation_relocation')
+    store_runtime_api()
+
+
 def make_sand_retaining_walls(root):
     wall_root = f"{root}/SandRetainingWalls"
     try:

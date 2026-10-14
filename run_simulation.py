@@ -755,18 +755,35 @@ def main(args):
     import carb
 
     # Create simulation app.
-    # Keep headless False because viewport capture needs an active viewport.
-    simulation_app = SimulationApp({
-        "headless": False,
+    # Headless Kit still renders offscreen viewports. Each evaluation worker
+    # selects a CUDA device explicitly; Vulkan device indices can differ from
+    # CUDA_VISIBLE_DEVICES, so use SimulationApp's CUDA-to-renderer mapping.
+    launch_config = {
+        "headless": args.headless,
         "width": 1024,
         "height": 1024,
         "renderer": str(args.renderer),
-    })
+        "limit_cpu_threads": args.cpu_threads,
+    }
+    if args.active_cuda_gpu is not None:
+        launch_config.update(active_cuda_gpus=[args.active_cuda_gpu],
+                             physics_gpu=args.active_cuda_gpu, multi_gpu=False)
+    if args.kit_log:
+        launch_config['extra_args'] = [f'--/log/file={args.kit_log}']
+    if args.shader_cache:
+        # Kit's shader cache permits one writer per directory. Sharing it
+        # between simultaneous GPU workers can stall driver compilation.
+        launch_config.setdefault('extra_args', []).extend([
+            f'--/rtx/shaderDb/shaderCachePath={args.shader_cache}/shaders',
+            f'--/rtx/shaderDb/driverShaderCachePath={args.shader_cache}/driver',
+        ])
+    simulation_app = SimulationApp(launch_config)
 
     # Import remaining Isaac Sim modules after SimulationApp is created.
     import omni.usd
     import omni.kit.app
     import omni.timeline
+    from omni.physx import get_physx_interface, get_physx_simulation_interface
 
     from pxr import Usd, UsdGeom, Gf, UsdLux, UsdPhysics, PhysxSchema, Sdf
 
@@ -780,6 +797,11 @@ def main(args):
         capture_viewport_to_buffer,
         create_viewport_window,
     )
+
+    def sync_physics_to_usd():
+        # State features, load metrics and bounds read USD. Physics-only ticks
+        # and tensor teleports must publish their results before those reads.
+        get_physx_interface().update_transformations(True, True, True)
 
     def create_video_overview_camera():
         """Create the fixed elevated camera used by the visible viewport."""
@@ -1692,9 +1714,10 @@ def main(args):
     # -----------------------------------------------------------------
     viewport = get_active_viewport()
     if viewport is None:
-        print("[ERROR] No active viewport found. Viewport capture cannot run.")
-        simulation_app.close()
-        return
+        overview_window = create_viewport_window(
+            name="Evaluation Overview", width=CAPTURE_WIDTH, height=CAPTURE_HEIGHT,
+        )
+        viewport = overview_window.viewport_api
 
     overview_camera_path = create_video_overview_camera()
 
@@ -1828,6 +1851,8 @@ def main(args):
         capture_views['overview'] = {
             'window': None, 'viewport': viewport, 'camera_path': overview_camera_path,
         }
+    elif args.headless:
+        viewport.updates_enabled = False
 
     # All non-sand scene work is complete at this point.
     wait_for_stage_loading_complete(
@@ -1840,6 +1865,11 @@ def main(args):
     if truck_pose_timeline_was_playing:
         timeline.pause()
         simulation_app.update()
+    # Sampling must always start from the authored truck, including after a
+    # previous episode placed it somewhere else.
+    truck_prim = stage.GetPrimAtPath(TRUCK_ROOT_PATH)
+    authored_truck_translation = prim_world_position(truck_prim).copy()
+    authored_truck_yaw = prim_local_yaw_z_deg(truck_prim)
     random_scene_profile = apply_randomized_dataset_scene()
     for _ in range(3):
         simulation_app.update()
@@ -1901,6 +1931,7 @@ def main(args):
             robot.set_joint_velocities(
                 np.zeros_like(original_joint_velocities)
             )
+            sync_physics_to_usd()
             for _ in range(3):
                 simulation_app.update()
 
@@ -1970,6 +2001,7 @@ def main(args):
         robot.set_joint_positions(snapshot["joint_positions"])
         robot.set_joint_velocities(snapshot["joint_velocities"])
         robot.apply_action(ArticulationAction(joint_positions=snapshot['joint_positions']))
+        sync_physics_to_usd()
         for _ in range(3):
             simulation_app.update()
 
@@ -3835,16 +3867,101 @@ def main(args):
     q_target = None
     last_idle_ui_update = 0.0
     idle_ui_interval = 1.0 / max(0.1, float(args.idle_ui_hz))
+    episode_initial_pose = {
+        "position": np.asarray(robot.get_world_pose()[0]).copy(),
+        "orientation": np.asarray(robot.get_world_pose()[1]).copy(),
+        "joint_positions": np.asarray(robot.get_joint_positions()).copy(),
+        "joint_velocities": np.zeros_like(robot.get_joint_velocities()),
+    }
+
+    def reset_evaluation_scene(scene_seed):
+        """Reset an episode without reopening USD or rebuilding render/PhysX assets."""
+        nonlocal random_scene_profile, sand_api
+        nonlocal state27_dig_target_world, state27_dig_target_source
+        nonlocal state27_unload_target_world, state27_unload_target_source, state27_truck_yaw
+        if not sand_enabled or args.sand_wall:
+            raise ValueError("Persistent evaluation requires sand and --no-sand-wall")
+        timeline.pause()
+        restore_excavator_pose_after_sand_init(episode_initial_pose)
+        robot.set_linear_velocity(np.zeros(3))
+        robot.set_angular_velocity(np.zeros(3))
+        args.scene_seed = int(scene_seed)
+        set_prim_translation_and_yaw(stage.GetPrimAtPath(TRUCK_ROOT_PATH),
+                                     authored_truck_translation, authored_truck_yaw)
+        simulation_app.update()
+        random_scene_profile = apply_randomized_dataset_scene()
+        lifted_pose = elevate_excavator_for_sand_init(
+            float(sand_module.SAND_FLOOR_Z), float(sand_module.SANDBOX_FILL_HEIGHT))
+        try:
+            sand_module.relocate_sand_source(random_scene_profile["sand_xy"])
+            sand_api = getattr(builtins, "_SAND_SITE", sand_api)
+            points, velocities, widths, _ = sand_module.sand_particle_points()
+            if not len(points):
+                raise RuntimeError("Episode reset generated no sand")
+            points_path = f"{sand_root_path}/{sand_module.PARTICLE_POINTS_PATH_SUFFIX}"
+            particle_prim = stage.GetPrimAtPath(points_path)
+            if not particle_prim.IsValid():
+                raise RuntimeError(f"Episode reset lost particle prim: {points_path}")
+            particles = UsdGeom.Points(particle_prim)
+            particles.GetPointsAttr().Set(points)
+            particles.GetVelocitiesAttr().Set(velocities)
+            particles.GetWidthsAttr().Set(widths)
+            sand_module.STATE.update(real_sand_particle_count=len(points), excavated_volume=0.0)
+            # Keep the collection settling procedure and duration. Only the
+            # rollout omits rendering on intermediate physics ticks.
+            timeline.play()
+            for _ in range(args.sand_settle_frames):
+                world.step(render=True)
+                simulation_app.update()
+        finally:
+            restore_excavator_pose_after_sand_init(lifted_pose)
+            restore_excavator_pose_after_sand_init(episode_initial_pose)
+            robot.set_linear_velocity(np.zeros(3))
+            robot.set_angular_velocity(np.zeros(3))
+        state27_dig_target_world, state27_dig_target_source = resolve_state27_dig_target()
+        state27_unload_target_world, state27_unload_target_source = resolve_state27_unload_target()
+        state27_truck_yaw = read_truck_yaw_rad()
+        hide_sand_source_guides()
+        return {"scene_seed": args.scene_seed, "particle_count": len(points),
+                "scene_profile": random_scene_profile}
+
     while simulation_app.is_running():
         lock_visible_viewport_to_overview()
 
         if not command_queue.empty():
             cmd = command_queue.get()
 
+            if cmd.get("type") == "reset_episode":
+                reset_start = time.perf_counter()
+                # Invalidate the old context even if reset fails. Motion must
+                # wait for a new handshake, source mask, scheduler and history.
+                active_contract = active_connection_id = tick_scheduler = None
+                active_observation_context = {}
+                active_phase_estimator = None
+                deployment_previous_q = deployment_previous_load = None
+                deployment_previous_fill_fraction = deployment_previous_fill_rate = None
+                deployment_elapsed_seconds = 0.0
+                q_target = None
+                bucket_source_tracker.clear()
+                try:
+                    seed = cmd["scene_seed"]
+                    if isinstance(seed, bool) or not isinstance(seed, int):
+                        raise ValueError("scene_seed must be an integer")
+                    result = reset_evaluation_scene(seed)
+                    response_queue.put({"type": "reset_episode_ack", "ok": True,
+                                        "reset_seconds": time.perf_counter() - reset_start, **result})
+                except Exception as exc:
+                    response_queue.put({"type": "error", "ok": False,
+                                        "error": f"EpisodeResetError: {type(exc).__name__}: {exc}"})
+                continue
+
             if cmd.get("type") == "scene_context":
                 response_queue.put({
                     "type": "scene_context",
                     "protocol_version": PROTOCOL_VERSION,
+                    "scene_seed": random_scene_profile["seed"],
+                    "scene_profile": random_scene_profile,
+                    "simulator_pid": os.getpid(),
                     "observation_context": {
                         "dig_target_xyz": state27_dig_target_world.tolist(),
                         "unload_landing_xyz": state27_unload_target_world.tolist(),
@@ -4031,9 +4148,14 @@ def main(args):
                 continue
 
             physics_start = time.perf_counter()
+            physics_time_before = world.current_time
             timeline.play()
+            # Timeline changes are queued until a Kit update. Physics-only
+            # steps need an explicit commit, or is_playing() remains false and
+            # World.step(render=False) silently performs no simulation.
+            timeline.commit()
             try:
-                for _ in range(bridge_step_ticks):
+                for tick in range(bridge_step_ticks):
                     q_target = q_target + vel * PHYSICS_DT
                     if canonical_joint_limits is not None:
                         q_target = np.clip(
@@ -4047,11 +4169,29 @@ def main(args):
                             joint_indices=canonical_joint_indices,
                         )
                     )
-                    world.step(render=True)
+                    # Refresh the viewport texture at the final physics state
+                    # before submitting readbacks. Capturing immediately after
+                    # physics-only ticks can otherwise return the previous
+                    # observation's texture from the renderer pipeline.
+                    render_tick = args.render_every_physics_step or tick == bridge_step_ticks - 1
+                    world.step(render=render_tick)
+                    if not render_tick:
+                        # PhysX simulate() is asynchronous. Fetch every tick
+                        # before issuing the next action or simulation step.
+                        get_physx_simulation_interface().fetch_results()
                     # simulation_app.update()
+                if not args.render_every_physics_step:
+                    sync_physics_to_usd()
             finally:
                 timeline.pause()
+                timeline.commit()
             physics_done = time.perf_counter()
+            physics_time_advanced = world.current_time - physics_time_before
+            if not math.isclose(physics_time_advanced, bridge_step_seconds, rel_tol=0.0, abs_tol=1.0e-5):
+                response_queue.put({"type": "error", "error": (
+                    f"Physics cadence mismatch: advanced {physics_time_advanced:.6f}s, "
+                    f"expected {bridge_step_seconds:.6f}s")})
+                continue
 
             q_raw, q = read_canonical_joint_positions()
             qd_raw, qd = read_canonical_joint_velocities()
@@ -4563,6 +4703,7 @@ def main(args):
                     "total_server_ms": (time.perf_counter() - bridge_step_start) * 1000.0,
                     "physics_ticks": int(bridge_step_ticks),
                     "simulated_seconds": float(bridge_step_seconds),
+                    "physics_time_advanced_seconds": float(physics_time_advanced),
                     "training_fps": float(active_contract["training_fps"]),
                 },
             }
@@ -4594,8 +4735,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--headless",
         action="store_true",
-        help="Accepted for compatibility; viewport capture still requires headless=False.",
+        help="Render offscreen policy cameras without opening an Isaac Sim window.",
     )
+    parser.add_argument('--active-cuda-gpu', type=int, default=None,
+                        help='CUDA device for both rendering and physics (honors CUDA_VISIBLE_DEVICES).')
+    parser.add_argument('--cpu-threads', type=int, default=16)
+    parser.add_argument('--kit-log', help='Independent Kit log path for this worker.')
+    parser.add_argument('--shader-cache', help='Persistent shader cache directory owned by this GPU worker.')
+    parser.add_argument('--render-every-physics-step', action=argparse.BooleanOptionalAction, default=True,
+                        help='Compatibility mode: also render intermediate physics ticks.')
     parser.add_argument(
         "--sand-amount",
         type=float,
@@ -4722,11 +4870,8 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    if args.headless:
-        print(
-            "[WARN] --headless was passed, but viewport capture requires "
-            "SimulationApp(headless=False)."
-        )
+    if args.cpu_threads < 1:
+        parser.error('--cpu-threads must be positive')
 
     if args.sand_settle_frames < 1:
         parser.error("--sand-settle-frames must be at least 1")

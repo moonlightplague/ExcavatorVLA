@@ -160,6 +160,7 @@ from excavator_common import vla_observation_contract
 from excavator_common import deployment_scene_contract
 from excavator_common.mesh_topology import closed_mesh_boundary_edge_count
 from excavator_common.evaluation_metrics import ParticleTransferTracker
+from excavator_common.evaluation_standard import TRUCK_COUNT_METHOD, canonical_joint_limits as resolve_joint_limits
 
 print(
     "[INFO] Run simulation project root:",
@@ -428,7 +429,7 @@ def capture_rgb_from_persistent_viewports(
         # renders all persistent viewports without advancing simulation time.
         simulation_app.update()
         render_updates += 1
-        if all(result["done"] for result in results.values()):
+        if render_updates >= int(wait_frames) and all(result["done"] for result in results.values()):
             break
         if time.perf_counter() >= deadline:
             break
@@ -1665,11 +1666,6 @@ def main(args):
     except Exception as e:
         print("[WARN] Could not get robot.dof_names:", repr(e), flush=True)
 
-    try:
-        print("[INFO] Joint names:", robot.joint_names, flush=True)
-    except Exception as e:
-        print("[WARN] Could not get robot.joint_names:", repr(e), flush=True)
-
     print(
         "[BRIDGE CONTRACT] DOF mapping:",
         f"raw_dof_names={raw_dof_names}",
@@ -1694,17 +1690,11 @@ def main(args):
 
     canonical_joint_limits = None
     try:
-        raw_limits = np.asarray(robot.get_dof_limits(), dtype=np.float32)
-        if raw_limits.ndim == 3:
-            raw_limits = raw_limits[0]
-        if raw_limits.ndim == 2 and raw_limits.shape[1] >= 2:
-            canonical_joint_limits = raw_limits[canonical_joint_indices, :2].copy()
-            print(
-                "[BRIDGE CONTRACT] canonical_joint_limits_rad=",
-                canonical_joint_limits.tolist(),
-                flush=True,
-            )
+        canonical_joint_limits = resolve_joint_limits(robot, canonical_joint_indices, np)
+        print('[BRIDGE CONTRACT] canonical_joint_limits_rad=', canonical_joint_limits.tolist(), flush=True)
     except Exception as exc:
+        if os.environ.get('EXCAVATOR_EVAL_METRICS') == '1':
+            raise RuntimeError('Evaluation requires valid articulation joint limits') from exc
         print("[WARN] Could not resolve canonical joint limits:", repr(exc), flush=True)
 
     # -----------------------------------------------------------------
@@ -1848,7 +1838,8 @@ def main(args):
 
     # Capture the existing display viewport alongside model cameras while the
     # timeline is paused. Its frame travels separately from model observations.
-    if os.environ.get('EXCAVATOR_EVAL_VIDEO') == '1':
+    if (os.environ.get('EXCAVATOR_EVAL_VIDEO') == '1'
+            or os.environ.get('EXCAVATOR_EVAL_METRICS') == '1'):
         capture_views['overview'] = {
             'window': None, 'viewport': viewport, 'camera_path': overview_camera_path,
         }
@@ -2846,6 +2837,7 @@ def main(args):
         result = {
             "available": False,
             "source": TRUCK_BED_COLLISION_PATH,
+            "scene_seed": int(random_scene_profile["seed"]),
             "reason": "",
             "local_min": None,
             "local_max": None,
@@ -2873,7 +2865,10 @@ def main(args):
                 ],
                 useExtentsHint=True,
             )
-            aligned_range = bbox_cache.ComputeLocalBound(
+            # ComputeLocalBound includes this prim's own transform. The point
+            # inverse below maps all the way into mesh coordinates, so its box
+            # must exclude that transform to avoid applying it twice.
+            aligned_range = bbox_cache.ComputeUntransformedBound(
                 bed_prim
             ).ComputeAlignedRange()
             if aligned_range.IsEmpty():
@@ -2902,26 +2897,31 @@ def main(args):
                 )
                 return result
 
+            world_from_local = UsdGeom.Xformable(
+                bed_prim
+            ).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+            # USD prim scales need not be one. Specify the tolerances in world
+            # meters and convert them into the mesh coordinates used below.
+            axis_scales = np.linalg.norm(np.asarray(world_from_local)[:3, :3], axis=1)
+            if not np.all(np.isfinite(axis_scales)) or np.any(axis_scales <= 1.0e-8):
+                raise ValueError('Invalid truck bed transform scale')
             # The collision mesh includes the floor and walls. Inset its
             # horizontal extent so particles sliding down an outer face do
             # not count. Only a small tolerance above the authored wall top
             # is allowed, so material still carried above the truck is not
             # mistaken for deposited material.
             horizontal_margin = float(
-                min(0.05, 0.05 * float(min(span[0], span[1])))
+                min(0.05, 0.05 * float(min(span[:2] * axis_scales[:2])))
             )
             lower_margin = 0.03
             upper_extra = 0.05
             count_min = local_min.copy()
             count_max = local_max.copy()
-            count_min[:2] += horizontal_margin
-            count_max[:2] -= horizontal_margin
-            count_min[2] -= lower_margin
-            count_max[2] += upper_extra
+            count_min[:2] += horizontal_margin / axis_scales[:2]
+            count_max[:2] -= horizontal_margin / axis_scales[:2]
+            count_min[2] -= lower_margin / axis_scales[2]
+            count_max[2] += upper_extra / axis_scales[2]
 
-            world_from_local = UsdGeom.Xformable(
-                bed_prim
-            ).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
             local_from_world = world_from_local.GetInverse()
             authored_world_range = bbox_cache.ComputeWorldBound(
                 bed_prim
@@ -3322,7 +3322,13 @@ def main(args):
         start = time.perf_counter()
         result = {
             "available": bool(truck_bed_counting_volume["available"]),
-            "method": "world_aabb_excluding_bucket_v2",
+            "method": TRUCK_COUNT_METHOD,
+            "scene_seed": truck_bed_counting_volume["scene_seed"],
+            "counting_volume": {
+                key: np.asarray(truck_bed_counting_volume[key]).tolist()
+                for key in ("world_min", "world_max", "local_min", "local_max")
+                if truck_bed_counting_volume[key] is not None
+            },
             "count": 0,
             "particle_count": 0,
             "candidate_count": 0,
@@ -3347,6 +3353,8 @@ def main(args):
             "elapsed_ms": 0.0,
         }
         try:
+            if truck_bed_counting_volume["scene_seed"] != int(random_scene_profile["seed"]):
+                raise ValueError("Truck counting volume belongs to a different scene")
             if not truck_bed_counting_volume["available"]:
                 return result
 
@@ -3475,11 +3483,10 @@ def main(args):
             result["bucket_overlap_count"] = int(
                 np.count_nonzero(bucket_overlap)
             )
-            result["count"] = int(
-                np.count_nonzero(~bucket_overlap)
-            )
+            deposited = inside_local_box & ~bucket_overlap
+            result["count"] = int(np.count_nonzero(deposited))
             if particle_indices is not None:
-                particle_indices.extend(np.flatnonzero(candidate_mask)[~bucket_overlap].tolist())
+                particle_indices.extend(np.flatnonzero(candidate_mask)[deposited].tolist())
             return result
         except Exception as exc:
             result["available"] = False
@@ -3886,6 +3893,7 @@ def main(args):
         nonlocal random_scene_profile, sand_api
         nonlocal state27_dig_target_world, state27_dig_target_source
         nonlocal state27_unload_target_world, state27_unload_target_source, state27_truck_yaw
+        nonlocal truck_bed_counting_volume
         if not sand_enabled or args.sand_wall:
             raise ValueError("Persistent evaluation requires sand and --no-sand-wall")
         timeline.pause()
@@ -3928,6 +3936,9 @@ def main(args):
         state27_dig_target_world, state27_dig_target_source = resolve_state27_dig_target()
         state27_unload_target_world, state27_unload_target_source = resolve_state27_unload_target()
         state27_truck_yaw = read_truck_yaw_rad()
+        truck_bed_counting_volume = authored_truck_bed_counting_volume()
+        if not truck_bed_counting_volume["available"]:
+            raise RuntimeError(f"Invalid truck counting volume after reset: {truck_bed_counting_volume['reason']}")
         hide_sand_source_guides()
         return {"scene_seed": args.scene_seed, "particle_count": len(points),
                 "scene_profile": random_scene_profile}
@@ -3968,6 +3979,15 @@ def main(args):
                     "protocol_version": PROTOCOL_VERSION,
                     "scene_seed": random_scene_profile["seed"],
                     "scene_profile": random_scene_profile,
+                    "canonical_joint_limits_rad": (canonical_joint_limits.tolist()
+                                                   if canonical_joint_limits is not None else None),
+                    "truck_counting_volume": {
+                        "method": TRUCK_COUNT_METHOD,
+                        "scene_seed": truck_bed_counting_volume["scene_seed"],
+                        **{key: truck_bed_counting_volume[key].tolist()
+                           for key in ("world_min", "world_max", "local_min", "local_max")
+                           if truck_bed_counting_volume[key] is not None},
+                    },
                     "simulator_pid": os.getpid(),
                     "observation_context": {
                         "dig_target_xyz": state27_dig_target_world.tolist(),
@@ -4224,6 +4244,11 @@ def main(args):
             encode_start = time.perf_counter()
             encoded_cameras = {}
             for camera_name, rgb in rgb_by_camera.items():
+                # Recording must not change the active viewports or render history.
+                # The overview is always captured in evaluation; only its transport
+                # and MP4 encoding depend on the recording option.
+                if camera_name == 'overview' and os.environ.get('EXCAVATOR_EVAL_VIDEO') != '1':
+                    continue
                 rgb = np.asarray(rgb)
 
                 if rgb.dtype != np.uint8:
@@ -4739,11 +4764,11 @@ def main(args):
             response_queue.put(reply)
 
         else:
-            # Network I/O runs on a dedicated thread.  Keep the paused UI
-            # responsive at a low rate instead of continuously RayTracing while
-            # the policy uses the GPU.
+            # Network I/O runs on a dedicated thread. Headless rendering must
+            # be driven only by physics/capture, never by wall-clock inference
+            # or MP4 latency. GUI diagnostics still need periodic UI updates.
             now = time.perf_counter()
-            if now - last_idle_ui_update >= idle_ui_interval:
+            if not args.headless and now - last_idle_ui_update >= idle_ui_interval:
                 lock_visible_viewport_to_overview()
                 simulation_app.update()
                 last_idle_ui_update = now

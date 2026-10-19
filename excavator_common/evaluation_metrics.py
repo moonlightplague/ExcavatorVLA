@@ -3,6 +3,7 @@ from collections import Counter
 import math
 from numbers import Integral
 import statistics
+from .evaluation_standard import EVALUATION_STANDARD
 
 
 METRIC_FIELDS = (
@@ -28,8 +29,10 @@ METRIC_DEFINITIONS = {
     'step_latency_ms': 'Per action: input validation, optional inference, action preparation, bridge round trip and returned-state validation; excludes trace/video writing.',
     'fps': 'Executed policy actions / rollout wall seconds, including trace/video writing; excludes startup/reset, initial observation and final video hold.',
     'aggregation': 'Numeric summary statistics describe completed episodes. Latency means/percentiles are computed within each episode; summary distributions are over episode values. Unavailable measurements are null.',
-    'failure_mode': 'none, no_payload, lost_payload, insufficient_payload, unstable_deposit, bucket_not_open, infrastructure_error, validation_error; unclassified for historical results without enough measurements.',
+    'failure_mode': 'v2: none, no_scoop, retained_payload, no_payload, lost_payload, insufficient_payload, completion_not_sustained, bucket_not_open, infrastructure_error, validation_error. Historical v1 may use unstable_deposit or unclassified.',
     'particle_sampling': 'Particle IDs are sampled once per returned observation. Transfers occurring entirely between observations are not observed. Counts use the strict initial-pile mask, independently of the observation load fallback.',
+    'completion_v2': 'Payload at or above the configured threshold AND bucket angle at least -0.8 rad for three consecutive action observations; increasing payload is allowed. The initial observation is excluded. Success and full task completion are identical.',
+    'truck_geometry_v3': 'Initial-pile IDs inside the current truck bed local bounding box (XY inset 0.05 m or less, lower Z tolerance 0.03 m, upper Z tolerance 0.05 m), excluding the current bucket. This is sampled geometric occupancy, not a contact or rest detector.',
 }
 
 
@@ -92,6 +95,16 @@ def failure_mode(status):
     minimum = status.get('min_particles')
     if minimum is None:
         return 'unclassified'
+    if status.get('evaluation_standard') == EVALUATION_STANDARD:
+        if payload >= minimum:
+            return 'bucket_not_open' if not status.get('final_bucket_open') else 'completion_not_sustained'
+        if payload > 0:
+            return 'insufficient_payload'
+        if status.get('retained_particles', 0) > 0:
+            return 'retained_payload'
+        if status.get('scooped_particles') == 0:
+            return 'no_scoop'
+        return 'lost_payload' if status.get('spillage_particles', 0) > 0 else 'no_payload'
     if payload >= minimum:
         return 'unstable_deposit'
     if payload > 0:

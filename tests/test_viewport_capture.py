@@ -74,6 +74,11 @@ class ViewportCaptureTests(unittest.TestCase):
         self.assertEqual(self.frames, 9)
         self.assertEqual(self.namespace['PENDING_VIEWPORT_CAPTURE_HELPERS'], [])
 
+    def test_early_readback_keeps_the_fixed_render_budget(self):
+        self.capture()
+        self.assertEqual(self.frames, 5)
+        self.assertEqual(self.namespace['LAST_CAPTURE_TIMING_MS']['camera_render_updates'], 5)
+
     def test_overview_keeps_video_resolution_and_model_cameras_keep_default(self):
         calls = []
 
@@ -130,7 +135,7 @@ class ViewportCaptureTests(unittest.TestCase):
         self.namespace['capsule_to_numpy_rgba'] = lambda *args: np.zeros((2, 2, 4), dtype=np.uint8)
         with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, 'all-zero RGB'):
             self.capture()
-        self.assertEqual(self.frames, 3)
+        self.assertEqual(self.frames, 15)
         self.assertEqual(self.namespace['PENDING_VIEWPORT_CAPTURE_HELPERS'], [])
 
     def test_opaque_black_render_is_delivered_without_fabricated_pixels(self):
@@ -140,7 +145,7 @@ class ViewportCaptureTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             rgb = self.capture()['0']
         np.testing.assert_array_equal(rgb, rgba[:, :, :3])
-        self.assertEqual(self.frames, 3)
+        self.assertEqual(self.frames, 15)
         self.assertEqual(self.namespace['PENDING_VIEWPORT_CAPTURE_HELPERS'], [])
 
     def test_bridge_returns_capture_error_to_client(self):

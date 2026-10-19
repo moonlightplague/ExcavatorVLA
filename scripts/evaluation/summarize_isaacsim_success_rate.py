@@ -16,11 +16,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from excavator_common.evaluation_metrics import (
     METRIC_DEFINITIONS, METRIC_FIELDS, failure_mode, failure_mode_counts, numeric_summary,
 )
+from excavator_common.evaluation_standard import EVALUATION_STANDARD
 
 
 EPISODE_PATTERN = re.compile(r"episode_(\d+)$")
 CSV_FIELDS = (
     "episode_index",
+    "scene_seed",
+    "evaluation_standard",
+    "evaluation_profile",
+    "evaluation_id",
+    "checkpoint_sha256",
     "status",
     "success",
     "task_completed_success_and_bucket_open",
@@ -38,6 +44,8 @@ CSV_FIELDS = (
     "rollout_time_from_policy_start_seconds",
     "rollout_time_from_simulation_launch_seconds",
     "min_particles",
+    "completion_observations",
+    "clipped_action_fraction",
     "execution_source",
     "metrics_schema_version",
     "failure_mode",
@@ -80,6 +88,16 @@ def load_episode_rows(episodes_dir: Path) -> list[dict[str, Any]]:
                     raise RuntimeError(
                         f"validation status={validation.get('status')!r}"
                     )
+                if payload.get('evaluation_standard') == EVALUATION_STANDARD:
+                    if (type(payload.get('success')) is not bool
+                            or payload['success'] != payload.get('task_completed_success_and_bucket_open')
+                            or not payload.get('evaluation_id') or not payload.get('checkpoint_sha256')):
+                        raise RuntimeError('Invalid v2 completion state or missing evaluation identity')
+                    if payload['success'] and (
+                            payload.get('completion_observations', 0) < 3
+                            or not payload.get('final_bucket_open')
+                            or payload.get('payload_particles', -1) < payload.get('min_particles', 1)):
+                        raise RuntimeError('Success does not meet the v2 completion rule')
             except Exception as exc:
                 payload["status"] = "validation_error"
                 payload["error"] = (
@@ -135,8 +153,24 @@ def build_summary(
     ]
     completed_total = len(completed)
     success_total = len(successes)
+    identities = {(row.get('evaluation_standard'), row.get('evaluation_profile'),
+                   row.get('evaluation_id'), row.get('execution_source'),
+                   row.get('checkpoint_sha256')) for row in rows}
+    if len(identities) > 1:
+        raise ValueError('Cannot aggregate different evaluation standards, profiles, identities or execution sources')
+    standard, profile, identity, source, checkpoint = next(iter(identities)) if identities else (None,) * 5
+    indices = [int(row['episode_index']) for row in rows]
+    if len(set(indices)) != len(indices) or any(i < 1 or i > expected_episodes for i in indices):
+        raise ValueError('Duplicate or out-of-range episode indices')
+    official = (standard == EVALUATION_STANDARD and profile == 'standard' and source == 'model'
+                and bool(identity) and completed_total == expected_episodes and not errors)
     return {
         "schema_version": "excavator_success_rate_summary_v1",
+        "evaluation_standard": standard,
+        "evaluation_profile": profile,
+        "evaluation_id": identity,
+        "official_result_valid": official,
+        "official_success_rate": success_total / expected_episodes if official else None,
         "expected_episodes": int(expected_episodes),
         "status_files_found": len(rows),
         "completed_episodes": completed_total,

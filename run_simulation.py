@@ -159,6 +159,7 @@ from excavator_common.deployment_contract import (
 from excavator_common import vla_observation_contract
 from excavator_common import deployment_scene_contract
 from excavator_common.mesh_topology import closed_mesh_boundary_edge_count
+from excavator_common.evaluation_metrics import ParticleTransferTracker
 
 print(
     "[INFO] Run simulation project root:",
@@ -3139,7 +3140,7 @@ def main(args):
             result["reason"] = f"{type(exc).__name__}:{exc}"
             return result
 
-    def estimate_bucket_load_particles(source_tracking_required=False):
+    def estimate_bucket_load_particles(source_tracking_required=False, particle_indices=None):
         start = time.perf_counter()
         result = {
             "count": 0,
@@ -3272,6 +3273,10 @@ def main(args):
                 inside_candidate_indices = candidate_indices[
                     np.nonzero(inside)[0]
                 ]
+                if particle_indices is not None:
+                    particle_indices.extend(
+                        inside_candidate_indices[initial_mask[inside_candidate_indices]].tolist()
+                    )
                 raw_from_pile = int(
                     np.count_nonzero(initial_mask[inside_candidate_indices])
                 )
@@ -3313,7 +3318,7 @@ def main(args):
         finally:
             result["elapsed_ms"] = (time.perf_counter() - start) * 1000.0
 
-    def estimate_truck_bed_load_particles():
+    def estimate_truck_bed_load_particles(particle_indices=None):
         start = time.perf_counter()
         result = {
             "available": bool(truck_bed_counting_volume["available"]),
@@ -3473,6 +3478,8 @@ def main(args):
             result["count"] = int(
                 np.count_nonzero(~bucket_overlap)
             )
+            if particle_indices is not None:
+                particle_indices.extend(np.flatnonzero(candidate_mask)[~bucket_overlap].tolist())
             return result
         except Exception as exc:
             result["available"] = False
@@ -4257,10 +4264,30 @@ def main(args):
                     OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT,
                 )
             )
+            track_evaluation_particles = os.environ.get('EXCAVATOR_EVAL_METRICS') == '1'
+            bucket_particle_indices = [] if track_evaluation_particles else None
+            truck_particle_indices = [] if track_evaluation_particles else None
             bucket_load_metrics = estimate_bucket_load_particles(
                 source_tracking_required=use_dataset_bucket_source_tracking,
+                particle_indices=bucket_particle_indices,
             )
-            truck_bed_load_metrics = estimate_truck_bed_load_particles()
+            truck_bed_load_metrics = estimate_truck_bed_load_particles(truck_particle_indices)
+            particle_transfer_metrics = None
+            if track_evaluation_particles:
+                particle_transfer_metrics = {'available': False, 'reason': 'invalid_source_tracking'}
+                if (use_dataset_bucket_source_tracking
+                        and bucket_load_metrics['source_tracking_valid']
+                        and truck_bed_load_metrics['available']
+                        and truck_bed_load_metrics['source_tracking_valid']
+                        and bucket_load_metrics['particle_count'] == truck_bed_load_metrics['particle_count']):
+                    try:
+                        tracker = bucket_source_tracker.get('transfer_history')
+                        if tracker is None:
+                            tracker = bucket_source_tracker['transfer_history'] = ParticleTransferTracker()
+                        particle_transfer_metrics = tracker.observe(
+                            bucket_load_metrics['particle_count'], bucket_particle_indices, truck_particle_indices)
+                    except ValueError as exc:
+                        particle_transfer_metrics = {'available': False, 'reason': str(exc)}
 
             tip_xyz = [0.0, 0.0, 0.0]
             load_xyz = [0.0, 0.0, 0.0]
@@ -4685,6 +4712,7 @@ def main(args):
                 "phase_source": str(observation_phase_source),
                 "bucket_load_metrics": bucket_load_metrics,
                 "truck_bed_load_metrics": truck_bed_load_metrics,
+                "particle_transfer_metrics": particle_transfer_metrics,
                 "task_text": task_text,
                 "primary_camera": primary_camera,
                 "rgb_shape": primary_rgb["rgb_shape"],

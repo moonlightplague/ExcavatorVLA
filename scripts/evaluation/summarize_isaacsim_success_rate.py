@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate Isaac Sim excavation success-rate episode status files."""
+"""Aggregate Isaac Sim excavation success, material transfer and timing metrics."""
 
 from __future__ import annotations
 
@@ -8,9 +8,14 @@ import csv
 import json
 import math
 import re
-import statistics
+import sys
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from excavator_common.evaluation_metrics import (
+    METRIC_DEFINITIONS, METRIC_FIELDS, failure_mode, failure_mode_counts, numeric_summary,
+)
 
 
 EPISODE_PATTERN = re.compile(r"episode_(\d+)$")
@@ -32,6 +37,11 @@ CSV_FIELDS = (
     "task_completion_time_from_simulation_launch_seconds",
     "rollout_time_from_policy_start_seconds",
     "rollout_time_from_simulation_launch_seconds",
+    "min_particles",
+    "execution_source",
+    "metrics_schema_version",
+    "failure_mode",
+    *METRIC_FIELDS,
     "error",
     "status_path",
 )
@@ -81,37 +91,15 @@ def load_episode_rows(episodes_dir: Path) -> list[dict[str, Any]]:
             for field in CSV_FIELDS
             if field not in ("episode_index", "status_path")
         }
+        if payload.get('status') != 'completed' or not row.get('failure_mode'):
+            row['failure_mode'] = failure_mode(payload)
+        if payload.get('status') != 'completed':
+            row['cycle_time_seconds'] = row['cycle_time_wall_seconds'] = None
         row["episode_index"] = index
         row["status_path"] = str(status_path.resolve())
         rows.append(row)
     rows.sort(key=lambda item: int(item["episode_index"]))
     return rows
-
-
-def numeric_summary(values: Iterable[Any]) -> dict[str, float | int | None]:
-    finite = sorted(
-        float(value)
-        for value in values
-        if value is not None and math.isfinite(float(value))
-    )
-    if not finite:
-        return {
-            "count": 0,
-            "min": None,
-            "mean": None,
-            "median": None,
-            "p95": None,
-            "max": None,
-        }
-    p95_index = max(0, math.ceil(0.95 * len(finite)) - 1)
-    return {
-        "count": len(finite),
-        "min": finite[0],
-        "mean": statistics.fmean(finite),
-        "median": statistics.median(finite),
-        "p95": finite[p95_index],
-        "max": finite[-1],
-    }
 
 
 def wilson_interval(successes: int, total: int) -> list[float | None]:
@@ -169,6 +157,13 @@ def build_summary(
         "early_terminated_episodes": sum(
             bool(row["early_terminated"]) for row in completed
         ),
+        "metrics_schema_version": "excavator_evaluation_metrics_v1",
+        "metric_definitions": METRIC_DEFINITIONS,
+        "metrics": {
+            field: numeric_summary(row.get(field) for row in completed)
+            for field in METRIC_FIELDS
+        },
+        "failure_mode_counts": failure_mode_counts(rows),
         "successful_episode_timing_seconds": {
             field: numeric_summary(row[field] for row in successes)
             for field in (

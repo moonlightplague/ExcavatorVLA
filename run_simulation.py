@@ -158,6 +158,7 @@ from excavator_common.deployment_contract import (
 )
 from excavator_common import vla_observation_contract
 from excavator_common import deployment_scene_contract
+from excavator_common.collection_target import dig_target_from_particles, SAND_INITIALIZATION_METHOD
 from excavator_common.mesh_topology import closed_mesh_boundary_edge_count
 from excavator_common.evaluation_metrics import ParticleTransferTracker
 from excavator_common.evaluation_standard import TRUCK_COUNT_METHOD, canonical_joint_limits as resolve_joint_limits
@@ -2328,11 +2329,8 @@ def main(args):
             flush=True,
         )
     else:
-        clean_retaining_walls = sand_api.get(
-            "clean_sand_retaining_walls"
-        )
-        if callable(clean_retaining_walls):
-            clean_retaining_walls()
+        # The rectangular generation walls must remain through settling.
+        # Disabling the optional circular wall must not remove them early.
         if stage.GetPrimAtPath(circular_wall_path).IsValid():
             raise RuntimeError(
                 "Circular sand wall remained after it was disabled: "
@@ -2344,6 +2342,15 @@ def main(args):
             f"sand_wall={bool(args.sand_wall)}",
             flush=True,
         )
+
+    def remove_sand_settling_walls():
+        """Match collection: remove temporary rectangular walls after settling."""
+        clean_retaining_walls = sand_api.get("clean_sand_retaining_walls")
+        if not callable(clean_retaining_walls):
+            raise RuntimeError("Sand runtime cannot remove temporary retaining walls")
+        clean_retaining_walls()
+        if stage.GetPrimAtPath(sand_wall_path).IsValid():
+            raise RuntimeError(f"Temporary sand retaining walls remained: {sand_wall_path}")
 
     actual_sand_center = (
         float(getattr(sand_module, "SAND_CENTER_X", float("nan"))),
@@ -2650,6 +2657,7 @@ def main(args):
             flush=True,
         )
 
+        remove_sand_settling_walls()
         restore_excavator_pose_after_sand_init(
             excavator_pose_snapshot
         )
@@ -3546,8 +3554,12 @@ def main(args):
             )
         return math.radians(prim_local_yaw_z_deg(truck_prim))
 
+    dig_target_generation = {}
+
     def resolve_state27_dig_target():
+        dig_target_generation.clear()
         if args.state27_dig_target_world is not None:
+            dig_target_generation.update(method="cli_recorded_dig_target")
             return (
                 np.asarray(
                     args.state27_dig_target_world,
@@ -3569,41 +3581,26 @@ def main(args):
                 random_scene_profile["sand_xy"][1],
             )
         )
-        target_z = 0.35
-        source = "configured_sand_center"
+        if not sand_enabled:
+            dig_target_generation.update(method="configured_sand_center_no_particles")
+            return np.asarray([center_x, center_y, 0.35], dtype=np.float32), "configured_sand_center"
         positions_fn = (
             sand_api.get("particle_positions_fn")
             if isinstance(sand_api, dict)
             else None
         )
-        if callable(positions_fn):
-            try:
-                points = np.asarray(
-                    positions_fn(),
-                    dtype=np.float32,
-                ).reshape(-1, 3)
-                if len(points):
-                    radius_squared = (
-                        np.square(points[:, 0] - center_x)
-                        + np.square(points[:, 1] - center_y)
-                    )
-                    local_points = points[radius_squared <= 1.0]
-                    if len(local_points) < 32:
-                        local_points = points
-                    target_z = float(
-                        np.percentile(local_points[:, 2], 65.0)
-                    )
-                    source = "sand_particle_percentile65"
-            except Exception as exc:
-                print(
-                    "[STATE27] Dig target particle lookup failed:",
-                    repr(exc),
-                    flush=True,
-                )
-        return np.asarray(
-            [center_x, center_y, target_z],
-            dtype=np.float32,
-        ), source
+        if not callable(positions_fn):
+            raise RuntimeError("Dig target requires settled sand particle positions")
+        points = np.asarray(positions_fn(), dtype=np.float32).reshape(-1, 3)
+        # Collection supplies a below-surface cut target, not a percentile of
+        # pile particle heights. Match its local cut-path probes and depth.
+        target, report = dig_target_from_particles(
+            points, [center_x, center_y], np.asarray(robot.get_world_pose()[0])[:2],
+            floor_z=float(sand_module.SAND_FLOOR_Z), np_module=np,
+        )
+        dig_target_generation.update(report)
+        print("[STATE28] Collection-compatible dig target:", report, flush=True)
+        return np.asarray(target, dtype=np.float32), report["method"]
 
     def resolve_state27_unload_target():
         bed_prim = stage.GetPrimAtPath(TRUCK_BED_COLLISION_PATH)
@@ -3910,6 +3907,11 @@ def main(args):
         try:
             sand_module.relocate_sand_source(random_scene_profile["sand_xy"])
             sand_api = getattr(builtins, "_SAND_SITE", sand_api)
+            if args.retaining_walls:
+                create_walls = sand_api.get("create_sand_retaining_walls")
+                if not callable(create_walls):
+                    raise RuntimeError("Sand runtime cannot create temporary retaining walls")
+                create_walls()
             points, velocities, widths, _ = sand_module.sand_particle_points()
             if not len(points):
                 raise RuntimeError("Episode reset generated no sand")
@@ -3929,10 +3931,13 @@ def main(args):
                 world.step(render=True)
                 simulation_app.update()
         finally:
-            restore_excavator_pose_after_sand_init(lifted_pose)
-            restore_excavator_pose_after_sand_init(episode_initial_pose)
-            robot.set_linear_velocity(np.zeros(3))
-            robot.set_angular_velocity(np.zeros(3))
+            try:
+                remove_sand_settling_walls()
+            finally:
+                restore_excavator_pose_after_sand_init(lifted_pose)
+                restore_excavator_pose_after_sand_init(episode_initial_pose)
+                robot.set_linear_velocity(np.zeros(3))
+                robot.set_angular_velocity(np.zeros(3))
         state27_dig_target_world, state27_dig_target_source = resolve_state27_dig_target()
         state27_unload_target_world, state27_unload_target_source = resolve_state27_unload_target()
         state27_truck_yaw = read_truck_yaw_rad()
@@ -3979,6 +3984,13 @@ def main(args):
                     "protocol_version": PROTOCOL_VERSION,
                     "scene_seed": random_scene_profile["seed"],
                     "scene_profile": random_scene_profile,
+                    "sand_initialization": {
+                        "method": SAND_INITIALIZATION_METHOD,
+                        "settle_frames": int(args.sand_settle_frames),
+                        "temporary_rectangular_walls": bool(args.retaining_walls),
+                        "circular_wall": bool(args.sand_wall),
+                    },
+                    "dig_target_generation": dict(dig_target_generation),
                     "canonical_joint_limits_rad": (canonical_joint_limits.tolist()
                                                    if canonical_joint_limits is not None else None),
                     "truck_counting_volume": {

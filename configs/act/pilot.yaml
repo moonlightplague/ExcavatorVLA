@@ -1,0 +1,7 @@
+extends: full.yaml
+steps: 5000
+save_freq: 1000
+log_freq: 100
+job_name: excavator_act_pilot
+benchmark:
+  validation_freq: 1000

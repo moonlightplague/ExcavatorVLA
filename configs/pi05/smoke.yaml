@@ -1,0 +1,14 @@
+extends: full.yaml
+steps: 20
+batch_size: 1
+num_workers: 0
+save_freq: 20
+log_freq: 1
+job_name: excavator_pi05_smoke
+training:
+  gradient_accumulation_steps: 1
+benchmark:
+  validation_freq: 20
+  validation_max_batches: 1
+launcher:
+  gpu_ids: [0]

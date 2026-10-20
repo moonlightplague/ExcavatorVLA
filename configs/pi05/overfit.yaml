@@ -1,0 +1,13 @@
+extends: full.yaml
+dataset:
+  episodes: [1]
+steps: 2000
+num_workers: 0
+save_freq: 500
+log_freq: 50
+job_name: excavator_pi05_overfit
+benchmark:
+  validation_freq: 500
+  validation_max_batches: 10
+launcher:
+  gpu_ids: [0]

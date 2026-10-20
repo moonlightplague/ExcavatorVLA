@@ -1,0 +1,16 @@
+extends: full.yaml
+# Freeze split first, then choose one high-quality TRAIN episode explicitly.
+# Episode 1 belongs to the frozen training split; held-out overrides are rejected.
+dataset:
+  episodes: [1]
+steps: 2000
+batch_size: 8
+num_workers: 2
+save_freq: 500
+log_freq: 50
+job_name: excavator_act_overfit
+benchmark:
+  validation_freq: 500
+  validation_max_batches: 10
+launcher:
+  gpu_ids: [0]

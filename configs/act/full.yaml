@@ -1,0 +1,49 @@
+# Paths are relative to this file. Batch size is per GPU.
+dataset:
+  repo_id: local/excavator
+  root: ../../../data/export
+  episodes: null
+  video_backend: pyav
+policy:
+  type: act
+  device: cuda
+  n_obs_steps: 1
+  chunk_size: 10
+  n_action_steps: 3
+  vision_backbone: resnet18
+  pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1
+  dim_model: 512
+  n_heads: 8
+  dim_feedforward: 3200
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+  temporal_ensemble_coeff: null
+  kl_weight: 10.0
+  dropout: 0.1
+  optimizer_lr: 0.00001
+  optimizer_lr_backbone: 0.00001
+  optimizer_weight_decay: 0.0001
+steps: 40000
+batch_size: 8
+num_workers: 8
+seed: 1000
+save_freq: 5000
+log_freq: 200
+grad_clip_norm: 10.0
+job_name: excavator_act
+output_dir: null
+benchmark:
+  split_file: ../splits/excavator_v4_seed1000.json
+  split_seed: 1000
+  validation_freq: 5000
+  validation_max_batches: 0  # 0 evaluates the full validation split.
+launcher:
+  output_root: ../../../outputs/train
+  hf_home: ../../../models/hf-cache
+  torch_home: ../../../models/torch-cache
+  gpu_ids: [0, 1]
+  mixed_precision: bf16
+  cpu_threads: 4

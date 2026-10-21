@@ -76,10 +76,11 @@ def evaluate_loader(policy, pre, post, loader, limits, max_batches=0):
             actions = torch.stack([post(chunk[:, i]) for i in range(chunk.shape[1])], dim=1).cpu().numpy()
         times.append((time.perf_counter() - started) * 1000)
         predicted.append(actions)
-        targets.append(batch['action'].cpu().numpy())
-        pads.append(batch['action_is_pad'].cpu().numpy())
-        weights.append(batch['action_loss_weight'].cpu().numpy().reshape(actions.shape[:2]))
-        recovery.append(batch['observation.recovery_active'].cpu().numpy().reshape(actions.shape[:2]))
+        n_steps = actions.shape[1]
+        targets.append(batch['action'].cpu().numpy()[:, :n_steps])
+        pads.append(batch['action_is_pad'].cpu().numpy()[:, :n_steps])
+        weights.append(batch['action_loss_weight'].cpu().numpy()[:, :n_steps].reshape(actions.shape[:2]))
+        recovery.append(batch['observation.recovery_active'].cpu().numpy()[:, :n_steps].reshape(actions.shape[:2]))
         episode_ids.append(batch['episode_index'].cpu().numpy())
         frame_ids.append(batch['frame_index'].cpu().numpy())
     if not predicted:

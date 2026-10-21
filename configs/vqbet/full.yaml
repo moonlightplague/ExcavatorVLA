@@ -1,0 +1,49 @@
+# Paths are relative to this file. Batch size is per GPU.
+dataset:
+  repo_id: local/excavator
+  root: ../../../data/export
+  episodes: null
+  video_backend: pyav
+policy:
+  type: vqbet
+  device: cuda
+  n_obs_steps: 1
+  n_action_pred_token: 3
+  action_chunk_size: 5
+  vision_backbone: resnet18
+  pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1
+  use_group_norm: false
+  crop_shape: null
+  n_vqvae_training_steps: 1000
+  vqvae_n_embed: 16
+  vqvae_embedding_dim: 256
+  gpt_n_layer: 8
+  gpt_n_head: 8
+  gpt_hidden_dim: 512
+  normalization_mapping:
+    VISUAL: MEAN_STD
+    STATE: MEAN_STD
+    ACTION: MEAN_STD
+  optimizer_lr: 0.0001
+  optimizer_weight_decay: 0.000001
+steps: 40000
+batch_size: 8
+num_workers: 8
+seed: 1000
+save_freq: 5000
+log_freq: 200
+grad_clip_norm: 10.0
+job_name: excavator_vqbet
+output_dir: null
+benchmark:
+  split_file: ../splits/excavator_v4_seed1000.json
+  split_seed: 1000
+  validation_freq: 5000
+  validation_max_batches: 0
+launcher:
+  output_root: ../../../outputs/train
+  hf_home: ../../../models/hf-cache
+  torch_home: ../../../models/torch-cache
+  gpu_ids: [0, 1]
+  mixed_precision: bf16
+  cpu_threads: 4

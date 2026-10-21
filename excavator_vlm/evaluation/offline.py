@@ -47,8 +47,12 @@ def main(load_policy, make_dataset, policy_type, argv=None):
     if args.split != 'train' and set(episodes) & set(provenance['training_episodes']):
         raise ValueError('Selected held-out evaluation overlaps actual training episodes')
     policy, pre, post = load_policy(checkpoint, args.device)
-    chunk_len = policy.config.chunk_size if hasattr(policy.config, 'chunk_size') else policy.config.horizon
-    dataset = make_dataset('local/excavator', args.dataset.resolve(), episodes, chunk_len)
+    if policy_type == 'vqbet':
+        dataset = make_dataset('local/excavator', args.dataset.resolve(), episodes,
+                               policy.config.n_action_pred_token, policy.config.action_chunk_size)
+    else:
+        chunk_len = policy.config.chunk_size if hasattr(policy.config, 'chunk_size') else policy.config.horizon
+        dataset = make_dataset('local/excavator', args.dataset.resolve(), episodes, chunk_len)
     if policy_type == 'pi05':
         # Base construction initializes tensors before strict loading; reset after
         # that work so independent CLI sampling matches fixed-seed validation.

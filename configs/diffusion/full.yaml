@@ -18,7 +18,8 @@ policy:
   n_groups: 8
   diffusion_step_embed_dim: 128
   num_train_timesteps: 100
-  num_inference_steps: 100
+  noise_scheduler_type: DDIM
+  num_inference_steps: 10
   do_mask_loss_for_padding: true
   normalization_mapping:
     VISUAL: MEAN_STD

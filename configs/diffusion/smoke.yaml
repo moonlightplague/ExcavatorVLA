@@ -1,0 +1,12 @@
+extends: full.yaml
+steps: 20
+batch_size: 2
+num_workers: 0
+save_freq: 20
+log_freq: 1
+job_name: excavator_diffusion_smoke
+benchmark:
+  validation_freq: 20
+  validation_max_batches: 2
+launcher:
+  gpu_ids: [0]

@@ -25,6 +25,9 @@ def main():
     from excavator_vlm.policies.pi05.checkpoints import load_base
     from excavator_vlm.policies.pi05.config import build_policy_config, resolve_settings
     from excavator_vlm.policies.pi05.inference import check_environment
+    from excavator_vlm.policies.pi05.precision import (
+        assert_fp32_training, configure_trainable_precision, precision_summary,
+    )
 
     check_environment()
     if not torch.cuda.is_available():
@@ -37,6 +40,7 @@ def main():
     torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
     policy = policy_class()(config)
+    configure_trainable_precision(policy)
     report = load_base(policy, settings['assets']['base_path'], settings['assets']['base_sha256'])
     print(f'Loaded {report["loaded_tensors"]} real pretrained tensors', flush=True)
     batch = {'observation.state': torch.zeros(1, 28, device='cuda'),
@@ -60,6 +64,7 @@ def main():
     if any(p.grad is not None for p in policy.model.paligemma_with_expert.paligemma.parameters()):
         raise AssertionError('Frozen VLM received gradients')
     optimizer.step()
+    assert_fp32_training(policy, optimizer)
     changed = not torch.equal(before, policy.model.action_out_proj.weight)
     if not changed:
         raise AssertionError('Action projection did not update')
@@ -72,6 +77,7 @@ def main():
         **report, 'flow_loss': float(loss.detach()), 'grad_norm_before_clip': float(norm),
         'action_projection_updated': changed, 'inference_shape': list(actions.shape),
         'trainable_parameters': sum(p.numel() for p in parameters),
+        'parameter_precision': precision_summary(policy),
         'peak_cuda_memory_bytes': torch.cuda.max_memory_allocated(),
         'elapsed_seconds': time.perf_counter() - started}
     args.output.mkdir(parents=True)

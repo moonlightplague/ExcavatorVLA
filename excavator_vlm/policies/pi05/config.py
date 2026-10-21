@@ -24,7 +24,8 @@ def resolve_settings(path, overrides=None):
         assets[key] = str((path.parent / Path(assets[key]).expanduser()).resolve())
     if not isinstance(assets['base_sha256'], str) or len(assets['base_sha256']) != 64:
         raise ValueError('A pinned base weight SHA-256 is required')
-    required = {'gradient_accumulation_steps', 'validation_batch_size', 'resume', 'keep_checkpoints'}
+    required = {'gradient_accumulation_steps', 'validation_batch_size', 'resume', 'keep_checkpoints',
+                'trainable_dtype'}
     if not isinstance(training, dict) or set(training) != required:
         raise ValueError(f'training must specify {sorted(required)}')
     for key in ('gradient_accumulation_steps', 'validation_batch_size', 'keep_checkpoints'):
@@ -32,6 +33,8 @@ def resolve_settings(path, overrides=None):
             raise ValueError(f'{key} must be a positive integer')
     if training['resume']:
         training['resume'] = str((path.parent / Path(training['resume']).expanduser()).resolve())
+    if training['trainable_dtype'] != 'float32':
+        raise ValueError('PI05 expert parameters and optimizer moments must use float32 storage')
     policy = settings['policy']
     if policy.get('type') != 'pi05':
         raise ValueError('PI05 entrypoint requires policy.type: pi05')
@@ -47,6 +50,10 @@ def resolve_settings(path, overrides=None):
         raise ValueError('All three real excavator cameras are required')
     if policy.get('normalization_mapping') != {'VISUAL': 'IDENTITY', 'STATE': 'QUANTILES', 'ACTION': 'QUANTILES'}:
         raise ValueError('PI05 uses identity visual and train-only quantile state/action normalization')
+    if policy['device'] == 'cuda' and (policy.get('dtype') != 'bfloat16'
+                                     or settings['launcher']['mixed_precision'] != 'bf16'):
+        raise ValueError('CUDA PI05 uses a BF16 frozen backbone and matching BF16 autocast; '
+                         'trainable storage remains FP32')
     return settings
 
 

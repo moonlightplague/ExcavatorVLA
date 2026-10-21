@@ -9,5 +9,12 @@ Pretrained weights remain in the parent project's `models/pi05_base/`.
 Batch size is per GPU; effective batch also includes gradient accumulation.
 All step counts refer to optimizer updates, not micro-batches.
 
+`training.trainable_dtype: float32` keeps expert/projection/time parameters,
+gradients and AdamW moments in FP32. `policy.dtype: bfloat16` applies to frozen
+backbone initialization (with upstream FP32 normalization/patch exceptions),
+not trainable storage. CUDA forward compute uses BF16 autocast for both training
+and new-checkpoint inference. Old BF16 checkpoints remain evaluable but cannot
+be used for an exact FP32 resume; start a new run from the immutable base.
+
 Use only paths under `configs/pi05/`. See [the pipeline guide](../../docs/pi05.md)
 for environment, licensed tokenizer preparation, smoke/resume and evaluation.

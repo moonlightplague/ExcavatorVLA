@@ -61,6 +61,7 @@ class ContractTests(unittest.TestCase):
                     settings = resolve_settings(SUBMODULE / f'configs/pi05/{name}.yaml',
                                                 {'output_dir': str(Path(directory) / name)})
                     self.assertEqual(settings['steps'], steps)
+                    self.assertEqual(settings['training']['trainable_dtype'], 'float32')
                     self.assertEqual(Path(settings['assets']['base_path']), (SUBMODULE.parent / 'models/pi05_base').resolve())
                     config = build_policy_config(settings)
                     self.assertEqual(tuple(config.image_features), CAMERAS)
@@ -71,6 +72,8 @@ class ContractTests(unittest.TestCase):
     def test_rejects_unsupported_training_modes(self):
         for overrides in ({'policy': {'train_expert_only': False}},
                           {'policy': {'empty_cameras': 1}},
+                          {'training': {'trainable_dtype': 'bfloat16'}},
+                          {'launcher': {'mixed_precision': 'no'}},
                           {'training': {'gradient_accumulation_steps': 0}}):
             with self.assertRaises(ValueError):
                 resolve_settings(SUBMODULE / 'configs/pi05/smoke.yaml', overrides)
@@ -224,6 +227,7 @@ class TrainerTests(unittest.TestCase):
                 patch.object(inference, 'check_environment'), \
                 patch.object(adapter, 'policy_class', return_value=TinyPolicy), \
                 patch.object(checkpoints, 'load_base', return_value={'test_fixture': True}), \
+                patch.object(inference, 'load_base', return_value={'test_fixture': True}), \
                 patch.object(train, 'prepare', return_value=fixture), \
                 patch.object(train, 'make_pi05_dataset', side_effect=lambda repo, root, episodes, *args: ToyDataset(episodes)):
             root = Path(directory)
@@ -244,11 +248,19 @@ class TrainerTests(unittest.TestCase):
             for key in expected:
                 torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
             manifest = json.loads((actual_path / 'checkpoint.json').read_text())
+            from excavator_vlm.policies.pi05.precision import PRECISION_CONTRACT
+            self.assertEqual(manifest['precision_contract'], PRECISION_CONTRACT)
+            self.assertTrue(all(value.dtype == torch.float32 for value in actual.values()))
+            restored, _, _ = inference.load_pi05(actual_path, 'cpu')
+            for key in expected:
+                torch.testing.assert_close(restored.state_dict()[key], actual[key], rtol=0, atol=0)
             self.assertEqual(manifest['step'], 2)
             self.assertTrue((actual_path.parent / 'validation.json').is_file())
             history = Path(settings['output_dir']) / 'validation_history.jsonl'
             self.assertEqual(json.loads(history.read_text().splitlines()[-1])['step'], 2)
             saved = torch.load(actual_path.parent / 'training_state.pt', weights_only=True)
+            self.assertTrue(all(value.dtype == torch.float32 for state in saved['optimizer']['state'].values()
+                                for key, value in state.items() if key in ('exp_avg', 'exp_avg_sq')))
             self.assertEqual(saved['consumed_microbatches'], 4)
             with self.assertRaises(ValueError):
                 apply_delta(torch.nn.Linear(2, 2), actual_path)

@@ -10,7 +10,7 @@ assets:
 policy:
   type: pi05
   device: cuda
-  dtype: bfloat16
+  dtype: bfloat16 # Frozen backbone initialization, NOT trainable parameter storage.
   n_obs_steps: 1
   chunk_size: 10
   n_action_steps: 3
@@ -36,6 +36,7 @@ policy:
   scheduler_decay_steps: 40000
   scheduler_decay_lr: 0.0000025
 training:
+  trainable_dtype: float32 # Expert, projections, gradients and AdamW moments.
   gradient_accumulation_steps: 8
   validation_batch_size: 1
   resume: null

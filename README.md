@@ -46,6 +46,10 @@ transformer/action head; it needs no ACT base checkpoint. Pi0.5 assets remain in
 training/resume, delta checkpoint and evaluation commands are documented in
 [the PI05 pipeline guide](docs/pi05.md). PI05 uses its own pinned Transformers
 compatibility implementation; do not install it over the working ACT environment.
+PI05 training keeps all trainable expert/projection/time parameters and AdamW
+moments in FP32, with a frozen mixed-BF16 backbone and matching BF16 forward
+autocast for training/new-checkpoint inference. Legacy BF16 checkpoints remain
+evaluable; start a new run for the FP32 precision comparison.
 
 ## Environment and data
 

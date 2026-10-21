@@ -4,6 +4,7 @@ from pathlib import Path
 
 from ...data.contract import CAMERAS
 from .checkpoints import apply_delta, asset_overrides, load_base, resolve_checkpoint
+from .precision import PRECISION_CONTRACT, configure_trainable_precision
 
 
 def check_environment():
@@ -26,6 +27,9 @@ def load_pi05(checkpoint, device='cpu'):
 
     checkpoint = resolve_checkpoint(checkpoint)
     manifest = json.loads((checkpoint / 'checkpoint.json').read_text())
+    precision = manifest.get('precision_contract')
+    if precision not in (None, PRECISION_CONTRACT):
+        raise ValueError(f'Unsupported PI05 precision contract: {precision}')
     assets = asset_overrides(manifest)
     config = PreTrainedConfig.from_pretrained(str(checkpoint))
     if config.type != 'pi05':
@@ -42,6 +46,8 @@ def load_pi05(checkpoint, device='cpu'):
     stats = json.loads((checkpoint / 'normalization_stats.json').read_text())
     pre, post = make_processors(config, stats, assets['tokenizer_path'])
     policy = policy_class()(config)
+    if precision == PRECISION_CONTRACT:
+        configure_trainable_precision(policy)
     load_base(policy, assets['base_path'], assets['base_sha256'])
     apply_delta(policy, checkpoint)
     return policy.eval(), pre, post

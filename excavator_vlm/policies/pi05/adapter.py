@@ -2,6 +2,7 @@
 import torch
 
 from ...data.contract import CAMERAS
+from .precision import inference_precision
 
 
 def supervision_weights(batch):
@@ -46,6 +47,12 @@ def policy_class():
             for name, parameter in self.named_parameters():
                 if '.gemma_expert.lm_head.' in name:
                     parameter.requires_grad_(False)
+
+        def predict_action_chunk(self, batch, **kwargs):
+            # New FP32-expert checkpoints use the same CUDA BF16 compute policy
+            # as training. Legacy checkpoints retain their original behavior.
+            with inference_precision(self):
+                return super().predict_action_chunk(batch, **kwargs)
 
         def forward(self, batch, denominator=None, world_size=1):
             images, image_masks = self._preprocess_images(batch)

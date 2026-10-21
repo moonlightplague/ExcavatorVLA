@@ -86,6 +86,8 @@ def run(settings, config, config_path, stop_after=None):
     from .inference import check_environment
     from .processors import make_processors
     from .sampling import ResumableBatchSampler
+    from .precision import (assert_fp32_training, configure_trainable_precision, precision_summary,
+                            validate_resume_precision)
 
     check_environment()
     # Fail before allocating the large model if tokenizer assets are absent.
@@ -108,6 +110,7 @@ def run(settings, config, config_path, stop_after=None):
     state, resume_path = None, None
     if resume:
         resume_path = resolve_checkpoint(resume)
+        validate_resume_precision(json.loads((resume_path / 'checkpoint.json').read_text()))
         # Only our own tensor/container checkpoint state is accepted.
         state = torch.load(resume_path.parent / 'training_state.pt', map_location='cpu', weights_only=True)
         old = json.loads((resume_path / 'benchmark_provenance.json').read_text())
@@ -125,6 +128,9 @@ def run(settings, config, config_path, stop_after=None):
             raise ValueError('Resume target steps must exceed the saved optimizer step')
 
     policy = policy_class()(config)
+    # Cast BEFORE strict base loading: preserve the original FP32 pretrained
+    # expert values instead of loading into BF16 and then widening rounded data.
+    configure_trainable_precision(policy)
     loaded = load_base(policy, settings['assets']['base_path'], settings['assets']['base_sha256'])
     if resume_path:
         manifest = apply_delta(policy, resume_path)
@@ -144,6 +150,7 @@ def run(settings, config, config_path, stop_after=None):
     if state:
         optimizer.load_state_dict(state['optimizer'])
         scheduler.load_state_dict(state['scheduler'])
+    assert_fp32_training(policy, optimizer)
     policy, optimizer = accelerator.prepare(policy, optimizer)
     raw = accelerator.unwrap_model(policy)
     seen = state['consumed_microbatches'] if state else 0
@@ -158,7 +165,8 @@ def run(settings, config, config_path, stop_after=None):
     if state:
         deserialize_rng_state(state['rng'][accelerator.process_index])
     run_dir = Path(settings['output_dir'])
-    provenance = {'adapter': 'excavator_pi05_v1', 'dataset_fingerprint': report['fingerprint'],
+    provenance = {'adapter': 'excavator_pi05_v2_fp32', 'parameter_precision': precision_summary(raw),
+                  'dataset_fingerprint': report['fingerprint'],
                   'split_manifest': split, 'training_episodes': episodes, 'language_conditioning': True,
                   'normalization': 'quantiles from selected training episodes only',
                   'batch_contract': {'world_size': accelerator.num_processes, 'batch_size': settings['batch_size'],
@@ -222,6 +230,8 @@ def run(settings, config, config_path, stop_after=None):
             if accelerator.reduce(torch.isfinite(norm).int(), reduction='sum').item() != accelerator.num_processes:
                 raise FloatingPointError(f'Nonfinite gradients at step {step}')
             optimizer.step()
+            if step == start_step + 1:
+                assert_fp32_training(raw, optimizer)
             scheduler.step()
             flow = accelerator.reduce(local_numerator, reduction='sum') / denominator
             if step == start_step + 1 or step % settings['log_freq'] == 0:

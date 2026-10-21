@@ -10,6 +10,7 @@ from safetensors.torch import load_file, save_file
 
 from ...common.runtime import dump
 from ...data.contract import file_hash
+from .precision import PRECISION_CONTRACT, assert_fp32_training, precision_summary
 
 FORMAT = 'excavator_pi05_trainable_delta_v1'
 
@@ -92,6 +93,9 @@ def apply_delta(policy, checkpoint):
 
 
 def save_checkpoint(path, policy, pre, post, stats, assets, provenance, training_state):
+    assert_fp32_training(policy)
+    if precision_summary(policy)['contract'] != PRECISION_CONTRACT:
+        raise ValueError('New PI05 checkpoints must declare the FP32 trainable precision contract')
     path = Path(path)
     if path.exists():
         raise FileExistsError(f'Refusing to overwrite checkpoint: {path}')
@@ -109,7 +113,8 @@ def save_checkpoint(path, policy, pre, post, stats, assets, provenance, training
     dump(pretrained / 'normalization_stats.json', stats)
     dump(pretrained / 'benchmark_provenance.json', provenance)
     dump(pretrained / 'checkpoint.json', {'format': FORMAT, **assets, 'trainable_keys': keys,
-         'delta_sha256': file_hash(pretrained / 'model.safetensors'), 'step': training_state['step']})
+         'delta_sha256': file_hash(pretrained / 'model.safetensors'), 'step': training_state['step'],
+         'precision_contract': PRECISION_CONTRACT, 'parameter_precision': precision_summary(policy)})
     # Tensor/container-only state; restore with weights_only=True, never arbitrary pickle objects.
     torch.save(training_state, temporary / 'training_state.pt')
     temporary.rename(path)

@@ -248,3 +248,5 @@ _ExcavatorVLA_sync/
 
 # Streamlit
 .streamlit/secrets.toml
+
+.mpm_warp_cache

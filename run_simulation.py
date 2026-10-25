@@ -2638,7 +2638,8 @@ def main(args):
 
         for _ in range(max(1, int(args.sand_settle_frames))):
             world.step(render=True)
-            simulation_app.update()
+            if sand_api.get("soil_backend") != "newton_mpm":
+                simulation_app.update()
 
         sand_api = getattr(
             builtins,
@@ -2656,6 +2657,10 @@ def main(args):
             f"error={status.get('real_sand_error', '')}",
             flush=True,
         )
+
+        cache_mpm = sand_api.get("cache_mpm_initial_state")
+        if callable(cache_mpm):
+            cache_mpm()
 
         remove_sand_settling_walls()
         restore_excavator_pose_after_sand_init(
@@ -3912,24 +3917,37 @@ def main(args):
                 if not callable(create_walls):
                     raise RuntimeError("Sand runtime cannot create temporary retaining walls")
                 create_walls()
-            points, velocities, widths, _ = sand_module.sand_particle_points()
-            if not len(points):
-                raise RuntimeError("Episode reset generated no sand")
-            points_path = f"{sand_root_path}/{sand_module.PARTICLE_POINTS_PATH_SUFFIX}"
-            particle_prim = stage.GetPrimAtPath(points_path)
-            if not particle_prim.IsValid():
-                raise RuntimeError(f"Episode reset lost particle prim: {points_path}")
-            particles = UsdGeom.Points(particle_prim)
-            particles.GetPointsAttr().Set(points)
-            particles.GetVelocitiesAttr().Set(velocities)
-            particles.GetWidthsAttr().Set(widths)
-            sand_module.STATE.update(real_sand_particle_count=len(points), excavated_volume=0.0)
+            if sand_api.get("soil_backend") == "newton_mpm":
+                restore_mpm = sand_api.get("reset_mpm_initial_state")
+                restored_mpm = bool(callable(restore_mpm) and restore_mpm())
+                if not restored_mpm:
+                    sand_module.rebuild_real_particle_sand()
+                sand_api = getattr(builtins, "_SAND_SITE", sand_api)
+                points = sand_module.current_real_particle_positions()
+                sand_module.STATE["excavated_volume"] = 0.0
+            else:
+                points, velocities, widths, _ = sand_module.sand_particle_points()
+                if not len(points):
+                    raise RuntimeError("Episode reset generated no sand")
+                points_path = f"{sand_root_path}/{sand_module.PARTICLE_POINTS_PATH_SUFFIX}"
+                particle_prim = stage.GetPrimAtPath(points_path)
+                if not particle_prim.IsValid():
+                    raise RuntimeError(f"Episode reset lost particle prim: {points_path}")
+                particles = UsdGeom.Points(particle_prim)
+                particles.GetPointsAttr().Set(points)
+                particles.GetVelocitiesAttr().Set(velocities)
+                particles.GetWidthsAttr().Set(widths)
+                sand_module.STATE.update(real_sand_particle_count=len(points), excavated_volume=0.0)
             # Keep the collection settling procedure and duration. Only the
             # rollout omits rendering on intermediate physics ticks.
             timeline.play()
-            for _ in range(args.sand_settle_frames):
+            settling_frames = args.sand_settle_frames
+            if sand_api.get("soil_backend") == "newton_mpm" and restored_mpm:
+                settling_frames = min(15, settling_frames)
+            for _ in range(settling_frames):
                 world.step(render=True)
-                simulation_app.update()
+                if sand_api.get("soil_backend") != "newton_mpm":
+                    simulation_app.update()
         finally:
             try:
                 remove_sand_settling_walls()

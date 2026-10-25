@@ -6,6 +6,9 @@ import builtins
 import asyncio
 import numpy as np
 
+from excavator_app import newton_mpm_soil as _mpm
+_mpm.close()  # release subscriptions when Script Editor reloads this runtime
+
 import omni.usd
 import omni.kit.app
 import omni.ui as ui
@@ -662,6 +665,8 @@ def update_particle_runtime_state():
     STATE["particle_budget_target"] = int(particle_performance_target_count())
     STATE["particle_budget_applied"] = bool(STATE.get("particle_budget_applied", False))
     STATE["particle_budget_iters"] = int(STATE.get("particle_budget_iters", 0) or 0)
+    if _mpm.enabled() and _mpm.current() is not None:
+        _mpm.current().publish_status()
 
 
 def apply_sand_fidelity_to_particle_globals(fidelity=None, announce=False):
@@ -1983,6 +1988,9 @@ def soil_depth_at_point(x, y, z):
 
 
 def current_real_particle_positions():
+    controller = _mpm.current()
+    if _mpm.enabled() and controller is not None:
+        return controller.metric_positions.copy()
     root = root_path()
     prim = get_prim(f"{root}/{PARTICLE_POINTS_PATH_SUFFIX}")
     if not prim.IsValid():
@@ -1995,6 +2003,12 @@ def current_real_particle_positions():
 
 
 def current_real_particle_positions_sampled(max_samples=None):
+    controller = _mpm.current()
+    if _mpm.enabled() and controller is not None:
+        points = controller.metric_positions
+        total = len(points)
+        limit = total if max_samples is None else max(1, int(max_samples))
+        return (points.copy() if total <= limit else points[np.linspace(0, total-1, limit, dtype=np.int64)]), total
     root = root_path()
     prim = get_prim(f"{root}/{PARTICLE_POINTS_PATH_SUFFIX}")
     if not prim.IsValid():
@@ -2061,6 +2075,10 @@ def sand_reset_health_stats(prev_points=None):
             displacement_max = float(np.max(d))
 
     bad_reasons = []
+    if not np.isfinite(points).all():
+        bad_reasons.append("nonfinite_particles")
+    if _mpm.enabled() and _mpm.current() is not None and _mpm.current().error:
+        bad_reasons.append(_mpm.current().error)
     if z_min < z_min_allowed:
         bad_reasons.append(f"z_min={z_min:.3f}<limit={z_min_allowed:.3f}")
     if z_max > z_max_allowed:
@@ -2292,6 +2310,11 @@ def real_sand_stats():
         "physics_timesteps_per_second": int(PHYSX_TIMESTEPS_PER_SECOND),
         "vram_gb": estimate_particle_vram_gb(points.shape[0]),
     }
+    if _mpm.enabled() and _mpm.current() is not None:
+        controller = _mpm.current()
+        stats.update(backend="newton_mpm", mass=controller.metric_mass, radius=controller.radius,
+                     spacing=controller.spacing, material=dict(controller.material),
+                     mpm=controller.diagnostics())
     if points.shape[0] == 0:
         stats.update({"z_min": None, "z_max": None, "in_diggable": 0, "above_ground": 0, "excavated_volume_live": 0.0})
         return stats
@@ -2710,6 +2733,11 @@ def print_particle_spacing_diagnostics():
 
 
 def make_real_particle_sand(root):
+    if _mpm.enabled():
+        if not ENABLE_REAL_PARTICLE_SAND:
+            return None
+        return _mpm.create(globals(), root)
+
     STATE["real_sand_enabled"] = False
     STATE["real_sand_particle_count"] = 0
     STATE["real_sand_error"] = ""
@@ -2849,6 +2877,7 @@ def clear_path(path):
 
 
 def clear_previous_site(root):
+    _mpm.close()
     stage = get_stage()
     root_str = as_path_string(root)
     if get_prim(root_str).IsValid():
@@ -3143,6 +3172,7 @@ def reset_sand_surface():
 
 
 def clear_real_particle_sand():
+    _mpm.close()
     root = root_path()
     clear_path(f"{root}/{PARTICLE_POINTS_PATH_SUFFIX}")
     clear_path(f"{root}/{PARTICLE_SYSTEM_PATH_SUFFIX}")
@@ -3155,6 +3185,7 @@ def clear_real_particle_sand():
 
 
 def rebuild_real_particle_sand():
+    _mpm.close()
     root = root_path()
     ensure_physics_scene()
     clear_path(f"{root}/{PARTICLE_POINTS_PATH_SUFFIX}")
@@ -3435,6 +3466,7 @@ def store_runtime_api():
         "suppress_control_ground": True,
     }
     info("Stored runtime API in builtins._SAND_SITE")
+    _mpm.augment_api(globals(), builtins._SAND_SITE)
 
 
 def notify_excavator_obstacle_cache_dirty(reason):
@@ -3482,6 +3514,8 @@ def build_sand_site():
 
 
 def build_ui():
+    if _mpm.enabled():
+        return _mpm.build_ui(globals())
     global WINDOW, STATUS_LABEL, DIRTY_LABEL, PARAM_MODELS
 
     def set_dirty(text="Changed, needs Apply"):

@@ -1012,6 +1012,8 @@ AUTO_COLLECT_LEROBOT_V3_EXPORT_TIMEOUT_S = float(
     os.environ.get("EXCAVATOR_LEROBOT_V3_EXPORT_TIMEOUT_S", "1200") or 1200.0
 )
 EXPERT_PLANNER_V1_ENABLED = env_bool("EXCAVATOR_EXPERT_PLANNER_V1", True)
+# Process-local task adapter; reset on module reload for normal GUI collection.
+DIG_CURL_CANDIDATE_FILTER = None
 PLANNER_VERSION = "dig_plan_v4_joint_space_world_debug_expert_v1" if EXPERT_PLANNER_V1_ENABLED else "dig_plan_v4_joint_space_world_debug"
 QUALITY_GATE_VERSION = "quality_gate_v3_low_bin_warning_scatter_accept"
 RUNTIME_PATCH_TAG = "20260703_reject_trainable_lowbin_scatter_recovery"
@@ -32023,6 +32025,12 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                     row for row in curl_candidates
                     if row["ground_ok"]
                 ]
+                # Optional task-specific endpoint constraints. The repeat
+                # baseline uses this to reject low curl-only poses before IK
+                # selection; normal collection keeps its existing policy.
+                curl_filter = getattr(runtime_module(), "DIG_CURL_CANDIDATE_FILTER", None)
+                if callable(curl_filter):
+                    valid_curl_candidates = [row for row in valid_curl_candidates if curl_filter(row)]
                 if not valid_curl_candidates:
                     if planning_deadline_exceeded(deadline):
                         fail_reasons.append("planning budget exceeded")

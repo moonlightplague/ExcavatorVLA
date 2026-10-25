@@ -3144,6 +3144,8 @@ def build_lerobot_v3_stats(
     }
     if effort_dim is not None and effort_dim > 0:
         stats["observation.effort"] = vector_stats_for_rows(rows, "observation.effort", effort_dim)
+    if any("observation.return_to_pile" in row for row in rows):
+        stats["observation.return_to_pile"] = scalar_stats_for_rows(rows, "observation.return_to_pile")
     for key in [
         "timestamp",
         "frame_index",
@@ -3169,6 +3171,62 @@ def lerobot_v3_required_paths(export_dir: str, image_keys: Sequence[str]) -> Lis
         os.path.join(export_dir, "meta", "episodes", "chunk-000", "file-000.parquet"),
         os.path.join(export_dir, "data", "chunk-000", "file-000.parquet"),
     ]
+
+
+def repeat_return_spans(meta):
+    """Validate explicit physical-return provenance before assigning frame labels.
+
+    Legacy episodes do not acquire this optional feature. A return is phase 0
+    within a completed cycle's recorded sample bounds; it is never a blanket
+    exception for arbitrary stage regressions or a relabeling of unload frames.
+    """
+    baseline = meta.get("repeat_baseline") if isinstance(meta, dict) else None
+    if not isinstance(baseline, dict):
+        return None
+    if baseline.get("version") != "repeat_flat_fill_v1":
+        raise ValueError("Unsupported repeat return supervision version")
+    count = int((baseline.get("config") or {}).get("scoops", 0))
+    cycles = meta.get("repeat_cycles", [])
+    if (count < 2 or len(cycles) != count or meta.get("repeat_returns_completed") != count
+            or not meta.get("source_sampling_audit", {}).get("ok")):
+        raise ValueError("Incomplete or unaudited physical return supervision")
+    spans = []
+    previous_end = 0
+    for index, cycle in enumerate(cycles):
+        begin, end = int(cycle["return_start"]), int(cycle["sample_end"])
+        if (not cycle.get("returned") or int(cycle["scoop_index"]) != index
+                or not previous_end <= begin < end):
+            raise ValueError("Invalid physical return sample bounds")
+        spans.append((index, begin, end))
+        previous_end = end
+    return spans
+
+
+def lerobot_stage_transition_errors(stage_values, scoop_values, return_values=None):
+    """Count accidental regressions while allowing explicitly supervised returns."""
+    if return_values is None:
+        return_values = [0] * len(stage_values)
+    if len(stage_values) != len(scoop_values) or len(stage_values) != len(return_values):
+        raise ValueError("Stage, scoop and return columns must have equal length")
+    regressions = invalid_returns = 0
+    previous_stage = previous_scoop = None
+    saw_unload = False
+    for value, scoop_value, return_value in zip(stage_values, scoop_values, return_values):
+        stage, scoop = int(value), int(scoop_value)
+        if scoop != previous_scoop:
+            saw_unload = False
+        is_return = bool(return_value == 1)
+        valid_return = bool(is_return and stage == 0 and scoop == previous_scoop and saw_unload)
+        if return_value not in (0, 1) or (is_return and not valid_return):
+            invalid_returns += 1
+        valid_next_scoop = bool(previous_stage == 9 and stage == 0
+                                and previous_scoop is not None and scoop == previous_scoop + 1)
+        if previous_stage == 9 and stage < 9 and not (valid_next_scoop or valid_return):
+            regressions += 1
+        if stage == 9:
+            saw_unload = True
+        previous_stage, previous_scoop = stage, scoop
+    return regressions, invalid_returns
 
 
 def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Dict[str, object]:
@@ -3236,6 +3294,7 @@ def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Di
     if "observation.effort" in features:
         required_stats.append("observation.effort")
     for key in [
+        "observation.return_to_pile",
         "observation.recovery_active",
         "observation.recovery_type_id",
         "observation.recovery_attempt_index",
@@ -3299,6 +3358,8 @@ def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Di
                 requested_columns.append("observation.stage_current_id")
             if "observation.scoop_index" in features:
                 requested_columns.append("observation.scoop_index")
+            if "observation.return_to_pile" in features:
+                requested_columns.append("observation.return_to_pile")
             for key in [
                 "observation.recovery_active",
                 "observation.recovery_type_id",
@@ -3394,30 +3455,25 @@ def validate_lerobot_v3_export(export_dir: str, image_keys: Sequence[str]) -> Di
                     )
             if "observation.stage_current_id" in action_df.columns:
                 stage_regressions = 0
+                invalid_returns = 0
                 for _episode_index, group in action_df.groupby("episode_index", sort=False):
-                    previous_stage = None
-                    previous_scoop = None
                     stage_values = group["observation.stage_current_id"].tolist()
                     scoop_values = (
                         group["observation.scoop_index"].tolist()
                         if "observation.scoop_index" in group.columns
                         else [0] * len(stage_values)
                     )
-                    for value, scoop_value in zip(stage_values, scoop_values):
-                        stage = int(value)
-                        scoop = int(scoop_value)
-                        valid_next_scoop = bool(
-                            previous_stage == 9
-                            and stage == 0
-                            and previous_scoop is not None
-                            and scoop == previous_scoop + 1
-                        )
-                        if previous_stage == 9 and stage < 9 and not valid_next_scoop:
-                            stage_regressions += 1
-                        previous_stage = stage
-                        previous_scoop = scoop
+                    return_values = (group["observation.return_to_pile"].tolist()
+                                     if "observation.return_to_pile" in group.columns else None)
+                    regressions, bad_returns = lerobot_stage_transition_errors(
+                        stage_values, scoop_values, return_values,
+                    )
+                    stage_regressions += regressions
+                    invalid_returns += bad_returns
                 if stage_regressions:
                     reasons.append(f"stage/regressions_after_unload:{stage_regressions}")
+                if invalid_returns:
+                    reasons.append(f"stage/invalid_return_to_pile:{invalid_returns}")
             if str(info.get("quality_policy") or "") == LEROBOT_QUALITY_POLICY_GOLD_V1:
                 state_schema = str(info.get("state_schema") or "current-v4")
                 joint_offset = 3 if state_schema == LEROBOT_LEGACY_V11_STATE_SCHEMA else 0
@@ -3647,6 +3703,9 @@ def collect_lerobot_rows(
         meta = read_json(resolve_episode_file(episode_dir, row_path_value(episode, "meta")), default={}) or {}
         if not trajectory:
             continue
+        return_spans = repeat_return_spans(meta)
+        if return_spans is not None and any(end > len(trajectory) for _scoop, _begin, end in return_spans):
+            raise ValueError("Physical return bounds exceed the source trajectory")
         quality_decision = lerobot_episode_quality_decision(
             episode,
             trajectory=trajectory,
@@ -3944,6 +4003,15 @@ def collect_lerobot_rows(
                 "raw_episode_id": episode.get("episode_id", sample.get("id", "")),
                 "raw_sample_index": sample.get("i"),
             }
+            if return_spans is not None:
+                sample_index = int(sample["i"])
+                scoop_index = int(sample.get("observation.scoop_index", 0) or 0)
+                row["observation.return_to_pile"] = int(
+                    int(phase_index) == 0 and any(
+                        scoop_index == scoop and begin <= sample_index < end
+                        for scoop, begin, end in return_spans
+                    )
+                )
             if include_effort:
                 row["observation.effort"] = effort
             for key in LEROBOT_IMAGE_KEYS:
@@ -4287,6 +4355,7 @@ def export_lerobot_dataset(
     rows: List[dict] = list(collected["rows"])  # type: ignore[arg-type]
     if not rows:
         raise ValueError(f"no exportable frames found for split={split}")
+    repeat_return_available = any("observation.return_to_pile" in row for row in rows)
     source_sampling_reports = list(collected.get("source_sampling_reports", []) or [])
     expected_dt_s = 1.0 / max(1.0e-6, float(base_export_fps))
     sampling_tolerance_hz = max(0.005, float(base_export_fps) * 0.001)
@@ -4605,6 +4674,8 @@ def export_lerobot_dataset(
                 row["observation.stage_current_id"]
             )
             data_row["observation.scoop_index"] = int(row["observation.scoop_index"])
+            if repeat_return_available:
+                data_row["observation.return_to_pile"] = int(row.get("observation.return_to_pile", 0))
             data_row["observation.scoops_target"] = int(row["observation.scoops_target"])
             data_row["observation.scoops_min"] = int(row["observation.scoops_min"])
             data_row["observation.scoops_max"] = int(row["observation.scoops_max"])
@@ -4697,6 +4768,11 @@ def export_lerobot_dataset(
             "shape": [1],
             "names": ["scoop_index"],
         }
+        if repeat_return_available:
+            features["observation.return_to_pile"] = {
+                "dtype": "int64", "shape": [1], "names": ["return_to_pile"],
+                "class_names": ["task_motion", "physical_return"],
+            }
         features["observation.scoops_target"] = {
             "dtype": "int64",
             "shape": [1],

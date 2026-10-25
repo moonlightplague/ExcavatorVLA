@@ -266,6 +266,10 @@ class NewtonSoil:
         self.spacing, self.voxel, _ = choose_resolution(runtime, self.max_points,
                                                        requested_spacing, requested_voxel)
         self.positions, volume = sample_material(runtime, self.spacing, self.max_points)
+        # USD display diameter only; never used by the model or contact solver.
+        self.render_diameter = float(os.environ.get('EXCAVATOR_MPM_RENDER_DIAMETER', '.012'))
+        if not math.isfinite(self.render_diameter) or self.render_diameter <= 0:
+            raise ValueError('MPM render diameter must be finite and positive')
         # Preserve the existing count-based collection/evaluation scale when
         # refining the MPM quadrature. A deterministic uniform subset of real
         # material IDs represents the full mass; never count passive grains.
@@ -341,7 +345,7 @@ class NewtonSoil:
         # and sphere diameters as the standalone visualization.
         self.render = UsdGeom.Points.Define(self.stage, render_root+"/FineGrains")
         self.render.CreateWidthsAttr(Vt.FloatArray.FromNumpy(
-            np.full(self.grains.size, max(0.05/12, self.spacing/12), dtype=np.float32)))
+            np.full(self.grains.size, self.render_diameter, dtype=np.float32)))
         self.render.CreateDisplayColorAttr([Gf.Vec3f(0.47, 0.27, 0.10)])
         self.render.CreateVisibilityAttr(UsdGeom.Tokens.inherited)
         self.render.CreatePointsAttr(Vt.Vec3fArray.FromNumpy(self.grains.flatten().numpy()))
@@ -771,6 +775,7 @@ class NewtonSoil:
             particle_spacing_xy=self.spacing, particle_spacing_z=self.spacing,
             mpm_grid_size=self.voxel, mpm_steps=self.steps, mpm_time=self.sim_time,
             mpm_peak_force_N=self.peak_force, mpm_render_grains=int(self.grains.size),
+            mpm_render_diameter_m=self.render_diameter,
             mpm_material_points=len(self.positions), mpm_material_point_mass=self.mass,
             mpm_sleeping=self.sleeping, mpm_solver_substeps=self.solver_substeps,
             mpm_material=dict(self.material), real_sand_error=self.error,
@@ -790,6 +795,7 @@ class NewtonSoil:
                 "sleeping": self.sleeping, "solver_substeps": self.solver_substeps,
                 "max_particle_speed": self.max_particle_speed,
                 "render_grains": int(self.grains.size), "peak_force_N": self.peak_force,
+                "render_grain_diameter_m": self.render_diameter,
                 "bodies": list(self.body_paths), "colliders": list(self.collision_paths),
                 "last_link_wrenches": self.last_force.tolist(), "step_wall_seconds": self.step_wall_seconds}
 

@@ -66,6 +66,7 @@ bash eval_smolvla_success.sh /absolute/path/to/checkpoint/pretrained_model 1 350
 | `EXCAVATOR_MPM_VOXEL_SIZE` | `0.10` | 请求的最小网格边长 m；预算不足时和间距同步增大 |
 | `EXCAVATOR_MPM_PARTICLE_SPACING` | 网格的 `0.75` 倍 | 请求的最小采样间距；不能大于网格 |
 | `EXCAVATOR_MPM_MAX_PARTICLES` | `40000` | 硬上限，可调低，拒绝大于 40000 |
+| `EXCAVATOR_MPM_RENDER_DIAMETER` | `0.012` | 仅显示细砂的直径 m，不参与材料体积、质量或碰撞 |
 | `EXCAVATOR_MPM_DENSITY` | 保持原总质量 | 显式设置密度 kg/m³ 时覆盖原总质量兼容逻辑 |
 | `EXCAVATOR_MPM_DEVICE` | 原 PhysX CUDA device | 排查时显式指定 CUDA 可见设备序号 |
 | `EXCAVATOR_MPM_SEED` | `4107` | 初始材料采样抖动种子 |

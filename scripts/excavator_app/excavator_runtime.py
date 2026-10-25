@@ -1014,6 +1014,8 @@ AUTO_COLLECT_LEROBOT_V3_EXPORT_TIMEOUT_S = float(
 EXPERT_PLANNER_V1_ENABLED = env_bool("EXCAVATOR_EXPERT_PLANNER_V1", True)
 # Process-local task adapter; reset on module reload for normal GUI collection.
 DIG_CURL_CANDIDATE_FILTER = None
+DIG_CURL_POSE_CANDIDATES = None
+DIG_PLAN_POINT_ADJUSTER = None
 PLANNER_VERSION = "dig_plan_v4_joint_space_world_debug_expert_v1" if EXPERT_PLANNER_V1_ENABLED else "dig_plan_v4_joint_space_world_debug"
 QUALITY_GATE_VERSION = "quality_gate_v3_low_bin_warning_scatter_accept"
 RUNTIME_PATCH_TAG = "20260703_reject_trainable_lowbin_scatter_recovery"
@@ -31199,6 +31201,11 @@ def dig_plan_specs_from_candidate(target_xyz, candidate):
     ]
 
 
+def clearance_route_stage_label(parent_stage, route_index):
+    prefix = "clearance_route_post" if "unload" in str(parent_stage) else "clearance_route"
+    return f"{prefix}_{int(route_index) + 1}"
+
+
 def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
     specs = dig_plan_specs_from_candidate(target_xyz, candidate)
     beams = [
@@ -31356,7 +31363,7 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
             if planning_deadline_exceeded(path_eval_deadline):
                 return None, "planning budget exceeded"
             q_route = np.array(q_route_raw, dtype=np.float32).copy()
-            route_label = f"clearance_route_{route_idx + 1}"
+            route_label = clearance_route_stage_label(label, route_idx)
             route_duration = max(0.45, min(PATH_CLEARANCE_DURATION, float(duration) * 0.65))
             route_motion = plan_joint_motion_metrics(q_route, q_motion_seed, route_duration)
             route_duration = max(route_duration, float(route_motion.get("estimated_time", route_duration) or route_duration))
@@ -31492,12 +31499,15 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
             return budget_failure(label)
         new_beams = []
         fail_reasons = []
+        stage_point = point
 
         for beam in beams:
             if planning_deadline_exceeded(deadline):
                 fail_reasons.append("planning budget exceeded")
                 break
             q_seed = np.array(beam["q"], dtype=np.float32).copy()
+            point_adjuster = getattr(runtime_module(), "DIG_PLAN_POINT_ADJUSTER", None)
+            point = point_adjuster(label, stage_point, q_seed) if callable(point_adjuster) else stage_point
             if label == "unload_to_bin":
                 dump_deg = float(candidate.get("unload_dump_deg", BUCKET_UNLOAD_DUMP_DEG))
                 q_release_align, dump_info = plan_dump_pose_to_bin(
@@ -31639,7 +31649,7 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                         fail_reasons.append("planning budget exceeded")
                         break
                     q_route = np.array(q_route_raw, dtype=np.float32).copy()
-                    route_label = f"clearance_route_{route_idx + 1}"
+                    route_label = clearance_route_stage_label(label, route_idx)
                     route_duration = max(0.45, min(PATH_CLEARANCE_DURATION, float(duration) * 0.65))
                     route_motion = plan_joint_motion_metrics(q_route, q_motion_seed, route_duration)
                     route_duration = max(route_duration, float(route_motion.get("estimated_time", route_duration) or route_duration))
@@ -31988,8 +31998,15 @@ def plan_dig_sequence_candidate(target_xyz, candidate, deadline=None):
                         extra_arm_deg=float(coord.get("arm_delta_deg", 0.0)),
                         pose_info=coord,
                     )
+                curl_provider = getattr(runtime_module(), "DIG_CURL_POSE_CANDIDATES", None)
+                if callable(curl_provider):
+                    for row in curl_provider(q_seed, point, deadline=deadline):
+                        add_curl_candidate(row["q"], "task_coordinated_curl_ik",
+                                           "closed_bucket_with_rotation_clearance", pose_info=row.get("info"))
+                task_curl_ready = any(row["source"] == "task_coordinated_curl_ik" and row["ground_ok"]
+                                      for row in curl_candidates)
                 try:
-                    curl_rows, curl_reason = solve_dig_pose_candidates(
+                    curl_rows, curl_reason = ([], "task_coordinated_curl_ik") if task_curl_ready else solve_dig_pose_candidates(
                         label,
                         point,
                         target_bucket_deg,
@@ -37602,10 +37619,14 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
         float(UNLOAD_DUMP_MAX_OPEN_SECONDS),
         max(float(CONTROL_DT), 1.5 * abs(bucket_delta) / max(1e-4, open_rate_rad_s)),
     )
-    profile_frames = max(2, int(math.ceil(profile_seconds * float(CONTROL_HZ))))
+    # This loop advances one physics frame, not one control tick. A 30 Hz
+    # controller normally steps two 60 Hz frames; counting control ticks here
+    # cut both the opening profile and its timeout in half.
+    physics_frame_dt = float(CONTROL_DT) / max(1.0, float(control_step_frames()))
+    profile_frames = max(2, int(math.ceil(profile_seconds / physics_frame_dt)))
     max_frames = max(
         profile_frames,
-        int(math.ceil(float(UNLOAD_DUMP_MAX_OPEN_SECONDS) * float(CONTROL_HZ))),
+        int(math.ceil(float(UNLOAD_DUMP_MAX_OPEN_SECONDS) / physics_frame_dt)),
     )
     metric_frames = max(1, int(UNLOAD_DUMP_METRIC_SAMPLE_FRAMES))
     opening_positive = bucket_delta >= 0.0
@@ -37640,6 +37661,7 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
         target_bucket,
         deg_to_rad(float(UNLOAD_DUMP_FLOW_CENTER_BUCKET_DEG)),
     )
+    motion_complete = False
     for frame in range(max_frames):
         if motion_cancel_requested(task_id):
             update_status(f"[MOVE STOPPED] {stage_name}_dump_pose", force=True)
@@ -37706,6 +37728,7 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
                 "decision=stop_opening_and_settle",
                 force_log=debug_diagnostics_enabled(),
             )
+            motion_complete = True
             break
         real_bucket = float(q_after[bucket_idx])
         target_reached = (
@@ -37715,6 +37738,7 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
         )
         if u >= 1.0 and target_reached:
             q_final = q_after.copy()
+            motion_complete = True
             break
 
     STATE["dataset_current_q_goal"] = q_final.copy()
@@ -37746,7 +37770,15 @@ async def execute_unload_bucket_dump_motion(q_dump, stage_name, task_id=None):
         )
     except Exception as e:
         info_print("[WARN] [UNLOAD DUMP DIRECT DONE] cannot read real bucket:", type(e).__name__, e)
-    return True
+    if not motion_complete:
+        reason = (
+            f"execution_failed/unload_dump_incomplete:{stage_name}:"
+            f"bucket_real={rad_to_deg(float(q_final[bucket_idx])):.2f};"
+            f"bucket_target={rad_to_deg(target_bucket):.2f}"
+        )
+        set_execution_failure_reason(reason)
+        info_print("[UNLOAD DUMP INCOMPLETE]", reason, force_log=True)
+    return motion_complete
 
 
 async def dump_bucket_at_target(stage_name, task_id=None, planned_q_dump=None, planned_q_release_align=None):

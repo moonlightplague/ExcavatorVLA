@@ -1,7 +1,7 @@
 # Paths are relative to this YAML file. This is a full training run, not a smoke test.
 dataset:
   repo_id: local/excavator
-  root: ../data/repeat/export
+  root: ../data/repeat/export_repeat
   episodes: null                 # Set a list of episode IDs to select training data.
   video_backend: pyav
   image_transforms:

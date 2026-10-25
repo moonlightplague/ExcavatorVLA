@@ -4,6 +4,55 @@ Local runtime: Isaac Sim `6.1.0-rc.26`, RTX 4090 GPUs, PhysX particle soil.
 Policy/export Python: `ExcavatorVLA-current` (LeRobot 0.4.4).
 The optional Newton MPM backend was not included in these live validations.
 
+## Follow-up: five-scoop collection failure repair
+
+The two runs in `data/repeat/raw` requested five-scoop episodes and exhausted
+10 and 15 attempts with zero successes. Their recorded prefixes completed at
+most three scoops. This was a controller/planner failure, not an export counter
+error. The original collection was retained unchanged.
+
+The repair corrects physics-frame timing in the dump opening loop and rejects
+an opening timeout. Bucket predictions retain lateral marker offsets, floor
+clearance uses enabled physical collider meshes, and IK refines a target that
+violates that clearance. Cut engagement can use actual collider vertices when
+internal markers miss the remaining sand; empty-query floor estimates cannot
+validate engagement. The existing execution, transfer, spill, and final quality
+gates still decide whether the episode is trainable.
+
+Closed escape/curl planning, loaded route continuity, collision sampling, and
+fixed-count dense-target retries were also repaired. The retries use the
+current pile and preserve physical returns without resets between scoops.
+
+Both original worker identities and scene-seed namespaces were replayed with
+sand amount 1.0 and five requested scoops:
+
+| Original worker | Attempts | Trainable episodes | Scoops / returns | Frames | Score |
+|---|---:|---:|---:|---:|---:|
+| `r1_w1` | 1 | 1 | 5 / 5 | 1,362 | 89.81 |
+| `r1_w0` | 2 | 1 | 5 / 5 | 1,401 | 89.28 |
+
+Worker 0's first randomized layout was correctly rejected before recording for
+physical robot/truck overlap. Its next layout completed the episode. Worker 1's
+later cuts illustrate the engagement correction: the internal tip marker had
+zero sand depth, while real collider contact depths were 0.21–0.34 m, and the
+last three deposits delivered 208, 147, and 132 source particles to the truck.
+
+Both episodes passed `baseline/validate_repeat.py`: five successful deposits,
+five recorded returns, source audit, uniform 10 Hz, finite 28D states/4D actions,
+and complete camera images. Their strict standard/VLA exports were appended
+into `outputs/repeat_fix/export_repeat`: 2 episodes, 2,763 frames in each of
+three RGB videos, and 289 explicit physical-return frames.
+
+78 automated tests passed: 44 baseline tests, 2 dump-motion tests, 5 route
+contract tests, 1 IK movement test, 15 export-contract tests, and 11 append tests.
+The dump-motion tests exercise the actual coroutine at both 30/60 Hz control
+rates and verify that a stalled loaded bucket cannot report completion.
+
+Evidence: `outputs/repeat_fix/validation.json`, `checks.json`, `diagnosis.json`,
+`export_validation.log`, and the `physical_contact*/` raw runs and worker logs.
+These two replay successes verify the repaired failure cases; they do not
+establish a collection success rate across all randomized scenes.
+
 The initial live trials exposed three issues addressed by this implementation:
 
 - The old home return uses direct joint placement with recording disabled.

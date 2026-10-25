@@ -24,7 +24,7 @@ def parse_args(argv=None):
     parser.add_argument("--bed-wall-margin", type=float, default=.60)
     parser.add_argument("--return-plan-seconds", type=float, default=12.)
     parser.add_argument("--dump-settle-seconds", type=float, default=1.)
-    parser.add_argument("--dig-target-spacing", type=float, default=.55)
+    parser.add_argument("--dig-target-spacing", type=float, default=.28)
     parser.add_argument("--min-dig-height", type=float, default=.15)
     parser.add_argument("--min-curl-height", type=float, default=1.05)
     parser.add_argument("--soil-backend", choices=("physx", "newton_mpm"),

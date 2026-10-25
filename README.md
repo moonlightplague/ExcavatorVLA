@@ -23,7 +23,8 @@ python baseline/collect_repeat.py --help
 `ISAAC_PYTHON` defaults to the root `run_isaac_python.sh`. `POLICY_PYTHON`
 defaults to the active Python and needs numpy, pandas, pyarrow, and imageio-ffmpeg
 for export; the Isaac Python runtime is separate. `DATA_ROOT` defaults to
-`data/repeat`, resolved relative to the caller's directory. `SCOOPS_PER_EPISODE`
+`data/repeat`, resolved relative to the caller's directory. The publication is
+`$DATA_ROOT/export_repeat`; override it with `EXPORT_DIR`. `SCOOPS_PER_EPISODE`
 sets the default cycle count; `COLLECT_STATUS_SECONDS` controls the heartbeat.
 Sand amount defaults to 1.0, matching the single-scoop launcher. Override with
 `SAND_AMOUNT` or `--sand-amount` for a larger source pile.
@@ -58,7 +59,7 @@ Each episode follows this sequence:
    the requested number of times, including the **final physical return**.
 
 Dig candidates cover the source polygon beyond the original narrow central
-search. New cuts are at least 0.55 m from previous targets; target height stays
+search. New cuts prefer at least 0.28 m from previous targets; target height stays
 at least 0.15 m above ground. This avoids repeatedly curling against the floor
 of the first crater. The original source-boundary and material-density checks
 still filter candidates. Tune with `--dig-target-spacing` and `--min-dig-height`.
@@ -68,7 +69,33 @@ IK and collision planner before execution, keeping the bucket rotation clear
 of the crater floor. The curl endpoint must also pass the runtime's existing
 gravity-closed check; a bucket-only rotation cannot bypass the raised target.
 Tune with `--min-curl-height`. Candidate and overall planning budgets are at
-least 8 and 60 seconds respectively to allow the additional posture constraints.
+least 12 and 60 seconds respectively to allow the additional posture constraints.
+
+The normalized target rings include fresh cuts near the pile center. Spacing
+is measured in meters, so the dense inner rings remain available. Planning
+respects the enabled bucket collision meshes. Display meshes and the load-volume marker
+do not set the floor clearance. Floor violations feed the IK height correction.
+If internal tip markers miss a thin sand layer, real collider vertices can
+establish cutting contact using the same particle surface and depth threshold.
+Empty-query floor estimates cannot establish contact; actual captured and
+delivered sand still has to pass the original quality gates.
+The escape after curl uses a retaining carry
+orientation instead of reopening to the cutting angle.
+Additional closed-bucket IK candidates coordinate boom/arm raising with curl
+when a low cut needs more rotation clearance than the stock small adjustments.
+The complete curl arc must clear the floor and rigid obstacles. Escape and lift
+heights follow the selected curl pose. Targets without a safe low curl are
+rejected. If separated targets cannot be planned, fixed-count collection retries
+the freshly measured, denser areas of the same pile, including previous cut
+locations. Spatial exclusion alone does not mark the material exhausted. This
+fallback is recorded as `repeat_dig_revisit` and does not reset the sand or arm.
+
+Predictions preserve the actual 3D marker offsets. Unload cells are preflighted
+with bounded opening-center IK, a closed carry posture, and collision checks;
+loaded transit uses the same collision sampling resolution as execution. Loaded
+clearance waypoints stay in the continuous lift/unload motion group. The dump
+opening profile counts physics frames and fails if neither release nor the
+requested opening completes before its timeout.
 
 The original `return_home=True` branch teleports joints with recording disabled;
 this baseline always calls the digging executor with `return_home=False` and
@@ -110,7 +137,7 @@ data/repeat/
         meta.json, score.json, trajectory.jsonl, events.jsonl, sand_metrics.jsonl
         images/...
         repeat_cycles.jsonl
-  export/
+  export_repeat/
     meta/info.json, meta/stats.json, meta/tasks.parquet, meta/episodes/...
     data/chunk-*/file-*.parquet
     videos/observation.images.{0,1,2}/chunk-*/file-*.mp4

@@ -13,6 +13,8 @@ from pathlib import Path
 import numpy as np
 
 from baseline.bed_fill import BedFillPlanner, FillConfig
+from baseline.motion_geometry import BucketFloor, RigidBucketKinematics
+from baseline.unload_planner import UnloadPlanner, damped_ik
 
 
 @dataclass(frozen=True)
@@ -21,7 +23,7 @@ class RepeatConfig:
     return_plan_seconds: float = 12.0
     settle_seconds: float = 1.0
     fill: FillConfig = field(default_factory=FillConfig)
-    dig_target_spacing_m: float = .55
+    dig_target_spacing_m: float = .28
     min_dig_height_m: float = .15
     min_curl_height_m: float = 1.05
 
@@ -40,6 +42,9 @@ class RepeatConfig:
 class RepeatController:
     def __init__(self, rt, config):
         self.rt, self.config = rt, config
+        self.floor = BucketFloor(rt)
+        self.kinematics = RigidBucketKinematics(rt)
+        self.unloader = UnloadPlanner(rt)
         self.reset()
 
     def reset(self):
@@ -48,6 +53,9 @@ class RepeatController:
         self.before = None
         self.selected = None
         self.meta = None
+        self.floor.reset()
+        self.kinematics.reset()
+        self.unloader.reset()
 
     def ensure_bed(self):
         if self.bed is None:
@@ -78,6 +86,15 @@ class RepeatController:
             row.update(radius_ok=bool(status.get("ok")), radius_m=status.get("radius_m"))
             if row["radius_ok"]:
                 allowed.append(row)
+        if getattr(rt, "IK_MODEL", None) is not None:
+            reachable = []
+            for row in allowed:
+                q_dump, detail = self.unloader.solve(row["landing"], rt.get_real_joint_positions())
+                row["dump_preflight_ok"] = q_dump is not None
+                if q_dump is not None:
+                    row["dump_release_error_m"] = float(detail["drop"].get("release_xy_err", 0))
+                    reachable.append(row)
+            allowed = reachable
         if not allowed:
             raise RuntimeError("No safe truck-bed cell is inside the excavator reach window.")
         self.selected = allowed[0]
@@ -88,6 +105,57 @@ class RepeatController:
                       f"landing={landing.tolist()}", f"height={self.selected['cell_height']:.3f}",
                       f"particles={self.selected['cell_count']}", force_log=True)
         return landing, allowed
+
+    def curl_candidates(self, q_seed, target, deadline=None):
+        """Close while raising the bucket clear of the full rotation arc."""
+        rt = self.rt
+        seed = np.asarray(q_seed, dtype=np.float32)
+        indices = [rt.CTRL.name_to_idx[name] for name in ("swing", "boom", "arm")]
+        bucket = rt.CTRL.name_to_idx["bucket"]
+        closed = seed.copy()
+        closed[bucket] = rt.deg_to_rad(rt.CURL_HOLD_TARGET_DEG)
+        def full(values):
+            q = closed.copy()
+            q[indices] = values
+            return q
+        def position(values):
+            return np.asarray(rt.bucket_point_world("load", q=full(values), reference_q=seed), dtype=float)
+        swing = float(seed[indices[0]])
+        lower = [swing - .15, *[rt.planner_effective_joint_bounds_rad(name)[0] for name in ("boom", "arm")]]
+        upper = [swing + .15, *[rt.planner_effective_joint_bounds_rad(name)[1] for name in ("boom", "arm")]]
+        seeds = [seed[indices], [swing, np.radians(20.), np.radians(-70.)],
+                 [swing, np.radians(40.), np.radians(-85.)]]
+        target = np.asarray(target, dtype=float).copy()
+        base_z = max(float(target[2]), float(rt.GROUND_TOP_Z) + self.config.min_curl_height_m)
+        rows = []
+        for extra_z in np.arange(.15, .76, .15):
+            if deadline is not None and rt.time.time() >= deadline:
+                break
+            target[2] = base_z + extra_z
+            for values, error in damped_ik(position, target, seeds, lower, upper):
+                q = full(values)
+                if rt.gravity_carry_closed_for_q(q)[0]:
+                    phase_ok = rt.path_phase_check(seed, q, "curl_to_hold_material",
+                                                   samples=rt.PATH_CHECK_SAMPLES, deadline=deadline)[0]
+                    obstacle_ok = phase_ok and rt.path_obstacle_check(seed, q, "curl_to_hold_material",
+                                                                     samples=rt.PATH_CHECK_SAMPLES, deadline=deadline)[0]
+                    if phase_ok and obstacle_ok:
+                        rows.append({"q": q, "info": {"load_target": target.tolist(), "error_m": error}})
+            if len(rows) >= 3:
+                break
+        if deadline is not None:
+            rt.info_print("[REPEAT CURL IK]", f"target={np.asarray(target).tolist()}",
+                          f"solutions={len(rows)}", f"heights={[row['info']['load_target'][2] for row in rows]}",
+                          force_log=True)
+        return rows
+
+    def adjust_plan_point(self, label, point, q_seed):
+        point = np.asarray(point, dtype=np.float32).copy()
+        if label in ("pull_exit_cut", "lift_carry"):
+            load = self.rt.bucket_point_world("load", q=q_seed, reference_q=q_seed)
+            margin = .04 if label == "pull_exit_cut" else .20
+            point[2] = max(float(point[2]), float(load[2]) + margin)
+        return point
 
     async def return_arm(self, q_goal):
         rt = self.rt
@@ -182,12 +250,15 @@ def install(rt, config):
     # this repeatedly closes the bucket in the same low crater. Search more of
     # the actual source polygon, prefer fresh cuts, and leave a floor clearance.
     # Existing sand-boundary, density, reach and physical quality gates still run.
-    rt.AUTO_DIG_RING_RADII = [0., .45, .90, 1.15, 1.40]
-    rt.AUTO_DIG_RING_POINTS = [1, 8, 12, 16, 20]
+    # Ring radii are normalized by ~0.67 m in this scene, while previous-cut
+    # spacing is in meters. Keep dense nearby cuts available; physical mesh
+    # clearance, rather than a large spatial exclusion, protects the floor.
+    rt.AUTO_DIG_RING_RADII = [0., .45, .65, .90, 1.15, 1.40]
+    rt.AUTO_DIG_RING_POINTS = [1, 8, 10, 12, 16, 20]
     rt.MULTI_SCOOP_TARGET_MIN_SPACING_M = config.dig_target_spacing_m
     rt.AUTO_COLLECT_TARGET_MIN_Z = max(float(rt.AUTO_COLLECT_TARGET_MIN_Z),
                                       float(rt.GROUND_TOP_Z) + config.min_dig_height_m)
-    rt.AUTO_COLLECT_CANDIDATE_PLAN_SECONDS = max(float(rt.AUTO_COLLECT_CANDIDATE_PLAN_SECONDS), 8.)
+    rt.AUTO_COLLECT_CANDIDATE_PLAN_SECONDS = max(float(rt.AUTO_COLLECT_CANDIDATE_PLAN_SECONDS), 12.)
     rt.AUTO_COLLECT_FIND_PLAN_MAX_SECONDS = max(float(rt.AUTO_COLLECT_FIND_PLAN_MAX_SECONDS), 60.)
     rt.STATE.update(dataset_scoops_target=config.scoops, dataset_scoops_min=config.scoops,
                     dataset_scoop_adaptive_stop_enabled=False)
@@ -200,6 +271,115 @@ def install(rt, config):
     original_initial_pose = rt.auto_collect_initial_pose_for_attempt
     original_find_plan = rt.auto_collect_find_plan
     original_specs = rt.dig_plan_specs_from_candidate
+    original_floor_target = rt.dig_floor_safe_target_z
+    original_ground_report = rt.predicted_phase_ground_report
+    original_ground_ok = rt.phase_ground_ok
+    original_ground_correction = rt.predicted_phase_ground_vertical_correction
+    original_front_quality = rt.cut_front_edge_quality
+    original_dump_plan = rt.plan_dump_pose_to_bin
+    original_chain_points = rt.predicted_chain_world_points
+    original_spatial_filter = rt.multi_scoop_filter_new_spatial_targets
+    original_path_phase_check = rt.path_phase_check
+    original_path_obstacle_check = rt.path_obstacle_check
+
+    @wraps(original_spatial_filter)
+    def spatial_filter(ranked_targets):
+        fresh, report = original_spatial_filter(ranked_targets)
+        if not fresh and ranked_targets:
+            report = {**report, "repeat_target_fallback": True,
+                      "preferred_spatially_exhausted": True, "spatially_exhausted": False}
+            return list(ranked_targets), report
+        return fresh, report
+
+    def carry_samples(mode, samples):
+        # Planning with six samples missed a truck-wall collision at 21/24.
+        # Keep the dense check on loaded transit; digging has its own contact
+        # checks and candidate budget.
+        if "unload" in str(mode) or "clearance_route_post" in str(mode) or str(mode) == "lift_carry":
+            return max(int(samples), int(rt.PATH_CHECK_SAMPLES))
+        return samples
+
+    @wraps(original_path_phase_check)
+    def path_phase_check(q_start, q_goal, mode, samples=rt.PATH_CHECK_SAMPLES, deadline=None):
+        return original_path_phase_check(q_start, q_goal, mode, samples=carry_samples(mode, samples), deadline=deadline)
+
+    @wraps(original_path_obstacle_check)
+    def path_obstacle_check(q_start, q_goal, mode, samples=rt.PATH_CHECK_SAMPLES, deadline=None):
+        return original_path_obstacle_check(q_start, q_goal, mode, samples=carry_samples(mode, samples), deadline=deadline)
+
+    @wraps(original_chain_points)
+    def chain_points(q, end_effector="mid", reference_q=None):
+        if getattr(rt, "IK_MODEL", None) is None or end_effector not in ("mid", "tip", "load", "pour"):
+            return original_chain_points(q, end_effector=end_effector, reference_q=reference_q)
+        return controller.kinematics.points(q, end_effector)
+
+    @wraps(original_floor_target)
+    def floor_target(effector, angle_deg):
+        height, detail = original_floor_target(effector, angle_deg)
+        if getattr(rt, "IK_MODEL", None) is None:
+            return height, detail
+        minimum = controller.floor.target_floor(effector, angle_deg)
+        return max(height, minimum), {**detail, "repeat_mesh_floor_target_z": minimum}
+
+    @wraps(original_ground_report)
+    def ground_report(q, mode, reference_q=None):
+        report = original_ground_report(q, mode, reference_q=reference_q)
+        if getattr(rt, "IK_MODEL", None) is not None:
+            report["repeat_mesh_min_z"] = controller.floor.minimum_z(q)
+            report["repeat_mesh_q_rad"] = np.asarray(q).tolist()
+        return report
+
+    @wraps(original_ground_ok)
+    def ground_ok(mode, report):
+        ok, reason = original_ground_ok(mode, report)
+        height = report.get("repeat_mesh_min_z") if isinstance(report, dict) else None
+        if ok and height is not None and height < float(rt.GROUND_TOP_Z) + .005:
+            return False, f"physical_bucket_mesh_below_floor:{height:.3f}"
+        return ok, reason
+
+    @wraps(original_ground_correction)
+    def ground_correction(mode, report, margin=.02):
+        amount, detail = original_ground_correction(mode, report, margin=margin)
+        height = report.get("repeat_mesh_min_z") if isinstance(report, dict) else None
+        if height is not None:
+            mesh_amount = max(0., float(rt.GROUND_TOP_Z) + controller.floor.clearance - float(height))
+            if mesh_amount > float(amount):
+                return mesh_amount, {**detail, "limiting_point": "bucket_collision_mesh",
+                                     "repeat_mesh_min_z": float(height)}
+        return amount, detail
+
+    @wraps(original_front_quality)
+    def front_quality(mode, report):
+        ok, reason, penalty = original_front_quality(mode, report)
+        if ok or "not engaged enough" not in reason or not isinstance(report, dict):
+            return ok, reason, penalty
+        q = report.get("repeat_mesh_q_rad")
+        if q is None:
+            return ok, reason, penalty
+        contact = controller.floor.sand_contact(q)
+        report["repeat_mesh_sand_contact"] = contact
+        if contact["depth_m"] >= float(rt.FRONT_EDGE_MIN_TIP_DEPTH):
+            return True, f"physical_cut_contact depth={contact['depth_m']:.3f}", 8.
+        return ok, reason, penalty
+
+    @wraps(original_dump_plan)
+    def dump_plan(q_seed=None, dump_deg=None, *args, **kwargs):
+        if getattr(rt, "IK_MODEL", None) is None:
+            return original_dump_plan(q_seed, dump_deg, *args, **kwargs)
+        seed = rt.get_real_joint_positions() if q_seed is None else q_seed
+        q, detail = controller.unloader.solve(
+            rt.unload_bin_landing_point(), seed,
+            dump_degrees=rt.unload_dump_target_deg() if dump_deg is None else dump_deg,
+            min_release_z=kwargs.get("release_z_override"),
+        )
+        if q is not None:
+            import copy
+            detail = copy.deepcopy(detail)
+            detail["drop"] = rt.unload_drop_report(q=q, reference_q=seed)
+            if kwargs.get("log", True):
+                rt.info_print("[REPEAT EXACT DUMP]", f"release_error={detail['drop'].get('release_xy_err')}", force_log=True)
+            return q.copy(), detail
+        return None, detail
 
     def curl_candidate_ok(row):
         # The stock curl selector prioritizes a bucket-only rotation even when
@@ -212,6 +392,8 @@ def install(rt, config):
         return bool(closed)
 
     rt.DIG_CURL_CANDIDATE_FILTER = curl_candidate_ok
+    rt.DIG_CURL_POSE_CANDIDATES = controller.curl_candidates
+    rt.DIG_PLAN_POINT_ADJUSTER = controller.adjust_plan_point
 
     @wraps(original_specs)
     def dig_specs(target_xyz, candidate):
@@ -229,8 +411,16 @@ def install(rt, config):
         for spec in specs:
             name, point, *parameters = spec
             point = np.asarray(point, dtype=np.float32).copy()
+            if name == "approach_contact" and parameters[1] is not None and getattr(rt, "IK_MODEL", None) is not None:
+                point[2] = max(float(point[2]), controller.floor.target_floor(parameters[2], parameters[1]))
             if name in minimum_z:
                 point[2] = max(float(point[2]), minimum_z[name])
+            if name == "pull_exit_cut":
+                # Curl has already sealed the bucket. Reusing the digging
+                # attack angle here can select the opposite elbow branch and
+                # tip the load out before secure_load. Plan a gravity-retaining
+                # escape instead.
+                parameters[0], parameters[1] = None, "carry"
             adjusted.append((name, point, *parameters))
         candidate["computed_curl_z"] = curl_z
         candidate["computed_exit_cut_z"] = max(float(candidate.get("computed_exit_cut_z", floor)), curl_z + .04)
@@ -255,13 +445,53 @@ def install(rt, config):
         # The stock helper catches unload-selection errors and falls back to the
         # bed center. Validate outside that catch so a bad bed/reach is rejected.
         try:
+            if getattr(rt, "IK_MODEL", None) is not None:
+                # Pre-sample checks can run before the scene/initial pose is
+                # applied. Anchor to the measured frames used for this dig.
+                controller.kinematics.reset()
+                controller.floor.reset()
+                controller.unloader.reset()
+                controller.kinematics.ensure()
+                controller.floor.ensure()
+                ref = controller.kinematics.reference
+                snapshot = {"q": ref["q"].tolist(), "signs": ref["signs"].tolist(),
+                            "radial": ref["radial"].tolist(),
+                            "points": {k: v.tolist() for k, v in ref["points"].items()},
+                            "ends": {k: v.tolist() for k, v in ref["ends"].items()},
+                            "scene": rt.task_scene_context(),
+                            "bounds": {name: list(rt.planner_effective_joint_bounds_rad(name)) for name in ("boom", "arm")},
+                            "floor": {"angle": controller.floor.reference["angle"],
+                                      "support": controller.floor.reference["support"].tolist(),
+                                      "angles": controller.floor.reference["angles"],
+                                      "effectors": {name: points.tolist() for name, points in
+                                                    controller.floor.reference["effectors"].items()}}}
+                rt.write_json_file(str(Path(rt.STATE["auto_collect_run_dir"]) / f"repeat_kinematics_{attempt_index:06d}.json"), snapshot)
             controller.choose_landing()
         except (ValueError, RuntimeError) as exc:
             rt.STATE["dig_plan_best_failure"] = {
                 "failed_stage": "repeat_bed_fill", "failure_reason": str(exc),
             }
             return None, None, [{"failed_stage": "repeat_bed_fill", "failure_reason": str(exc)}]
-        return await original_find_plan(attempt_index, ranked_targets=ranked_targets)
+        target, sequence, attempts = await original_find_plan(attempt_index, ranked_targets=ranked_targets)
+        all_targets = rt.STATE.get("multi_scoop_ranked_targets_all") or []
+        if sequence is None and all_targets and rt.STATE.get("dataset_scoop_target_history"):
+            # Upstream only retries denser, previously used areas when adaptive
+            # stopping is enabled. This fixed-count task still needs that
+            # planning fallback; spacing must not imply material exhaustion.
+            rt.dataset_record_event("repeat_dig_revisit", data={
+                "scoop_index": (rt.STATE.get("multi_scoop_planning_index")
+                                if rt.STATE.get("multi_scoop_planning_index") is not None
+                                else int(rt.STATE.get("dataset_scoop_index", 0)) + 1),
+                "reason": "fresh_targets_failed_planning", "candidates": len(all_targets),
+            })
+            spacing = rt.MULTI_SCOOP_TARGET_MIN_SPACING_M
+            rt.MULTI_SCOOP_TARGET_MIN_SPACING_M = 0.
+            try:
+                target, sequence, retried = await original_find_plan(attempt_index, ranked_targets=all_targets)
+                attempts = [*attempts, *retried]
+            finally:
+                rt.MULTI_SCOOP_TARGET_MIN_SPACING_M = spacing
+        return target, sequence, attempts
 
     @wraps(original_episode)
     async def episode():
@@ -299,6 +529,16 @@ def install(rt, config):
     rt.auto_collect_initial_pose_for_attempt = initial_pose
     rt.auto_collect_find_plan = find_plan
     rt.dig_plan_specs_from_candidate = dig_specs
+    rt.dig_floor_safe_target_z = floor_target
+    rt.predicted_phase_ground_report = ground_report
+    rt.predicted_chain_world_points = chain_points
+    rt.phase_ground_ok = ground_ok
+    rt.predicted_phase_ground_vertical_correction = ground_correction
+    rt.cut_front_edge_quality = front_quality
+    rt.multi_scoop_filter_new_spatial_targets = spatial_filter
+    rt.path_phase_check = path_phase_check
+    rt.path_obstacle_check = path_obstacle_check
+    rt.plan_dump_pose_to_bin = dump_plan
     rt.auto_collect_begin_episode = begin
     rt.execute_dig_target_ball = execute
     rt.auto_collect_finish_episode = finish

@@ -3183,7 +3183,7 @@ def repeat_return_spans(meta):
     baseline = meta.get("repeat_baseline") if isinstance(meta, dict) else None
     if not isinstance(baseline, dict):
         return None
-    if baseline.get("version") != "repeat_flat_fill_v1":
+    if baseline.get("version") not in ("repeat_flat_fill_v1", "repeat_flat_fill_v2"):
         raise ValueError("Unsupported repeat return supervision version")
     count = int((baseline.get("config") or {}).get("scoops", 0))
     cycles = meta.get("repeat_cycles", [])

@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-30
+
+- Accept repeated-digging v2 metadata for physical-return export while preserving the existing cycle-boundary and source-audit requirements and v1 compatibility.
+- Ignore local datasets, checkpoint directories, downloaded model weights, and temporary execution files.
+- Validate with 15 export contract tests, 11 append tests, and a live three-scoop strict standard/VLA export.
+
 ## Unreleased
 
 ### Added

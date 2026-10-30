@@ -2,6 +2,9 @@
 
 ## 2026-10-30
 
+- Ignore local datasets, checkpoint directories, downloaded model weights, and temporary execution files.
+- Remove three obsolete `run_simulation.py.before_*` backup copies; use `run_simulation.py` and Git history as the maintained source.
+- Validate repository cleanup with all 72 simulator-independent SmolVLA tests passing.
 - Record resolved soil backend and settling wall settings in simulator scene metadata and support explicit wall timing.
 - Update observation regression tests for the evaluation image pipeline.
 

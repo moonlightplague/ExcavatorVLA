@@ -250,3 +250,15 @@ _ExcavatorVLA_sync/
 .streamlit/secrets.toml
 
 .mpm_warp_cache
+
+# Local datasets, checkpoints, and downloaded model weights
+/data
+/outputs/
+/models
+/checkpoints/
+.venv*/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.tmp

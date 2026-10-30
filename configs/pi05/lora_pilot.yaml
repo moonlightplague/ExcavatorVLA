@@ -1,0 +1,12 @@
+extends: lora_overfit.yaml
+dataset:
+  episodes: null
+steps: 5000
+save_freq: 1000
+log_freq: 50
+job_name: excavator_pi05_lora_pilot
+training:
+  gradient_accumulation_steps: 8
+benchmark:
+  validation_freq: 1000
+  validation_max_batches: 0

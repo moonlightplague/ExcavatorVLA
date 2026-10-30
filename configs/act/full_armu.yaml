@@ -1,0 +1,9 @@
+extends: full.yaml
+# Arm U: identical to full.yaml except the dataset carries sign-asymmetric,
+# mass-conserving action_loss_weight inside the two curl phases.
+# Single-variable ablation against the control run.
+dataset:
+  root: ../../../data/export_armu
+benchmark:
+  split_file: ../splits/excavator_v4_armu_seed1000.json
+job_name: excavator_act_armu

@@ -1,5 +1,6 @@
 """Expert-only PI05 training with valid-weight accumulation and exact data addressing."""
 import argparse
+import copy
 from contextlib import contextmanager, nullcontext
 from importlib.metadata import version
 import json
@@ -58,6 +59,8 @@ def schedule_spec(config, steps):
 
 
 def lr_multiplier(step, spec):
+    if spec.get('kind') == 'constant_resume':
+        return spec['learning_rate'] / spec['base_lr']
     if step < spec['warmup']:
         return (step + 1) / spec['warmup']
     progress = min(1., max(0., (step - spec['warmup']) / max(1, spec['total'] - spec['warmup'])))
@@ -88,6 +91,8 @@ def run(settings, config, config_path, stop_after=None):
     from .sampling import ResumableBatchSampler
     from .precision import (assert_fp32_training, configure_trainable_precision, precision_summary,
                             validate_resume_precision)
+    from .lora import (VLM_LORA, check_first_update, finetuning_metadata, finetuning_spec,
+                       optimizer_groups, setup_finetuning, update_snapshot)
 
     check_environment()
     # Fail before allocating the large model if tokenizer assets are absent.
@@ -98,7 +103,7 @@ def run(settings, config, config_path, stop_after=None):
         raise RuntimeError('CUDA unavailable: launch in a GPU-enabled shell')
     torch.set_num_threads(settings['launcher']['cpu_threads'])
     accelerator = Accelerator(cpu=config.device == 'cpu', mixed_precision=settings['launcher']['mixed_precision'],
-        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)])
+        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True, gradient_as_bucket_view=True)])
     config.device = str(accelerator.device)
     set_seed(settings['seed'])
     report, split, frames, episodes = prepare(settings)
@@ -106,11 +111,17 @@ def run(settings, config, config_path, stop_after=None):
     dataset = make_pi05_dataset(settings['dataset']['repo_id'], settings['dataset']['root'], episodes,
                                config.chunk_size, settings['dataset']['video_backend'])
     pre, post = make_processors(config, stats, tokenizer)
+    requested_finetuning = finetuning_spec(settings['training'].get('mode', 'expert_only'),
+                                         settings['training'].get('lora'))
     resume = settings['training']['resume']
     state, resume_path = None, None
     if resume:
         resume_path = resolve_checkpoint(resume)
-        validate_resume_precision(json.loads((resume_path / 'checkpoint.json').read_text()))
+        resume_manifest = json.loads((resume_path / 'checkpoint.json').read_text())
+        validate_resume_precision(resume_manifest)
+        saved_mode = resume_manifest.get('finetuning', {'mode': 'expert_only', 'lora': None})
+        if finetuning_spec(saved_mode['mode'], saved_mode.get('lora')) != requested_finetuning:
+            raise ValueError('Exact resume requires unchanged training mode and LoRA configuration')
         # Only our own tensor/container checkpoint state is accepted.
         state = torch.load(resume_path.parent / 'training_state.pt', map_location='cpu', weights_only=True)
         old = json.loads((resume_path / 'benchmark_provenance.json').read_text())
@@ -132,6 +143,22 @@ def run(settings, config, config_path, stop_after=None):
     # expert values instead of loading into BF16 and then widening rounded data.
     configure_trainable_precision(policy)
     loaded = load_base(policy, settings['assets']['base_path'], settings['assets']['base_sha256'])
+    zero_check, zero_input, before_injection = None, None, None
+    if requested_finetuning['mode'] == VLM_LORA and not state:
+        from torch.utils.data import default_collate
+        zero_input = default_collate([dataset[0]])
+        zero_input = {key: zero_input[key] for key in ('observation.state', 'task',
+                      'observation.images.0', 'observation.images.1', 'observation.images.2')}
+        with preserved_rng(0), torch.inference_mode():
+            before_injection = policy.predict_action_chunk(pre(copy.deepcopy(zero_input))).cpu()
+    setup_finetuning(policy, requested_finetuning)
+    if before_injection is not None:
+        with preserved_rng(0), torch.inference_mode():
+            after_injection = policy.predict_action_chunk(pre(copy.deepcopy(zero_input))).cpu()
+        torch.testing.assert_close(after_injection, before_injection, rtol=1e-4, atol=1e-5)
+        zero_check = {'status': 'passed', 'shape': list(after_injection.shape),
+                      'max_abs_difference': (after_injection - before_injection).abs().max().item(),
+                      'check': 'actual recorded observation, same sampling seed, before/after zero LoRA'}
     if resume_path:
         manifest = apply_delta(policy, resume_path)
         if manifest['base_sha256'] != settings['assets']['base_sha256']:
@@ -143,13 +170,26 @@ def run(settings, config, config_path, stop_after=None):
             if key not in ('device',) and current[key] != old_config.get(key):
                 raise ValueError(f'Resume policy setting differs: {key}')
     parameters = [p for p in policy.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(parameters, lr=config.optimizer_lr, betas=tuple(config.optimizer_betas),
+    optimizer = torch.optim.AdamW(optimizer_groups(policy), lr=config.optimizer_lr, betas=tuple(config.optimizer_betas),
                                   eps=config.optimizer_eps, weight_decay=config.optimizer_weight_decay)
     spec = state['schedule'] if state else schedule_spec(config, settings['steps'])
+    resume_lr = settings['training'].get('resume_lr')
+    if resume_lr is not None:
+        if not state:
+            raise ValueError('A learning-rate override requires saved optimizer/RNG state')
+        spec = {'kind': 'constant_resume', 'learning_rate': float(resume_lr),
+                'base_lr': config.optimizer_lr, 'from_step': state['step'],
+                'previous_schedule': state['schedule']}
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: lr_multiplier(step, spec))
     if state:
         optimizer.load_state_dict(state['optimizer'])
         scheduler.load_state_dict(state['scheduler'])
+        if resume_lr is not None:
+            if any(abs(value - config.optimizer_lr) > 1e-15 for value in scheduler.base_lrs):
+                raise ValueError('Resume LR override requires matching optimizer-group base learning rates')
+            for group in optimizer.param_groups:
+                group['lr'] = float(resume_lr)
+            scheduler._last_lr = [float(resume_lr)] * len(optimizer.param_groups)
     assert_fp32_training(policy, optimizer)
     policy, optimizer = accelerator.prepare(policy, optimizer)
     raw = accelerator.unwrap_model(policy)
@@ -165,7 +205,8 @@ def run(settings, config, config_path, stop_after=None):
     if state:
         deserialize_rng_state(state['rng'][accelerator.process_index])
     run_dir = Path(settings['output_dir'])
-    provenance = {'adapter': 'excavator_pi05_v2_fp32', 'parameter_precision': precision_summary(raw),
+    provenance = {'adapter': 'excavator_pi05_v3_finetuning', 'parameter_precision': precision_summary(raw),
+                  'finetuning': finetuning_metadata(raw),
                   'dataset_fingerprint': report['fingerprint'],
                   'split_manifest': split, 'training_episodes': episodes, 'language_conditioning': True,
                   'normalization': 'quantiles from selected training episodes only',
@@ -176,6 +217,8 @@ def run(settings, config, config_path, stop_after=None):
         if not state:
             run_dir.mkdir(parents=True, exist_ok=False)
             dump(run_dir / 'resolved_settings.json', settings)
+            if zero_check is not None:
+                dump(run_dir / 'zero_lora_check.json', zero_check)
             dump(run_dir / 'dataset_contract.json', report)
             dump(run_dir / 'normalization_stats.json', stats)
             dump(run_dir / 'split_manifest.json', split)
@@ -201,6 +244,7 @@ def run(settings, config, config_path, stop_after=None):
     accelerator.wait_for_everyone()
     log = (run_dir / 'train.log').open('a' if state else 'w') if accelerator.is_main_process else None
     start_step = state['step'] if state else 0
+    audit_before = update_snapshot(raw)
     best = state['best_validation_mae'] if state else float('inf')
     started = time.perf_counter()
     if config.device.startswith('cuda'):
@@ -232,6 +276,11 @@ def run(settings, config, config_path, stop_after=None):
             optimizer.step()
             if step == start_step + 1:
                 assert_fp32_training(raw, optimizer)
+                update_audit = check_first_update(raw, audit_before)
+                update_audit['step'] = step
+                if accelerator.is_main_process:
+                    dump(run_dir / f'first_update_check_{step:06d}.json', update_audit)
+                del audit_before
             scheduler.step()
             flow = accelerator.reduce(local_numerator, reduction='sum') / denominator
             if step == start_step + 1 or step % settings['log_freq'] == 0:
@@ -239,6 +288,8 @@ def run(settings, config, config_path, stop_after=None):
                        'grad_norm_before_clip': float(norm), 'lr': optimizer.param_groups[0]['lr'],
                        'elapsed_seconds': time.perf_counter() - started, 'consumed_microbatches': seen,
                        'peak_cuda_memory_bytes': torch.cuda.max_memory_allocated() if config.device.startswith('cuda') else 0}
+                row['world_size'] = accelerator.num_processes
+                row['training_mode'] = requested_finetuning['mode']
                 if log:
                     log.write(json.dumps(row, allow_nan=False) + '\n')
                     log.flush()
@@ -313,10 +364,14 @@ def main():
     parser.add_argument('--accumulation', type=int)
     parser.add_argument('--output', type=Path)
     parser.add_argument('--resume', type=Path)
+    parser.add_argument('--resume-lr', type=float,
+                        help='Explicitly replace the remaining schedule with this constant LR; preserve optimizer/RNG')
     parser.add_argument('--stop-after', type=int, help='Checkpoint and stop after this absolute update (resume smoke tests)')
     parser.add_argument('--device', choices=('cpu', 'cuda'))
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.resume_lr is not None and not args.resume:
+        parser.error('--resume-lr requires --resume')
     overrides = {key: value for key, value in {'steps': args.steps, 'batch_size': args.batch_size,
                  'num_workers': args.num_workers, 'output_dir': str(args.output.resolve()) if args.output else None}.items()
                  if value is not None}
@@ -336,6 +391,8 @@ def main():
         checkpoint = resolve_checkpoint(args.resume)
         overrides.setdefault('training', {})['resume'] = str(checkpoint)
         overrides['output_dir'] = str(args.output.resolve()) if args.output else str(checkpoint.parents[2])
+    if args.resume_lr is not None:
+        overrides.setdefault('training', {})['resume_lr'] = args.resume_lr
     settings = resolve_settings(args.config, overrides)
     if args.stop_after is not None and not 1 <= args.stop_after <= settings['steps']:
         parser.error('--stop-after must be within the configured update budget')

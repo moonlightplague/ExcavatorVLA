@@ -11,6 +11,7 @@ from safetensors.torch import load_file, save_file
 from ...common.runtime import dump
 from ...data.contract import file_hash
 from .precision import PRECISION_CONTRACT, assert_fp32_training, precision_summary
+from .lora import assert_finetuning_matches, finetuning_metadata
 
 FORMAT = 'excavator_pi05_trainable_delta_v1'
 
@@ -82,6 +83,7 @@ def apply_delta(policy, checkpoint):
     manifest = json.loads((checkpoint / 'checkpoint.json').read_text())
     if manifest.get('format') != FORMAT:
         raise ValueError('Unsupported PI05 checkpoint format')
+    assert_finetuning_matches(policy, manifest)
     keys = trainable_keys(policy)
     if manifest.get('trainable_keys') != keys:
         raise ValueError('Checkpoint fine-tuning parameter set differs from the current policy')
@@ -114,7 +116,8 @@ def save_checkpoint(path, policy, pre, post, stats, assets, provenance, training
     dump(pretrained / 'benchmark_provenance.json', provenance)
     dump(pretrained / 'checkpoint.json', {'format': FORMAT, **assets, 'trainable_keys': keys,
          'delta_sha256': file_hash(pretrained / 'model.safetensors'), 'step': training_state['step'],
-         'precision_contract': PRECISION_CONTRACT, 'parameter_precision': precision_summary(policy)})
+         'precision_contract': PRECISION_CONTRACT, 'parameter_precision': precision_summary(policy),
+         'finetuning': finetuning_metadata(policy)})
     # Tensor/container-only state; restore with weights_only=True, never arbitrary pickle objects.
     torch.save(training_state, temporary / 'training_state.pt')
     temporary.rename(path)

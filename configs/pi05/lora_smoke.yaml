@@ -1,0 +1,10 @@
+extends: lora_overfit.yaml
+steps: 2
+save_freq: 2
+log_freq: 1
+job_name: excavator_pi05_lora_smoke
+training:
+  gradient_accumulation_steps: 1
+benchmark:
+  validation_freq: 2
+  validation_max_batches: 1

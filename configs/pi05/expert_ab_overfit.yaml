@@ -1,0 +1,7 @@
+extends: overfit.yaml
+job_name: excavator_pi05_expert_ab_overfit
+training:
+  mode: expert_only
+  gradient_accumulation_steps: 4
+launcher:
+  gpu_ids: [0, 1]

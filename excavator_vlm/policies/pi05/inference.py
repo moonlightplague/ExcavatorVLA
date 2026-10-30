@@ -5,6 +5,7 @@ from pathlib import Path
 from ...data.contract import CAMERAS
 from .checkpoints import apply_delta, asset_overrides, load_base, resolve_checkpoint
 from .precision import PRECISION_CONTRACT, configure_trainable_precision
+from .lora import setup_from_manifest
 
 
 def check_environment():
@@ -49,5 +50,6 @@ def load_pi05(checkpoint, device='cpu'):
     if precision == PRECISION_CONTRACT:
         configure_trainable_precision(policy)
     load_base(policy, assets['base_path'], assets['base_sha256'])
+    setup_from_manifest(policy, manifest)
     apply_delta(policy, checkpoint)
     return policy.eval(), pre, post

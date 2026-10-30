@@ -74,18 +74,24 @@ def trajectory_reward(status):
     way to the truck.
 
     Counts default to zero because an episode that fails before its first
-    observation is finalized without any particle metric at all.
+    observation is finalized without any particle metric at all. The metrics are
+    also written as JSON null rather than omitted in that case, so a missing key
+    and a null value have to be handled the same way.
     """
-    payload = int(status.get('payload_particles', 0))
-    spillage = int(status.get('spillage_particles', 0))
+    def count(key):
+        value = status.get(key)
+        return 0 if value is None else int(value)
+
+    payload = count('payload_particles')
+    spillage = count('spillage_particles')
     return {
-        'episode_status': status['status'],
-        'success': bool(status['success']),
+        'episode_status': status.get('status'),
+        'success': bool(status.get('success')),
         'failure_mode': status.get('failure_mode'),
         'payload_particles': payload,
         'spillage_particles': spillage,
-        'scooped_particles': int(status.get('scooped_particles', 0)),
-        'max_bucket_particles': int(status.get('max_bucket_particles', 0)),
+        'scooped_particles': count('scooped_particles'),
+        'max_bucket_particles': count('max_bucket_particles'),
         'score': payload - spillage,
     }
 

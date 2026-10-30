@@ -1,0 +1,4 @@
+extends: expert_ab_overfit.yaml
+steps: 3000
+training:
+  keep_checkpoints: 6 # Preserve all existing 2k checkpoints and the new 2.5k/3k checkpoints.

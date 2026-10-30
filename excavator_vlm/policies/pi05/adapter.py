@@ -3,6 +3,7 @@ import torch
 
 from ...data.contract import CAMERAS
 from .precision import inference_precision
+from .lora import set_lora_training
 
 
 def supervision_weights(batch):
@@ -53,6 +54,11 @@ def policy_class():
             # as training. Legacy checkpoints retain their original behavior.
             with inference_precision(self):
                 return super().predict_action_chunk(batch, **kwargs)
+
+        def train(self, mode=True):
+            super().train(mode)
+            set_lora_training(self, mode)
+            return self
 
         def forward(self, batch, denominator=None, world_size=1):
             images, image_masks = self._preprocess_images(batch)

@@ -264,6 +264,21 @@ class TrainerTests(unittest.TestCase):
             self.assertEqual(saved['consumed_microbatches'], 4)
             with self.assertRaises(ValueError):
                 apply_delta(torch.nn.Linear(2, 2), actual_path)
+            # Explicit LR-changing continuation must keep moments, step counts
+            # and consumed-data progress rather than restart training/warmup.
+            settings['steps'] = 3
+            settings['training']['resume'] = str(actual_path)
+            settings['training']['resume_lr'] = 2.5e-5
+            train.run(settings, config, SUBMODULE / 'configs/pi05/smoke.yaml')
+            continued = torch.load(Path(settings['output_dir']) / 'checkpoints/000003/training_state.pt',
+                                   weights_only=True)
+            self.assertEqual(continued['step'], 3)
+            self.assertEqual(continued['consumed_microbatches'], 6)
+            self.assertEqual(continued['schedule']['kind'], 'constant_resume')
+            self.assertEqual(continued['schedule']['from_step'], 2)
+            self.assertTrue(all(group['lr'] == 2.5e-5 for group in continued['optimizer']['param_groups']))
+            self.assertTrue(all(value['step'].item() == 3 for value in continued['optimizer']['state'].values()))
+            self.assertEqual(continued['scheduler']['last_epoch'], 3)
 
 
 if __name__ == '__main__':

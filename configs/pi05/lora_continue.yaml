@@ -1,0 +1,4 @@
+extends: lora_overfit.yaml
+steps: 3000
+training:
+  keep_checkpoints: 6

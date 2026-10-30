@@ -1,0 +1,8 @@
+extends: full.yaml
+# Arm T: identical to full.yaml except the dataset carries phase-reweighted
+# action_loss_weight. Single-variable ablation against the control run.
+dataset:
+  root: ../../../data/export_phw
+benchmark:
+  split_file: ../splits/excavator_v4_phw_seed1000.json
+job_name: excavator_act_phw

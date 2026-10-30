@@ -65,13 +65,15 @@ def main(load_policy, make_dataset, policy_type, argv=None):
                    partial_evaluation=args.max_batches > 0, policy_type=policy_type, seed=0)
     if policy_type == 'pi05':
         from ..policies.pi05.precision import precision_summary
+        from ..policies.pi05.lora import finetuning_metadata
         manifest = json.loads((checkpoint / 'checkpoint.json').read_text())
         metrics.update(checkpoint_format=manifest['format'], base_sha256=manifest['base_sha256'],
                        policy_dtype=policy.config.dtype, num_inference_steps=policy.config.num_inference_steps,
                        chunk_size=policy.config.chunk_size,
                        policy_dtype_scope='backbone initialization; see parameter_precision for actual storage',
                        precision_contract=manifest.get('precision_contract'),
-                       parameter_precision=precision_summary(policy))
+                       parameter_precision=precision_summary(policy),
+                       finetuning=finetuning_metadata(policy))
     args.output.mkdir(parents=True, exist_ok=False)
     (args.output / 'metrics.json').write_text(json.dumps(metrics, indent=2, allow_nan=False) + '\n')
     np.savez_compressed(args.output / 'actions.npz', **arrays)

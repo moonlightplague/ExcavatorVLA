@@ -39,6 +39,29 @@ def write(directory, rows, meta):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_v2_audit_requires_metrics_and_continuous_cut(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            rows, meta = fixture(directory)
+            meta["repeat_baseline"]["version"] = "repeat_flat_fill_v2"
+            meta["final_metrics"] = {"samples": 4}
+            write(directory, rows, meta)
+            with self.assertRaisesRegex(ValueError, "Missing repeat metrics"):
+                validate_episode(directory)
+            meta["repeat_metrics"] = {
+                "metrics_schema_version": "repeat_episode_metrics_v1", "success": True, "available": True,
+                "samples": 4, "runtime_seconds": 5., "simulated_runtime_seconds": .4,
+                "cycle_time_seconds": .4, "cycle_time_wall_seconds": 5.,
+                "spillage_particles": 2, "retained_particles": 1, "scooped_particles": 23,
+                "scoop_cycles": [{"success": True}] * 2}
+            (directory / "repeat_metrics.json").write_text(json.dumps(meta["repeat_metrics"]))
+            write(directory, rows, meta)
+            self.assertEqual(validate_episode(directory)["scoops"], 2)
+            meta["plan"] = [{"phase": name} for name in ("approach_contact", "insert_cut", "clearance_route_1", "pull_mid_cut", "pull_exit_cut")]
+            write(directory, rows, meta)
+            with self.assertRaisesRegex(ValueError, "detour interrupts"):
+                validate_episode(directory)
+
     def test_complete_episode_passes(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)

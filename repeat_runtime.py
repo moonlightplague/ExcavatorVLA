@@ -9,10 +9,12 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from functools import wraps
 from pathlib import Path
+import time
 
 import numpy as np
 
 from baseline.bed_fill import BedFillPlanner, FillConfig
+from baseline.episode_metrics import RepeatEpisodeMetrics
 from baseline.motion_geometry import BucketFloor, RigidBucketKinematics
 from baseline.unload_planner import UnloadPlanner, damped_ik
 
@@ -42,7 +44,10 @@ class RepeatConfig:
 class RepeatController:
     def __init__(self, rt, config):
         self.rt, self.config = rt, config
-        self.floor = BucketFloor(rt)
+        # Endpoint-only 3.5 cm clearance leaves the opening-to-pull rotation
+        # grazing the floor between endpoints. Reserve headroom for that arc so
+        # the planner can select a direct cut instead of a free-space detour.
+        self.floor = BucketFloor(rt, clearance=.10)
         self.kinematics = RigidBucketKinematics(rt)
         self.unloader = UnloadPlanner(rt)
         self.reset()
@@ -53,6 +58,8 @@ class RepeatController:
         self.before = None
         self.selected = None
         self.meta = None
+        self.metrics = None
+        self.attempt_started = time.perf_counter()
         self.floor.reset()
         self.kinematics.reset()
         self.unloader.reset()
@@ -162,10 +169,15 @@ class RepeatController:
         q_start = rt.sync_motion_start_q("repeat_return_pre_dig")
         rt.clear_planning_runtime_caches("repeat_return_actual_pose")
         deadline = rt.time.time() + self.config.return_plan_seconds
-        waypoints, reason = rt.find_clearance_route(
-            q_start, q_goal, "pre_dig", "repeat_return_pre_dig", deadline=deadline,
-            samples=rt.PATH_CHECK_SAMPLES,
-        )
+        direct = rt.path_phase_check(q_start, q_goal, "pre_dig", samples=rt.PATH_CHECK_SAMPLES, deadline=deadline)[0]
+        direct = direct and rt.path_obstacle_check(q_start, q_goal, "pre_dig", samples=rt.PATH_CHECK_SAMPLES, deadline=deadline)[0]
+        if direct:
+            waypoints, reason = [], "direct_ok"
+        else:
+            waypoints, reason = rt.find_clearance_route(
+                q_start, q_goal, "pre_dig", "repeat_return_pre_dig", deadline=deadline,
+                samples=rt.PATH_CHECK_SAMPLES,
+            )
         if waypoints is None:
             rt.set_execution_failure_reason(f"execution_failed/repeat_return_no_route:{reason}")
             return False
@@ -193,6 +205,25 @@ class RepeatController:
         return bool(ok)
 
     async def execute_cycle(self, original, rebuild_plan=True, task_name="dig_target_ball", return_home=True):
+        if self.metrics is not None:
+            self.metrics.start_cycle(self.rt.STATE.get("dataset_scoop_index", 0))
+        success = False
+        try:
+            success = await self._execute_cycle(original, rebuild_plan, task_name, return_home)
+            return success
+        finally:
+            if self.metrics is not None:
+                reason = "" if success else (self.rt.STATE.get("last_execution_failure_reason") or "execution_failed")
+                row = self.metrics.finish_cycle(success, reason)
+                if self.cycles and self.cycles[-1]["scoop_index"] == row["scoop_index"]:
+                    self.cycles[-1]["metrics"] = row
+            if self.cycles and self.cycles[-1]["scoop_index"] == int(self.rt.STATE.get("dataset_scoop_index", 0)):
+                cycle = self.cycles[-1]
+                directory = Path(self.rt.STATE["dataset_episode_dir"])
+                self.rt.append_jsonl_dataset(str(directory / "repeat_cycles.jsonl"), cycle)
+                self.rt.dataset_record_event("repeat_cycle_end", data=cycle)
+
+    async def _execute_cycle(self, original, rebuild_plan=True, task_name="dig_target_ball", return_home=True):
         rt = self.rt
         sequence = rt.STATE.get("dig_plan_sequence") or []
         q_return = next((np.asarray(q).copy() for name, q, _duration in sequence if name == "pre_dig"), None)
@@ -222,9 +253,6 @@ class RepeatController:
             "sample_end": int(rt.STATE.get("dataset_samples", 0)) - episode_start,
         }
         self.cycles.append(cycle)
-        directory = Path(rt.STATE["dataset_episode_dir"])
-        rt.append_jsonl_dataset(str(directory / "repeat_cycles.jsonl"), cycle)
-        rt.dataset_record_event("repeat_cycle_end", data=cycle)
         if returned:
             self.bed.commit(selected["landing"])
         return returned
@@ -281,6 +309,26 @@ def install(rt, config):
     original_spatial_filter = rt.multi_scoop_filter_new_spatial_targets
     original_path_phase_check = rt.path_phase_check
     original_path_obstacle_check = rt.path_obstacle_check
+    original_clearance_route = rt.find_clearance_route
+    original_record_sample = rt.dataset_record_sample
+
+    @wraps(original_clearance_route)
+    def clearance_route(q_start, q_goal, mode, label, deadline=None, samples=None):
+        # A generic free-space route inside a cut lifts out of the pile and
+        # reinserts the bucket (sometimes via identical 6.5 m waypoints). Reject
+        # that IK candidate so the planner searches for a safe continuous cut.
+        # Ground/obstacle checks still run on every candidate and at execution.
+        if str(mode) in {"approach_contact", "insert_cut", "pull_mid_cut",
+                         "curl_to_hold_material", "pull_exit_cut"}:
+            return None, "repeat_cut_requires_direct_collision_checked_path"
+        return original_clearance_route(q_start, q_goal, mode, label, deadline=deadline, samples=samples)
+
+    @wraps(original_record_sample)
+    def record_sample(*args, **kwargs):
+        recorded = original_record_sample(*args, **kwargs)
+        if recorded and controller.metrics is not None:
+            controller.metrics.observe()
+        return recorded
 
     @wraps(original_spatial_filter)
     def spatial_filter(ranked_targets):
@@ -502,11 +550,15 @@ def install(rt, config):
     def begin(*args, **kwargs):
         meta = original_begin(*args, **kwargs)
         controller.meta = meta
-        meta["repeat_baseline"] = {"version": "repeat_flat_fill_v1", "config": asdict(config),
+        meta["repeat_baseline"] = {"version": "repeat_flat_fill_v2", "config": asdict(config),
                                    "stop_policy": "fixed_successful_cycles",
+                                   "cut_policy": "continuous_collision_checked_no_clearance_detours",
+                                   "mesh_floor_clearance_m": controller.floor.clearance,
                                    "return_policy": "recorded_physical_collision_checked",
                                    "ground_top_z": float(rt.GROUND_TOP_Z),
                                    "soil_backend": rt.os.environ.get("EXCAVATOR_SOIL_BACKEND", "physx")}
+        controller.metrics = RepeatEpisodeMetrics(rt, controller.attempt_started)
+        meta["repeat_metrics_path"] = str(Path(rt.STATE["dataset_episode_dir"]) / "repeat_metrics.json")
         rt.write_json_file(rt.STATE["dataset_meta_path"], meta)
         return meta
 
@@ -523,7 +575,17 @@ def install(rt, config):
             success, reason = False, "quality_rejected/repeat_incomplete_physical_returns"
         if success:
             rt.multi_scoop_set_stop("requested_repeat_cycles_completed", True, {"cycles": len(cycles)})
-        return original_finish(meta, success, reason)
+        result = original_finish(meta, success, reason)
+        if controller.metrics is not None:
+            bed = controller.ensure_bed().measure(rt.sand_particle_positions())
+            metrics = controller.metrics.finalize(meta, bed)
+            meta["repeat_metrics"] = metrics
+            rt.write_json_file(meta["repeat_metrics_path"], metrics)
+            rt.write_json_file(rt.STATE["dataset_meta_path"], meta)
+            rt.append_jsonl_dataset(str(Path(rt.STATE["auto_collect_run_dir"]) / "repeat_metrics.jsonl"),
+                                    {"episode_id": meta.get("episode_id"),
+                                     "episode_index": meta.get("episode_index"), **metrics})
+        return result
 
     rt.auto_collect_one_episode = episode
     rt.auto_collect_initial_pose_for_attempt = initial_pose
@@ -538,6 +600,8 @@ def install(rt, config):
     rt.multi_scoop_filter_new_spatial_targets = spatial_filter
     rt.path_phase_check = path_phase_check
     rt.path_obstacle_check = path_obstacle_check
+    rt.find_clearance_route = clearance_route
+    rt.dataset_record_sample = record_sample
     rt.plan_dump_pose_to_bin = dump_plan
     rt.auto_collect_begin_episode = begin
     rt.execute_dig_target_ball = execute

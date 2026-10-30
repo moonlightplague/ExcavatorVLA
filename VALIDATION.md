@@ -1,3 +1,48 @@
+# Validation — 2026-10-30
+
+The v2 controller completed a live three-scoop episode on its first attempt
+with PhysX soil and sand amount 1.0. The run reused scene namespace
+`run_20261025_210534_repeat_20261025_210508_595202_r1_w0` and worker identity
+`repeat_20261025_210508_595202_r1_w0` with the normal randomized collector.
+
+The old plans contained duplicated 6.5 m clearance waypoints between insertion
+and pulling. Rejecting those routes first exposed a small intermediate mesh
+floor penetration despite valid endpoints. Reserving 0.10 m at mesh-based target
+heights allowed continuous cuts while keeping the existing floor/path checks.
+All three cuts in the final run had no clearance detours; all three physical
+returns used checked direct paths with zero clearance waypoints.
+
+| Check | Result |
+|---|---:|
+| Completed scoops / physical returns | 3 / 3 |
+| Source / exported frames | 690 |
+| Frames in each of three exported videos | 690 |
+| Exported physical-return frames | 75 |
+| Episode score | 90.0 |
+| Strict source-ID payload | 1,559 particles / 561.24 kg |
+| Unique scooped source IDs | 1,571 |
+| Final retained / spilled source IDs | 0 / 24 |
+| Spillage fraction | 1.53% |
+| Full episode simulation time, including returns | 68.97 s |
+| Mean scoop execution/return time | 22.94 simulation seconds |
+| Recorded episode wall runtime / preparation-inclusive attempt | 256.47 / 309.87 s |
+
+The per-episode metrics file, embedded metadata, and run-level metric index
+agreed. `baseline/validate_repeat.py` passed the v2 metric/continuous-cut audit,
+source clock and images, all returns, canonical 28D state/4D actions, and actual
+video frame counts. Strict standard/VLA export also passed. Payload can exceed
+observed captured IDs because transient bucket occupancy between observations
+is not observed; the shared online evaluation tracker uses the same accounting.
+Spillage includes material returned to the pile, unlike the collector's existing
+quality-gate spill estimate.
+
+98 automated tests passed: 57 baseline tests, 15 online evaluation metric tests,
+15 existing export contract tests, and 11 append tests. They cover failed and
+rejected episode reports, unique source identity, repeated scoops, retained
+material, overlap exclusion, timing, cut routing, and v1/v2 return compatibility.
+Temporary live data, exports and metric files were removed after validation.
+This smoke test does not establish success rates across all scenes or soil backends.
+
 # Validation — 2026-10-25
 
 Local runtime: Isaac Sim `6.1.0-rc.26`, RTX 4090 GPUs, PhysX particle soil.

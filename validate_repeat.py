@@ -30,6 +30,26 @@ def validate_episode(directory):
     require(meta.get("all_scoops_success"), "A scoop failed the existing quality gate")
     require(meta.get("repeat_returns_completed") == count, "Incomplete physical returns")
     require(meta.get("source_sampling_audit", {}).get("ok"), "Source sampling audit failed")
+    if meta["repeat_baseline"].get("version") == "repeat_flat_fill_v2":
+        metrics = meta.get("repeat_metrics", {})
+        require(metrics.get("metrics_schema_version") == "repeat_episode_metrics_v1", "Missing repeat metrics")
+        require(json.loads((directory / "repeat_metrics.json").read_text()) == metrics,
+                "Persisted repeat metrics disagree with metadata")
+        require(metrics.get("success") and metrics.get("available"), "Repeat metrics unavailable or unsuccessful")
+        require(metrics["samples"] == meta["final_metrics"]["samples"], "Metric sample count mismatch")
+        for key in ("runtime_seconds", "simulated_runtime_seconds", "cycle_time_seconds", "cycle_time_wall_seconds"):
+            require(np.isfinite(metrics[key]) and metrics[key] > 0, f"Invalid {key}")
+        require(metrics["spillage_particles"] + metrics["retained_particles"] <= metrics["scooped_particles"],
+                "Inconsistent source particle accounting")
+        require(len(metrics["scoop_cycles"]) == count and all(row["success"] for row in metrics["scoop_cycles"]),
+                "Missing scoop cycle measurements")
+        plans = [meta.get("plan", [])] + [row.get("plan", []) for row in meta.get("scoop_plans", [])]
+        for plan in plans:
+            contact = next((index for index, stage in enumerate(plan) if stage.get("phase") == "approach_contact"), None)
+            exit_cut = next((index for index, stage in enumerate(plan) if stage.get("phase") == "pull_exit_cut"), len(plan) - 1)
+            if contact is not None:
+                require(not any(str(stage.get("phase", "")).startswith("clearance_route")
+                                for stage in plan[contact:exit_cut + 1]), "Clearance detour interrupts the cut")
     if "min_curl_height_m" in config:
         minimum = config["min_curl_height_m"] + meta["repeat_baseline"].get("ground_top_z", 0)
         plans = [meta.get("plan", [])] + [row.get("plan", []) for row in meta.get("scoop_plans", [])]

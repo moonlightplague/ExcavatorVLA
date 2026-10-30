@@ -90,6 +90,15 @@ the freshly measured, denser areas of the same pile, including previous cut
 locations. Spatial exclusion alone does not mark the material exhausted. This
 fallback is recorded as `repeat_dig_revisit` and does not reset the sand or arm.
 
+Cutting phases use a continuous, collision-checked path. A failed direct path
+from contact through insertion, pull and curl rejects that IK candidate instead
+of inserting generic free-space clearance waypoints that lift the arm and lower
+it back into the pile. The planner searches other candidates with the existing
+ground, mesh and obstacle checks. Returns try the checked direct path first;
+clearance routes remain available for returns and travel around the truck.
+Mesh-based target heights reserve 0.10 m above the floor for the bucket's
+rotation between cut endpoints; endpoint clearance alone missed that arc.
+
 Predictions preserve the actual 3D marker offsets. Unload cells are preflighted
 with bounded opening-center IK, a closed carry posture, and collision checks;
 loaded transit uses the same collision sampling resolution as execution. Loaded
@@ -136,7 +145,8 @@ data/repeat/
       episode_*/
         meta.json, score.json, trajectory.jsonl, events.jsonl, sand_metrics.jsonl
         images/...
-        repeat_cycles.jsonl
+        repeat_cycles.jsonl, repeat_metrics.json
+      repeat_metrics.jsonl
   export_repeat/
     meta/info.json, meta/stats.json, meta/tasks.parquet, meta/episodes/...
     data/chunk-*/file-*.parquet
@@ -153,6 +163,36 @@ scheduled writer normally labels these frames `pre_dig`; return event pairs and
 the cycle's sample boundaries distinguish them from the next dig's approach.
 The task text explicitly requests repeated
 digging, spreading, and returns and is retained by the exporter.
+
+Every recorded episode, including failed and rejected episodes, writes
+`repeat_metrics.json`. The same report is embedded as `meta.json.repeat_metrics`
+and appended with episode identity to the run's `repeat_metrics.jsonl`. Reports
+include final payload, unique scooped material, retained material, spillage and
+spillage fraction; particle counts and masses in kg; simulation cycle time;
+wall runtime; preparation-inclusive attempt runtime; per-scoop execution/cycle
+times and counts; payload throughput; final bed coverage and surface variation;
+and the original score and quality metrics. Per-scoop metrics also appear in
+`repeat_cycles.jsonl` for cycles that reached the return step.
+
+Particle accounting reuses the online evaluator's `ParticleTransferTracker`:
+only initial-pile IDs count, repeat scoops do not double-count IDs, initial truck
+contents are excluded, and bucket/truck overlap belongs to the bucket.
+Spillage includes scooped material returned to the pile or still airborne.
+Sampling runs at recording start, each recorded 10 Hz frame, cycle boundaries,
+and finish; transfers entirely between observations can be missed. Region
+geometry uses this collector's bucket volume and truck polygon/Z bounds, so
+the counts need not match evaluation's truck-local bounding box exactly.
+Unavailable identity measurements are explicitly null with a reason.
+
+`cycle_time_seconds` measures the entire repeated episode in simulation time,
+including settling, planning between scoops and the final physical return;
+`cycle_time_wall_seconds` is its wall-clock counterpart. Both are null for
+incomplete/rejected episodes, whose elapsed times are still recorded in
+`simulated_runtime_seconds` and `runtime_seconds`. `attempt_runtime_seconds`
+also includes scene preparation and initial planning. Per-scoop times begin at
+executor entry and include settling and return. Every report embeds these
+definitions and the `repeat_episode_metrics_v1` schema identifier. Policy and
+bridge inference latencies do not apply to this scripted collector.
 
 The parent process exports successful episodes sequentially, avoiding append
 contention between simulators. The publication uses `current-v4` 28D state,
@@ -198,7 +238,8 @@ python -m unittest discover -s baseline/tests -v
 
 They check rotated bed geometry, measurements and fill ranking, visit memory,
 per-attempt isolation, physical return orchestration and failure propagation,
-fixed-count completion, exact initial-pose overrides, and the real shell's
+fixed-count completion, continuous-cut routing, sampled particle accounting,
+successful/failed episode timing and metric persistence, exact initial-pose overrides, and the real shell's
 multiworker argument handling and sequential export using mock child processes.
 
 Audit a successful **live** run and its export:
@@ -210,5 +251,5 @@ python baseline/validate_repeat.py --run-dir /path/to/raw/run_... \
 
 This checks all cycles and recorded nonzero return actions, source 10 Hz cadence,
 canonical state/actions, camera-frame uniqueness and files, source-soil transfer,
-and actual MP4 frame counts against Parquet. Live validation results for this
+v2 metric persistence and continuous cuts, and actual MP4 frame counts against Parquet. Live validation results for this
 checkout are recorded in `VALIDATION.md`.

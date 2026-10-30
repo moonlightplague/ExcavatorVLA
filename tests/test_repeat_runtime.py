@@ -15,6 +15,8 @@ def fake_runtime(directory):
     q = np.array([.5, .4, -.8, .2])
     rt = SimpleNamespace(
         STATE={"dig_plan_sequence": [("pre_dig", q.copy(), 1.)],
+               "dataset_initial_pile_particle_mask": np.ones(10, dtype=bool),
+               "auto_collect_run_dir": directory,
                "dataset_samples": 10, "dataset_episode_sample_start": 10,
                "dataset_episode_dir": directory, "dataset_scoop_index": 0,
                "dataset_recording": True, "dataset_meta_path": str(Path(directory) / "meta.json")},
@@ -25,7 +27,11 @@ def fake_runtime(directory):
         unload_context_polygon_xy=lambda ctx, safe_margin: np.array(
             [[-3 + safe_margin, -1 + safe_margin], [3 - safe_margin, -1 + safe_margin],
              [3 - safe_margin, 1 - safe_margin], [-3 + safe_margin, 1 - safe_margin]]),
-        sand_particle_positions=lambda: np.zeros((0, 3)), bucket_pour_pos=lambda: [0, 0, 4],
+        sand_particle_positions=lambda: np.zeros((10, 3)), bucket_pour_pos=lambda: [0, 0, 4],
+        sand_region_masks=lambda points: (np.ones(len(points), dtype=bool), np.zeros(len(points), dtype=bool), np.zeros(len(points), dtype=bool)),
+        sand_particle_mass=lambda: .01,
+        dataset_simulation_time_seconds=lambda: rt.STATE["dataset_samples"] * .1,
+        dataset_record_sample=Mock(return_value=True),
         unload_landing_radius_status=lambda *args, **kwargs: {"ok": True, "radius_m": 8},
         sync_motion_start_q=Mock(return_value=q.copy() + 1),
         clear_planning_runtime_caches=Mock(),
@@ -65,6 +71,44 @@ def fake_runtime(directory):
 
 
 class RepeatRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cut_cannot_leave_pile_on_generic_clearance_detour(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rt = fake_runtime(directory)
+            original_route = rt.find_clearance_route
+            install(rt, RepeatConfig())
+            for stage in ("approach_contact", "insert_cut", "pull_mid_cut", "curl_to_hold_material", "pull_exit_cut"):
+                route, reason = rt.find_clearance_route(np.zeros(4), np.ones(4), stage, "plan_cut")
+                self.assertIsNone(route)
+                self.assertIn("requires_direct", reason)
+            original_route.assert_not_called()
+            for stage in ("pre_dig", "unload_to_bin"):
+                self.assertIsNotNone(rt.find_clearance_route(np.zeros(4), np.ones(4), stage, "plan_travel")[0])
+            self.assertEqual(original_route.call_count, 2)
+
+    async def test_metrics_sample_recording_and_persist_upstream_quality_rejections(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rt = fake_runtime(directory)
+            def rejected(meta, success, reason):
+                meta.update(success=False, status="rejected", failure_reason="quality_rejected/test", scoops_completed=2)
+                return False
+            rt.auto_collect_finish_episode = rejected
+            controller = install(rt, RepeatConfig(scoops=2))
+            meta = rt.auto_collect_begin_episode()
+            initial = controller.metrics.observations
+            rt.dataset_record_sample("pull_mid_cut")
+            self.assertEqual(controller.metrics.observations, initial + 1)
+            rt.dataset_record_sample.__wrapped__.return_value = False
+            rt.dataset_record_sample("pull_mid_cut")
+            self.assertEqual(controller.metrics.observations, initial + 1)
+            controller.cycles = [{"returned": True}] * 2
+            self.assertFalse(rt.auto_collect_finish_episode(meta, True, "ok"))
+            metrics = meta["repeat_metrics"]
+            self.assertFalse(metrics["success"])
+            self.assertIsNone(metrics["cycle_time_seconds"])
+            self.assertEqual(metrics["failure_reason"], "quality_rejected/test")
+            self.assertIn(str(Path(directory) / "repeat_metrics.json"), [call.args[0] for call in rt.write_json_file.call_args_list])
+            self.assertEqual(rt.append_jsonl_dataset.call_args.args[0], str(Path(directory) / "repeat_metrics.jsonl"))
+
     async def test_physical_contact_can_engage_sand_below_named_tip_marker(self):
         with tempfile.TemporaryDirectory() as directory:
             rt = fake_runtime(directory)
@@ -84,7 +128,7 @@ class RepeatRuntimeTests(unittest.IsolatedAsyncioTestCase):
             rt = fake_runtime(directory)
             install(rt, RepeatConfig())
             amount, detail = rt.predicted_phase_ground_vertical_correction("pull_mid_cut", {"repeat_mesh_min_z": -.007})
-            self.assertAlmostEqual(amount, .042)
+            self.assertAlmostEqual(amount, .107)
             self.assertEqual(detail["limiting_point"], "bucket_collision_mesh")
 
     async def test_fixed_count_retries_dense_targets_without_resetting_history(self):
@@ -134,13 +178,15 @@ class RepeatRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(original.await_args.kwargs["return_home"], False)
             call = rt.move_to_profile.await_args
             self.assertEqual(call.kwargs["mode"], "pre_dig")
-            self.assertTrue(call.kwargs["path_waypoints"])
+            self.assertEqual(call.kwargs["path_waypoints"], [])
+            rt.find_clearance_route.assert_not_called()
             self.assertEqual(controller.cycles[-1]["scoop_index"], 1)
 
     async def test_return_failure_propagates_and_is_never_committed(self):
         with tempfile.TemporaryDirectory() as directory:
             rt = fake_runtime(directory)
             rt.find_clearance_route.return_value = (None, "truck wall")
+            rt.path_obstacle_check.return_value = (False, "truck wall", 1, {})
             controller = RepeatController(rt, RepeatConfig(scoops=2, settle_seconds=.1))
             controller.choose_landing()
             self.assertFalse(await controller.execute_cycle(rt.execute_dig_target_ball))
@@ -148,6 +194,28 @@ class RepeatRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(controller.bed.visits, [])
             self.assertFalse(controller.cycles[0]["returned"])
             self.assertIn("repeat_return_no_route", rt.set_execution_failure_reason.call_args.args[0])
+
+    async def test_blocked_direct_return_keeps_collision_checked_clearance_route(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rt = fake_runtime(directory)
+            rt.path_obstacle_check.return_value = (False, "truck wall", 1, {})
+            controller = RepeatController(rt, RepeatConfig(scoops=2, settle_seconds=.1))
+            controller.choose_landing()
+            self.assertTrue(await controller.execute_cycle(rt.execute_dig_target_ball))
+            rt.find_clearance_route.assert_called_once()
+            self.assertTrue(rt.move_to_profile.await_args.kwargs["path_waypoints"])
+
+    async def test_failed_dig_still_has_attempted_scoop_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rt = fake_runtime(directory)
+            rt.execute_dig_target_ball.return_value = False
+            controller = install(rt, RepeatConfig(scoops=2))
+            rt.auto_collect_begin_episode()
+            self.assertFalse(await rt.execute_dig_target_ball(rebuild_plan=False))
+            self.assertEqual(controller.cycles, [])
+            self.assertEqual(len(controller.metrics.cycles), 1)
+            self.assertFalse(controller.metrics.cycles[0]["success"])
+            self.assertIsNone(controller.metrics.cycles[0]["cycle_time_seconds"])
 
     async def test_dig_failure_does_not_attempt_return(self):
         with tempfile.TemporaryDirectory() as directory:

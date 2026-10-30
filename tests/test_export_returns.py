@@ -31,6 +31,14 @@ class ReturnExportTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 export.repeat_return_spans(meta)
 
+    def test_v2_keeps_the_audited_return_contract_and_unknown_versions_fail(self):
+        meta = self.meta()
+        meta["repeat_baseline"]["version"] = "repeat_flat_fill_v2"
+        self.assertEqual(export.repeat_return_spans(meta), [(0, 8, 10), (1, 18, 20)])
+        meta["repeat_baseline"]["version"] = "repeat_flat_fill_v3"
+        with self.assertRaisesRegex(ValueError, "Unsupported"):
+            export.repeat_return_spans(meta)
+
     def test_return_after_last_unload_is_valid_supervision(self):
         stages = [0, 4, 9, 0, 0, 0, 4, 9, 0, 0]
         scoops = [0] * 5 + [1] * 5

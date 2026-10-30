@@ -13,15 +13,18 @@ class SuccessEvalObservationTests(unittest.TestCase):
         source = Path(__file__).resolve().parents[2] / 'scripts/eval_smolvla_success.py'
         tree = ast.parse(source.read_text())
         functions = [node for node in tree.body
-                     if isinstance(node, ast.FunctionDef) and node.name in ('observation', 'validate_state')]
+                     if isinstance(node, ast.FunctionDef) and node.name in
+                     ('decoded_frames', 'policy_batch', 'validate_state')]
         self.images = {name: np.zeros((2, 2, 3), dtype=np.uint8) for name in ('0', '1', '2')}
         self.names = [f'state_{index}' for index in range(28)]
         namespace = {
             'np': np, 'torch': torch, 'F': F, 'STATE_NAMES_28D': self.names,
+            'CAMERA_IDS': ('0', '1', '2'),
             'decode_camera_images': lambda *args, **kwargs: self.images,
         }
         exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), 'exec'), namespace)
-        self.observe = namespace['observation']
+        self.observe = lambda reply: namespace['policy_batch'](
+            namespace['decoded_frames'](reply), namespace['validate_state'](reply), reply['task_text'])
         self.reply = {
             'observation_32d_ready': True,
             'observation_contract': {'observation.state': {'names': self.names}},

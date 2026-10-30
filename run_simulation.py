@@ -158,7 +158,16 @@ from excavator_common.deployment_contract import (
 )
 from excavator_common import vla_observation_contract
 from excavator_common import deployment_scene_contract
-from excavator_common.collection_target import dig_target_from_particles, SAND_INITIALIZATION_METHOD
+from excavator_common.collection_target import dig_target_from_particles
+from excavator_common.simulation_settings import resolve_simulation_settings
+
+
+def _sand_walls_during_settle():
+    """True keeps HEAD behaviour; False restores pre-36367cb wall timing."""
+    return os.environ.get(
+        "EXCAVATOR_SAND_WALLS_DURING_SETTLE", "1"
+    ).strip().lower() not in ("0", "false", "no", "off")
+
 from excavator_common.mesh_topology import closed_mesh_boundary_edge_count
 from excavator_common.evaluation_metrics import ParticleTransferTracker
 from excavator_common.evaluation_standard import TRUCK_COUNT_METHOD, canonical_joint_limits as resolve_joint_limits
@@ -2331,6 +2340,21 @@ def main(args):
     else:
         # The rectangular generation walls must remain through settling.
         # Disabling the optional circular wall must not remove them early.
+        # EXCAVATOR_SAND_WALLS_DURING_SETTLE=0 restores the collection-time
+        # behaviour (36367cb^): walls are removed before settling so the pile
+        # collapses freely and matches the training-data sand distribution.
+        if not _sand_walls_during_settle():
+            _early_clean = sand_api.get("clean_sand_retaining_walls")
+            if not callable(_early_clean):
+                raise RuntimeError(
+                    "Sand runtime cannot remove temporary retaining walls"
+                )
+            _early_clean()
+            print(
+                "[SAND] Retaining walls removed before settling "
+                "(EXCAVATOR_SAND_WALLS_DURING_SETTLE=0)",
+                flush=True,
+            )
         if stage.GetPrimAtPath(circular_wall_path).IsValid():
             raise RuntimeError(
                 "Circular sand wall remained after it was disabled: "
@@ -3912,7 +3936,7 @@ def main(args):
         try:
             sand_module.relocate_sand_source(random_scene_profile["sand_xy"])
             sand_api = getattr(builtins, "_SAND_SITE", sand_api)
-            if args.retaining_walls:
+            if args.retaining_walls and _sand_walls_during_settle():
                 create_walls = sand_api.get("create_sand_retaining_walls")
                 if not callable(create_walls):
                     raise RuntimeError("Sand runtime cannot create temporary retaining walls")
@@ -3997,15 +4021,21 @@ def main(args):
                 continue
 
             if cmd.get("type") == "scene_context":
+                simulation_settings = resolve_simulation_settings(
+                    soil_backend=sand_api.get("soil_backend", "physx"))
                 response_queue.put({
                     "type": "scene_context",
                     "protocol_version": PROTOCOL_VERSION,
                     "scene_seed": random_scene_profile["seed"],
                     "scene_profile": random_scene_profile,
+                    "simulation_settings": simulation_settings,
                     "sand_initialization": {
-                        "method": SAND_INITIALIZATION_METHOD,
+                        "method": simulation_settings["sand_initialization_method"],
                         "settle_frames": int(args.sand_settle_frames),
                         "temporary_rectangular_walls": bool(args.retaining_walls),
+                        "walls_collide_during_settle": bool(
+                            args.retaining_walls and simulation_settings["sand_walls_during_settle"]
+                            and simulation_settings["soil_backend"] == "physx"),
                         "circular_wall": bool(args.sand_wall),
                     },
                     "dig_target_generation": dict(dig_target_generation),

@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-30
+
+- Record resolved soil backend and settling wall settings in simulator scene metadata and support explicit wall timing.
+- Update observation regression tests for the evaluation image pipeline.
+
 ## 2026-07-16 - Simulator Bridge Optimization
 
 Author: ylx

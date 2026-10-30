@@ -2,9 +2,19 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 outputs/
-models/
+/models
 .venv*/
 *.safetensors
 *.pt
 *.pth
 *.ckpt
+
+# Local datasets and generated execution artifacts
+/data
+/checkpoints/
+.cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.log
+*.tmp

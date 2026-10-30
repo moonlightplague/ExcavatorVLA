@@ -2,6 +2,7 @@
 
 ## 2026-10-30
 
+- Ignore local datasets, checkpoint directories, runtime logs, and development caches.
 - Add PI05 VLM LoRA training, checkpoint reconstruction, continuation and A/B evaluation tools with regression coverage.
 - Add ACT ablation configurations and split manifests.
 - Add rollout selection and fine-tuning dataset conversion; guard overwrite ownership and selection accounting.

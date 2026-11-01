@@ -43,6 +43,15 @@ def validate_episode(directory):
                 "Inconsistent source particle accounting")
         require(len(metrics["scoop_cycles"]) == count and all(row["success"] for row in metrics["scoop_cycles"]),
                 "Missing scoop cycle measurements")
+        if meta.get("raw_storage", {}).get("policy") == "metrics_only":
+            receipt = json.loads((directory / "export.json").read_text())
+            require(receipt.get("validated") and receipt.get("raw_pruned")
+                    and receipt.get("episode_id") == meta.get("episode_id"), "Invalid export/cleanup receipt")
+            require(meta.get("raw_storage", {}).get("exported"), "Trainable raw data pruned without export")
+            return {"episode": str(directory), "frames": metrics["samples"], "scoops": count,
+                    "score": meta["score_summary"]["score"], "export": receipt,
+                    "validation_mode": "retained_metrics_and_export_receipt",
+                    "raw_trajectory_available": False}
         plans = [meta.get("plan", [])] + [row.get("plan", []) for row in meta.get("scoop_plans", [])]
         for plan in plans:
             contact = next((index for index, stage in enumerate(plan) if stage.get("phase") == "approach_contact"), None)

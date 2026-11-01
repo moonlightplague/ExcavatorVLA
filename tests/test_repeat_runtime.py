@@ -4,7 +4,8 @@ import tempfile
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
+import subprocess
 
 import numpy as np
 
@@ -40,6 +41,7 @@ def fake_runtime(directory):
         dataset_record_event=Mock(), info_print=Mock(), plan_joint_motion_metrics=lambda *a, **k: {"estimated_time": 1.},
         move_to_profile=AsyncMock(return_value=True), get_real_joint_positions=lambda: q.copy(),
         control_step_frames=lambda: 1, append_jsonl_dataset=Mock(), write_json_file=Mock(),
+        dataset_writer_flush=Mock(),
         multi_scoop_set_stop=Mock(),
         multi_scoop_filter_new_spatial_targets=lambda rows: (list(rows), {}),
         auto_collect_one_episode=AsyncMock(), auto_collect_begin_episode=Mock(return_value={}),
@@ -71,6 +73,35 @@ def fake_runtime(directory):
 
 
 class RepeatRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_streaming_waits_for_flushed_metrics_before_export(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rt = fake_runtime(directory)
+            controller = install(rt, RepeatConfig(scoops=2, stream_export_dir="/export", policy_python="/policy/python"))
+            meta = rt.auto_collect_begin_episode()
+            controller.cycles = [{"returned": True}] * 2
+            def export(command, check, env):
+                rt.dataset_writer_flush.assert_called_once_with("repeat_export_and_prune")
+                self.assertIn("repeat_metrics", meta)
+                self.assertTrue(rt.append_jsonl_dataset.called)
+                self.assertEqual(command[0], "/policy/python")
+                self.assertIn("--episode-dir", command)
+                self.assertTrue(check)
+                self.assertNotIn("ISAAC_PATH", env)
+            with patch("baseline.repeat_runtime.subprocess.run", side_effect=export) as process:
+                rt.auto_collect_finish_episode(meta, True, "ok")
+            process.assert_called_once()
+
+    async def test_stream_export_failure_stops_collection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rt = fake_runtime(directory)
+            controller = install(rt, RepeatConfig(scoops=2, stream_export_dir="/export", policy_python="/policy/python"))
+            meta = rt.auto_collect_begin_episode()
+            controller.cycles = [{"returned": True}] * 2
+            with patch("baseline.repeat_runtime.subprocess.run", side_effect=subprocess.CalledProcessError(1, "export")):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    rt.auto_collect_finish_episode(meta, True, "ok")
+            self.assertTrue(rt.STATE["auto_collect_stop_requested"])
+
     async def test_cut_cannot_leave_pile_on_generic_clearance_detour(self):
         with tempfile.TemporaryDirectory() as directory:
             rt = fake_runtime(directory)

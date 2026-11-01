@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from functools import wraps
 from pathlib import Path
+import subprocess
 import time
 
 import numpy as np
@@ -16,6 +17,7 @@ import numpy as np
 from baseline.bed_fill import BedFillPlanner, FillConfig
 from baseline.episode_metrics import RepeatEpisodeMetrics
 from baseline.motion_geometry import BucketFloor, RigidBucketKinematics
+from baseline.stream_export import policy_environment
 from baseline.unload_planner import UnloadPlanner, damped_ik
 
 
@@ -28,6 +30,8 @@ class RepeatConfig:
     dig_target_spacing_m: float = .28
     min_dig_height_m: float = .15
     min_curl_height_m: float = 1.05
+    stream_export_dir: str = ""
+    policy_python: str = ""
 
     def __post_init__(self):
         if not 2 <= self.scoops <= 64:
@@ -39,6 +43,8 @@ class RepeatConfig:
         for name in ("dig_target_spacing_m", "min_dig_height_m", "min_curl_height_m"):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be finite and positive.")
+        if bool(self.stream_export_dir) != bool(self.policy_python):
+            raise ValueError("Streaming export requires both a destination and policy Python.")
 
 
 class RepeatController:
@@ -513,7 +519,8 @@ def install(rt, config):
                                       "angles": controller.floor.reference["angles"],
                                       "effectors": {name: points.tolist() for name, points in
                                                     controller.floor.reference["effectors"].items()}}}
-                rt.write_json_file(str(Path(rt.STATE["auto_collect_run_dir"]) / f"repeat_kinematics_{attempt_index:06d}.json"), snapshot)
+                if not config.stream_export_dir:
+                    rt.write_json_file(str(Path(rt.STATE["auto_collect_run_dir"]) / f"repeat_kinematics_{attempt_index:06d}.json"), snapshot)
             controller.choose_landing()
         except (ValueError, RuntimeError) as exc:
             rt.STATE["dig_plan_best_failure"] = {
@@ -585,6 +592,25 @@ def install(rt, config):
             rt.append_jsonl_dataset(str(Path(rt.STATE["auto_collect_run_dir"]) / "repeat_metrics.jsonl"),
                                     {"episode_id": meta.get("episode_id"),
                                      "episode_index": meta.get("episode_index"), **metrics})
+        if config.stream_export_dir:
+            # Block the next episode while waiting for export/cleanup. The
+            # policy Python has the export dependencies that Isaac lacks.
+            rt.dataset_writer_flush("repeat_export_and_prune")
+            if rt.STATE.get("dataset_async_writer_errors"):
+                raise RuntimeError("Raw writer failed; refusing export/cleanup")
+            rt.info_print("[REPEAT EXPORT]", f"episode={meta.get('episode_id')}",
+                          "waiting_for_validated_export_and_cleanup", force_log=True)
+            try:
+                subprocess.run([
+                    config.policy_python, str(Path(__file__).with_name("stream_export.py")),
+                    "--run-dir", str(rt.STATE["auto_collect_run_dir"]),
+                    "--episode-dir", str(rt.STATE["dataset_episode_dir"]),
+                    "--export-dir", config.stream_export_dir,
+                ], check=True, env=policy_environment())
+            except Exception:
+                rt.STATE["auto_collect_stop_requested"] = True
+                rt.info_print("[REPEAT EXPORT ERROR]", "collection_stopped; unexported_raw_retained", force_log=True)
+                raise
         return result
 
     rt.auto_collect_one_episode = episode

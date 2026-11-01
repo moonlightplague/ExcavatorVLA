@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch the repeat baseline with Isaac Python; export with collect_repeat.sh."""
+"""Launch the repeat baseline with Isaac Python and optional streaming export."""
 from __future__ import annotations
 
 import argparse
@@ -27,11 +27,16 @@ def parse_args(argv=None):
     parser.add_argument("--dig-target-spacing", type=float, default=.28)
     parser.add_argument("--min-dig-height", type=float, default=.15)
     parser.add_argument("--min-curl-height", type=float, default=1.05)
+    parser.add_argument("--stream-export-dir", default="",
+                        help="Export each finalized successful episode, then retain only raw metrics.")
+    parser.add_argument("--policy-python", default="", help="Python with LeRobot export dependencies.")
     parser.add_argument("--soil-backend", choices=("physx", "newton_mpm"),
                         default=os.environ.get("EXCAVATOR_SOIL_BACKEND", "physx"))
     args, forwarded = parser.parse_known_args(argv)
     if not 2 <= args.scoops_per_episode <= 64:
         parser.error("--scoops-per-episode must be between 2 and 64")
+    if bool(args.stream_export_dir) != bool(args.policy_python):
+        parser.error("--stream-export-dir and --policy-python must be supplied together")
     return args, forwarded
 
 
@@ -43,7 +48,8 @@ def main(argv=None):
 
     config = RepeatConfig(args.scoops_per_episode, args.return_plan_seconds, args.dump_settle_seconds,
                           FillConfig(args.bed_long_cells, args.bed_short_cells, args.bed_wall_margin),
-                          args.dig_target_spacing, args.min_dig_height, args.min_curl_height)
+                          args.dig_target_spacing, args.min_dig_height, args.min_curl_height,
+                          stream_export_dir=args.stream_export_dir, policy_python=args.policy_python)
     os.environ["EXCAVATOR_SOIL_BACKEND"] = args.soil_backend
     for path in (ISAAC_REPO, ISAAC_REPO / "scripts"):
         sys.path.insert(0, str(path))

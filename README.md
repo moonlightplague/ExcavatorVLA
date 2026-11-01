@@ -134,7 +134,11 @@ baseline: a small number of scoops cannot guarantee a perfectly level truck bed.
 
 ## Data and SmolVLA
 
-The existing raw and LeRobot layouts are preserved:
+`collect_repeat.sh` exports each successful episode before that worker starts
+another episode. Appends from all workers share a blocking lock. Once the strict
+LeRobot export validates and an export receipt is saved, the episode's large raw
+files are deleted. Raw storage therefore holds at most one pending episode per
+worker, plus retained metrics and collection logs.
 
 ```text
 data/repeat/
@@ -143,18 +147,20 @@ data/repeat/
     run_*/
       summary.json, episodes.jsonl, trainable_episodes.jsonl, ...
       episode_*/
-        meta.json, score.json, trajectory.jsonl, events.jsonl, sand_metrics.jsonl
-        images/...
-        repeat_cycles.jsonl, repeat_metrics.json
+        meta.json, score.json, repeat_cycles.jsonl, repeat_metrics.json
+        export.json                     # successful episodes: validated export/cleanup receipt
       repeat_metrics.jsonl
+  metrics/
+    repeat_*_summary.json                # combined batch totals and averages
   export_repeat/
     meta/info.json, meta/stats.json, meta/tasks.parquet, meta/episodes/...
     data/chunk-*/file-*.parquet
     videos/observation.images.{0,1,2}/chunk-*/file-*.mp4
 ```
 
-Raw metadata retains `episode_mode=multi_scoop` and adds `repeat_baseline`,
-`repeat_cycles`, and `repeat_returns_completed`. Per-cycle reports contain the
+Retained metadata includes `repeat_baseline`, `repeat_cycles`,
+`repeat_returns_completed`, the source sampling audit, final quality metrics,
+and `raw_storage.policy=metrics_only`. Per-cycle reports contain the
 selected landing, bed fill before/after depositing/returning, return success,
 return pose, and episode-local sample boundaries (end is exclusive). Existing
 `observation.scoop_index` and stage labels identify all cycles. Return movement
@@ -194,8 +200,14 @@ executor entry and include settling and return. Every report embeds these
 definitions and the `repeat_episode_metrics_v1` schema identifier. Policy and
 bridge inference latencies do not apply to this scripted collector.
 
-The parent process exports successful episodes sequentially, avoiding append
-contention between simulators. The publication uses `current-v4` 28D state,
+Each worker flushes all pending raw/metric writes, exports using `POLICY_PYTHON`
+with its original library/Python paths restored, and waits for validated append
+and cleanup. Export errors stop that worker and preserve its unexported raw data;
+the parent checks export/cleanup receipts before counting a success. Images,
+trajectories, events, per-frame sand records, and debug plans are removed after
+successful publication. Rejected/failed episodes retain their metrics but shed
+the same large raw files without export. Kinematic debug snapshots are disabled
+for streaming collection. The publication uses `current-v4` 28D state,
 4D command velocity actions in rad/s, three RGB 256×256 videos at the source
 10 Hz, and excludes unstable effort from policy inputs. Scoop/stage supervision
 remains available as extra columns. Source trajectories are not retimed.
@@ -204,11 +216,26 @@ cycle sample bounds and phase 0. It identifies physical returns without adding
 state dimensions or inventing another stage. Export validation accepts these
 flagged returns and still rejects unmarked regressions or stale lift/dig stages
 after unloading. Legacy single-scoop exports do not acquire this optional field.
-Worker failures stop the launcher after available successes have been exported;
-raw failures and diagnostic records remain inspectable. Ctrl+C stops worker
-process groups. The parent retries incomplete targets only while progress is made.
+Worker failures stop the launcher; completed exports and retained episode metrics
+remain available. Ctrl+C stops worker/export process groups. The parent retries
+incomplete targets only while progress is made.
 
-To export an existing raw run again:
+At batch exit, `$DATA_ROOT/metrics/${BATCH_ID}_summary.json` combines metrics from
+every worker and retry round belonging to this invocation. It contains episode
+counts, totals, average payload/mass, wall and simulation runtimes, spillage/mass,
+retention, scores, bed coverage, and completed-scoop averages. All recorded
+episodes and trainable episodes have separate sections; rejected/failed sections
+are included when present. Nulls are excluded with metric-specific denominators.
+Mean episode spillage fraction and pooled spilled/scooped fraction are separate.
+Planning-only attempts are counted but cannot contribute episode averages.
+Existing episodes in the export destination are excluded from the batch summary.
+An interrupted/failed batch receives a partial summary marked accordingly.
+
+`validate_repeat.py` recognizes retained metrics and export receipts. Its result
+labels that mode explicitly; it cannot re-audit deleted raw trajectories. Pass
+`--export-dir` to validate the actual publication as well.
+
+To export an older, unpruned raw run (metrics-only episodes cannot be re-exported):
 
 ```bash
 python ExcavatorVLA-isaac/excavator_dataset_tools.py /absolute/path/to/raw/run_... \

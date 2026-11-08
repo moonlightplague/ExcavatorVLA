@@ -1,0 +1,18 @@
+extends: lora_overfit.yaml
+dataset:
+  root: ../../../data/pi05_singlecycle_physx_pilot_v2
+  episodes: null
+steps: 10000
+save_freq: 2000
+log_freq: 50
+job_name: excavator_pi05_lora_singlecycle20_physx_10k
+training:
+  data_soil_backend: physx
+  gradient_accumulation_steps: 4
+  keep_checkpoints: 5 # Explicitly retain 2k, 4k, 6k, 8k and 10k for comparison.
+benchmark:
+  split_file: ../splits/pi05_singlecycle20_physx_v2_seed1000.json
+  validation_freq: 2000
+  validation_max_batches: 0
+launcher:
+  gpu_ids: [0, 1]

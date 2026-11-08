@@ -1,0 +1,5 @@
+extends: lora_overfit.yaml
+steps: 5000
+training:
+  # The continuation runner preserves the 3k comparison baseline separately.
+  keep_checkpoints: 1

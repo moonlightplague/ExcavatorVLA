@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "seed": 1000,
+  "method": "source_parent_split_first_then_diverse_subset_20_4_4",
+  "train": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19
+  ],
+  "validation": [
+    20,
+    21,
+    22,
+    23
+  ],
+  "test": [
+    24,
+    25,
+    26,
+    27
+  ],
+  "dataset_fingerprint": "286d046a1370e0022c629872cd41c92b94020c27e371dc9be440bd47a0350d91"
+}

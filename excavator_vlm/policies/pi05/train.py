@@ -24,6 +24,9 @@ from .dataset import make_pi05_dataset, training_stats
 
 def prepare(settings, create=False):
     report, frames = audit_dataset(settings['dataset']['root'], settings['policy']['chunk_size'])
+    required_backend = settings['training'].get('data_soil_backend')
+    if required_backend is not None and report.get('collection_backend', {}).get('soil_backend') != required_backend:
+        raise ValueError('Training requires verified per-episode evidence for the requested collection backend')
     path = Path(settings['benchmark']['split_file'])
     if not path.exists() and create:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -212,6 +215,8 @@ def run(settings, config, config_path, stop_after=None):
                   'normalization': 'quantiles from selected training episodes only',
                   'batch_contract': {'world_size': accelerator.num_processes, 'batch_size': settings['batch_size'],
                                      'accumulation': settings['training']['gradient_accumulation_steps']}}
+    if 'collection_backend' in report:
+        provenance['collection_backend'] = report['collection_backend']
     validation_loader = None
     if accelerator.is_main_process:
         if not state:

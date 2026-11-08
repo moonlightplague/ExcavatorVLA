@@ -28,8 +28,10 @@ def resolve_settings(path, overrides=None):
     required = {'gradient_accumulation_steps', 'validation_batch_size', 'resume', 'keep_checkpoints',
                 'trainable_dtype'}
     if (not isinstance(training, dict) or not required.issubset(training)
-            or set(training) - required - {'mode', 'lora', 'resume_lr'}):
-        raise ValueError(f'training must specify {sorted(required)}; optional mode/lora/resume_lr')
+            or set(training) - required - {'mode', 'lora', 'resume_lr', 'data_soil_backend'}):
+        raise ValueError(f'training must specify {sorted(required)}; optional mode/lora/resume_lr/data_soil_backend')
+    if training.get('data_soil_backend') not in (None, 'physx', 'newton_mpm'):
+        raise ValueError('data_soil_backend must explicitly select physx or newton_mpm')
     training.update(finetuning_spec(training.get('mode', 'expert_only'), training.get('lora')))
     for key in ('gradient_accumulation_steps', 'validation_batch_size', 'keep_checkpoints'):
         if type(training[key]) is not int or training[key] < 1:

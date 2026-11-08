@@ -63,6 +63,36 @@ def read_frames(root):
         ['episode_index', 'frame_index']).reset_index(drop=True)
 
 
+def audit_backend_provenance(root, episode_ids, expected=None):
+    """Verify per-parent collection evidence; a backend name in a folder is insufficient."""
+    root = Path(root).resolve()
+    manifest = json.loads((root / 'backend_provenance.json').read_text())
+    backend = manifest.get('soil_backend')
+    if (manifest.get('schema_version') != 'excavator_backend_provenance_v1'
+            or backend not in ('physx', 'newton_mpm') or expected not in (None, backend)):
+        raise ValueError('Dataset backend provenance schema/backend differs from the requested backend')
+    entries = manifest.get('episodes', [])
+    ids = [entry['episode_index'] for entry in entries]
+    if len(set(ids)) != len(ids) or set(ids) != set(map(int, episode_ids)):
+        raise ValueError('Backend evidence must cover every dataset episode exactly once')
+    for entry in entries:
+        evidence = entry['evidence']
+        path = (root / evidence['path']).resolve()
+        if not path.is_relative_to(root) or file_hash(path) != evidence['sha256']:
+            raise ValueError('Collection backend evidence path/hash differs')
+        payload = json.loads(path.read_text())
+        value = payload
+        for key in evidence['field'].split('.'):
+            if not isinstance(value, dict) or key not in value:
+                raise ValueError('Collection metadata does not explicitly identify the soil backend')
+            value = value[key]
+        if value != backend or entry.get('soil_backend') != backend:
+            raise ValueError('Mixed or unknown collection soil backends are not allowed')
+    return {'soil_backend': backend, 'episodes_verified': len(entries),
+            'manifest_sha256': file_hash(root / 'backend_provenance.json'),
+            'basis': 'per-parent collection metadata field and immutable file checksum'}
+
+
 def audit_dataset(root, chunk_size=10):
     """Check timestamps and causal action history, rather than just equal lengths.
 
@@ -132,14 +162,23 @@ def audit_dataset(root, chunk_size=10):
                  *meta_files, root / 'meta/tasks.parquet']:
         digest.update(str(path.relative_to(root)).encode())
         digest.update(file_hash(path).encode())
+    backend_report = None
+    if (root / 'backend_provenance.json').is_file():
+        backend_report = audit_backend_provenance(root, ids)
+        digest.update(b'backend_provenance.json')
+        digest.update(backend_report['manifest_sha256'].encode())
     valid = sum(sum(min(chunk_size, length - i) for i in range(length)) for length in lengths)
-    return {
+    report = {
         'status': 'passed', 'schema': 'current-v4', 'fps': info['fps'],
         'episodes': len(ids), 'frames': len(frames), 'fingerprint': digest.hexdigest(),
         'fingerprint_scope': 'info + data parquet + episode metadata + tasks; excludes video bytes',
         'max_previous_action_error': max_history_error, 'camera_episode_checks': checked,
         'chunk_size': chunk_size, 'padded_timestep_fraction': 1 - valid / (len(frames) * chunk_size),
-    }, frames
+    }
+    if backend_report is not None:
+        report['collection_backend'] = backend_report
+        report['fingerprint_scope'] += ' + per-parent backend provenance manifest'
+    return report, frames
 
 
 def make_split(frames, fingerprint, seed=1000):

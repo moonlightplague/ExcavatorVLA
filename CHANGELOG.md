@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-11-08
+
+- Add collection-matched evaluation scene preparation using the existing repeat sampler, initial pose, digging planner, and low-fill unload selection.
+- Record feasible scene setups without executing expert digging actions, with deterministic seed streams and isolated-GPU renderer configuration.
+
 ## 2026-10-31
 
 - Export each successful repeat episode immediately with worker backpressure and a shared append lock; restore the policy Python environment outside Isaac.

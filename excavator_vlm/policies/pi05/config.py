@@ -32,7 +32,7 @@ def resolve_settings(path, overrides=None):
     required = {'gradient_accumulation_steps', 'validation_batch_size', 'resume', 'keep_checkpoints',
                 'trainable_dtype'}
     if (not isinstance(training, dict) or not required.issubset(training)
-            or set(training) - required - {'mode', 'lora', 'resume_lr', 'data_soil_backend'}):
+            or set(training) - required - {'mode', 'lora', 'resume_lr', 'data_soil_backend', 'recovery_save_freq'}):
         raise ValueError(f'training must specify {sorted(required)}; optional mode/lora/resume_lr/data_soil_backend')
     if training.get('data_soil_backend') not in (None, 'physx', 'newton_mpm'):
         raise ValueError('data_soil_backend must explicitly select physx or newton_mpm')
@@ -40,6 +40,9 @@ def resolve_settings(path, overrides=None):
     for key in ('gradient_accumulation_steps', 'validation_batch_size', 'keep_checkpoints'):
         if type(training[key]) is not int or training[key] < 1:
             raise ValueError(f'{key} must be a positive integer')
+    recovery = training.get('recovery_save_freq', 0)
+    if type(recovery) is not int or recovery < 0:
+        raise ValueError('recovery_save_freq must be a nonnegative integer')
     if training['resume']:
         training['resume'] = str((path.parent / Path(training['resume']).expanduser()).resolve())
     resume_lr = training.get('resume_lr')

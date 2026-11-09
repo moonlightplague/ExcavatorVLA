@@ -2,6 +2,8 @@
 
 ## 2026-11-09
 
+- Add user-approved shared-GPU restart from complete optimizer/RNG state, archive interrupted attempts/logs, and keep one rolling 100-step recovery checkpoint alongside the requested 2k milestones.
+- Release gradients after the first-update audit and before validation/checkpoint inference without changing optimizer updates or batch contracts.
 - Correct repeated expert-replay acceptance to use immutable archived collection payload thresholds, fix exclusive observation boundaries, and support verified reassessment of blocked runs without discarding the original failed gate or replay evidence.
 - Add an opt-in bucket command-target slew profile of 20 rad/s while preserving legacy limits and rejecting checkpoint/evaluation profile mismatches.
 - Add immutable repeated-data action relabeling, per-parent PhysX evidence, causal action-history updates and a frozen 80/10/10 split preserving prior pilot parent assignments.

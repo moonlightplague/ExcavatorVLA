@@ -67,6 +67,23 @@ recomputed, never manually flipped to passed. Source cycle `sample_end` is an
 exclusive observation boundary; the final synthetic zero-action observation
 does not count toward the source cycle's payload.
 
+If training exits abnormally, explicitly user-approved shared-GPU restart is:
+
+```bash
+.venv-pi05/bin/python ExcavatorVLA-vlm/scripts/run_pi05_repeat_history.py \
+  --output outputs/experiments/pi05_repeat_history_c_bucket20_20k_20261109_01 \
+  --resume-training --allow-shared-gpus --detach
+```
+
+This resumes the latest complete optimizer/RNG state, not the last logged step.
+It archives the previous status/loss log, keeps the same two-GPU effective batch,
+and uses zero video-loader subprocesses per rank. Extra recovery saves occur
+every 100 steps; only the newest rolling state is kept in addition to the ten
+requested 2k milestones. The GPU-sharing launch guard requires 18000 MiB free
+per selected GPU but cannot reserve VRAM or guarantee other jobs do not grow.
+No other GPU process is terminated. Gradient storage is released after the
+parameter-update audit and before validation to reduce transient memory usage.
+
 After the gate passes, the runner checks the training configuration and runs
 two real optimizer updates using two-GPU DDP to check memory/update execution.
 It resumes those same optimizer/RNG states to 20000 updates, using the C window

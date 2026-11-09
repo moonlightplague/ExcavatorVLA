@@ -293,6 +293,9 @@ def run(settings, config, config_path, stop_after=None):
                 if accelerator.is_main_process:
                     dump(run_dir / f'first_update_check_{step:06d}.json', update_audit)
                 del audit_before
+            # Preserve gradients for the first-update audit above; they are not
+            # checkpoint state. Release before validation/checkpoint inference.
+            optimizer.zero_grad(set_to_none=True)
             scheduler.step()
             flow = accelerator.reduce(local_numerator, reduction='sum') / denominator
             if step == start_step + 1 or step % settings['log_freq'] == 0:
@@ -309,7 +312,9 @@ def run(settings, config, config_path, stop_after=None):
             stopping = stop_after is not None and step >= stop_after
             validate = bool(settings['benchmark']['validation_freq']) and (
                 step % settings['benchmark']['validation_freq'] == 0 or step == settings['steps'])
-            save = validate or step % settings['save_freq'] == 0 or step == settings['steps'] or stopping
+            recovery_freq = settings['training'].get('recovery_save_freq', 0)
+            recovery_save = bool(recovery_freq) and step % recovery_freq == 0
+            save = validate or recovery_save or step % settings['save_freq'] == 0 or step == settings['steps'] or stopping
             if save:
                 accelerator.wait_for_everyone()
                 metrics = None
@@ -339,7 +344,10 @@ def run(settings, config, config_path, stop_after=None):
                         dump(run_dir / 'best_checkpoint.json', {'step': step, 'checkpoint': str(pretrained),
                             'validation_first_action_mae_rad_s': best,
                             'partial_validation': settings['benchmark']['validation_max_batches'] > 0})
-                    retain_checkpoints(run_dir, settings['training']['keep_checkpoints'])
+                    if recovery_freq:
+                        retain_checkpoints(run_dir, settings['training']['keep_checkpoints'], settings['save_freq'])
+                    else:
+                        retain_checkpoints(run_dir, settings['training']['keep_checkpoints'])
                     print(f'Checkpoint: {pretrained}', flush=True)
                 accelerator.wait_for_everyone()
             if stopping:
@@ -373,6 +381,8 @@ def main():
     parser.add_argument('--episodes')
     parser.add_argument('--gpus')
     parser.add_argument('--accumulation', type=int)
+    parser.add_argument('--recovery-save-freq', type=int,
+                        help='Save rolling resumable state every N updates; retain ordinary milestone checkpoints')
     parser.add_argument('--output', type=Path)
     parser.add_argument('--resume', type=Path)
     parser.add_argument('--resume-lr', type=float,
@@ -397,6 +407,8 @@ def main():
         overrides['dataset'] = {'episodes': [int(e) for e in args.episodes.split(',')]}
     if args.accumulation is not None:
         overrides['training'] = {'gradient_accumulation_steps': args.accumulation}
+    if args.recovery_save_freq is not None:
+        overrides.setdefault('training', {})['recovery_save_freq'] = args.recovery_save_freq
     if args.resume:
         from .checkpoints import resolve_checkpoint
         checkpoint = resolve_checkpoint(args.resume)

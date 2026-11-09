@@ -145,13 +145,19 @@ def resolve_checkpoint(path):
     return path
 
 
-def retain_checkpoints(run, keep):
+def retain_checkpoints(run, keep, milestone_freq=None):
     """Prune only complete, owned PI05 checkpoints from this experiment."""
     run = Path(run).resolve()
     root = run / 'checkpoints'
     paths = sorted(p for p in root.glob('[0-9]*') if p.is_dir() and not p.is_symlink()
                    and p.name.isdecimal() and (p / 'pretrained_model/checkpoint.json').is_file())
-    protected = set(paths[-keep:])
+    if milestone_freq is not None:
+        if type(milestone_freq) is not int or milestone_freq < 1:
+            raise ValueError('Checkpoint milestone frequency must be a positive integer')
+        milestones = [p for p in paths if int(p.name) % milestone_freq == 0]
+        protected = set(milestones[-keep:]) | set(paths[-1:])
+    else:
+        protected = set(paths[-keep:])
     for name in ('best_checkpoint.json', 'last_checkpoint.json'):
         if (run / name).exists():
             protected.add(Path(json.loads((run / name).read_text())['checkpoint']).parent.resolve())

@@ -7,13 +7,14 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 
 from run_pi05_lora_ab import Experiment, PROJECT, SUBMODULE, read, source_hashes
 
 sys.path.insert(0, str(SUBMODULE))
 from excavator_vlm.data.contract import file_hash
 from excavator_vlm.data.replay_gate import assess_replay
-from excavator_vlm.data.action_limits import collection_payload_threshold
+from excavator_vlm.data.action_limits import collection_payload_threshold, require_replay_gate
 
 CONFIG = SUBMODULE / 'configs/pi05/history_c_repeat20k.yaml'
 DATASET = PROJECT / 'outputs/datasets/pi05_repeat_physx_bucket20_v2'
@@ -22,7 +23,53 @@ REFERENCE_CHECKPOINT = PROJECT / 'outputs/experiments/pi05_singlecycle20_physx_1
 
 class RepeatHistoryExperiment(Experiment):
     def __init__(self, args):
-        if args.resume_existing:
+        if args.resume_training:
+            self.args, self.root = args, args.output.resolve()
+            self.state = read(self.root / 'status.json')
+            if self.state.get('status') != 'failed' or self.state.get('training_started') is not True:
+                raise ValueError('Training restart requires a failed, previously started experiment')
+            latest = read(self.root / 'train/last_checkpoint.json')
+            checkpoint = Path(latest['checkpoint']).resolve()
+            if (checkpoint.parent.parent != (self.root / 'train/checkpoints').resolve()
+                    or not (checkpoint.parent / 'training_state.pt').is_file()
+                    or read(checkpoint / 'checkpoint.json')['step'] != latest['step']):
+                raise ValueError('Latest owned complete training checkpoint is invalid')
+            require_replay_gate(DATASET, read(DATASET / 'audit.json')['fingerprint'])
+            permitted = {'ExcavatorVLA-vlm/excavator_vlm/policies/pi05/train.py',
+                         'ExcavatorVLA-vlm/excavator_vlm/policies/pi05/config.py',
+                         'ExcavatorVLA-vlm/excavator_vlm/policies/pi05/checkpoints.py',
+                         'ExcavatorVLA-vlm/scripts/run_pi05_repeat_history.py'}
+            current = source_hashes()
+            for name, digest in self.state['source_hashes'].items():
+                if name not in permitted and current.get(name) != digest:
+                    raise ValueError(f'Unexpected source change before training restart: {name}')
+            stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ')
+            with (self.root / f'prior_interrupted_attempt_{stamp}.json').open('x') as handle:
+                json.dump(self.state, handle, indent=2, allow_nan=False)
+            log = self.root / 'train/train.log'
+            previous_step = None
+            if log.is_file():
+                lines = log.read_text().splitlines()
+                previous_step = json.loads(lines[-1])['step'] if lines else None
+                archive = log.with_name(f'train_before_restart_{stamp}.log')
+                log.rename(archive)
+                self.state['previous_training_log'] = str(archive)
+            for stage in self.state['stages']:
+                if stage['status'] == 'running':
+                    stage.update(status='failed', error='previous interrupted attempt; original status archived')
+            self.state.pop('error', None)
+            self.state.update(status='running', phase='resume_preflight', pid=os.getpid(),
+                              restart_started_utc=datetime.now(timezone.utc).isoformat(),
+                              source_hashes=current, resume_from_step=latest['step'],
+                              previous_last_logged_step=previous_step,
+                              allow_shared_gpus=args.allow_shared_gpus,
+                              recovery_save_freq=100, dataloader_workers_per_rank=0,
+                              restart_tag=stamp)
+            self.environment = {**os.environ, 'HF_HUB_OFFLINE': '1', 'HF_DATASETS_OFFLINE': '1',
+                                'TOKENIZERS_PARALLELISM': 'false', 'NCCL_P2P_DISABLE': '1',
+                                'NCCL_IB_DISABLE': '1', 'PYTHONUNBUFFERED': '1'}
+            self.children = []
+        elif args.resume_existing:
             self.args, self.root = args, args.output.resolve()
             self.state = read(self.root / 'status.json')
             if (self.state.get('status') != 'blocked'
@@ -51,7 +98,7 @@ class RepeatHistoryExperiment(Experiment):
         else:
             super().__init__(args)
         self.state['source_hashes'][str(Path(__file__).relative_to(PROJECT))] = file_hash(Path(__file__))
-        self.state.update(training_started=False, requested_steps=20000,
+        self.state.update(training_started=args.resume_training, requested_steps=20000,
                           checkpoint_steps=list(range(2000, 20001, 2000)),
                           dataset=str(DATASET), config=str(CONFIG),
                           observation_history=[-6, -3, 0], soil_backend='physx',
@@ -60,6 +107,20 @@ class RepeatHistoryExperiment(Experiment):
                           replay_episodes=[0, 77, 99],
                           replay_gate='archived collection payload threshold; physical-joint error <=0.15 rad; target error <=0.001 rad')
         self.save()
+
+    def idle(self):
+        if not self.args.allow_shared_gpus:
+            return super().idle()
+        # Explicitly user-approved sharing. Prior measured training occupancy is
+        # about 17.5 GiB/rank; this is a launch guard, NOT a memory reservation.
+        while True:
+            output = subprocess.check_output(['nvidia-smi', '--query-gpu=index,memory.free',
+                                               '--format=csv,noheader,nounits'], text=True)
+            free = {int(row[0]): int(row[1]) for row in (line.split(',') for line in output.splitlines())}
+            if all(free.get(gpu, 0) >= 18000 for gpu in self.args.gpus):
+                return
+            print(f'Waiting for >=18000 MiB free per shared GPU: {free}', flush=True)
+            time.sleep(10)
 
     def check_sources(self):
         expected = dict(self.state['source_hashes'])
@@ -111,6 +172,15 @@ class RepeatHistoryExperiment(Experiment):
         return criterion
 
     def execute(self):
+        if self.args.resume_training:
+            tag = self.state['restart_tag']
+            command, overrides = self.train_command('history_c_repeat20k.yaml', self.root / 'train', resume=True)
+            command += ['--num-workers', '0', '--recovery-save-freq', '100']
+            self.run(f'ddp_train_20000_shared_{tag}', [(command, overrides)])
+            self.state.update(status='completed', phase='finished',
+                              completed_utc=datetime.now(timezone.utc).isoformat())
+            self.save()
+            return
         if not CONFIG.is_file() or not (DATASET / 'repair_report.json').is_file():
             raise FileNotFoundError('Build the separate relabelled dataset before this experiment')
         if read(DATASET / 'repair_report.json')['training_ready']:
@@ -201,30 +271,43 @@ def main():
     parser.add_argument('--detach', action='store_true')
     parser.add_argument('--resume-existing', action='store_true',
                         help='Reassess this blocked, never-trained experiment using verified existing replay traces')
+    parser.add_argument('--resume-training', action='store_true',
+                        help='Resume a failed training run from its latest complete optimizer/RNG checkpoint')
+    parser.add_argument('--allow-shared-gpus', action='store_true',
+                        help='Explicitly allow GPU sharing; do not stop any other GPU process')
     args = parser.parse_args()
+    if args.resume_existing and args.resume_training:
+        parser.error('Choose replay reassessment or training resume, not both')
     args.output = args.output.resolve()
     if args.detach:
-        if args.output.exists() and not args.resume_existing:
+        if args.output.exists() and not (args.resume_existing or args.resume_training):
             raise FileExistsError('Refusing to overwrite an existing experiment')
         args.output.parent.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ')
-        log = (args.output.with_suffix(f'.reassess_{stamp}.launcher.log') if args.resume_existing
+        log = (args.output.with_suffix(f'.restart_{stamp}.launcher.log') if args.resume_training else
+               args.output.with_suffix(f'.reassess_{stamp}.launcher.log') if args.resume_existing
                else args.output.with_suffix('.launcher.log'))
         with log.open('x') as handle:
             command = [sys.executable, '-u', str(Path(__file__).resolve()), '--output', str(args.output)]
             if args.resume_existing:
                 command.append('--resume-existing')
+            if args.resume_training:
+                command.append('--resume-training')
+            if args.allow_shared_gpus:
+                command.append('--allow-shared-gpus')
             child = subprocess.Popen(command, cwd=PROJECT,
                                      stdout=handle, stderr=subprocess.STDOUT, start_new_session=True,
                                      env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
         print(json.dumps({'pid': child.pid, 'status': str(args.output / 'status.json'), 'launcher_log': str(log)}))
         return
-    args.gpus = [0, 1]; args.steps = 20000; args.allow_shared_gpus = False; args.resume_lr = None
+    args.gpus = [0, 1]; args.steps = 20000; args.resume_lr = None
     experiment = RepeatHistoryExperiment(args)
     try:
         experiment.execute()
     except BaseException as exc:
         experiment.state.update(status='failed', error=f'{type(exc).__name__}: {exc}')
+        if experiment.state['stages'] and experiment.state['stages'][-1]['status'] == 'running':
+            experiment.state['stages'][-1].update(status='failed', error=f'{type(exc).__name__}: {exc}')
         experiment.save()
         raise
 

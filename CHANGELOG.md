@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-11-09 — Newton collision consistency
+
+- Sync the Newton soil adapter with collection: swept static-mesh collision prevents thin-floor tunneling without attributing static impulses to the bucket.
+- Support `EXCAVATOR_MPM_HZ` at fixed 60–240 Hz, with the existing 120 Hz shared default; collection's explicit frequency must also be supplied for matching deployment dynamics.
+- Keep material-point accounting and passive rendering-grain separation unchanged.
+
 ## 2026-10-30
 
 - Ignore local datasets, checkpoint directories, downloaded model weights, and temporary execution files.

@@ -112,14 +112,17 @@ def aggregate_wrenches(impulses, positions, collider_ids, body_ids, origins, bod
 
 
 def mpm_substeps(dt):
-    """Fixed 120 Hz MPM: two substeps per normal 60 Hz PhysX tick.
+    """Fixed MPM frequency (120 Hz by default), at least one solve per PhysX tick.
 
     Deliberately independent of outlier particle speeds. Collider projection
     and an explicit escape guard handle/check penetration instead of global CFL.
     """
     if not math.isfinite(dt) or dt <= 0:
         raise ValueError(f'Invalid PhysX dt: {dt}')
-    return max(1, math.ceil(dt*120-1e-6))
+    frequency = float(os.environ.get('EXCAVATOR_MPM_HZ', '120'))
+    if not math.isfinite(frequency) or not 60 <= frequency <= 240:
+        raise ValueError('EXCAVATOR_MPM_HZ must be between 60 and 240')
+    return max(1, math.ceil(dt*frequency-1e-6))
 
 
 def make_gpu_kernels(wp):
@@ -145,6 +148,51 @@ def make_gpu_kernels(wp):
         wp.atomic_max(output, 0, wp.length(velocities[wp.tid()]))
 
     return contact_wrench, max_speed
+
+
+def make_static_ccd_kernel(wp):
+    """Stop segments crossing thin static shells before pointwise SDF can miss them.
+
+    The truck floor is thinner than a falling particle's displacement. Testing
+    only the advected point can see it outside the opposite side of that shell.
+    Ray tests use the actual imported triangles, with no substitute floor.
+    """
+    @wp.kernel
+    def static_ccd(previous: wp.array(dtype=wp.vec3),
+                   positions: wp.array(dtype=wp.vec3), velocities: wp.array(dtype=wp.vec3),
+                   gradients: wp.array(dtype=wp.mat33), meshes: wp.array(dtype=wp.uint64),
+                   separation: float, friction: float, hits: wp.array(dtype=wp.int32)):
+        i = wp.tid()
+        start = previous[i]
+        displacement = positions[i] - start
+        distance = wp.length(displacement)
+        if distance > 1.0e-4:
+            direction = displacement / distance
+            nearest = distance + 1.0e-5
+            normal = wp.vec3(0.0)
+            collided = bool(False)
+            for collider in range(meshes.shape[0]):
+                query = wp.mesh_query_ray(meshes[collider], start, direction, distance + 1.0e-5)
+                if query.result and query.t > 1.0e-6 and query.t < nearest:
+                    candidate = wp.normalize(query.normal)
+                    if wp.dot(candidate, direction) < -1.0e-6:
+                        nearest = query.t
+                        normal = candidate
+                        collided = True
+            if collided:
+                velocity = velocities[i]
+                inward = wp.min(0.0, wp.dot(velocity, normal))
+                tangent = velocity - wp.dot(velocity, normal)*normal
+                speed = wp.length(tangent)
+                scale = wp.max(0.0, 1.0 + friction*inward/wp.max(speed, 1.0e-8))
+                velocities[i] = tangent*scale + wp.max(0.0, wp.dot(velocity, normal))*normal
+                # Conservative first-impact position; tangential motion resumes
+                # next step, without crossing a second wall at a corner.
+                positions[i] = start + direction*nearest + normal*separation
+                gradient = gradients[i]
+                gradients[i] = 0.5*(gradient-wp.transpose(gradient))
+                wp.atomic_add(hits, 0, 1)
+    return static_ccd
 
 
 def material_density(runtime, point_count, point_volume, legacy_count):
@@ -328,6 +376,7 @@ class NewtonSoil:
             device = f"cuda:{max(0, int(gpu or 0))}"
         self.device = device
         self.wrench_kernel, self.speed_kernel = make_gpu_kernels(wp)
+        self.static_ccd_kernel = make_static_ccd_kernel(wp)
         self.projection_wrench_kernel = make_projection_wrench_kernel(wp)
         wp.config.kernel_cache_dir = str(Path(__file__).resolve().parents[2]/".mpm_warp_cache")
         newton.use_coord_layout_targets = True
@@ -360,6 +409,8 @@ class NewtonSoil:
             self.applied_impulse = np.zeros_like(self.last_force)
             self.gpu_wrench = wp.zeros((self.model.body_count, 6), dtype=wp.float32, device=device)
             self.gpu_max_speed = wp.zeros(1, dtype=wp.float32, device=device)
+            self.ccd_hits = wp.zeros(1, dtype=wp.int32, device=device)
+            self.ccd_hit_count = 0
             # Display samples do not affect the material-point budget or scores.
             grains_per_point = max(1, min(8, 160000//n))
             self.grains = self.solver.sample_render_grains(self.state, grains_per_point)
@@ -399,7 +450,7 @@ class NewtonSoil:
             self.close()
             raise
         print(f"[MPM READY] grid={self.voxel} spacing={self.spacing} budget={self.max_points} "
-              f"substeps=2@60Hz contact_reduce=gpu points={n} metric_points={metric_count} render_grains={self.grains.size} "
+              f"substeps={mpm_substeps(1/60)}@60Hz contact_reduce=gpu points={n} metric_points={metric_count} render_grains={self.grains.size} "
               f"mass_kg={n*self.mass:.3f} bodies={self.body_paths} colliders={len(self.collision_paths)} "
               f"device={device}", flush=True)
 
@@ -477,6 +528,8 @@ class NewtonSoil:
             self.solver.reset(self.state, flags=0)
         self.last_force.fill(0)
         self.applied_impulse.fill(0)
+        self.ccd_hits.zero_()
+        self.ccd_hit_count = 0
         self.force_origins = self.state.body_q.numpy()[:, :3].copy()
         self.error, self.sleeping, self.quiet_checks = '', False, 0
         self.steps, self.sim_time, self.solver_substeps, self.peak_force = 0, 0., 0, 0.
@@ -612,6 +665,8 @@ class NewtonSoil:
             body_com=self.model.body_com, body_mass=self.model.body_mass,
             body_inv_inertia=self.model.body_inv_inertia)
         self.collider_body_ids = self.solver.collider_body_index.numpy()
+        self.static_mesh_ids = self.wp.array([mesh.id for mesh in self.static_meshes],
+                                            dtype=self.wp.uint64, device=self.device)
 
     def _attach_view(self):
         if not self.body_paths:
@@ -725,8 +780,6 @@ class NewtonSoil:
                 # colliders using a wider band, without adding global substeps.
                 self.solver.project_outside(self.state, self.state, h,
                                             gap=max(.25, math.sqrt(3)*self.voxel))
-                self.solver.update_particle_frames(self.previous, self.state, h)
-                self.solver.update_render_grains(self.previous, self.state, self.grains, h)
                 impulses, positions, ids = self.solver.collect_collider_impulses(self.state)
                 self.gpu_wrench.zero_()
                 self.wp.launch(self.wrench_kernel, dim=ids.size,
@@ -742,6 +795,15 @@ class NewtonSoil:
                                 self.gpu_wrench], device=self.device)
                 finally:
                     collider.query_max_dist = old_gap
+                # Static impacts have no PhysX recipient. Apply CCD after the
+                # dynamic projection-wrench reduction so its impulse cannot be
+                # attributed to a nearby bucket collider.
+                self.wp.launch(self.static_ccd_kernel, dim=self.model.particle_count,
+                    inputs=[self.previous.particle_q, self.state.particle_q, self.state.particle_qd,
+                            self.state.mpm.particle_qd_grad, self.static_mesh_ids,
+                            min(.002, .02*self.voxel), .5, self.ccd_hits], device=self.device)
+                self.solver.update_particle_frames(self.previous, self.state, h)
+                self.solver.update_render_grains(self.previous, self.state, self.grains, h)
                 # Only 6 values per real body cross to the PhysX adapter. Grid
                 # contact arrays remain on the GPU; no NumPy grid reduction.
                 impulse = self.gpu_wrench.numpy().astype(np.float64)
@@ -781,10 +843,11 @@ class NewtonSoil:
                 self.sleeping = True
                 print(f'[MPM SLEEP] all material points quiet: vmax={self.max_particle_speed:.6g} m/s', flush=True)
         if self.steps == 1 or self.steps % 120 == 0:
+            self.ccd_hit_count = int(self.ccd_hits.numpy()[0])
             print(f"[MPM STEP] steps={self.steps} t={self.sim_time:.3f} "
                   f"z=({self.positions[:,2].min():.4f},{self.positions[:,2].max():.4f}) "
                   f"peak_link_force_N={self.peak_force:.3f} vmax={self.max_particle_speed:.6g} "
-                  f"wall_s={self.step_wall_seconds:.3f}", flush=True)
+                  f"wall_s={self.step_wall_seconds:.3f} ccd_hits={self.ccd_hit_count}", flush=True)
 
     def _body_near_soil(self, poses, velocities, dt):
         """Conservative swept AABBs; carried material also keeps its body awake."""
@@ -832,7 +895,8 @@ class NewtonSoil:
                 "time": self.sim_time, "grid_m": self.voxel, "device": self.device,
                 "points": len(self.positions), "point_mass_kg": self.mass,
                 "spacing_m": self.spacing, "point_budget": self.max_points,
-                "substep_mode": "fixed_120hz", "contact_reduction": "gpu",
+                "substep_mode": f"fixed_{os.environ.get('EXCAVATOR_MPM_HZ', '120')}hz", "contact_reduction": "gpu",
+                "static_ccd_hits": self.ccd_hit_count,
                 "host_contact_values": self.host_contact_values,
                 "physics_wall_seconds": self.physics_wall_seconds,
                 "render_update_wall_seconds": self.render_wall_seconds,

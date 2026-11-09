@@ -4044,6 +4044,9 @@ def main(args):
                     "truck_counting_volume": {
                         "method": TRUCK_COUNT_METHOD,
                         "scene_seed": truck_bed_counting_volume["scene_seed"],
+                        "local_from_world": np.asarray(
+                            truck_bed_counting_volume["local_from_world"], dtype=np.float64
+                        ).tolist() if truck_bed_counting_volume.get("local_from_world") is not None else None,
                         **{key: truck_bed_counting_volume[key].tolist()
                            for key in ("world_min", "world_max", "local_min", "local_max")
                            if truck_bed_counting_volume[key] is not None},
@@ -4793,6 +4796,7 @@ def main(args):
                     }
                 ),
                 "observation_context": reply_observation_context,
+                "bucket_landmarks_world": {"tip": tip_xyz, "load": load_xyz, "pour": pour_xyz},
                 "phase_report": dict(observation_phase_report),
                 "phase_source": str(observation_phase_source),
                 "bucket_load_metrics": bucket_load_metrics,

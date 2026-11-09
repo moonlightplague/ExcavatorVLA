@@ -162,6 +162,37 @@ def material_density(runtime, point_count, point_volume, legacy_count):
     return density, source
 
 
+def make_projection_wrench_kernel(wp):
+    """Return the extra particle projection momentum to the contacted body.
+
+    Newton project_outside changes particle velocities but does not add those
+    impulses to collect_collider_impulses. Use the same pre-projection query
+    and sum -m*delta_v about the link origin, just like the grid impulses.
+    """
+    global Collider  # Warp resolves postponed annotations in module globals.
+    from newton._src.solvers.implicit_mpm.rasterized_collisions import Collider, collision_sdf
+
+    @wp.kernel
+    def projection_wrench(q: wp.array(dtype=wp.vec3), before: wp.array(dtype=wp.vec3),
+                          after: wp.array(dtype=wp.vec3), collider: Collider,
+                          poses: wp.array(dtype=wp.transform), velocities: wp.array(dtype=wp.spatial_vector),
+                          dt: float, mass: float, output: wp.array(dtype=wp.float32, ndim=2)):
+        i = wp.tid()
+        delta = after[i]-before[i]
+        if wp.length_sq(delta) > 0.0:
+            sdf, normal, velocity, cid, material = collision_sdf(
+                q[i], -2, collider, poses, velocities, poses, dt)
+            if cid >= 0:
+                body = collider.collider_body_index[cid]
+                if body >= 0:
+                    impulse = -mass*delta
+                    torque = wp.cross(q[i]-wp.transform_get_translation(poses[body]), impulse)
+                    for axis in range(3):
+                        wp.atomic_add(output, body, axis, impulse[axis])
+                        wp.atomic_add(output, body, axis+3, torque[axis])
+    return projection_wrench
+
+
 def current():
     return getattr(builtins, "_EXCAVATOR_MPM_SOIL", None)
 
@@ -267,7 +298,7 @@ class NewtonSoil:
                                                        requested_spacing, requested_voxel)
         self.positions, volume = sample_material(runtime, self.spacing, self.max_points)
         # USD display diameter only; never used by the model or contact solver.
-        self.render_diameter = float(os.environ.get('EXCAVATOR_MPM_RENDER_DIAMETER', '.012'))
+        self.render_diameter = float(os.environ.get('EXCAVATOR_MPM_RENDER_DIAMETER', '.014'))
         if not math.isfinite(self.render_diameter) or self.render_diameter <= 0:
             raise ValueError('MPM render diameter must be finite and positive')
         # Preserve the existing count-based collection/evaluation scale when
@@ -297,6 +328,7 @@ class NewtonSoil:
             device = f"cuda:{max(0, int(gpu or 0))}"
         self.device = device
         self.wrench_kernel, self.speed_kernel = make_gpu_kernels(wp)
+        self.projection_wrench_kernel = make_projection_wrench_kernel(wp)
         wp.config.kernel_cache_dir = str(Path(__file__).resolve().parents[2]/".mpm_warp_cache")
         newton.use_coord_layout_targets = True
         with wp.ScopedDevice(device):
@@ -319,6 +351,8 @@ class NewtonSoil:
             config.voxel_size, config.max_iterations, config.tolerance = self.voxel, 150, 1e-4
             self.solver = SolverImplicitMPM(self.model, config=config)
             self.state, self.previous = self.model.state(), self.model.state()
+            self.pre_projection_q = wp.clone(self.state.particle_q)
+            self.pre_projection_v = wp.clone(self.state.particle_qd)
             self.collider_model = self.model
             self._setup_colliders()
             self.last_force = np.zeros((self.model.body_count, 6), dtype=np.float32)
@@ -684,6 +718,8 @@ class NewtonSoil:
                 self.previous.particle_q.assign(self.state.particle_q)
                 self.previous.mpm.particle_transform.assign(self.state.mpm.particle_transform)
                 self.solver.step(self.state, self.state, control=None, contacts=None, dt=h)
+                self.pre_projection_q.assign(self.state.particle_q)
+                self.pre_projection_v.assign(self.state.particle_qd)
                 # Fixed substeps can advect a fast outlier beyond a narrow
                 # distance-query band. Project against actual imported mesh
                 # colliders using a wider band, without adding global substeps.
@@ -696,6 +732,16 @@ class NewtonSoil:
                 self.wp.launch(self.wrench_kernel, dim=ids.size,
                     inputs=[impulses, positions, ids, self.solver.collider_body_index,
                             self.state.body_q, self.gpu_wrench], device=self.device)
+                collider = self.solver._mpm_model.collider
+                old_gap = collider.query_max_dist
+                collider.query_max_dist = max(.25, math.sqrt(3)*self.voxel)
+                try:
+                    self.wp.launch(self.projection_wrench_kernel, dim=self.model.particle_count,
+                        inputs=[self.pre_projection_q, self.pre_projection_v, self.state.particle_qd,
+                                collider, self.state.body_q, self.state.body_qd, h, self.mass,
+                                self.gpu_wrench], device=self.device)
+                finally:
+                    collider.query_max_dist = old_gap
                 # Only 6 values per real body cross to the PhysX adapter. Grid
                 # contact arrays remain on the GPU; no NumPy grid reduction.
                 impulse = self.gpu_wrench.numpy().astype(np.float64)

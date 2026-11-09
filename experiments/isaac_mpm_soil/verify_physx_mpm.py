@@ -65,6 +65,22 @@ try:
         np.testing.assert_allclose(output.numpy(),
             soil.aggregate_wrenches(impulses, positions, ids, bodies, origins, 1), atol=1e-6)
     print('MPM_GPU_WRENCH_REFERENCE_PASSED', flush=True)
+    # Projection changes momentum separately from grid contacts. Check its
+    # rigid reaction with an off-center particle and an independently computed
+    # -m*delta_v and r cross impulse, without advancing either physical state.
+    with wp.ScopedDevice(controller.device):
+        pose = controller.state.body_q.numpy()
+        sample = pose[0,:3]+np.array([.02, .01, 0.], dtype=np.float32)
+        dv = np.array([.1, -.2, .3], dtype=np.float32)
+        output.zero_()
+        wp.launch(controller.projection_wrench_kernel, dim=1, inputs=[
+            wp.array([sample], dtype=wp.vec3), wp.zeros(1,dtype=wp.vec3),
+            wp.array([dv],dtype=wp.vec3), controller.solver._mpm_model.collider,
+            controller.state.body_q, controller.state.body_qd, 1/120, controller.mass, output])
+        expected = -controller.mass*dv
+        np.testing.assert_allclose(output.numpy()[0], np.r_[expected,np.cross(sample-pose[0,:3],expected)],
+                                   rtol=1e-5,atol=1e-7)
+    print('MPM_PROJECTION_MOMENTUM_REFERENCE_PASSED', flush=True)
     physx_com = controller.body_view.get_coms().numpy()[controller.model_to_view, :3]
     np.testing.assert_allclose(controller.model.body_com.numpy(), physx_com)
     minimum_z, maximum_z, maximum_reaction = 1., 0., 0.

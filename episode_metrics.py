@@ -29,7 +29,7 @@ SCHEMA = "repeat_episode_metrics_v1"
 TRANSFER_FIELDS = ("payload_particles", "scooped_particles", "retained_particles",
                    "spillage_particles", "spillage_fraction")
 DEFINITIONS = {
-    "particle_accounting": "Online evaluation ParticleTransferTracker; strict initial-pile IDs, no region-count fallback.",
+    "particle_accounting": "Online evaluation ParticleTransferTracker; strict source material IDs captured at episode start, no region-count fallback. Newton includes avalanched source points and excludes soil initially in bucket/truck.",
     "payload_particles": "Source IDs currently in truck, excluding IDs in truck at episode start; bucket overlap excluded.",
     "scooped_particles": "Unique source IDs observed in bucket; repeat scoops of an ID count once per episode.",
     "retained_particles": "Scooped source IDs still in bucket at measurement time.",

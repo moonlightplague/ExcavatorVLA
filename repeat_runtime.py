@@ -19,6 +19,7 @@ from baseline.episode_metrics import RepeatEpisodeMetrics
 from baseline.motion_geometry import BucketFloor, RigidBucketKinematics
 from baseline.stream_export import policy_environment
 from baseline.unload_planner import UnloadPlanner, damped_ik
+from baseline.tuning import configure_workspace, install_quality_policy, episode_quality, install_source_identity
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,14 @@ class RepeatConfig:
     min_curl_height_m: float = 1.05
     stream_export_dir: str = ""
     policy_python: str = ""
+    scene_profile: str = "broad"
+    acceptance_profile: str = "strict"
+    episode_min_score: float = 65.0
+    episode_max_spill_ratio: float = .50
+    release_clearance_m: float = .65
+    truck_reach_min_m: float = 6.7
+    truck_reach_max_m: float = 7.0
+    truck_approach: str = "side"
 
     def __post_init__(self):
         if not 2 <= self.scoops <= 64:
@@ -45,6 +54,18 @@ class RepeatConfig:
                 raise ValueError(f"{name} must be finite and positive.")
         if bool(self.stream_export_dir) != bool(self.policy_python):
             raise ValueError("Streaming export requires both a destination and policy Python.")
+        if self.scene_profile not in ("broad", "reachable") or self.acceptance_profile not in ("strict", "episode"):
+            raise ValueError("Unknown repeat scene or acceptance profile.")
+        if not np.isfinite(self.episode_min_score) or not 0 <= self.episode_min_score <= 100:
+            raise ValueError("Episode minimum score must be between 0 and 100.")
+        if not np.isfinite(self.episode_max_spill_ratio) or not 0 <= self.episode_max_spill_ratio <= 1:
+            raise ValueError("Episode maximum spill ratio must be between 0 and 1.")
+        if not np.isfinite(self.release_clearance_m) or self.release_clearance_m < .20:
+            raise ValueError("Release clearance must be at least 0.20 m above the truck wall.")
+        if not np.isfinite([self.truck_reach_min_m, self.truck_reach_max_m]).all() or not 0 < self.truck_reach_min_m <= self.truck_reach_max_m:
+            raise ValueError("Truck reach radii must be finite, positive, and ordered.")
+        if self.truck_approach not in ("side", "rear"):
+            raise ValueError("Truck approach must be side or rear.")
 
 
 class RepeatController:
@@ -275,6 +296,9 @@ def install(rt, config):
         raise RuntimeError("Repeat baseline is already installed.")
     controller = RepeatController(rt, config)
     rt.repeat_baseline = controller
+    configure_workspace(rt, config.scene_profile, config.truck_reach_min_m, config.truck_reach_max_m, config.truck_approach)
+    install_quality_policy(rt, config)
+    install_source_identity(rt)
     # The upstream adaptive mode rejects the technical cap and may stop at an
     # unrelated truck particle target. This baseline has an explicit fixed count.
     rt.MULTI_SCOOP_ADAPTIVE_STOP_ENABLED = False
@@ -564,6 +588,30 @@ def install(rt, config):
                                    "return_policy": "recorded_physical_collision_checked",
                                    "ground_top_z": float(rt.GROUND_TOP_Z),
                                    "soil_backend": rt.os.environ.get("EXCAVATOR_SOIL_BACKEND", "physx")}
+        meta["repeat_baseline"]["source_identity"] = rt.STATE.get("repeat_source_identity", "initial_pile_region")
+        meta["repeat_baseline"]["strict_scoop_thresholds"] = {
+            "min_score": getattr(rt, "MULTI_SCOOP_MIN_SCORE", 70.),
+            "max_spill_ratio": getattr(rt, "MULTI_SCOOP_MAX_SPILL_RATIO", .30)}
+        meta["repeat_baseline"]["acceptance_policy_version"] = (
+            "repeat_episode_source_efficiency_v2" if config.acceptance_profile == "episode" else "upstream_strict_scoop_v1")
+        meta["repeat_baseline"]["mpm_requested_hz"] = float(rt.os.environ.get("EXCAVATOR_MPM_HZ", "120"))
+        meta["repeat_baseline"]["mpm_requested_particle_budget"] = int(
+            rt.os.environ.get("EXCAVATOR_MPM_MAX_PARTICLES", "40000"))
+        api_getter = getattr(rt, "get_sand_site_api", None)
+        api = (api_getter() or {}) if api_getter is not None else {}
+        if api:
+            resolved_backend = api.get("soil_backend", "physx")
+            if resolved_backend != meta["repeat_baseline"]["soil_backend"]:
+                raise RuntimeError("Requested and active repeat soil backends disagree")
+            soil = {"backend": resolved_backend, "material": api.get("particle_material_config"),
+                    "resolution": api.get("derived_particle_config")}
+            if resolved_backend == "newton_mpm":
+                soil["mpm"] = api["mpm_diagnostics"]()
+                if not soil["mpm"].get("active") or soil["mpm"].get("error"):
+                    raise RuntimeError("Repeat collection requires active, healthy Newton MPM soil")
+            meta["repeat_baseline"]["soil"] = soil
+        randomization = meta.get("scene_randomization") or {}
+        meta["repeat_baseline"]["scene_seed"] = randomization.get("candidate", {}).get("scene_seed")
         controller.metrics = RepeatEpisodeMetrics(rt, controller.attempt_started)
         meta["repeat_metrics_path"] = str(Path(rt.STATE["dataset_episode_dir"]) / "repeat_metrics.json")
         rt.write_json_file(rt.STATE["dataset_meta_path"], meta)
@@ -576,10 +624,22 @@ def install(rt, config):
     @wraps(original_finish)
     def finish(meta, success, reason):
         cycles = controller.cycles
+        api_getter = getattr(rt, "get_sand_site_api", None)
+        api = (api_getter() or {}) if api_getter is not None else {}
+        if callable(api.get("mpm_diagnostics")):
+            meta["repeat_baseline"]["mpm_final"] = api["mpm_diagnostics"]()
         meta["repeat_cycles"] = cycles
         meta["repeat_returns_completed"] = sum(bool(cycle["returned"]) for cycle in cycles)
         if success and (len(cycles) != config.scoops or not all(cycle["returned"] for cycle in cycles)):
             success, reason = False, "quality_rejected/repeat_incomplete_physical_returns"
+        if config.acceptance_profile == "episode":
+            if controller.metrics is not None:
+                controller.metrics.observe()
+            report = episode_quality(rt.STATE.get("dataset_scoop_results", []), config,
+                                     controller.metrics.transfer if controller.metrics is not None else None)
+            meta["repeat_episode_quality"] = report
+            if success and not report["success"]:
+                success, reason = False, "quality_rejected/repeat_" + report["reason"]
         if success:
             rt.multi_scoop_set_stop("requested_repeat_cycles_completed", True, {"cycles": len(cycles)})
         result = original_finish(meta, success, reason)
@@ -598,8 +658,11 @@ def install(rt, config):
             rt.dataset_writer_flush("repeat_export_and_prune")
             if rt.STATE.get("dataset_async_writer_errors"):
                 raise RuntimeError("Raw writer failed; refusing export/cleanup")
-            rt.info_print("[REPEAT EXPORT]", f"episode={meta.get('episode_id')}",
-                          "waiting_for_validated_export_and_cleanup", force_log=True)
+            exporting = bool(meta.get("success") and meta.get("status") == "trainable")
+            rt.info_print("[REPEAT EXPORT]" if exporting else "[REPEAT REJECTED]",
+                          f"episode={meta.get('episode_id')}",
+                          "waiting_for_validated_export_and_cleanup" if exporting else
+                          f"reason={meta.get('failure_reason')} retaining_metrics_without_export", force_log=True)
             try:
                 subprocess.run([
                     config.policy_python, str(Path(__file__).with_name("stream_export.py")),

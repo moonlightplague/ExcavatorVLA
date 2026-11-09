@@ -22,6 +22,7 @@ META_FIELDS = {
     "repeat_baseline", "repeat_cycles", "repeat_returns_completed", "scoops_completed",
     "all_scoops_success", "source_sampling_audit", "score_summary", "final_metrics",
     "repeat_metrics", "created_at", "finished_at", "duration_wall_s", "duration_simulation_s",
+    "repeat_episode_quality", "scoop_results",
 }
 POLICY_ENV_KEYS = ("PATH", "PYTHONPATH", "PYTHONHOME", "LD_LIBRARY_PATH", "LD_PRELOAD")
 

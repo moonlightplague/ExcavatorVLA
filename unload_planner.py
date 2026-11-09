@@ -48,7 +48,9 @@ class UnloadPlanner:
     def solve(self, landing, seed, release_height=None, *, dump_degrees=88., min_release_z=None):
         if release_height is None:
             wall_z = float(self.rt.task_scene_context()["unload_bin_z_range"][1])
-            minimum = .65 if min_release_z is None else max(.65, float(min_release_z) - wall_z)
+            clearance = getattr(getattr(self.rt, 'repeat_baseline', None), 'config', None)
+            clearance = getattr(clearance, 'release_clearance_m', .65)
+            minimum = clearance if min_release_z is None else max(clearance, float(min_release_z) - wall_z)
             for height in (minimum, minimum + .5, minimum + 1.):
                 q, detail = self.solve(landing, seed, height, dump_degrees=dump_degrees)
                 if q is not None:

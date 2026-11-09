@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-11-09
+
+- Add a measured-swing reachable workspace with randomized side loading, configurable release clearance, and explicit Newton solve frequency/point budget.
+- Default collection to ten cycles, Newton MPM at 60 Hz/32,000 points, sand amount 3, the reachable side-loading profile and explicit episode efficiency acceptance; retain strict acceptance as an option.
+- Preserve avalanched source material identity and distinguish new source-ID deposits from losses of an earlier truck load.
+- Add an explicit ten-cycle episode efficiency policy while retaining original strict decisions, hard capture/delivery/execution checks, physical returns, and the source audit.
+- Add a fixed-attempt Newton benchmark that counts failed plans and rejections, records seed ranges and source hashes, and reports acceptance uncertainty and strict-equivalent outcomes.
+- Retain scoop quality measurements after raw pruning; audit episode policy and active soil configuration, and report rejected cleanup separately from export.
+- Document the diagnosis and parameter choices in `TUNING.md`.
+- Complete a fixed four-scene Newton trial: 2/4 accepted and exported under the episode policy versus 1/4 strict-equivalent, with ten productive rounds/returns each; validate 4,929 frames per camera and the real LeRobot reader. See `VALIDATION.md` for limits and hard failures.
+
 ## 2026-11-08
 
 - Add collection-matched evaluation scene preparation using the existing repeat sampler, initial pose, digging planner, and low-fill unload selection.

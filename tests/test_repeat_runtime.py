@@ -73,6 +73,23 @@ def fake_runtime(directory):
 
 
 class RepeatRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_newton_request_requires_the_live_backend_and_retains_its_configuration(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, EXCAVATOR_SOIL_BACKEND='newton_mpm'):
+            rt = fake_runtime(directory)
+            api = {'soil_backend': 'physx'}
+            rt.get_sand_site_api = lambda: api
+            install(rt, RepeatConfig(scoops=2))
+            with self.assertRaisesRegex(RuntimeError, 'backends disagree'):
+                rt.auto_collect_begin_episode()
+            api.update(soil_backend='newton_mpm', mpm_diagnostics=lambda: {'active': False, 'error': ''})
+            with self.assertRaisesRegex(RuntimeError, 'active, healthy Newton'):
+                rt.auto_collect_begin_episode()
+            api.update(mpm_diagnostics=lambda: {'active': True, 'error': '', 'grid_m': .12},
+                       particle_material_config={'friction': .68}, derived_particle_config={'mass': .9})
+            meta = rt.auto_collect_begin_episode()
+            self.assertEqual(meta['repeat_baseline']['soil']['mpm']['grid_m'], .12)
+            self.assertEqual(meta['repeat_baseline']['soil']['material']['friction'], .68)
+
     async def test_streaming_waits_for_flushed_metrics_before_export(self):
         with tempfile.TemporaryDirectory() as directory:
             rt = fake_runtime(directory)

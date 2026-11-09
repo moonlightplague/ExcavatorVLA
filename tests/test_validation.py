@@ -2,8 +2,10 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 from baseline.validate_repeat import validate_episode
+from baseline.tuning import episode_quality
 
 
 def fixture(directory):
@@ -39,6 +41,43 @@ def write(directory, rows, meta):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_episode_policy_is_recomputed_and_still_requires_delivery_on_every_cycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            rows, meta = fixture(directory)
+            config = meta['repeat_baseline']['config']
+            config.update(acceptance_profile='episode', episode_min_score=65., episode_max_spill_ratio=.5)
+            meta['scoop_results'] = [dict(success=True, strict_success=True, execution_success=True,
+                score=90., spill_ratio=.1, freeze_count=0, bin_gain_from_pile_particles=9,
+                max_bucket_from_pile_particles=10, lift_bucket_from_pile_particles=10,
+                spill_from_lift_particles=1) for _ in range(2)]
+            meta['repeat_episode_quality'] = episode_quality(meta['scoop_results'], SimpleNamespace(**config))
+            write(directory, rows, meta)
+            validate_episode(directory)
+            meta['repeat_episode_quality']['weighted_spill_ratio'] = 0.
+            write(directory, rows, meta)
+            with self.assertRaisesRegex(ValueError, 'disagrees'):
+                validate_episode(directory)
+            meta['repeat_episode_quality'] = episode_quality(meta['scoop_results'], SimpleNamespace(**config))
+            meta['scoop_results'][1]['bin_gain_from_pile_particles'] = 0
+            write(directory, rows, meta)
+            with self.assertRaisesRegex(ValueError, 'soil delivery'):
+                validate_episode(directory)
+            # Actual new IDs, rather than the net bed count, establish delivery
+            # when an earlier load loses some material during a later return.
+            for report in meta['scoop_results']:
+                report.update(source_delivered_particles=9, source_captured_particles=10,
+                              source_spillage_particles=1, source_score=90.)
+            meta['repeat_metrics'] = {'spillage_fraction': .1}
+            meta['repeat_episode_quality'] = episode_quality(meta['scoop_results'],
+                SimpleNamespace(**config), meta['repeat_metrics'])
+            write(directory, rows, meta)
+            validate_episode(directory)
+            meta['scoop_results'][1]['source_delivered_particles'] = 0
+            write(directory, rows, meta)
+            with self.assertRaisesRegex(ValueError, 'soil delivery'):
+                validate_episode(directory)
+
     def test_v2_audit_requires_metrics_and_continuous_cut(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)

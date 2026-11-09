@@ -99,6 +99,7 @@ def combine_batch(raw_root, batch_id, export_dir, requested, status):
                         "planning_diagnostic_count": run_summary.get("planning_diagnostics", 0)})
         records.extend(rows)
     trainable = [row for row in records if row["status"] == "trainable"]
+    attempts = sum(s["collection_attempt_count"] for s in sources)
     completed = (status == "complete" and len(trainable) == requested
                  and len(receipts) == requested and all(r.get("raw_pruned") for r in receipts))
     if status == "complete" and not completed:
@@ -113,7 +114,9 @@ def combine_batch(raw_root, batch_id, export_dir, requested, status):
         "created_at_utc": datetime.now(timezone.utc).isoformat(), "status": status,
         "completed": completed, "requested_successful_episodes": requested,
         "export_dir": str(Path(export_dir).resolve()), "exported_episode_count": len(receipts),
-        "collection_attempt_count": sum(s["collection_attempt_count"] for s in sources),
+        "collection_attempt_count": attempts,
+        "acceptance_rate": len(trainable) / attempts if attempts else None,
+        "export_acceptance_rate": len(receipts) / attempts if attempts else None,
         "planning_diagnostic_count": sum(s["planning_diagnostic_count"] for s in sources),
         "source_files": sources, "combined": combined,
         "source_metric_definitions": records[0].get("definitions", {}) if records else {},
@@ -143,6 +146,9 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     write_json(args.output, result)
     print(f"Combined metrics and averages: {args.output}", flush=True)
+    print(f"Acceptance: {result['exported_episode_count']}/{result['collection_attempt_count']} attempts "
+          f"exported ({result['export_acceptance_rate']:.1%})" if result['collection_attempt_count'] else
+          "Acceptance: no collection attempts completed", flush=True)
 
 
 if __name__ == "__main__":

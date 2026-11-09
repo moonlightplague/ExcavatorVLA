@@ -8,6 +8,13 @@ from pathlib import Path
 
 import numpy as np
 
+from types import SimpleNamespace
+
+try:
+    from baseline.tuning import episode_quality
+except ImportError:
+    from tuning import episode_quality
+
 
 def read_jsonl(path):
     with Path(path).open() as handle:
@@ -30,6 +37,16 @@ def validate_episode(directory):
     require(meta.get("all_scoops_success"), "A scoop failed the existing quality gate")
     require(meta.get("repeat_returns_completed") == count, "Incomplete physical returns")
     require(meta.get("source_sampling_audit", {}).get("ok"), "Source sampling audit failed")
+    if config.get("acceptance_profile") == "episode":
+        results = meta.get("scoop_results", [])
+        quality = episode_quality(results, SimpleNamespace(**config), meta.get("repeat_metrics"))
+        require(quality.get("success"), "Episode efficiency policy failed")
+        require(meta.get("repeat_episode_quality") == quality, "Episode quality report disagrees with scoop measurements")
+        require(all(row.get("execution_success") and row.get("freeze_count", 0) == 0
+                    and row.get("source_delivered_particles", row.get("bin_gain_from_pile_particles", 0)) >= 3
+                    and row.get("max_bucket_from_pile_particles", 0) >= 5
+                    and row.get("lift_bucket_from_pile_particles", 0) >= 5
+                    for row in results), "A scoop failed physical execution or soil delivery")
     if meta["repeat_baseline"].get("version") == "repeat_flat_fill_v2":
         metrics = meta.get("repeat_metrics", {})
         require(metrics.get("metrics_schema_version") == "repeat_episode_metrics_v1", "Missing repeat metrics")
@@ -102,7 +119,8 @@ def validate_episode(directory):
                         "bed_particles": cycle["bed_after_return"]["particle_count"],
                         "surface_std_m": cycle["bed_after_return"]["surface_std_m"],
                         "occupied_fraction": cycle["bed_after_return"]["occupied_fraction"]})
-    require(all(row.get("success") and row.get("bin_gain_from_pile_particles", 0) > 0
+    require(all(row.get("success") and
+                row.get("source_delivered_particles", row.get("bin_gain_from_pile_particles", 0)) > 0
                 for row in meta["scoop_results"]), "Cycle did not transfer source soil to truck")
     return {"episode": str(directory), "frames": len(rows), "scoops": count, "returns": returns,
             "score": meta["score_summary"]["score"], "task": rows[0]["task"]}

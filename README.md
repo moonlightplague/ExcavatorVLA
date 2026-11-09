@@ -1,20 +1,25 @@
 # Repeated dig, unload, and return baseline
 
+See [TUNING.md](TUNING.md) for the ten-cycle Newton setup, acceptance definitions,
+and fixed-attempt measurement procedure.
+
 From the repository root:
 
 ```bash
-./collect_repeat.sh 10                  # 10 successful episodes, 3 cycles each
+./collect_repeat.sh 10                  # 10 successful episodes, 10 cycles each
 ./collect_repeat.sh 10 2 0,1 4          # two GPUs, 4 cycles per episode
 ```
 
 Arguments are successful **episodes**, worker count, GPU IDs, and cycles per
-episode (2–64; default 3). Further arguments go to the baseline/Isaac launcher:
+episode (2–64; default 10). Further arguments go to the baseline/Isaac launcher:
 
 ```bash
 DATA_ROOT=/path/to/repeat_data POLICY_PYTHON=/path/to/training/python \
   ./collect_repeat.sh 1 1 0 3 --max-attempts 5 --sand-amount 1.0
 
+./collect_repeat.sh 10 2 0,1 10 --soil-backend newton_mpm
 ./collect_repeat.sh 1 1 0 3 \
+  --soil-backend physx --scene-profile broad --acceptance-profile strict --sand-amount 1 \
   --fixed-scene-profile /absolute/path/to/validated_scene.json
 
 python baseline/collect_repeat.py --help
@@ -26,22 +31,82 @@ for export; the Isaac Python runtime is separate. `DATA_ROOT` defaults to
 `data/repeat`, resolved relative to the caller's directory. The publication is
 `$DATA_ROOT/export_repeat`; override it with `EXPORT_DIR`. `SCOOPS_PER_EPISODE`
 sets the default cycle count; `COLLECT_STATUS_SECONDS` controls the heartbeat.
-Sand amount defaults to 1.0, matching the single-scoop launcher. Override with
+Sand amount defaults to 3.0. Override with
 `SAND_AMOUNT` or `--sand-amount` for a larger source pile.
 
-The baseline defaults to the established PhysX particle soil, keeping the
-existing soil implementation untouched. To use the locally integrated Newton
-MPM backend, select `--soil-backend newton_mpm` or set `EXCAVATOR_SOIL_BACKEND`.
+The baseline defaults to the locally integrated Newton MPM backend, the
+reachable side-loading workspace, a 60 Hz MPM solve and 32,000 material-point
+budget, with a 512 × 512 headless application window (recorded RGB stays 256 × 256).
+`--soil-backend physx --scene-profile broad --acceptance-profile strict --sand-amount 1` selects the
+legacy PhysX setup. `EXCAVATOR_SOIL_BACKEND`, `EXCAVATOR_MPM_HZ` and
+`EXCAVATOR_MPM_MAX_PARTICLES` can override backend/solver defaults.
 Material behavior, resolution, and source-particle quality counts depend on the
-backend. The baseline never changes quality thresholds to accept a backend.
+backend. Acceptance policies are explicit and recorded in episode metadata.
+
+Episode efficiency acceptance is the default; `--acceptance-profile strict`
+restores the original per-cycle efficiency gate. The full tuned configuration is:
+
+```bash
+./collect_repeat.sh 10 2 0,1 10 --soil-backend newton_mpm \
+  --scene-profile reachable --acceptance-profile episode --sand-amount 3 \
+  --truck-reach-min 6.7 --truck-reach-max 7.0 --truck-approach side --release-clearance .45 \
+  --bed-wall-margin 1.0 --dump-settle-seconds 1.5 \
+  --mpm-hz 60 --mpm-particle-budget 32000
+```
+
+The reachable sampler measures the truck landing radius from the actual swing
+joint, rather than the world origin. Its 6.7–7.0 m radius reserves a closed,
+loaded carry posture at the dump; truck bearings span -100° to -80° in world
+coordinates, truck rear alignment varies by 70–85° on either side, robot yaw by
+±15°, and pile positions remain randomized. This puts the long bed axis across
+the arm's reach arc and makes more low-fill cells available. `--truck-approach rear`
+retains rear loading with ±25° alignment. Existing geometric legality, mesh collision, and dump IK
+checks remain active. This is a narrower collection workspace than `broad`.
+
+`--acceptance-profile strict` uses the original per-scoop score ≥70 and spill
+≤30% defaults. `episode` retains capture ≥5 and newly delivered ≥3 source points on
+every scoop, successful execution and all physical returns, and the source
+10 Hz camera audit. It checks **mean source-ID scoop score ≥65 and capture-weighted spill
+≤50% over the complete episode**, rather than rejecting immediately for one
+inefficient scoop. Original decisions remain in `strict_success`, `strict_reason`
+and `quality_warnings` in each retained `scoop_results` row; efficiency thresholds
+are configurable with `--episode-min-score` and `--episode-max-spill-ratio`.
+The saved quality configuration records both sets of thresholds.
+Each cycle's source-ID tracker excludes the truck's existing load, so new delivery
+is not confused with net truck gain. The source score uses the existing 35/30/15/5/10
+capture/transfer/retention/smoothness/completion weights and a 20× spill penalty.
+The final unique-ID episode ledger must also have ≤50% spillage, so loss of older
+deposits remains an episode rejection condition. Both weighted and final spill
+ratios are retained in `repeat_episode_quality`.
+
+Newton source IDs include source material that avalanches beyond the authored
+pile polygon during settling. They exclude soil already in the truck/bucket at
+episode start. Rendering grains are never counted as material.
+
+Measure acceptance with a fixed attempt budget, without success-target retries:
+
+```bash
+python baseline/benchmark_repeat.py --output outputs/repeat_benchmark \
+  --attempts 8 --gpu-ids 0,1 --seed-start 75000 --mpm-hz 60 \
+  --mpm-particle-budget 32000
+```
+
+This launches consecutive independent scene seeds, writes commands/source hashes,
+and reports accepted/exported episodes divided by **all attempts**, including
+planning failures, plus a 95% Wilson interval and the count passing the original
+strict checks. `--scene-seed-start` is different from `--scene-seed`: the latter
+replays one fixed layout. `--planning-only` probes first-plan feasibility without
+executing digging actions; it cannot measure ten-cycle acceptance.
 
 ## Controller
 
 `collect_repeat.py` boots the original `run_vla_train_scene.py`, then installs
 `repeat_runtime.py` after bootstrap reloads its modules. The adapter reuses the
 original digging controller, current-sand target ranking, collision checks,
-camera scheduler, quality gates, run indices, and LeRobot exporter. Soil source
-files are untouched. A small optional curl-candidate hook in the runtime lets
+camera scheduler, run indices, and LeRobot exporter. The Newton adapter adds
+swept collision checks against actual static triangles to prevent sand crossing
+the thin truck floor between solves. Its implicit MPM material model remains
+in use. The shared deployment adapter has the same collision repair. A small optional curl-candidate hook in the runtime lets
 this task enforce the endpoint clearance during planning. A small integration in
 `ExcavatorVLA-isaac/excavator_dataset_tools.py` exports the explicit return flag
 and validates legitimate unload-to-return transitions.
@@ -112,7 +177,7 @@ records its own physical return. The reset/initial placement happens outside
 the recorded episode. There are no scene or sand resets between scoops.
 
 Completion requires the requested fixed cycle count, successful physical
-returns, the existing per-scoop transfer/spill/score gates, and the original
+returns, the selected transfer/spill/score policy, and the original
 uniform physical 10 Hz source audit. A blocked return, failed later dig, or bad
 camera stream rejects the entire episode. A successful prefix is not silently
 published. The existing adaptive truck-particle target and technical-cap stop
@@ -120,7 +185,7 @@ are disabled for this fixed-length task.
 
 `bed_fill.py` constructs a grid along the truck collision polygon's long axis,
 including rotated trucks. Default grid: 5 × 3. Landing points use the inset bed
-polygon (at least 0.60 m wall margin) and the original reach window. Each cell's
+polygon (1.0 m default wall margin) and the selected profile's reach window. Each cell's
 90th-percentile surface height, occupancy, and previous landing proximity guide
 placement. Empty cells use the bed floor, so they are not mistaken for filled
 cells. Off-bed, underground, non-finite, and high airborne particles are excluded.
@@ -129,7 +194,7 @@ The planner only chooses landing targets; it never relocates soil. Actual bed
 coverage and surface variation are recorded so uneven loads remain visible.
 
 Options include `--bed-long-cells`, `--bed-short-cells`, `--bed-wall-margin`,
-`--return-plan-seconds` (12), and `--dump-settle-seconds` (1). This is a placement
+`--return-plan-seconds` (12), and `--dump-settle-seconds` (1.5). This is a placement
 baseline: a small number of scoops cannot guarantee a perfectly level truck bed.
 
 ## Data and SmolVLA

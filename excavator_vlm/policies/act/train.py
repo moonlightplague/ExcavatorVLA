@@ -63,10 +63,33 @@ def run(settings, cfg, config_path):
     stats = training_stats(frames, episodes)
     dataset = make_act_dataset(cfg.dataset.repo_id, cfg.dataset.root, episodes,
                                cfg.policy.chunk_size, cfg.dataset.video_backend)
-    policy = ExcavatorACTPolicy(cfg.policy).to(accelerator.device)
-    pre, post = make_act_pre_post_processors(cfg.policy, stats)
+    continuation = None
+    if settings.get('continuation'):
+        from lerobot.policies.factory import make_pre_post_processors
+        from .continuation import validate_continuation
+        checkpoint = Path(settings['continuation']['checkpoint'])
+        continuation = validate_continuation(checkpoint, cfg.policy, report, split, episodes, stats)
+        cfg.policy.pretrained_backbone_weights = None
+        policy = ExcavatorACTPolicy.from_pretrained(str(checkpoint), config=cfg.policy,
+                                                    strict=True, local_files_only=True)
+        pre, post = make_pre_post_processors(cfg.policy, pretrained_path=str(checkpoint),
+            preprocessor_overrides={'device_processor': {'device': str(accelerator.device)}})
+    else:
+        policy = ExcavatorACTPolicy(cfg.policy)
+        pre, post = make_act_pre_post_processors(cfg.policy, stats)
+    policy = policy.to(accelerator.device)
     optimizer, scheduler = make_optimizer_and_scheduler(cfg, policy)
-    train_loader = loader_for(dataset, cfg.batch_size, cfg.num_workers, shuffle=True)
+    sampling_report = {'kind': 'uniform_shuffle_without_replacement'}
+    if continuation or settings['sampling']['manifest']:
+        from torch.utils.data import DataLoader
+        from .sampling import make_sampler
+        sampler, sampling_report = make_sampler(dataset, episodes, settings['sampling'], cfg.seed)
+        train_loader = DataLoader(dataset, batch_size=cfg.batch_size, sampler=sampler,
+            num_workers=cfg.num_workers, drop_last=False,
+            multiprocessing_context='spawn' if cfg.num_workers else None,
+            persistent_workers=cfg.num_workers > 0, timeout=60 if cfg.num_workers else 0)
+    else:
+        train_loader = loader_for(dataset, cfg.batch_size, cfg.num_workers, shuffle=True)
     policy, optimizer, train_loader = accelerator.prepare(policy, optimizer, train_loader)
     validation_loader = None
     if accelerator.is_main_process:
@@ -78,6 +101,9 @@ def run(settings, cfg, config_path):
         dump(cfg.output_dir / 'dataset_contract.json', report)
         dump(cfg.output_dir / 'split_manifest.json', split)
         dump(cfg.output_dir / 'normalization_stats.json', stats)
+        dump(cfg.output_dir / 'sampling.json', sampling_report)
+        if continuation:
+            dump(cfg.output_dir / 'continuation.json', continuation)
         dump(cfg.output_dir / 'provenance.json', {
             'packages': {key: version(key) for key in ('lerobot', 'torch', 'torchvision', 'numpy', 'av')},
             'source_hashes': {str(p.relative_to(SUBMODULE)): file_hash(p)
@@ -87,6 +113,7 @@ def run(settings, cfg, config_path):
             'global_batch_size': cfg.batch_size * accelerator.num_processes,
             'normalization': 'selected training episodes only; fixed ImageNet image stats',
             'language_conditioning': False,
+            'continuation': continuation, 'sampling': sampling_report,
         })
         if settings['benchmark']['validation_freq']:
             validation = make_act_dataset(cfg.dataset.repo_id, cfg.dataset.root, split['validation'],
@@ -124,6 +151,8 @@ def run(settings, cfg, config_path):
                 if log:
                     row = dict(step=step, **dict(zip(parts, values)), grad_norm=float(norm),
                                lr=optimizer.param_groups[0]['lr'], elapsed_seconds=time.perf_counter() - started)
+                    if continuation:
+                        row['source_plus_finetune_steps'] = continuation['source_step'] + step
                     log.write(json.dumps(row) + '\n')
                     log.flush()
                     print(json.dumps(row), flush=True)

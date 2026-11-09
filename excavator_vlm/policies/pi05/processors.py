@@ -4,16 +4,22 @@ from pathlib import Path
 import torch
 
 from ...data.contract import CAMERAS
+from .history import MASK, history_spec, window_mask
 
 
 class CheckedPreprocessor:
-    def __init__(self, pipeline, max_length):
+    def __init__(self, pipeline, max_length, history=None):
         self.pipeline, self.max_length = pipeline, max_length
+        self.history = history
 
     def __call__(self, batch):
         if not batch.get('task'):
             raise ValueError('PI05 requires a nonempty language task')
         state = batch['observation.state']
+        if self.history is not None and len(self.history['delta_indices']) > 1:
+            batch = {**batch, MASK: window_mask(batch, self.history)}
+        elif state.ndim not in (1, 2):
+            raise ValueError('Single-frame PI05 requires [28] or [B,28] state')
         if state.shape[-1] != 28 or not torch.isfinite(state).all():
             raise ValueError('Expected finite 28D excavator state')
         for key in CAMERAS:
@@ -38,6 +44,12 @@ def make_processors(config, stats, tokenizer_path):
         UnnormalizerProcessorStep,
     )
     from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
+    history = history_spec(config)
+    if config.n_obs_steps > 1:
+        from .history_processor import HistoryPromptProcessorStep
+        prompt = HistoryPromptProcessorStep(tuple(history['delta_indices']), history['fps'], config.max_state_dim)
+    else:
+        prompt = Pi05PrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim)
 
     tokenizer_path = Path(tokenizer_path).resolve()
     if not (tokenizer_path / 'tokenizer_config.json').is_file():
@@ -48,7 +60,7 @@ def make_processors(config, stats, tokenizer_path):
         RenameObservationsProcessorStep(rename_map={}), AddBatchDimensionProcessorStep(),
         NormalizerProcessorStep(features={**config.input_features, **config.output_features},
                                 norm_map=config.normalization_mapping, stats=tensors),
-        Pi05PrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
+        prompt,
         TokenizerProcessorStep(tokenizer_name=str(tokenizer_path), max_length=config.tokenizer_max_length,
                                padding='max_length', padding_side='right', truncation=False),
         DeviceProcessorStep(device=config.device),
@@ -57,7 +69,7 @@ def make_processors(config, stats, tokenizer_path):
         UnnormalizerProcessorStep(features=config.output_features, norm_map=config.normalization_mapping, stats=tensors),
         DeviceProcessorStep(device='cpu'),
     ], name='policy_postprocessor', to_transition=policy_action_to_transition, to_output=transition_to_policy_action)
-    return CheckedPreprocessor(pre, config.tokenizer_max_length), post
+    return CheckedPreprocessor(pre, config.tokenizer_max_length, history), post
 
 
 def validate_tokens(batch, max_length):

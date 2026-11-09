@@ -41,13 +41,20 @@ def main(load_policy, make_dataset, policy_type, argv=None):
     validate_split(split, frames.episode_index.unique(), report['fingerprint'])
     if report['fingerprint'] != provenance['dataset_fingerprint']:
         raise ValueError('Evaluation dataset differs from checkpoint dataset fingerprint')
+    if policy_type == 'pi05':
+        from ..data.action_limits import check_checkpoint_contract
+        check_checkpoint_contract(json.loads((checkpoint / 'checkpoint.json').read_text()), load_info(args.dataset))
     episodes = [int(e) for e in args.episodes.split(',')] if args.episodes else split[args.split]
     if not episodes or not set(episodes).issubset(split[args.split]) or len(set(episodes)) != len(episodes):
         raise ValueError('Episode subset must be unique and within the selected split')
     if args.split != 'train' and set(episodes) & set(provenance['training_episodes']):
         raise ValueError('Selected held-out evaluation overlaps actual training episodes')
     policy, pre, post = load_policy(checkpoint, args.device)
-    if policy_type == 'vqbet':
+    if policy_type == 'pi05':
+        from ..policies.pi05.history import history_spec
+        dataset = make_dataset('local/excavator', args.dataset.resolve(), episodes,
+                               policy.config.chunk_size, 'pyav', history_spec(policy.config))
+    elif policy_type == 'vqbet':
         dataset = make_dataset('local/excavator', args.dataset.resolve(), episodes,
                                policy.config.n_action_pred_token, policy.config.action_chunk_size)
     else:
@@ -68,6 +75,7 @@ def main(load_policy, make_dataset, policy_type, argv=None):
         from ..policies.pi05.lora import finetuning_metadata
         manifest = json.loads((checkpoint / 'checkpoint.json').read_text())
         metrics.update(checkpoint_format=manifest['format'], base_sha256=manifest['base_sha256'],
+                       observation_history=history_spec(policy.config),
                        policy_dtype=policy.config.dtype, num_inference_steps=policy.config.num_inference_steps,
                        chunk_size=policy.config.chunk_size,
                        policy_dtype_scope='backbone initialization; see parameter_precision for actual storage',

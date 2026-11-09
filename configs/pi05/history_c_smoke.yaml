@@ -1,0 +1,11 @@
+extends: history_c.yaml
+steps: 20
+save_freq: 20
+log_freq: 1
+num_workers: 0
+job_name: excavator_pi05_history_c_smoke
+benchmark:
+  validation_freq: 20
+  validation_max_batches: 2
+launcher:
+  gpu_ids: [0]

@@ -6,6 +6,7 @@ from ...data.contract import CAMERAS
 from .checkpoints import apply_delta, asset_overrides, load_base, resolve_checkpoint
 from .precision import PRECISION_CONTRACT, configure_trainable_precision
 from .lora import setup_from_manifest
+from .history import bind_history
 
 
 def check_environment():
@@ -28,6 +29,8 @@ def load_pi05(checkpoint, device='cpu'):
 
     checkpoint = resolve_checkpoint(checkpoint)
     manifest = json.loads((checkpoint / 'checkpoint.json').read_text())
+    from ...data.action_limits import checkpoint_contract
+    checkpoint_contract(manifest)
     precision = manifest.get('precision_contract')
     if precision not in (None, PRECISION_CONTRACT):
         raise ValueError(f'Unsupported PI05 precision contract: {precision}')
@@ -35,6 +38,7 @@ def load_pi05(checkpoint, device='cpu'):
     config = PreTrainedConfig.from_pretrained(str(checkpoint))
     if config.type != 'pi05':
         raise ValueError('Expected a PI05 checkpoint')
+    bind_history(config, manifest.get('observation_history'))
     config.device = device
     if str(device) == 'cpu':
         config.dtype = 'float32'

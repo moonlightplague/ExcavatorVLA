@@ -63,9 +63,10 @@ def evaluate_loader(policy, pre, post, loader, limits, max_batches=0):
             break
         observation = {key: batch[key] for key in ('observation.state', *CAMERAS)}
         if policy.config.type == 'pi05':
+            from ..policies.pi05.history import observation_batch
             if 'task' not in batch:
                 raise ValueError('PI05 offline evaluation requires the recorded language task')
-            observation['task'] = batch['task']
+            observation = observation_batch(batch)
         # CPU transfer waits for CUDA completion; timing covers preprocessing,
         # prediction, physical-unit unnormalization and output transfer.
         if next(policy.parameters()).is_cuda:

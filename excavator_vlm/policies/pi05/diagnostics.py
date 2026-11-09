@@ -267,7 +267,9 @@ def run(args):
     report['trainable_parameters'] = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     report['active_dropout'] = [name for name, m in policy.named_modules()
                                 if isinstance(m, torch.nn.Dropout) and m.p > 0]
-    dataset = make_pi05_dataset('local/excavator', args.dataset.resolve(), [args.episode], policy.config.chunk_size)
+    from .history import history_spec, observation_batch
+    dataset = make_pi05_dataset('local/excavator', args.dataset.resolve(), [args.episode],
+                               policy.config.chunk_size, 'pyav', history_spec(policy.config))
     arrays = {}
     first_batch, first_noise = None, None
     for frame in args.frames:
@@ -277,7 +279,7 @@ def run(args):
         if int(batch['episode_index'][0]) != args.episode or int(batch['frame_index'][0]) != frame:
             raise ValueError('Selected dataset index does not match the requested episode/frame')
         training = training_batch(pre, copy.deepcopy(batch))
-        observation = pre({key: copy.deepcopy(batch[key]) for key in ('observation.state', *CAMERAS, 'task')})
+        observation = pre(observation_batch(copy.deepcopy(batch)))
         compared = compare_observations(training, observation)
         if not all(value['exact_equal'] for value in compared.values()):
             raise AssertionError('Training and inference preprocessing differ')

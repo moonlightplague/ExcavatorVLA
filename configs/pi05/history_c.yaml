@@ -1,0 +1,28 @@
+# Scheme C: three synchronized RGB/state observations, no subtask labels.
+# Requires a controller-compatible repeated dataset, backend evidence and frozen split.
+extends: full.yaml
+dataset:
+  root: ../../../data/repeat/export_repeat
+policy:
+  n_obs_steps: 3
+  tokenizer_max_length: 512
+observation_history:
+  delta_indices: [-6, -3, 0] # 10 Hz: -0.6 s, -0.3 s, current.
+training:
+  mode: vlm_lora_expert_full
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0
+    targets: [q_proj, k_proj, v_proj, o_proj]
+    init_seed: 0
+  data_soil_backend: physx
+  gradient_accumulation_steps: 4
+  keep_checkpoints: 5
+steps: 10000
+save_freq: 2000
+job_name: excavator_pi05_history_c
+benchmark:
+  split_file: ../splits/pi05_repeat_history_c_seed1000.json
+  validation_freq: 2000
+  validation_max_batches: 0

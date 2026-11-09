@@ -20,10 +20,14 @@ from ...common.runtime import dump
 from ...data.contract import audit_dataset, file_hash, make_split, validate_split
 from .config import build_policy_config, config_dict, resolve_settings
 from .dataset import make_pi05_dataset, training_stats
+from .history import bind_history, history_spec, observation_batch
 
 
 def prepare(settings, create=False):
     report, frames = audit_dataset(settings['dataset']['root'], settings['policy']['chunk_size'])
+    from ...data.action_limits import DEFAULT_PROFILE, require_replay_gate
+    if report.get('action_contract', {}).get('profile', DEFAULT_PROFILE) != DEFAULT_PROFILE:
+        require_replay_gate(settings['dataset']['root'], report['fingerprint'])
     required_backend = settings['training'].get('data_soil_backend')
     if required_backend is not None and report.get('collection_backend', {}).get('soil_backend') != required_backend:
         raise ValueError('Training requires verified per-episode evidence for the requested collection backend')
@@ -112,7 +116,7 @@ def run(settings, config, config_path, stop_after=None):
     report, split, frames, episodes = prepare(settings)
     stats = training_stats(frames, episodes)
     dataset = make_pi05_dataset(settings['dataset']['repo_id'], settings['dataset']['root'], episodes,
-                               config.chunk_size, settings['dataset']['video_backend'])
+                               config.chunk_size, settings['dataset']['video_backend'], history_spec(config))
     pre, post = make_processors(config, stats, tokenizer)
     requested_finetuning = finetuning_spec(settings['training'].get('mode', 'expert_only'),
                                          settings['training'].get('lora'))
@@ -150,8 +154,7 @@ def run(settings, config, config_path, stop_after=None):
     if requested_finetuning['mode'] == VLM_LORA and not state:
         from torch.utils.data import default_collate
         zero_input = default_collate([dataset[0]])
-        zero_input = {key: zero_input[key] for key in ('observation.state', 'task',
-                      'observation.images.0', 'observation.images.1', 'observation.images.2')}
+        zero_input = observation_batch(zero_input)
         with preserved_rng(0), torch.inference_mode():
             before_injection = policy.predict_action_chunk(pre(copy.deepcopy(zero_input))).cpu()
     setup_finetuning(policy, requested_finetuning)
@@ -167,7 +170,8 @@ def run(settings, config, config_path, stop_after=None):
         if manifest['base_sha256'] != settings['assets']['base_sha256']:
             raise ValueError('Resume base checkpoint differs')
         from lerobot.configs.policies import PreTrainedConfig
-        old_config = config_dict(PreTrainedConfig.from_pretrained(str(resume_path)))
+        old_config = config_dict(bind_history(PreTrainedConfig.from_pretrained(str(resume_path)),
+                                             manifest.get('observation_history')))
         current = config_dict(config)
         for key in current:
             if key not in ('device',) and current[key] != old_config.get(key):
@@ -208,7 +212,10 @@ def run(settings, config, config_path, stop_after=None):
     if state:
         deserialize_rng_state(state['rng'][accelerator.process_index])
     run_dir = Path(settings['output_dir'])
+    from ...data.action_limits import default_contract
     provenance = {'adapter': 'excavator_pi05_v3_finetuning', 'parameter_precision': precision_summary(raw),
+                  'action_contract': report.get('action_contract', default_contract()),
+                  'observation_history': history_spec(config),
                   'finetuning': finetuning_metadata(raw),
                   'dataset_fingerprint': report['fingerprint'],
                   'split_manifest': split, 'training_episodes': episodes, 'language_conditioning': True,
@@ -244,7 +251,7 @@ def run(settings, config, config_path, stop_after=None):
             dump(run_dir / f'resume_from_{state["step"]:06d}_{os.getpid()}.json', settings)
         if settings['benchmark']['validation_freq']:
             validation = make_pi05_dataset(settings['dataset']['repo_id'], settings['dataset']['root'],
-                split['validation'], config.chunk_size, settings['dataset']['video_backend'])
+                split['validation'], config.chunk_size, settings['dataset']['video_backend'], history_spec(config))
             validation_loader = DataLoader(validation, batch_size=settings['training']['validation_batch_size'])
     accelerator.wait_for_everyone()
     log = (run_dir / 'train.log').open('a' if state else 'w') if accelerator.is_main_process else None
@@ -309,7 +316,7 @@ def run(settings, config, config_path, stop_after=None):
                 if accelerator.is_main_process and validate:
                     with preserved_rng(0):
                         metrics, _ = evaluate_loader(raw, pre, post, validation_loader,
-                            [6., 2.5, 2.5, 6.], settings['benchmark']['validation_max_batches'])
+                            provenance['action_contract']['limits_rad_s'], settings['benchmark']['validation_max_batches'])
                 rng = _gather_rng(accelerator)
                 if accelerator.is_main_process:
                     improved = metrics is not None and metrics['first_action']['mae'] < best
@@ -339,8 +346,7 @@ def run(settings, config, config_path, stop_after=None):
                 break
         if accelerator.is_main_process:
             with preserved_rng(0), torch.inference_mode():
-                check_batch = {key: batches[0][key] for key in ('observation.state', 'task',
-                               'observation.images.0', 'observation.images.1', 'observation.images.2')}
+                check_batch = observation_batch(batches[0])
                 expected = raw.predict_action_chunk(pre(check_batch)).cpu()
             pretrained = resolve_checkpoint(run_dir)
             apply_delta(raw, pretrained)

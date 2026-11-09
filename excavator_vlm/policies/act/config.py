@@ -1,13 +1,33 @@
 """ACT-only configuration validation and LeRobot configuration construction."""
 import copy
 from importlib.metadata import version
+import math
+from pathlib import Path
 
 from ...common.config import resolve_settings as resolve_common_settings
 from ...data.contract import load_info, policy_features
 
 
 def resolve_settings(path, overrides=None):
-    settings = resolve_common_settings(path, overrides)
+    settings = resolve_common_settings(path, overrides, extra_sections=('continuation', 'sampling'))
+    continuation = settings.get('continuation')
+    if continuation is not None:
+        if not isinstance(continuation, dict) or set(continuation) != {'checkpoint'}:
+            raise ValueError('continuation must specify a checkpoint (weights-only fine-tuning)')
+        continuation['checkpoint'] = str((Path(path).resolve().parent /
+                                         Path(continuation['checkpoint']).expanduser()).resolve())
+    sampling = settings.setdefault('sampling', {'manifest': None, 'transition_probability': 0.0})
+    if not isinstance(sampling, dict) or set(sampling) != {'manifest', 'transition_probability'}:
+        raise ValueError('sampling must specify manifest and transition_probability')
+    probability = sampling['transition_probability']
+    if (isinstance(probability, bool) or not isinstance(probability, (int, float))
+            or not math.isfinite(probability) or not 0 <= probability <= 1):
+        raise ValueError('transition_probability must be finite and between zero and one')
+    if probability and not sampling['manifest']:
+        raise ValueError('Transition sampling requires a training-only window manifest')
+    if sampling['manifest']:
+        sampling['manifest'] = str((Path(path).resolve().parent /
+                                    Path(sampling['manifest']).expanduser()).resolve())
     if settings['policy'].get('type') != 'act':
         raise ValueError('ACT entrypoint requires policy.type: act')
     if settings['policy'].get('temporal_ensemble_coeff') is not None:

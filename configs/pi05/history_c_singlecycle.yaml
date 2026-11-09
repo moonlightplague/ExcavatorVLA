@@ -1,0 +1,8 @@
+# Integration pilot on the existing verified dataset; does not train repeated digging.
+extends: lora_singlecycle20_physx_10k.yaml
+policy:
+  n_obs_steps: 3
+  tokenizer_max_length: 512
+observation_history:
+  delta_indices: [-6, -3, 0]
+job_name: excavator_pi05_history_c_singlecycle

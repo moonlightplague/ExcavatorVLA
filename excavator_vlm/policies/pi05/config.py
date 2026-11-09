@@ -6,18 +6,22 @@ from pathlib import Path
 from ...common.config import resolve_settings as resolve_common_settings
 from ...data.contract import CAMERAS, load_info
 from .lora import finetuning_spec
+from .history import bind_history, history_spec, make_history
 
 BASE_SHA256 = '0eb11ca9587678c1d2ef8cf32807c29f8ce53a2bfdfc1aa4a4c96f16fca59b0f'
 
 
 def config_dict(config):
     import draccus
-    return draccus.encode(config)
+    result = draccus.encode(config)
+    if config.n_obs_steps > 1:
+        result['excavator_observation_history'] = history_spec(config)
+    return result
 
 
 def resolve_settings(path, overrides=None):
     path = Path(path).resolve()
-    settings = resolve_common_settings(path, overrides, extra_sections=('assets', 'training'))
+    settings = resolve_common_settings(path, overrides, extra_sections=('assets', 'training', 'observation_history'))
     assets, training = settings.get('assets'), settings.get('training')
     if not isinstance(assets, dict) or set(assets) != {'base_path', 'base_sha256', 'tokenizer_path'}:
         raise ValueError('assets must specify base_path, base_sha256 and tokenizer_path')
@@ -55,8 +59,16 @@ def resolve_settings(path, overrides=None):
         raise ValueError('Initial benchmark disables RTC and model compilation')
     if policy.get('max_state_dim') != 32 or policy.get('max_action_dim') != 32:
         raise ValueError('Keep the pretrained internal 32D state/action interface')
-    if policy.get('n_obs_steps') != 1 or not 1 <= policy['n_action_steps'] <= policy['chunk_size']:
+    if type(policy.get('n_obs_steps')) is not int or not 1 <= policy['n_obs_steps'] <= 8 or not 1 <= policy['n_action_steps'] <= policy['chunk_size']:
         raise ValueError('Invalid observation/action horizon')
+    history = settings.get('observation_history', {'delta_indices': [0]})
+    if not isinstance(history, dict) or set(history) != {'delta_indices'}:
+        raise ValueError('observation_history must specify delta_indices only')
+    spec = make_history(history['delta_indices'])
+    if len(spec['delta_indices']) != policy['n_obs_steps']:
+        raise ValueError('n_obs_steps must equal the number of history offsets')
+    if policy['n_obs_steps'] > 1 and policy['tokenizer_max_length'] < 512:
+        raise ValueError('History prompts require tokenizer_max_length >= 512; truncation is forbidden')
     if policy.get('empty_cameras', 0) != 0:
         raise ValueError('All three real excavator cameras are required')
     if policy.get('normalization_mapping') != {'VISUAL': 'IDENTITY', 'STATE': 'QUANTILES', 'ACTION': 'QUANTILES'}:
@@ -86,4 +98,5 @@ def build_policy_config(settings):
     # Do not let LeRobot silently turn a requested GPU run into CPU execution.
     config.device = settings['policy']['device']
     config.validate_features()
+    bind_history(config, make_history(settings.get('observation_history', {'delta_indices': [0]})['delta_indices']))
     return config

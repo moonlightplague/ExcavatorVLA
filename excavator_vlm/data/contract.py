@@ -6,6 +6,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .action_limits import action_contract
+
 CAMERAS = tuple(f'observation.images.{i}' for i in range(3))
 JOINTS = ('swing', 'boom', 'arm', 'bucket')
 ACTION_NAMES = tuple(f'{joint}_cmd_velocity' for joint in JOINTS)
@@ -43,8 +45,7 @@ def load_info(root):
             raise ValueError(f'{name}: expected 256x256 RGB video')
     if features.get('action_loss_weight', {}).get('shape') != [1]:
         raise ValueError('Missing scalar action_loss_weight supervision')
-    if not np.array_equal(info.get('action_limits_rad_s'), [6., 2.5, 2.5, 6.]):
-        raise ValueError('Unexpected deployment action limits')
+    action_contract(info)
     return info
 
 
@@ -173,6 +174,7 @@ def audit_dataset(root, chunk_size=10):
         'episodes': len(ids), 'frames': len(frames), 'fingerprint': digest.hexdigest(),
         'fingerprint_scope': 'info + data parquet + episode metadata + tasks; excludes video bytes',
         'max_previous_action_error': max_history_error, 'camera_episode_checks': checked,
+        'action_contract': action_contract(info),
         'chunk_size': chunk_size, 'padded_timestep_fraction': 1 - valid / (len(frames) * chunk_size),
     }
     if backend_report is not None:

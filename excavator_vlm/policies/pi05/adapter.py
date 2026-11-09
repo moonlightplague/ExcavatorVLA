@@ -4,6 +4,7 @@ import torch
 from ...data.contract import CAMERAS
 from .precision import inference_precision
 from .lora import set_lora_training
+from .history import history_spec, observation_batch, temporal_images
 
 
 def supervision_weights(batch):
@@ -30,7 +31,7 @@ def flow_loss_terms(element_losses, batch):
 def training_batch(preprocessor, batch):
     if 'task' not in batch:
         raise ValueError('PI05 requires the recorded language task')
-    processed = preprocessor({key: batch[key] for key in ('observation.state', *CAMERAS, 'action', 'task')})
+    processed = preprocessor(observation_batch(batch, action=True))
     for key in ('action_is_pad', 'action_loss_weight'):
         processed[key] = batch[key].to(processed['action'].device)
     return processed
@@ -41,6 +42,11 @@ def policy_class():
     from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 
     class ExcavatorPI05Policy(PI05Policy):
+        def _preprocess_images(self, batch):
+            if self.config.n_obs_steps == 1:
+                return super()._preprocess_images(batch)
+            return temporal_images(batch, history_spec(self.config), super()._preprocess_images)
+
         def __init__(self, config):
             super().__init__(config)
             # The causal-language-model output head is unused in PI05 action flow.

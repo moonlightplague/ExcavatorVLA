@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-11-09 — Newton repeat collection
+
+- Catch material-point segments crossing actual thin static collision meshes, applying first-impact separation and static friction after dynamic force reduction.
+- Add configurable fixed 60–240 Hz MPM solving while preserving the shared 120 Hz default, and report swept-collision hits in diagnostics.
+- Add an optional truck-position sampling hook for the repeat adapter's measured swing-joint workspace; preserve the original sampler by default.
+- Cover thin-shell crossings, outward motion and misses with real Warp CPU/CUDA kernel regression checks.
+
 ## 2026-10-30
 
 - Accept repeated-digging v2 metadata for physical-return export while preserving the existing cycle-boundary and source-audit requirements and v1 compatibility.

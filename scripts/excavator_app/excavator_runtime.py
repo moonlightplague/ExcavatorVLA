@@ -16731,6 +16731,11 @@ def auto_scene_sample_polar_xy(rng, radius_range, angle_deg_range):
     return xy, radius, angle_deg
 
 
+def auto_scene_sample_truck_unload_xy(rng, radius_range, angle_deg_range):
+    """Default world-space sampler; repeat tasks may supply a measured reach frame."""
+    return auto_scene_sample_polar_xy(rng, radius_range, angle_deg_range)
+
+
 def auto_scene_seed_context(attempt_index):
     run_id = str(STATE.get("auto_collect_run_id", "") or "").strip()
     run_suffix = str(os.environ.get("EXCAVATOR_AUTO_RUN_ID_SUFFIX", "") or "").strip()
@@ -18054,7 +18059,7 @@ def auto_scene_sample_candidate(attempt_index):
                 last_reason = str((truck_base or {}).get("reason", "truck_baseline_invalid"))
                 break
             unload_polar = workspace.get("truck_unload_polar", {}) if isinstance(workspace, dict) else {}
-            unload_xy, unload_radius, unload_angle_deg = auto_scene_sample_polar_xy(
+            unload_xy, unload_radius, unload_angle_deg = auto_scene_sample_truck_unload_xy(
                 rng,
                 unload_polar.get("radius", AUTO_SCENE_TRUCK_RANDOM_RADIUS_RANGE),
                 unload_polar.get("angle_deg", AUTO_SCENE_TRUCK_RANDOM_ANGLE_DEG_RANGE),

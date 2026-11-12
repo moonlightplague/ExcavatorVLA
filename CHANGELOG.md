@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-11-12 — Training artifact maintenance
+
+- Ignore local assistant/editor state, runtime caches, experiment-tracking outputs and generated coverage reports.
+- Preserve PI05 milestone checkpoints explicitly retained by the single-cycle and repeated-task comparison configurations.
+- Verify 13 PI05 training and checkpoint tests; preserve pending training/evaluation changes separately.
+
 ## 2026-11-09
 
 - Add user-approved shared-GPU restart from complete optimizer/RNG state, archive interrupted attempts/logs, and keep one rolling 100-step recovery checkpoint alongside the requested 2k milestones.

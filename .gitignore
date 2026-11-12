@@ -18,3 +18,19 @@ outputs/
 .ipynb_checkpoints/
 *.log
 *.tmp
+
+# Local tooling, experiment tracking, and regenerated runtime caches
+/.agents/
+/.codex/
+/.vscode/
+/logs/
+/wandb/
+/tensorboard/
+.mpm_warp_cache/
+.shader-cache/
+
+# Generated test coverage reports
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml

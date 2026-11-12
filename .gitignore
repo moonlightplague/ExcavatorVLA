@@ -17,3 +17,18 @@ __pycache__/
 *.pth
 *.ckpt
 *.safetensors
+
+# Local tooling, experiment tracking, and regenerated runtime caches
+/.agents/
+/.codex/
+/.vscode/
+/wandb/
+/tensorboard/
+.mpm_warp_cache/
+.shader-cache/
+
+# Generated test coverage reports
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml

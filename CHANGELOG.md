@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-11-12 — Collection artifact maintenance
+
+- Ignore local assistant/editor state, runtime caches, experiment-tracking outputs and generated coverage reports.
+- Verify five collection-launcher contract tests while preserving collection defaults and export behavior.
+
 ## 2026-11-09
 
 - Add a measured-swing reachable workspace with randomized side loading, configurable release clearance, and explicit Newton solve frequency/point budget.

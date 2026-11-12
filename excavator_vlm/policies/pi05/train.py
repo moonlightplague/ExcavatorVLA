@@ -74,14 +74,16 @@ def lr_multiplier(step, spec):
     return spec['floor'] + (1 - spec['floor']) * .5 * (1 + math.cos(math.pi * progress))
 
 
-def _gather_rng(accelerator):
+def _gather_rng(accelerator, group=None):
     from lerobot.utils.random_utils import serialize_rng_state
     state = serialize_rng_state()
     if accelerator.num_processes == 1:
         return [state]
+    if group is None:
+        raise ValueError('Distributed RNG gathering requires its CPU checkpoint group')
     import torch.distributed as dist
     result = [None] * accelerator.num_processes
-    dist.all_gather_object(result, state)
+    dist.all_gather_object(result, state, group=group)
     return result
 
 
@@ -100,6 +102,7 @@ def run(settings, config, config_path, stop_after=None):
                             validate_resume_precision)
     from .lora import (VLM_LORA, check_first_update, finetuning_metadata, finetuning_spec,
                        optimizer_groups, setup_finetuning, update_snapshot)
+    from .validation import checkpoint_barrier, checkpoint_group, validation_preview
 
     check_environment()
     # Fail before allocating the large model if tokenizer assets are absent.
@@ -111,6 +114,7 @@ def run(settings, config, config_path, stop_after=None):
     torch.set_num_threads(settings['launcher']['cpu_threads'])
     accelerator = Accelerator(cpu=config.device == 'cpu', mixed_precision=settings['launcher']['mixed_precision'],
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True, gradient_as_bucket_view=True)])
+    control_group = checkpoint_group(accelerator)
     config.device = str(accelerator.device)
     set_seed(settings['seed'])
     report, split, frames, episodes = prepare(settings)
@@ -224,7 +228,7 @@ def run(settings, config, config_path, stop_after=None):
                                      'accumulation': settings['training']['gradient_accumulation_steps']}}
     if 'collection_backend' in report:
         provenance['collection_backend'] = report['collection_backend']
-    validation_loader = None
+    validation_loader, validation_selection = None, None
     if accelerator.is_main_process:
         if not state:
             run_dir.mkdir(parents=True, exist_ok=False)
@@ -252,12 +256,20 @@ def run(settings, config, config_path, stop_after=None):
         if settings['benchmark']['validation_freq']:
             validation = make_pi05_dataset(settings['dataset']['repo_id'], settings['dataset']['root'],
                 split['validation'], config.chunk_size, settings['dataset']['video_backend'], history_spec(config))
+            validation, validation_selection = validation_preview(
+                validation, settings['training'].get('validation_samples_per_episode', 0))
             validation_loader = DataLoader(validation, batch_size=settings['training']['validation_batch_size'])
+            dump(run_dir / 'validation_selection.json', validation_selection)
     accelerator.wait_for_everyone()
     log = (run_dir / 'train.log').open('a' if state else 'w') if accelerator.is_main_process else None
     start_step = state['step'] if state else 0
     audit_before = update_snapshot(raw)
     best = state['best_validation_mae'] if state else float('inf')
+    # The resumable checkpoint is committed BEFORE its validation. Recover any
+    # subsequently completed score from the small sidecar, not a second 9GB save.
+    if resume_path and (resume_path.parent / 'validation.json').is_file():
+        previous_metrics = json.loads((resume_path.parent / 'validation.json').read_text())
+        best = min(best, previous_metrics['first_action']['mae'])
     started = time.perf_counter()
     if config.device.startswith('cuda'):
         torch.cuda.reset_peak_memory_stats()
@@ -316,25 +328,29 @@ def run(settings, config, config_path, stop_after=None):
             recovery_save = bool(recovery_freq) and step % recovery_freq == 0
             save = validate or recovery_save or step % settings['save_freq'] == 0 or step == settings['steps'] or stopping
             if save:
-                accelerator.wait_for_everyone()
-                metrics = None
-                if accelerator.is_main_process and validate:
-                    with preserved_rng(0):
-                        metrics, _ = evaluate_loader(raw, pre, post, validation_loader,
-                            provenance['action_contract']['limits_rad_s'], settings['benchmark']['validation_max_batches'])
-                rng = _gather_rng(accelerator)
+                checkpoint_barrier(accelerator, control_group)
+                rng = _gather_rng(accelerator, control_group)
                 if accelerator.is_main_process:
-                    improved = metrics is not None and metrics['first_action']['mae'] < best
-                    if improved:
-                        best = metrics['first_action']['mae']
                     state = {'step': step, 'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict(),
                              'schedule': spec, 'rng': rng, 'consumed_microbatches': seen,
                              'batch_contract': provenance['batch_contract'], 'best_validation_mae': best}
                     pretrained = save_checkpoint(run_dir / 'checkpoints' / f'{step:06d}', raw, pre, post, stats,
                                                  settings['assets'], provenance, state)
                     dump(run_dir / 'last_checkpoint.json', {'step': step, 'checkpoint': str(pretrained)})
+                    print(f'Checkpoint committed before validation: {pretrained}', flush=True)
+                    metrics = None
+                    if validate:
+                        print(f'Validation step {step}: starting {validation_selection["selected_frames"]} selected frames', flush=True)
+                        with preserved_rng(0):
+                            metrics, _ = evaluate_loader(raw, pre, post, validation_loader,
+                                provenance['action_contract']['limits_rad_s'], settings['benchmark']['validation_max_batches'])
+                    improved = metrics is not None and metrics['first_action']['mae'] < best
+                    if improved:
+                        best = metrics['first_action']['mae']
                     if metrics is not None:
-                        metrics['partial_evaluation'] = settings['benchmark']['validation_max_batches'] > 0
+                        metrics['partial_evaluation'] = (validation_selection['partial_evaluation']
+                            or settings['benchmark']['validation_max_batches'] > 0)
+                        metrics['validation_selection'] = validation_selection
                         dump(pretrained.parent / 'validation.json', metrics)
                         # Keep learning curves even when large older checkpoints are pruned.
                         with (run_dir / 'validation_history.jsonl').open('a') as history:
@@ -343,13 +359,13 @@ def run(settings, config, config_path, stop_after=None):
                     if improved:
                         dump(run_dir / 'best_checkpoint.json', {'step': step, 'checkpoint': str(pretrained),
                             'validation_first_action_mae_rad_s': best,
-                            'partial_validation': settings['benchmark']['validation_max_batches'] > 0})
+                            'partial_validation': metrics['partial_evaluation']})
                     if recovery_freq:
                         retain_checkpoints(run_dir, settings['training']['keep_checkpoints'], settings['save_freq'])
                     else:
                         retain_checkpoints(run_dir, settings['training']['keep_checkpoints'])
                     print(f'Checkpoint: {pretrained}', flush=True)
-                accelerator.wait_for_everyone()
+                checkpoint_barrier(accelerator, control_group)
             if stopping:
                 break
         if accelerator.is_main_process:
@@ -366,7 +382,10 @@ def run(settings, config, config_path, stop_after=None):
     finally:
         if log:
             log.close()
-    accelerator.wait_for_everyone()
+    checkpoint_barrier(accelerator, control_group)
+    if control_group is not None:
+        import torch.distributed as dist
+        dist.destroy_process_group(control_group)
     accelerator.end_training()
 
 
@@ -383,6 +402,8 @@ def main():
     parser.add_argument('--accumulation', type=int)
     parser.add_argument('--recovery-save-freq', type=int,
                         help='Save rolling resumable state every N updates; retain ordinary milestone checkpoints')
+    parser.add_argument('--validation-samples-per-episode', type=int,
+                        help='Uniformly sample N frames per held-out episode for inline validation; 0 evaluates all frames')
     parser.add_argument('--output', type=Path)
     parser.add_argument('--resume', type=Path)
     parser.add_argument('--resume-lr', type=float,
@@ -409,6 +430,8 @@ def main():
         overrides['training'] = {'gradient_accumulation_steps': args.accumulation}
     if args.recovery_save_freq is not None:
         overrides.setdefault('training', {})['recovery_save_freq'] = args.recovery_save_freq
+    if args.validation_samples_per_episode is not None:
+        overrides.setdefault('training', {})['validation_samples_per_episode'] = args.validation_samples_per_episode
     if args.resume:
         from .checkpoints import resolve_checkpoint
         checkpoint = resolve_checkpoint(args.resume)

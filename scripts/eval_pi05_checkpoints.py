@@ -1,6 +1,7 @@
 """Compare saved PI05 checkpoints in the same recorded simulation scenes."""
 import argparse
 import csv
+import copy
 from datetime import datetime, timezone
 import json
 import os
@@ -16,7 +17,8 @@ from run_pi05_singlecycle_pilot import PROJECT, SUBMODULE, digest, source_manife
 DEFAULT_STEPS = [2000, 4000, 6000, 8000, 10000]
 METRICS = ['success', 'payload_particles', 'scooped_particles', 'spillage_particles',
            'spillage_fraction', 'cycle_time_seconds', 'failure_mode',
-           'policy_latency_ms_mean', 'policy_latency_ms_p95', 'fps', 'policy_steps_executed']
+           'policy_latency_ms_mean', 'policy_latency_ms_p95', 'fps', 'policy_steps_executed',
+           'repeat_cycles_completed', 'repeat_returns_completed', 'repeat_collection_success', 'repeat_strict_success']
 
 
 def read(path):
@@ -64,6 +66,9 @@ def build_plan(args):
                        '--render-every-physics-step', '--video', '--soil-backend', backend,
                        '--sand-walls-during-settle' if backend == 'physx'
                        else '--no-sand-walls-during-settle', '--output', str(output)]
+            if args.repeat_cycles:
+                command += ['--repeat-cycles', str(args.repeat_cycles),
+                            '--repeat-cycle-steps', str(args.repeat_cycle_steps)]
             jobs.append(dict(checkpoint_step=step, checkpoint=str(checkpoint),
                              reference_episode=episode, reference_split=subset,
                              source_export_episode=setup['provenance'].get('source_export_episode'),
@@ -73,7 +78,8 @@ def build_plan(args):
                 dataset_fingerprint=provenance['dataset_fingerprint'], gpu=args.gpu,
                 checkpoint_steps=args.checkpoint_steps, reference_episodes=args.reference_episodes,
                 seed=args.seed, replan_interval=args.replan_interval, rollout_steps=args.rollout_steps,
-                min_particles=args.min_particles, jobs=jobs)
+                min_particles=args.min_particles, repeat_cycles=args.repeat_cycles,
+                repeat_cycle_steps=args.repeat_cycle_steps, jobs=jobs)
 
 
 def gpu_idle(gpu):
@@ -137,7 +143,8 @@ def check_checkpoints(plan):
             raise ValueError(f'Checkpoint {step} uses different normalization statistics')
         if read(checkpoint / 'benchmark_provenance.json')['dataset_fingerprint'] != plan['dataset_fingerprint']:
             raise ValueError(f'Checkpoint {step} comes from different training data')
-        signature = (manifest['base_sha256'], manifest.get('precision_contract'), manifest['finetuning'])
+        signature = (manifest['base_sha256'], manifest.get('precision_contract'), manifest['finetuning'],
+                     manifest.get('observation_history'), manifest.get('action_contract'))
         if baseline is not None and signature != baseline:
             raise ValueError('Checkpoints differ in base model, precision or fine-tuning method')
         baseline = signature
@@ -150,7 +157,7 @@ def check_checkpoints(plan):
 
 def save_summary(output, rows):
     write(output / 'summary.json', rows)
-    fields = ['checkpoint_step', 'reference_episode', 'reference_split', 'source_export_episode',
+    fields = ['checkpoint_step', 'gpu', 'reference_episode', 'reference_split', 'source_export_episode',
               'soil_backend', *METRICS, 'checkpoint', 'video_path', 'video_duration_seconds']
     temporary = output / 'summary.csv.tmp'
     with temporary.open('w', newline='') as stream:
@@ -164,6 +171,8 @@ def run(args, plan):
     args.output.mkdir(parents=True, exist_ok=False)
     (args.output / 'logs').mkdir()
     snapshot = source_manifest(args.train_dir / 'training_config.yaml')
+    if args.repeat_cycles:
+        snapshot['scripts/repeat_eval.py'] = digest(PROJECT / 'scripts/repeat_eval.py')
     snapshot[str(Path(__file__).resolve().relative_to(PROJECT))] = digest(Path(__file__))
     inputs = [args.train_dir / name for name in ('resolved_settings.json', 'provenance.json',
                                                 'split_manifest.json', 'normalization_stats.json')]
@@ -236,7 +245,12 @@ def run(args, plan):
                 '-of', 'default=noprint_wrappers=1:nokey=1', str(video)], text=True).strip())
             row = {key: job[key] for key in ('checkpoint_step', 'reference_episode', 'reference_split',
                                            'source_export_episode', 'checkpoint')}
-            row.update(soil_backend=plan['soil_backend'], video_path=str(video), video_duration_seconds=duration)
+            row.update(gpu=args.gpu, soil_backend=plan['soil_backend'], video_path=str(video), video_duration_seconds=duration)
+            if args.repeat_cycles:
+                audit = read(Path(job['output']) / 'episodes/episode_0001/repeat_audit.json')
+                if (audit.get('status') != 'passed' or result.get('repeat_cycles_target') != args.repeat_cycles
+                        or result.get('evaluation_standard') != 'excavator_repeat_reference_v1'):
+                    raise RuntimeError('Missing or inconsistent full repeated-task trace validation')
             row.update({name: result.get(name) for name in METRICS})
             rows.append(row)
             save_summary(args.output, rows)
@@ -260,6 +274,107 @@ def run(args, plan):
         raise
 
 
+def parallel_queues(args):
+    """Disjoint checkpoint shards; each GPU runs fresh scenes sequentially."""
+    queues = []
+    for index, gpu in enumerate(args.gpus):
+        shard = args.checkpoint_steps[index::len(args.gpus)]
+        if not shard:
+            continue
+        leaf = copy.copy(args)
+        leaf.gpus, leaf.gpu, leaf.checkpoint_steps = None, gpu, shard
+        leaf.output = args.output / f'gpu_{gpu}'
+        command = [sys.executable, '-u', str(Path(__file__).resolve()), '--train-dir', str(args.train_dir),
+            '--output', str(leaf.output), '--checkpoint-steps', *map(str, shard),
+            '--reference-episodes', *map(str, args.reference_episodes), '--gpu', str(gpu),
+            '--rollout-steps', str(args.rollout_steps), '--replan-interval', str(args.replan_interval),
+            '--seed', str(args.seed), '--min-particles', str(args.min_particles),
+            '--cpu-threads', str(args.cpu_threads), '--repeat-cycles', str(args.repeat_cycles),
+            '--repeat-cycle-steps', str(args.repeat_cycle_steps)]
+        if args.latest_first:
+            command.append('--latest-first')
+        if not args.wait:
+            command.append('--no-wait')
+        if args.wait_for_experiment:
+            command += ['--wait-for-experiment', str(args.wait_for_experiment)]
+        queues.append({'gpu': gpu, 'command': command, 'plan': build_plan(leaf), 'output': leaf.output})
+    return queues
+
+
+def run_parallel(args):
+    args.output.mkdir(parents=True, exist_ok=False)
+    queues = parallel_queues(args)
+    state = {'status': 'running', 'phase': 'checkpoint_queues', 'pid': os.getpid(),
+        'training_run': str(args.train_dir), 'checkpoint_steps': args.checkpoint_steps,
+        'reference_episodes': args.reference_episodes,
+        'repeat_cycles': args.repeat_cycles, 'scope': 'five_cycle_recorded_goal_diagnostic'
+            if args.repeat_cycles else 'single_cycle_diagnostic',
+        'created_utc': datetime.now(timezone.utc).isoformat(),
+        'queues': {str(q['gpu']): {'status': 'starting', 'command': q['command']} for q in queues}}
+    processes, handles = [], []
+
+    def refresh():
+        rows = []
+        for queue in queues:
+            status_path = queue['output'] / 'status.json'
+            if status_path.exists():
+                child = read(status_path)
+                state['queues'][str(queue['gpu'])].update({key: child.get(key) for key in (
+                    'status', 'phase', 'current_step', 'current_reference', 'error', 'jobs')})
+            summary = queue['output'] / 'summary.json'
+            if summary.exists():
+                rows.extend(read(summary))
+        rows.sort(key=lambda row: (row['checkpoint_step'], row['reference_episode']))
+        state.update(completed_evaluations=len(rows),
+                     expected_evaluations=len(args.checkpoint_steps) * len(args.reference_episodes),
+                     updated_utc=datetime.now(timezone.utc).isoformat())
+        write(args.output / 'status.json', state)
+        save_summary(args.output, rows)
+        return rows
+
+    try:
+        for queue in queues:
+            handle = (args.output / f'gpu_{queue["gpu"]}.log').open('x')
+            handles.append(handle)
+            process = subprocess.Popen(queue['command'], cwd=PROJECT, env={**os.environ,
+                'PYTHONDONTWRITEBYTECODE': '1', 'HF_HUB_OFFLINE': '1', 'HF_DATASETS_OFFLINE': '1'},
+                stdin=subprocess.DEVNULL, stdout=handle, stderr=subprocess.STDOUT)
+            processes.append(process)
+            state['queues'][str(queue['gpu'])]['pid'] = process.pid
+        previous = None
+        while any(process.poll() is None for process in processes):
+            refresh()
+            progress = (state['completed_evaluations'], [(q.get('status'), q.get('current_step'))
+                                                       for q in state['queues'].values()])
+            if progress != previous:
+                print(f'Checkpoint queue progress: {progress}', flush=True)
+                previous = progress
+            time.sleep(5)
+        rows = refresh()
+        state['exit_codes'] = [process.returncode for process in processes]
+        if any(state['exit_codes']) or len(rows) != state['expected_evaluations']:
+            raise RuntimeError('Checkpoint queues incomplete; inspect per-GPU status/logs')
+        state.update(status='completed', phase='completed', completed_utc=datetime.now(timezone.utc).isoformat())
+        refresh()
+    except BaseException as exc:
+        state.update(status='failed', error=f'{type(exc).__name__}: {exc}')
+        refresh()
+        raise
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in processes:
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=40)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+        for handle in handles:
+            handle.close()
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--train-dir', type=Path, required=True)
@@ -267,11 +382,16 @@ def parse_args(argv=None):
     parser.add_argument('--checkpoint-steps', type=int, nargs='+', default=DEFAULT_STEPS)
     parser.add_argument('--reference-episodes', type=int, nargs='+', default=[0])
     parser.add_argument('--gpu', type=int, default=0)
+    parser.add_argument('--gpus', type=lambda value: [int(x) for x in value.split(',')],
+                        help='Run disjoint checkpoint queues on these physical GPUs, e.g. 0,1')
     parser.add_argument('--rollout-steps', type=int, default=350)
     parser.add_argument('--replan-interval', type=int, default=3)
     parser.add_argument('--seed', type=int, default=2)
     parser.add_argument('--min-particles', type=int, default=100)
     parser.add_argument('--cpu-threads', type=int, default=8)
+    parser.add_argument('--repeat-cycles', type=int, choices=(0, 5), default=0)
+    parser.add_argument('--repeat-cycle-steps', type=int, default=500)
+    parser.add_argument('--latest-first', action='store_true', help='Evaluate newer checkpoints before older ones')
     parser.add_argument('--wait-for-experiment', type=Path,
                         help='Wait for this controller, including its scheduled evaluations; auto-detects the training parent.')
     parser.add_argument('--wait', action=argparse.BooleanOptionalAction, default=True,
@@ -284,7 +404,13 @@ def parse_args(argv=None):
     if (len(set(args.checkpoint_steps)) != len(args.checkpoint_steps)
             or len(set(args.reference_episodes)) != len(args.reference_episodes)):
         parser.error('Duplicate checkpoint steps or reference episodes')
+    if args.gpus is not None and (not args.gpus or min(args.gpus) < 0 or len(set(args.gpus)) != len(args.gpus)):
+        parser.error('GPU list must contain distinct nonnegative physical indices')
     args.checkpoint_steps = sorted(args.checkpoint_steps)
+    if args.latest_first:
+        args.checkpoint_steps.reverse()
+    if args.repeat_cycles and (args.repeat_cycle_steps < 1 or args.rollout_steps < args.repeat_cycles * args.repeat_cycle_steps):
+        parser.error('Repeated evaluation needs a total rollout budget covering all five cycle budgets')
     args.train_dir = args.train_dir.resolve()
     args.output = args.output.resolve()
     if args.wait_for_experiment is None and (args.train_dir.parent / 'status.json').is_file():
@@ -296,7 +422,8 @@ def parse_args(argv=None):
 
 def main():
     args = parse_args()
-    plan = build_plan(args)
+    plan = ([{'gpu': queue['gpu'], 'plan': queue['plan']} for queue in parallel_queues(args)]
+            if args.gpus else build_plan(args))
     if args.dry_run:
         print(json.dumps(plan, indent=2))
         return
@@ -305,7 +432,10 @@ def main():
         raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGTERM, interrupted)
-    run(args, plan)
+    if args.gpus:
+        run_parallel(args)
+    else:
+        run(args, plan)
 
 
 if __name__ == '__main__':

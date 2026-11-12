@@ -84,6 +84,18 @@ per selected GPU but cannot reserve VRAM or guarantee other jobs do not grow.
 No other GPU process is terminated. Gradient storage is released after the
 parameter-update audit and before validation to reduce transient memory usage.
 
+The November 10 restart commits each complete checkpoint and its latest pointer
+**before** running validation. A separate Gloo CPU process group gathers RNG
+state and coordinates checkpoint/validation waits, so idle ranks do not leave
+NCCL collectives pending while the main rank evaluates. Restart validation uses
+eight uniformly spaced frames per held-out episode (80 frames across all ten
+validation parents), rather than evaluating the entire long sequence inline.
+`validation_selection.json` records the exact selected observation IDs; checkpoint
+metrics explicitly declare `partial_evaluation`. This is an offline progress
+preview, not full held-out validation or repeated-task closed-loop success.
+Optimizer, data addressing, LR schedule and the 20k total budget are unchanged.
+If validation fails after a save, the saved step remains resumable.
+
 After the gate passes, the runner checks the training configuration and runs
 two real optimizer updates using two-GPU DDP to check memory/update execution.
 It resumes those same optimizer/RNG states to 20000 updates, using the C window
@@ -95,6 +107,58 @@ The explicitly requested 2k/4k/.../20k checkpoints are all retained. The tempora
 
 Inspect the experiment's `status.json`, `logs/`, full-reference replay videos,
 and the candidate's `repair_report.json` / `expert_replay_gate.json` for actual
-progress. The shared model evaluator still needs separate repeated-task goal
-and completion handling; the full-reference flag here is an expert diagnostic,
-not a new repeated-model benchmark or proof of generalization.
+progress. The full-reference replay flag remains an expert-only diagnostic.
+
+## Five-cycle model checkpoint videos
+
+The opt-in `excavator_repeat_reference_v1` diagnostic evaluates the complete
+five-cycle task, including the final physical return, in one unreinitialized
+scene. All motion is predicted by the model. It uses the **recorded task-goal
+coordinates** from the archived `episode_index_record.json`, not a live
+bed-fill planner, expert actions, expert return poses, or expert frame timings.
+This controlled reference-scene comparison is not a novel-scene or live-planner
+generalization benchmark.
+
+Each cycle needs newly observed scooped material (collection minimum 5 IDs),
+at least the archived minimum deposit (3 IDs) and an open bucket for three
+observations. It then requires the emptied bucket (at most 5 particles) to
+return within 1.25 m XY of the current dig target and 0.15–2.5 m above it for
+three observations. These are explicit task-region criteria, not equality to
+an expert joint configuration. Only then is the next recorded task issued.
+The final cycle must also return. No cycle advances on a timer or a failure.
+
+The separate `repeat_strict_success` additionally requires **every** completed
+cycle to deposit at least `--min-particles` (100 below). A collection-threshold
+success is never presented as a 100-particle-per-cycle result. The video labels
+both the collection threshold and the strict outcome.
+
+New cycles exclude previously deposited particle IDs and initial bucket residue.
+Episode-wide particle accounting remains continuous. The bridge updates goals
+without physics ticks or resetting joints, material, clocks, fill filters or
+previous actions. C's observation history remains continuous across cycles;
+only stale queued old-goal actions are discarded to force a fresh prediction.
+
+```bash
+.venv-pi05/bin/python ExcavatorVLA-vlm/scripts/eval_pi05_checkpoints.py \
+  --train-dir outputs/experiments/pi05_repeat_history_c_bucket20_20k_20261109_01/train \
+  --output outputs/eval/pi05_repeat_history_c_bucket20_full5_checkpoints_dualgpu_20261111_01 \
+  --checkpoint-steps 2000 4000 6000 8000 10000 12000 14000 16000 18000 20000 \
+  --gpus 0,1 --reference-episodes 0 --repeat-cycles 5 --repeat-cycle-steps 500 \
+  --rollout-steps 2500 --replan-interval 3 --min-particles 100 --latest-first
+```
+
+GPU 0 runs 20k/16k/12k/8k/4k, GPU 1 runs 18k/14k/10k/6k/2k. Each gets the
+same initial scene, seed, task goals, PhysX backend, action limits and budgets.
+There are at most 500 model actions per cycle, including return, and 2500 in
+total. An incomplete cycle ends the task as failed, with later cycles marked
+`not_attempted`; it does not reset the scene or fabricate five separate trials.
+
+The top output contains live `status.json`, `summary.json` and `summary.csv`.
+Videos are `gpu_N/step_NNNNNN/reference_0000/episodes/episode_0001/evaluation.mp4`.
+Each episode also saves `repeat_task_spec.json`, `repeat_metrics.json`,
+`goal_updates.json`, `repeat_audit.json` and the full `steps.jsonl`.
+The independent audit reconstructs cycles, returns and per-cycle ID accounting,
+checks continuous history and goal geometry, and verifies every goal update
+preserved cameras/commanded joints with zero physics ticks. Unit tests include
+a clearly synthetic full shared-evaluator run; `tests/run_repeat_goal_update_live.py`
+performs the real PhysX transport/goal-update regression without model/expert motion.

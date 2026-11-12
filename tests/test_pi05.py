@@ -217,6 +217,35 @@ class TinyPolicy(torch.nn.Module):
 
 
 class TrainerTests(unittest.TestCase):
+    def test_validation_failure_still_leaves_a_complete_resumable_checkpoint(self):
+        from excavator_vlm.policies.pi05 import adapter, checkpoints, inference, train
+        from excavator_vlm.evaluation import offline_metrics
+        frames = pd.DataFrame({'episode_index': [1, 1],
+            'observation.state': [np.zeros(28), np.ones(28)], 'action': [np.zeros(4), np.ones(4)]})
+        fixture = ({'fingerprint': 'synthetic-unit-fixture'},
+                   {'train': [1], 'validation': [2], 'test': [3]}, frames, [1])
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(inference, 'check_environment'), \
+                patch.object(adapter, 'policy_class', return_value=TinyPolicy), \
+                patch.object(checkpoints, 'load_base', return_value={'test_fixture': True}), \
+                patch.object(train, 'prepare', return_value=fixture), \
+                patch.object(train, 'make_pi05_dataset', side_effect=lambda repo, root, episodes, *args: ToyDataset(episodes)), \
+                patch.object(offline_metrics, 'evaluate_loader', side_effect=RuntimeError('simulated validation error')):
+            settings = cpu_settings(directory)
+            toy_tokenizer(settings['assets']['tokenizer_path'])
+            config = build_policy_config(settings)
+            with self.assertRaisesRegex(RuntimeError, 'simulated validation error'):
+                train.run(settings, config, SUBMODULE / 'configs/pi05/smoke.yaml')
+            run = Path(settings['output_dir'])
+            last = json.loads((run / 'last_checkpoint.json').read_text())
+            self.assertEqual(last['step'], 2)
+            checkpoint = Path(last['checkpoint'])
+            self.assertTrue((checkpoint / 'model.safetensors').is_file())
+            saved = torch.load(checkpoint.parent / 'training_state.pt', weights_only=True)
+            self.assertEqual(saved['step'], 2)
+            self.assertEqual(saved['consumed_microbatches'], 4)
+            self.assertFalse((checkpoint.parent / 'validation.json').exists())
+
     def test_save_delta_resume_rng_sampler_and_validation_with_tiny_fixture(self):
         from excavator_vlm.policies.pi05 import adapter, checkpoints, inference, train
         frames = pd.DataFrame({'episode_index': [1, 1],

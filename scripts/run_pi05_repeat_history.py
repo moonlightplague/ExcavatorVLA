@@ -64,6 +64,8 @@ class RepeatHistoryExperiment(Experiment):
                               previous_last_logged_step=previous_step,
                               allow_shared_gpus=args.allow_shared_gpus,
                               recovery_save_freq=100, dataloader_workers_per_rank=0,
+                              validation_samples_per_episode=8,
+                              checkpoint_order='save_then_validate', checkpoint_control_backend='gloo',
                               restart_tag=stamp)
             self.environment = {**os.environ, 'HF_HUB_OFFLINE': '1', 'HF_DATASETS_OFFLINE': '1',
                                 'TOKENIZERS_PARALLELISM': 'false', 'NCCL_P2P_DISABLE': '1',
@@ -175,7 +177,8 @@ class RepeatHistoryExperiment(Experiment):
         if self.args.resume_training:
             tag = self.state['restart_tag']
             command, overrides = self.train_command('history_c_repeat20k.yaml', self.root / 'train', resume=True)
-            command += ['--num-workers', '0', '--recovery-save-freq', '100']
+            command += ['--num-workers', '0', '--recovery-save-freq', '100',
+                        '--validation-samples-per-episode', '8']
             self.run(f'ddp_train_20000_shared_{tag}', [(command, overrides)])
             self.state.update(status='completed', phase='finished',
                               completed_utc=datetime.now(timezone.utc).isoformat())

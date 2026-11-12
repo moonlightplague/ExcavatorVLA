@@ -108,6 +108,20 @@ class CheckpointEvaluationTests(unittest.TestCase):
                 '0, GPU-fixture, 23000, 0\n', 'GPU-fixture, 123\n']):
             self.assertFalse(evaluation.gpu_idle(0))
 
+    def test_parallel_repeated_queues_cover_each_checkpoint_once_latest_first(self):
+        args = self.args('--gpus', '0,1', '--checkpoint-steps', *map(str, range(2000, 20001, 2000)),
+                         '--repeat-cycles', '5', '--rollout-steps', '2500', '--latest-first')
+        queues = evaluation.parallel_queues(args)
+        self.assertEqual([queue['gpu'] for queue in queues], [0, 1])
+        self.assertEqual(queues[0]['plan']['checkpoint_steps'], [20000, 16000, 12000, 8000, 4000])
+        self.assertEqual(queues[1]['plan']['checkpoint_steps'], [18000, 14000, 10000, 6000, 2000])
+        self.assertEqual(sorted(job['checkpoint_step'] for queue in queues for job in queue['plan']['jobs']),
+                         list(range(2000, 20001, 2000)))
+        for queue in queues:
+            for job in queue['plan']['jobs']:
+                self.assertIn('--repeat-cycles', job['command'])
+                self.assertNotIn('--replay-reference', job['command'])
+
 
 if __name__ == '__main__':
     unittest.main()

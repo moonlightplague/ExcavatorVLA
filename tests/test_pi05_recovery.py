@@ -47,7 +47,8 @@ class RecoveryTests(unittest.TestCase):
     def test_recovery_option_does_not_change_policy_or_batch_contract(self):
         path = SUBMODULE / 'configs/pi05/history_c_repeat20k.yaml'
         original = resolve_settings(path)
-        changed = resolve_settings(path, {'training': {'recovery_save_freq': 100}, 'num_workers': 0})
+        changed = resolve_settings(path, {'training': {'recovery_save_freq': 100,
+                                  'validation_samples_per_episode': 8}, 'num_workers': 0})
         self.assertEqual(changed['policy'], original['policy'])
         self.assertEqual(changed['save_freq'], 2000)
         self.assertEqual(changed['training']['keep_checkpoints'], 10)
@@ -56,6 +57,8 @@ class RecoveryTests(unittest.TestCase):
         for value in (-1, True, 1.5):
             with self.assertRaises(ValueError):
                 resolve_settings(path, {'training': {'recovery_save_freq': value}})
+            with self.assertRaises(ValueError):
+                resolve_settings(path, {'training': {'validation_samples_per_episode': value}})
 
     def test_shared_mode_uses_free_memory_and_never_kills_other_processes(self):
         experiment = object.__new__(RepeatHistoryExperiment)

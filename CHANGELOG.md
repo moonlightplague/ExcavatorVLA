@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-11-12 — Experiment artifact maintenance
+
+- Ignore timestamped coarse MPM trial directories, captured videos, profiler results and launcher state while retaining Python probes and their required input textures.
+- Unstage 1,971 generated experiment files (888 MiB) and retain their ignored local copies.
+- Ignore regenerated renderer caches and local experiment-tracking output directories.
+- Verify collection/export compatibility with 26 export contract and append tests; keep pending simulator changes separately staged.
+
 ## 2026-11-09 — Newton repeat collection
 
 - Catch material-point segments crossing actual thin static collision meshes, applying first-impact separation and static friction after dynamic force reduction.

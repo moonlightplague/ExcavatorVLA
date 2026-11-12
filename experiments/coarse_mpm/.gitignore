@@ -1,0 +1,8 @@
+# Timestamped experiment runs contain trial data, captured frames, and metrics.
+# Match nested rock_texture runs too; retain Python probes and their input assets.
+*_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*/
+
+# Standalone generated previews and profiler/launcher state
+/*.mp4
+/profile_result.json
+/latest_gui_log.txt

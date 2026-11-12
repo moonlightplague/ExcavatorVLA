@@ -249,7 +249,7 @@ _ExcavatorVLA_sync/
 # Streamlit
 .streamlit/secrets.toml
 
-.mpm_warp_cache
+.mpm_warp_cache/
 
 # Local datasets, checkpoints, and downloaded model weights
 /data
@@ -262,3 +262,8 @@ _ExcavatorVLA_sync/
 *.ckpt
 *.safetensors
 *.tmp
+
+# Experiment tracking and regenerated renderer caches
+.shader-cache/
+/wandb/
+/tensorboard/

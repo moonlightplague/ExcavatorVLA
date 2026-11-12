@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-11-12 — Runtime artifact maintenance
+
+- Ignore regenerated renderer caches and local experiment-tracking outputs.
+- Verify 32 deployment, scene, observation and policy-client contract tests; preserve pending repeated-task goal changes separately.
+
 ## 2026-11-09 — Newton collision consistency
 
 - Sync the Newton soil adapter with collection: swept static-mesh collision prevents thin-floor tunneling without attributing static impulses to the bucket.

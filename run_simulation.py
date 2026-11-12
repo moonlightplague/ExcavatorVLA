@@ -3905,6 +3905,7 @@ def main(args):
     deployment_previous_fill_rate = None
     deployment_elapsed_seconds = 0.0
     q_target = None
+    last_observation_reply = None
     last_idle_ui_update = 0.0
     idle_ui_interval = 1.0 / max(0.1, float(args.idle_ui_hz))
     episode_initial_pose = {
@@ -4007,6 +4008,7 @@ def main(args):
                 deployment_previous_fill_fraction = deployment_previous_fill_rate = None
                 deployment_elapsed_seconds = 0.0
                 q_target = None
+                last_observation_reply = None
                 bucket_source_tracker.clear()
                 try:
                     seed = cmd["scene_seed"]
@@ -4083,6 +4085,7 @@ def main(args):
                     # dataset. Preserve that target across bridge commands.
                     _, q_target = read_canonical_joint_positions()
                     q_target = q_target.copy()
+                    last_observation_reply = None
                     if active_contract["observation_schema"] in (
                         OBSERVATION_SCHEMA_27D_PLUS_EFFORT,
                         OBSERVATION_SCHEMA_28D_PLUS_EFFORT,
@@ -4178,6 +4181,23 @@ def main(args):
                     "type": "error",
                     "error": "ticks is not accepted in protocol v2; cadence comes from training_fps.",
                 })
+                continue
+            if cmd.get('type') == 'set_task_goals':
+                try:
+                    if active_contract['observation_schema'] != OBSERVATION_SCHEMA_28D_V4_PLUS_EFFORT:
+                        raise ValueError('Task-goal updates require current-v4 observations')
+                    from excavator_common.task_goal_update import update_task_goals
+                    updated_context, updated_reply = update_task_goals(
+                        active_observation_context, last_observation_reply, cmd,
+                        float(base_yaw) + float(joint_positions[0]))
+                    active_observation_context = updated_context
+                    state27_dig_target_world = np.asarray(updated_context['dig_target_xyz'], dtype=np.float32)
+                    state27_unload_target_world = np.asarray(updated_context['unload_landing_xyz'], dtype=np.float32)
+                    last_observation_reply = updated_reply
+                    response_queue.put(updated_reply)
+                except Exception as exc:
+                    response_queue.put({'type': 'error', 'ok': False,
+                                        'error': f'TaskGoalUpdateError: {type(exc).__name__}: {exc}'})
                 continue
             context_update = cmd.get("observation_context")
             if context_update is not None:
@@ -4803,6 +4823,11 @@ def main(args):
                 "truck_bed_load_metrics": truck_bed_load_metrics,
                 "particle_transfer_metrics": particle_transfer_metrics,
                 "task_text": task_text,
+                "evaluation_particle_ids": ({
+                    'particle_count': int(bucket_load_metrics['particle_count']),
+                    'bucket': bucket_particle_indices, 'truck': truck_particle_indices,
+                } if active_observation_context.get('allow_task_goal_updates') is True
+                    and track_evaluation_particles and particle_transfer_metrics.get('available') else None),
                 "primary_camera": primary_camera,
                 "rgb_shape": primary_rgb["rgb_shape"],
                 "rgb_dtype": primary_rgb["rgb_dtype"],
@@ -4825,6 +4850,7 @@ def main(args):
                 },
             }
 
+            last_observation_reply = reply
             response_queue.put(reply)
 
         else:

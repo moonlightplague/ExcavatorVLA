@@ -5,6 +5,12 @@
 - Ignore regenerated renderer caches and local experiment-tracking outputs.
 - Verify 32 deployment, scene, observation and policy-client contract tests; preserve pending repeated-task goal changes separately.
 
+## 2026-11-11 — Opt-in repeated-task goals
+
+- Allow authenticated current-v4 clients to revise only dig/unload task coordinates after explicitly opting in during handshake.
+- Return recontextualized observations without advancing physics or changing commanded joints, source IDs, RGB frames, previous actions, or fill/history filters; expose source-particle IDs only for this opt-in task.
+- Preserve legacy immutable contexts and validate goal revisions and zero-time updates with CPU tests and a live PhysX regression.
+
 ## 2026-11-09 — Newton collision consistency
 
 - Sync the Newton soil adapter with collection: swept static-mesh collision prevents thin-floor tunneling without attributing static impulses to the bucket.

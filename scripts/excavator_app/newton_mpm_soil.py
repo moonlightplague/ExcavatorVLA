@@ -46,6 +46,24 @@ def triangulate(counts, indices, left_handed=False):
     return np.asarray(triangles, dtype=np.int32).reshape(-1)
 
 
+def soil_resolution_settings():
+    """Production coarse MPM defaults; fine remains an explicit override."""
+    profile = os.environ.get('EXCAVATOR_MPM_PROFILE', 'coarse').strip().lower()
+    if profile not in ('fine', 'coarse'):
+        raise ValueError('EXCAVATOR_MPM_PROFILE must be fine or coarse')
+    coarse = profile == 'coarse'
+    voxel = float(os.environ.get('EXCAVATOR_MPM_VOXEL_SIZE', '.20' if coarse else '.10'))
+    spacing = float(os.environ.get('EXCAVATOR_MPM_PARTICLE_SPACING', str(.75*voxel)))
+    budget = int(os.environ.get('EXCAVATOR_MPM_MAX_PARTICLES', '6000' if coarse else '40000'))
+    diameter = float(os.environ.get('EXCAVATOR_MPM_RENDER_DIAMETER', '.18' if coarse else '.014'))
+    if not all(math.isfinite(v) and v > 0 for v in (voxel, spacing, diameter)):
+        raise ValueError('MPM grid, spacing and display diameter must be finite and positive')
+    if spacing > voxel or not 0 < budget <= 40000:
+        raise ValueError('MPM requires spacing <= grid and a point budget in 1..40000')
+    return dict(profile=profile, voxel=voxel, spacing=spacing, max_points=budget,
+                render_diameter=diameter, render_material_centers=coarse)
+
+
 def material_layout(runtime, spacing):
     """Count the complete source before allocating any material-point arrays."""
     x0, x1, y0, y1 = runtime["current_sand_footprint_bbox_xy"]()
@@ -112,14 +130,14 @@ def aggregate_wrenches(impulses, positions, collider_ids, body_ids, origins, bod
 
 
 def mpm_substeps(dt):
-    """Fixed MPM frequency (120 Hz by default), at least one solve per PhysX tick.
+    """Fixed MPM frequency (60 Hz by default), at least one solve per PhysX tick.
 
     Deliberately independent of outlier particle speeds. Collider projection
     and an explicit escape guard handle/check penetration instead of global CFL.
     """
     if not math.isfinite(dt) or dt <= 0:
         raise ValueError(f'Invalid PhysX dt: {dt}')
-    frequency = float(os.environ.get('EXCAVATOR_MPM_HZ', '120'))
+    frequency = float(os.environ.get('EXCAVATOR_MPM_HZ', '60'))
     if not math.isfinite(frequency) or not 60 <= frequency <= 240:
         raise ValueError('EXCAVATOR_MPM_HZ must be between 60 and 240')
     return max(1, math.ceil(dt*frequency-1e-6))
@@ -335,18 +353,37 @@ class NewtonSoil:
         self.last_force = np.empty((0, 6), dtype=np.float32)
         self.sleeping, self.quiet_checks, self.solver_substeps = False, 0, 0
         self.max_particle_speed = float('inf')
-        self.sleep_speed = float(os.environ.get('EXCAVATOR_MPM_SLEEP_SPEED', '0.01'))
+        self.sleep_speed = float(os.environ.get('EXCAVATOR_MPM_SLEEP_SPEED', '0'))
         if not math.isfinite(self.sleep_speed) or self.sleep_speed < 0:
             raise ValueError('MPM sleep speed must be finite and nonnegative (0 disables sleep)')
         self.sim_view = self.body_view = None
-        self.max_points = int(os.environ.get('EXCAVATOR_MPM_MAX_PARTICLES', '40000'))
-        requested_voxel = float(os.environ.get('EXCAVATOR_MPM_VOXEL_SIZE', '.10'))
-        requested_spacing = float(os.environ.get('EXCAVATOR_MPM_PARTICLE_SPACING', str(.75*requested_voxel)))
+        settings = soil_resolution_settings()
+        self.profile = settings['profile']
+        self.execution_mode = os.environ.get('EXCAVATOR_MPM_EXECUTION', 'graph').strip().lower()
+        if self.execution_mode not in ('graph', 'reuse', 'plain'):
+            raise ValueError('EXCAVATOR_MPM_EXECUTION must be graph, reuse or plain')
+        self.grid_capacity = int(os.environ.get('EXCAVATOR_MPM_GRID_CAPACITY',
+                                               '4096' if self.profile == 'coarse' else '32768'))
+        if self.grid_capacity <= 0:
+            raise ValueError('MPM grid capacity must be positive')
+        self.graph_captures = self.graph_replays = 0
+        self._invalidate_solver_graph()
+        self.render_material_centers = settings['render_material_centers']
+        self.display_style = os.environ.get('EXCAVATOR_MPM_DISPLAY',
+            'rocks' if self.render_material_centers else 'points').strip().lower()
+        if self.display_style not in ('rocks', 'points'):
+            raise ValueError('EXCAVATOR_MPM_DISPLAY must be rocks or points')
+        if self.display_style == 'rocks' and not self.render_material_centers:
+            raise ValueError('Rock display requires the coarse material-center profile')
+        self.rock_instances, self.rock_metadata = None, {}
+        self.max_points = settings['max_points']
+        requested_voxel, requested_spacing = settings['voxel'], settings['spacing']
         self.spacing, self.voxel, _ = choose_resolution(runtime, self.max_points,
                                                        requested_spacing, requested_voxel)
         self.positions, volume = sample_material(runtime, self.spacing, self.max_points)
         # USD display diameter only; never used by the model or contact solver.
-        self.render_diameter = float(os.environ.get('EXCAVATOR_MPM_RENDER_DIAMETER', '.014'))
+        self.render_diameter = settings['render_diameter']
+        self.point_volume = volume
         if not math.isfinite(self.render_diameter) or self.render_diameter <= 0:
             raise ValueError('MPM render diameter must be finite and positive')
         # Preserve the existing count-based collection/evaluation scale when
@@ -397,8 +434,17 @@ class NewtonSoil:
             # infinite-mass proxy launching a light real PhysX body on impact.
             self._attach_view()
             config = SolverImplicitMPM.Config()
+            if self.execution_mode != 'plain':
+                config.warmstart_mode = 'particles'
+                config.max_active_cell_count = self.grid_capacity
             config.voxel_size, config.max_iterations, config.tolerance = self.voxel, 150, 1e-4
             self.solver = SolverImplicitMPM(self.model, config=config)
+            if self.execution_mode != 'plain' and not self.solver._sparse_rebuildable:
+                raise RuntimeError('Reusable MPM sparse grid is not supported')
+            if self.execution_mode == 'graph' and (
+                    not wp.is_mempool_enabled(device) or not wp.is_conditional_graph_supported()):
+                raise RuntimeError('MPM CUDA Graph needs a memory pool and conditional graph support; '
+                                   'use EXCAVATOR_MPM_EXECUTION=reuse to opt out explicitly')
             self.state, self.previous = self.model.state(), self.model.state()
             self.pre_projection_q = wp.clone(self.state.particle_q)
             self.pre_projection_v = wp.clone(self.state.particle_qd)
@@ -413,7 +459,10 @@ class NewtonSoil:
             self.ccd_hit_count = 0
             # Display samples do not affect the material-point budget or scores.
             grains_per_point = max(1, min(8, 160000//n))
-            self.grains = self.solver.sample_render_grains(self.state, grains_per_point)
+            # Coarse appearance: one sphere at each real MPM material center.
+            # These are NOT independent rigid bodies; no extra passive grains.
+            self.grains = (wp.clone(self.state.particle_q) if self.render_material_centers
+                           else self.solver.sample_render_grains(self.state, grains_per_point))
             self.collider_body_ids = self.solver.collider_body_index.numpy()
         path = f"{root}/{runtime['PARTICLE_POINTS_PATH_SUFFIX']}"
         self.points = UsdGeom.Points.Define(self.stage, path)
@@ -435,6 +484,9 @@ class NewtonSoil:
         self.render.CreateVisibilityAttr(UsdGeom.Tokens.inherited)
         self.render.CreatePointsAttr(Vt.Vec3fArray.FromNumpy(self.grains.flatten().numpy()))
         self.points.CreateDisplayColorAttr([Gf.Vec3f(0.47, 0.27, 0.10)])
+        if self.display_style == 'rocks':
+            from .soil_rock_display import create_rock_display
+            self.rock_instances, self.rock_metadata = create_rock_display(self)
         self.dirty = False
         self.publish_status()
         try:
@@ -453,6 +505,34 @@ class NewtonSoil:
               f"substeps={mpm_substeps(1/60)}@60Hz contact_reduce=gpu points={n} metric_points={metric_count} render_grains={self.grains.size} "
               f"mass_kg={n*self.mass:.3f} bodies={self.body_paths} colliders={len(self.collision_paths)} "
               f"device={device}", flush=True)
+
+    def _invalidate_solver_graph(self):
+        # Call before replacing collider/state buffers or resetting warm starts.
+        self._execution_graph = None
+        self._execution_signature = None
+        self._execution_warm = False
+
+    def _step_solver(self, dt):
+        if self.execution_mode == 'plain':
+            return self.solver.step(self.state, self.state, control=None, contacts=None, dt=dt)
+        signature = (id(self.state), id(self.collider_model), dt)
+        if self._execution_signature != signature:
+            self._invalidate_solver_graph()
+            self._execution_signature = signature
+        if self.execution_mode == 'reuse' or not self._execution_warm:
+            self.solver.step(self.state, self.state, control=None, contacts=None, dt=dt)
+            self._execution_warm = True
+        else:
+            if self._execution_graph is None:
+                with self.wp.ScopedCapture(device=self.device) as capture:
+                    self.solver.step(self.state, self.state, control=None, contacts=None, dt=dt)
+                self._execution_graph = capture.graph
+                self.graph_captures += 1
+                print('[MPM CORE GRAPH CAPTURED]', self.graph_captures, flush=True)
+            self.wp.capture_launch(self._execution_graph)
+            self.graph_replays += 1
+        # A moved/spread pile can exceed capacity. Never replay a truncated grid.
+        self.solver.check_sparse_grid_rebuild_status()
 
     def _source_spec(self):
         rt = self.runtime
@@ -502,6 +582,7 @@ class NewtonSoil:
         if spec.shape != self.initial_spec.shape or not np.allclose(spec, self.initial_spec, atol=2e-4, rtol=0):
             return False
         started = time.perf_counter()
+        self._invalidate_solver_graph()
         self._disable_source_walls()
         old_paths = list(self.body_paths)
         with self.wp.ScopedDevice(self.device):
@@ -655,6 +736,7 @@ class NewtonSoil:
         self.static_margins.append(margin)
 
     def _setup_colliders(self):
+        self._invalidate_solver_graph()
         bodies = len(self.body_paths)
         count = len(self.static_meshes)+bodies
         self.solver.setup_collider(model=self.collider_model,
@@ -772,7 +854,7 @@ class NewtonSoil:
                     self.state.body_qd.assign(velocities)
                 self.previous.particle_q.assign(self.state.particle_q)
                 self.previous.mpm.particle_transform.assign(self.state.mpm.particle_transform)
-                self.solver.step(self.state, self.state, control=None, contacts=None, dt=h)
+                self._step_solver(h)
                 self.pre_projection_q.assign(self.state.particle_q)
                 self.pre_projection_v.assign(self.state.particle_qd)
                 # Fixed substeps can advect a fast outlier beyond a narrow
@@ -803,7 +885,10 @@ class NewtonSoil:
                             self.state.mpm.particle_qd_grad, self.static_mesh_ids,
                             min(.002, .02*self.voxel), .5, self.ccd_hits], device=self.device)
                 self.solver.update_particle_frames(self.previous, self.state, h)
-                self.solver.update_render_grains(self.previous, self.state, self.grains, h)
+                if self.render_material_centers:
+                    self.wp.copy(self.grains, self.state.particle_q)
+                else:
+                    self.solver.update_render_grains(self.previous, self.state, self.grains, h)
                 # Only 6 values per real body cross to the PhysX adapter. Grid
                 # contact arrays remain on the GPU; no NumPy grid reduction.
                 impulse = self.gpu_wrench.numpy().astype(np.float64)
@@ -870,7 +955,11 @@ class NewtonSoil:
         from pxr import Vt
         started = time.perf_counter()
         self.points.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(self.metric_positions))
-        self.render.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(self.grains.flatten().numpy()))
+        if self.rock_instances is not None:
+            self.rock_instances.GetPositionsAttr().Set(Vt.Vec3fArray.FromNumpy(self.positions))
+        else:
+            # FineGrains is hidden by the rock display; only update the active visual.
+            self.render.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(self.grains.flatten().numpy()))
         self.dirty = False
         self.render_wall_seconds += time.perf_counter()-started
         self.render_updates += 1
@@ -885,8 +974,13 @@ class NewtonSoil:
             mpm_grid_size=self.voxel, mpm_steps=self.steps, mpm_time=self.sim_time,
             mpm_peak_force_N=self.peak_force, mpm_render_grains=int(self.grains.size),
             mpm_render_diameter_m=self.render_diameter,
+            mpm_profile=self.profile, mpm_point_volume_m3=self.point_volume,
+            mpm_display_style=self.display_style,
+            mpm_render_material_centers=self.render_material_centers,
             mpm_material_points=len(self.positions), mpm_material_point_mass=self.mass,
             mpm_sleeping=self.sleeping, mpm_solver_substeps=self.solver_substeps,
+            mpm_execution=self.execution_mode, mpm_grid_capacity=self.grid_capacity,
+            mpm_graph_captures=self.graph_captures, mpm_graph_replays=self.graph_replays,
             mpm_material=dict(self.material), real_sand_error=self.error,
         )
 
@@ -895,7 +989,9 @@ class NewtonSoil:
                 "time": self.sim_time, "grid_m": self.voxel, "device": self.device,
                 "points": len(self.positions), "point_mass_kg": self.mass,
                 "spacing_m": self.spacing, "point_budget": self.max_points,
-                "substep_mode": f"fixed_{os.environ.get('EXCAVATOR_MPM_HZ', '120')}hz", "contact_reduction": "gpu",
+                "substep_mode": f"fixed_{os.environ.get('EXCAVATOR_MPM_HZ', '60')}hz", "contact_reduction": "gpu",
+                "execution_mode": self.execution_mode, "grid_capacity": self.grid_capacity,
+                "graph_captures": self.graph_captures, "graph_replays": self.graph_replays,
                 "static_ccd_hits": self.ccd_hit_count,
                 "host_contact_values": self.host_contact_values,
                 "physics_wall_seconds": self.physics_wall_seconds,
@@ -906,6 +1002,9 @@ class NewtonSoil:
                 "max_particle_speed": self.max_particle_speed,
                 "render_grains": int(self.grains.size), "peak_force_N": self.peak_force,
                 "render_grain_diameter_m": self.render_diameter,
+                "profile": self.profile, "point_volume_m3": self.point_volume,
+                "display_style": self.display_style, "rock_display": dict(self.rock_metadata),
+                "render_material_centers": self.render_material_centers,
                 "bodies": list(self.body_paths), "colliders": list(self.collision_paths),
                 "last_link_wrenches": self.last_force.tolist(), "step_wall_seconds": self.step_wall_seconds}
 
@@ -915,6 +1014,7 @@ class NewtonSoil:
 
     def close(self):
         self.closed = True
+        self._invalidate_solver_graph()
         if self.subscription is not None:
             self.subscription.unsubscribe()
             self.subscription = None

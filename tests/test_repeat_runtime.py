@@ -73,6 +73,72 @@ def fake_runtime(directory):
 
 
 class RepeatRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_coarse_mass_outcome_controls_final_success_and_keeps_legacy_report(self):
+        for retained, expected in ((160, True), (159, False)):
+            with tempfile.TemporaryDirectory() as directory:
+                rt = fake_runtime(directory)
+                rt.sand_particle_mass = lambda: 5.
+                cfg = RepeatConfig(scoops=10, acceptance_profile='coarse_mass', min_delivered_kg=50.)
+                rt.multi_scoop_cycle_report = Mock()
+                controller = install(rt, cfg)
+                meta = rt.auto_collect_begin_episode()
+                controller.cycles = [{'returned': True}] * 10
+                rt.STATE['dataset_scoop_results'] = [dict(success=True, execution_success=True,
+                    freeze_count=0, strict_success=False, legacy_episode_success=False,
+                    score=55., lift_bucket_from_pile_particles=1, spill_from_lift_particles=0)] * 10
+                measured = [dict(success=True, payload_particles=20)] * 10
+                controller.metrics = SimpleNamespace(cycles=measured, error=None,
+                    transfer=dict(payload_particles=retained), observe=Mock(), finalize=Mock(return_value={}))
+                original_finish = rt.auto_collect_finish_episode.__wrapped__
+                rt.auto_collect_finish_episode(meta, True, 'ok')
+                self.assertEqual(original_finish.call_args.args[1], expected)
+                self.assertEqual(meta['repeat_episode_quality']['success'], expected)
+                self.assertFalse(meta['repeat_legacy_episode_quality']['success'])
+
+    async def test_fifty_kg_delivery_gate_rejects_the_episode_before_publication(self):
+        for last, expected in ((9, False), (10, True)):
+            with tempfile.TemporaryDirectory() as directory:
+                rt = fake_runtime(directory)
+                rt.sand_particle_mass = lambda: 5.
+                controller = install(rt, RepeatConfig(scoops=2, min_delivered_kg=50.))
+                meta = rt.auto_collect_begin_episode()
+                controller.cycles = [{'returned': True}] * 2
+                controller.metrics.cycles = [dict(payload_particles=count, cycle_time_seconds=1.,
+                    cycle_time_wall_seconds=1., success=True) for count in (10, last)]
+                original_finish = rt.auto_collect_finish_episode.__wrapped__
+                rt.auto_collect_finish_episode(meta, True, 'ok')
+                self.assertEqual(original_finish.call_args.args[1], expected)
+                self.assertEqual(meta['repeat_delivery_quality']['success'], expected)
+                if not expected:
+                    self.assertIn('low_delivered_mass_kg:2:45.000<50.000', original_finish.call_args.args[2])
+
+    async def test_requested_coarse_profile_rejects_a_fine_backend(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ,
+                EXCAVATOR_SOIL_BACKEND='newton_mpm', EXCAVATOR_MPM_PROFILE='coarse'):
+            rt = fake_runtime(directory)
+            rt.get_sand_site_api = lambda: {'soil_backend': 'newton_mpm',
+                'mpm_diagnostics': lambda: {'active': True, 'error': '', 'profile': 'fine'}}
+            install(rt, RepeatConfig(scoops=10))
+            with self.assertRaisesRegex(RuntimeError, 'MPM profiles disagree'):
+                rt.auto_collect_begin_episode()
+
+    async def test_lazy_coarse_source_is_scaled_before_first_settle_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rt = fake_runtime(directory)
+            rt.AUTO_PREFLIGHT_MIN_PARTICLES = 1000
+            rt.AUTO_DIG_MIN_LOCAL_PARTICLES = rt.AUTO_DIG_MIN_SWEPT_PARTICLES = 24
+            rt.sand_settle_status = lambda: rt.AUTO_PREFLIGHT_MIN_PARTICLES
+            install(rt, RepeatConfig(scoops=10))
+            controller = SimpleNamespace(runtime={'sand_particle_points': lambda: ([None]*10000, None)})
+            soil = SimpleNamespace(current=lambda: controller,
+                choose_resolution=Mock(return_value=(.075, .1, 10000)))
+            rt.get_sand_site_api = lambda: {'mpm_diagnostics': lambda: dict(
+                profile='coarse', active=True, error='', points=2000,
+                point_mass_kg=5., metric_point_mass_kg=5.)}
+            with patch.dict('sys.modules', {'excavator_app': SimpleNamespace(newton_mpm_soil=soil)}):
+                self.assertEqual(rt.sand_settle_status(), 200)
+                self.assertEqual(rt.sand_settle_status(), 200)
+
     async def test_newton_request_requires_the_live_backend_and_retains_its_configuration(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, EXCAVATOR_SOIL_BACKEND='newton_mpm'):
             rt = fake_runtime(directory)
@@ -304,9 +370,21 @@ class RepeatRuntimeTests(unittest.IsolatedAsyncioTestCase):
             controller.choose_landing()
             controller.bed.commit(controller.selected["landing"])
             controller.cycles.append({"returned": True})
+            rt.STATE.update(dataset_scoop_index=9, multi_scoop_planning_index=9,
+                dataset_scoop_target_history=[[99., 99., .2]],
+                multi_scoop_ranked_targets_all=[{'target_xyz': [99., 99., .2]}])
+            observed = []
+            async def inspect_at_entry():
+                observed.append((rt.STATE['dataset_scoop_index'], rt.STATE['multi_scoop_planning_index'],
+                    list(rt.STATE['dataset_scoop_target_history']), list(rt.STATE['multi_scoop_ranked_targets_all'])))
+            rt.auto_collect_one_episode.__wrapped__.side_effect = inspect_at_entry
             await rt.auto_collect_one_episode()
             self.assertIsNone(controller.bed)
             self.assertEqual(controller.cycles, [])
+            self.assertIsNone(rt.STATE['dataset_initial_pile_particle_mask'])
+            self.assertIsNone(rt.STATE['dataset_initial_pile_particle_ids'])
+            self.assertEqual(rt.STATE['dataset_initial_pile_particle_count'], 0)
+            self.assertEqual(observed, [(0, None, [], [])])
 
     async def test_unreachable_bed_fails_without_unsafe_fallback(self):
         with tempfile.TemporaryDirectory() as directory:

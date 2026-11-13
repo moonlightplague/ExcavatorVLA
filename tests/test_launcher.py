@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from baseline.collect_repeat import parse_args
 
@@ -15,6 +16,17 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class LauncherTests(unittest.TestCase):
+    def test_mass_profile_is_explicit_and_rejects_incompatible_or_invalid_settings(self):
+        args, forwarded = parse_args(['--mpm-profile', 'coarse', '--acceptance-profile', 'coarse_mass'])
+        self.assertEqual(args.acceptance_profile, 'coarse_mass')
+        self.assertEqual(args.min_delivered_kg, 50.)
+        self.assertEqual(forwarded, [])
+        for argv in (['--mpm-profile', 'fine'], ['--soil-backend', 'physx'],
+                     ['--min-delivered-kg', '0'], ['--min-retained-delivery-ratio', 'nan'],
+                     ['--min-retained-delivery-ratio', '1.1']):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                parse_args(['--acceptance-profile', 'coarse_mass', *argv])
+
     def test_cli_rejects_single_scoop(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             parse_args(["--scoops-per-episode", "1"])
@@ -23,6 +35,23 @@ class LauncherTests(unittest.TestCase):
         args, forwarded = parse_args(["--scoops-per-episode", "4", "--scene-seed", "2"])
         self.assertEqual(args.scoops_per_episode, 4)
         self.assertEqual(forwarded, ["--scene-seed", "2"])
+
+    def test_cli_selects_coarse_or_explicit_fine_without_forwarding_the_profile(self):
+        with patch.dict(os.environ, EXCAVATOR_MPM_PROFILE="coarse"):
+            self.assertEqual(parse_args([])[0].mpm_profile, "coarse")
+            args, forwarded = parse_args(["--mpm-profile", "fine", "--mpm-particle-budget", "32000"])
+            self.assertEqual(args.mpm_profile, "fine")
+            self.assertEqual(args.mpm_particle_budget, 32000)
+            self.assertEqual(forwarded, [])
+
+    def test_coarse_defaults_to_fifty_kg_in_every_dig_and_keeps_explicit_overrides(self):
+        self.assertEqual(parse_args(['--mpm-profile', 'coarse'])[0].min_delivered_kg, 50.)
+        self.assertEqual(parse_args(['--mpm-profile', 'fine'])[0].min_delivered_kg, 0.)
+        self.assertEqual(parse_args(['--soil-backend', 'physx'])[0].min_delivered_kg, 0.)
+        self.assertEqual(parse_args(['--min-delivered-kg', '70'])[0].min_delivered_kg, 70.)
+        for value in ('-1', 'nan', 'inf'):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                parse_args(['--min-delivered-kg', value])
 
     def run_shell(self, directory, skip_export=False):
         isaac = directory / "fake_isaac"

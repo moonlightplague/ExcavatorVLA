@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-11-13 — Coarse MPM repeat collection
+
+- Select the shared coarse/fine soil profile explicitly and reject requested/active profile mismatches.
+- Preserve fine-reference mass in coarse planning thresholds, search actual avalanched source material, and query its measured surface beyond the generation box with the existing physical path checks.
+- Clear source identity, cut history, scoop index and fallback candidates at the next episode boundary, retain scene/amount provenance, and keep coarse-specific search hooks off for fine MPM and PhysX.
+- Require at least 50 kg of measured new source delivery in every coarse dig by default; independently enforce the gate before streaming publication and during episode validation.
+- Add opt-in `coarse_mass` acceptance based on productive physical cycles and retained truck mass; preserve legacy decisions and convert native-grain contact/progress/load controls to equivalent kilograms without changing geometry limits.
+- Preserve the full feasible target pool through mass ranking, deduplicate clamped targets, and continue the checked cut while an early-contact cue reports an underfilled bucket.
+- Measure fixed-attempt export rates with a strict greater-than target, optional confidence-bound gate, disjoint worker seeds, model/source hashes, per-dig mass and elapsed-time accounting.
+- Validate the selected amount-9 recipe on 16 fixed scenes: 9/16 exports (56.25%), with all 90 delivered loads at least 74.56 kg; the 95% Wilson interval of 33.18–76.90% does not establish a general above-50% guarantee.
+- Independently audit all nine exports (22,186 frames per camera, 153 real-reader boundary samples); pass 196 CPU regression checks and document failed development variants without promoting them.
+- Record a provisional amount-9 recommendation, throughput and full reproduction commands; remove task-generated test datasets and diagnostics while preserving ignored shared experiments.
+
 ## 2026-11-12 — Collection artifact maintenance
 
 - Ignore local assistant/editor state, runtime caches, experiment-tracking outputs and generated coverage reports.

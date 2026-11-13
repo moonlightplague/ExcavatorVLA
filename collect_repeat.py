@@ -31,8 +31,11 @@ def parse_args(argv=None):
     parser.add_argument("--dig-target-spacing", type=float, default=.28)
     parser.add_argument("--min-dig-height", type=float, default=.15)
     parser.add_argument("--min-curl-height", type=float, default=1.05)
+    parser.add_argument("--min-delivered-kg", type=float, default=None,
+                        help="Minimum measured new source delivery in every dig; defaults to 50 kg for coarse MPM, 0 otherwise.")
     parser.add_argument("--scene-profile", choices=("broad", "reachable"), default="reachable")
-    parser.add_argument("--acceptance-profile", choices=("strict", "episode"), default="episode")
+    parser.add_argument("--acceptance-profile", choices=("strict", "episode", "coarse_mass"), default="episode")
+    parser.add_argument('--min-retained-delivery-ratio', type=float, default=.8)
     parser.add_argument("--episode-min-score", type=float, default=65.)
     parser.add_argument("--episode-max-spill-ratio", type=float, default=.50)
     parser.add_argument("--scene-seed-start", type=int, default=None,
@@ -44,6 +47,9 @@ def parse_args(argv=None):
     parser.add_argument("--truck-reach-min", type=float, default=6.7)
     parser.add_argument("--truck-reach-max", type=float, default=7.0)
     parser.add_argument("--truck-approach", choices=("side", "rear"), default="side")
+    parser.add_argument("--mpm-profile", choices=("coarse", "fine"),
+                        default=os.environ.get("EXCAVATOR_MPM_PROFILE", "coarse"),
+                        help="Shared Newton soil resolution/display profile; independent of the point budget.")
     parser.add_argument("--mpm-hz", type=int, choices=(60, 120, 240),
                         default=int(os.environ.get("EXCAVATOR_MPM_HZ", "60")))
     parser.add_argument("--mpm-particle-budget", type=int,
@@ -68,6 +74,18 @@ def parse_args(argv=None):
         parser.error("--width and --height must be positive")
     if args.soil_backend not in ("physx", "newton_mpm") or args.mpm_hz not in (60, 120, 240):
         parser.error("Invalid soil backend or MPM frequency in environment defaults")
+    if args.mpm_profile not in ("coarse", "fine"):
+        parser.error("EXCAVATOR_MPM_PROFILE must be coarse or fine")
+    if args.min_delivered_kg is None:
+        args.min_delivered_kg = 50. if args.soil_backend == "newton_mpm" and args.mpm_profile == "coarse" else 0.
+    if not math.isfinite(args.min_delivered_kg) or args.min_delivered_kg < 0:
+        parser.error("--min-delivered-kg must be finite and nonnegative")
+    if args.acceptance_profile == 'coarse_mass' and (args.soil_backend != 'newton_mpm' or args.mpm_profile != 'coarse'):
+        parser.error('--acceptance-profile coarse_mass requires Newton MPM with the coarse profile')
+    if not math.isfinite(args.min_retained_delivery_ratio) or not 0 <= args.min_retained_delivery_ratio <= 1:
+        parser.error('--min-retained-delivery-ratio must be finite and between zero and one')
+    if args.acceptance_profile == 'coarse_mass' and args.min_delivered_kg <= 0:
+        parser.error('coarse_mass requires a positive --min-delivered-kg')
     return args, forwarded
 
 
@@ -87,8 +105,10 @@ def main(argv=None):
                           episode_max_spill_ratio=args.episode_max_spill_ratio,
                           release_clearance_m=args.release_clearance,
                           truck_reach_min_m=args.truck_reach_min, truck_reach_max_m=args.truck_reach_max,
-                          truck_approach=args.truck_approach)
+                          truck_approach=args.truck_approach, min_delivered_kg=args.min_delivered_kg,
+                          min_retained_delivery_ratio=args.min_retained_delivery_ratio)
     os.environ["EXCAVATOR_SOIL_BACKEND"] = args.soil_backend
+    os.environ["EXCAVATOR_MPM_PROFILE"] = args.mpm_profile
     os.environ["EXCAVATOR_MPM_HZ"] = str(args.mpm_hz)
     os.environ["EXCAVATOR_MPM_MAX_PARTICLES"] = str(args.mpm_particle_budget)
     for path in (ISAAC_REPO, ISAAC_REPO / "scripts"):

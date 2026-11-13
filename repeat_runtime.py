@@ -19,7 +19,12 @@ from baseline.episode_metrics import RepeatEpisodeMetrics
 from baseline.motion_geometry import BucketFloor, RigidBucketKinematics
 from baseline.stream_export import policy_environment
 from baseline.unload_planner import UnloadPlanner, damped_ik
-from baseline.tuning import configure_workspace, install_quality_policy, episode_quality, install_source_identity
+from baseline.tuning import (configure_workspace, install_quality_policy, episode_quality,
+                             install_source_identity, delivery_mass_quality)
+from baseline.soil_planning import (configure_coarse_planning, complete_material_targets,
+                                    install_material_search_order)
+from baseline.coarse_source import install_current_source_planning
+from baseline.cut_control import install_cut_load_goal
 
 
 @dataclass(frozen=True)
@@ -41,6 +46,8 @@ class RepeatConfig:
     truck_reach_min_m: float = 6.7
     truck_reach_max_m: float = 7.0
     truck_approach: str = "side"
+    min_delivered_kg: float = 0.
+    min_retained_delivery_ratio: float = .8
 
     def __post_init__(self):
         if not 2 <= self.scoops <= 64:
@@ -54,7 +61,7 @@ class RepeatConfig:
                 raise ValueError(f"{name} must be finite and positive.")
         if bool(self.stream_export_dir) != bool(self.policy_python):
             raise ValueError("Streaming export requires both a destination and policy Python.")
-        if self.scene_profile not in ("broad", "reachable") or self.acceptance_profile not in ("strict", "episode"):
+        if self.scene_profile not in ("broad", "reachable") or self.acceptance_profile not in ("strict", "episode", "coarse_mass"):
             raise ValueError("Unknown repeat scene or acceptance profile.")
         if not np.isfinite(self.episode_min_score) or not 0 <= self.episode_min_score <= 100:
             raise ValueError("Episode minimum score must be between 0 and 100.")
@@ -66,6 +73,12 @@ class RepeatConfig:
             raise ValueError("Truck reach radii must be finite, positive, and ordered.")
         if self.truck_approach not in ("side", "rear"):
             raise ValueError("Truck approach must be side or rear.")
+        if not np.isfinite(self.min_delivered_kg) or self.min_delivered_kg < 0:
+            raise ValueError("Minimum delivered mass must be finite and nonnegative.")
+        if not np.isfinite(self.min_retained_delivery_ratio) or not 0 <= self.min_retained_delivery_ratio <= 1:
+            raise ValueError("Deposit retention must be finite and between zero and one.")
+        if self.acceptance_profile == 'coarse_mass' and self.min_delivered_kg <= 0:
+            raise ValueError("Coarse mass acceptance requires a positive delivered-mass minimum.")
 
 
 class RepeatController:
@@ -298,6 +311,7 @@ def install(rt, config):
     rt.repeat_baseline = controller
     configure_workspace(rt, config.scene_profile, config.truck_reach_min_m, config.truck_reach_max_m, config.truck_approach)
     install_quality_policy(rt, config)
+    install_cut_load_goal(rt, config)
     install_source_identity(rt)
     # The upstream adaptive mode rejects the technical cap and may stop at an
     # unrelated truck particle target. This baseline has an explicit fixed count.
@@ -341,6 +355,30 @@ def install(rt, config):
     original_path_obstacle_check = rt.path_obstacle_check
     original_clearance_route = rt.find_clearance_route
     original_record_sample = rt.dataset_record_sample
+    original_rank_targets = getattr(rt, "auto_collect_rank_dig_targets", None)
+    if original_rank_targets is not None:
+        @wraps(original_rank_targets)
+        def rank_targets(*args, **kwargs):
+            configure_coarse_planning(rt)
+            rows = original_rank_targets(*args, **kwargs)
+            resolution = rt.STATE.get("repeat_planning_resolution")
+            if resolution and rows:
+                # The native ranker already computed every feasible candidate,
+                # then trimmed each ring before returning. Grade that full pool.
+                pool = rt.STATE.get('last_auto_dig_target_scores')
+                feasible = [row for row in pool if row.get('planned')] if isinstance(pool, list) else rows
+                return complete_material_targets(feasible, resolution["metric_point_mass_kg"])
+            return rows
+        rt.auto_collect_rank_dig_targets = rank_targets
+    original_settle_status = getattr(rt, "sand_settle_status", None)
+    if original_settle_status is not None:
+        @wraps(original_settle_status)
+        def settle_status(*args, **kwargs):
+            # Soil is initialized lazily after this adapter is installed. Apply
+            # mass units before the first settle check, not only at first plan.
+            configure_coarse_planning(rt)
+            return original_settle_status(*args, **kwargs)
+        rt.sand_settle_status = settle_status
 
     @wraps(original_clearance_route)
     def clearance_route(q_start, q_goal, mode, label, deadline=None, samples=None):
@@ -520,6 +558,7 @@ def install(rt, config):
 
     @wraps(original_find_plan)
     async def find_plan(attempt_index, ranked_targets=None):
+        configure_coarse_planning(rt)
         # The stock helper catches unload-selection errors and falls back to the
         # bed center. Validate outside that catch so a bad bed/reach is rejected.
         try:
@@ -575,6 +614,15 @@ def install(rt, config):
     @wraps(original_episode)
     async def episode():
         controller.reset()
+        # The new scene is planned before the stock begin_episode resets its
+        # ledger. Source IDs, cut history and fallback targets belong to the
+        # preceding scene; none may affect the next scene's first plan.
+        rt.STATE.update(dataset_initial_pile_particle_ids=None,
+                        dataset_initial_pile_particle_mask=None,
+                        dataset_initial_pile_particle_count=0,
+                        dataset_scoop_index=0, multi_scoop_planning_index=None,
+                        dataset_scoop_target_history=[], multi_scoop_ranked_targets_all=[],
+                        multi_scoop_last_viability={})
         return await original_episode()
 
     @wraps(original_begin)
@@ -589,10 +637,18 @@ def install(rt, config):
                                    "ground_top_z": float(rt.GROUND_TOP_Z),
                                    "soil_backend": rt.os.environ.get("EXCAVATOR_SOIL_BACKEND", "physx")}
         meta["repeat_baseline"]["source_identity"] = rt.STATE.get("repeat_source_identity", "initial_pile_region")
+        if 'repeat_cut_advance_policy' in rt.STATE:
+            meta['repeat_baseline']['cut_stage_advance_policy'] = rt.STATE['repeat_cut_advance_policy']
+        if "repeat_planning_resolution" in rt.STATE:
+            meta["repeat_baseline"]["planning_resolution"] = rt.STATE["repeat_planning_resolution"]
+            meta["repeat_baseline"]["source_search_initial"] = rt.STATE.get("repeat_avalanche_extent")
+        if config.min_delivered_kg > 0:
+            meta["repeat_baseline"]["delivery_acceptance_policy"] = "per_dig_measured_source_mass_v1"
         meta["repeat_baseline"]["strict_scoop_thresholds"] = {
             "min_score": getattr(rt, "MULTI_SCOOP_MIN_SCORE", 70.),
             "max_spill_ratio": getattr(rt, "MULTI_SCOOP_MAX_SPILL_RATIO", .30)}
         meta["repeat_baseline"]["acceptance_policy_version"] = (
+            "repeat_coarse_mass_v1" if config.acceptance_profile == 'coarse_mass' else
             "repeat_episode_source_efficiency_v2" if config.acceptance_profile == "episode" else "upstream_strict_scoop_v1")
         meta["repeat_baseline"]["mpm_requested_hz"] = float(rt.os.environ.get("EXCAVATOR_MPM_HZ", "120"))
         meta["repeat_baseline"]["mpm_requested_particle_budget"] = int(
@@ -609,6 +665,13 @@ def install(rt, config):
                 soil["mpm"] = api["mpm_diagnostics"]()
                 if not soil["mpm"].get("active") or soil["mpm"].get("error"):
                     raise RuntimeError("Repeat collection requires active, healthy Newton MPM soil")
+                requested_profile = rt.os.environ.get("EXCAVATOR_MPM_PROFILE")
+                if requested_profile is not None and soil["mpm"].get("profile") != requested_profile:
+                    raise RuntimeError("Requested and active repeat MPM profiles disagree")
+                meta["repeat_baseline"]["mpm_requested_profile"] = requested_profile or soil["mpm"].get("profile")
+            if config.acceptance_profile == 'coarse_mass' and (
+                    resolved_backend != 'newton_mpm' or soil.get('mpm', {}).get('profile') != 'coarse'):
+                raise RuntimeError('Coarse mass acceptance requires the active coarse Newton model')
             meta["repeat_baseline"]["soil"] = soil
         randomization = meta.get("scene_randomization") or {}
         meta["repeat_baseline"]["scene_seed"] = randomization.get("candidate", {}).get("scene_seed")
@@ -628,6 +691,8 @@ def install(rt, config):
         api = (api_getter() or {}) if api_getter is not None else {}
         if callable(api.get("mpm_diagnostics")):
             meta["repeat_baseline"]["mpm_final"] = api["mpm_diagnostics"]()
+        if "repeat_avalanche_extent" in rt.STATE:
+            meta["repeat_baseline"]["source_search_final"] = rt.STATE["repeat_avalanche_extent"]
         meta["repeat_cycles"] = cycles
         meta["repeat_returns_completed"] = sum(bool(cycle["returned"]) for cycle in cycles)
         if success and (len(cycles) != config.scoops or not all(cycle["returned"] for cycle in cycles)):
@@ -640,6 +705,28 @@ def install(rt, config):
             meta["repeat_episode_quality"] = report
             if success and not report["success"]:
                 success, reason = False, "quality_rejected/repeat_" + report["reason"]
+        elif config.acceptance_profile == 'coarse_mass':
+            from baseline.coarse_acceptance import episode_mass_quality
+            if controller.metrics is not None:
+                controller.metrics.observe()
+                measured = {**controller.metrics.transfer, 'scoop_cycles': controller.metrics.cycles,
+                    'particle_mass_kg': rt.sand_particle_mass(), 'available': controller.metrics.error is None}
+            else:
+                measured = {}
+            report = episode_mass_quality(rt.STATE.get('dataset_scoop_results', []), config, measured)
+            meta['repeat_episode_quality'] = report
+            legacy = [{**row, 'success': row.get('legacy_episode_success', False)}
+                      for row in rt.STATE.get('dataset_scoop_results', [])]
+            meta['repeat_legacy_episode_quality'] = episode_quality(legacy, config,
+                controller.metrics.transfer if controller.metrics is not None else None)
+            if success and not report['success']:
+                success, reason = False, 'quality_rejected/repeat_' + report['reason']
+        if config.min_delivered_kg > 0:
+            measured = controller.metrics.cycles if controller.metrics is not None else []
+            delivery = delivery_mass_quality(measured, rt.sand_particle_mass(), config.min_delivered_kg, config.scoops)
+            meta["repeat_delivery_quality"] = delivery
+            if success and not delivery["success"]:
+                success, reason = False, "quality_rejected/repeat_" + delivery["reason"]
         if success:
             rt.multi_scoop_set_stop("requested_repeat_cycles_completed", True, {"cycles": len(cycles)})
         result = original_finish(meta, success, reason)
@@ -695,6 +782,9 @@ def install(rt, config):
     rt.auto_collect_begin_episode = begin
     rt.execute_dig_target_ball = execute
     rt.auto_collect_finish_episode = finish
+    install_current_source_planning(rt)
+    install_material_search_order(rt)
+    configure_coarse_planning(rt)
     rt.info_print("[REPEAT BASELINE]", f"scoops={config.scoops}",
                   "physical_return=True", "measured_flat_fill=True", force_log=True)
     return controller

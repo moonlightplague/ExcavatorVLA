@@ -1,5 +1,10 @@
 # Ten-cycle Newton MPM repeat collection
 
+This page records the historical **fine-MPM** configuration. Select
+`--mpm-profile fine` to reproduce it. The shared adapter now defaults to coarse;
+see [COARSE_MPM_VALIDATION.md](COARSE_MPM_VALIDATION.md) for its separate measured
+tests and the 50 kg minimum delivered load required in every dig.
+
 This setup targets complete episodes with ten physical dig, carry, dump and
 return cycles. Measure acceptance as validated exported episodes divided by
 **all scene attempts**, including planning failures and rejected episodes.
@@ -130,13 +135,13 @@ Use a Python environment with NumPy, pandas, PyArrow and imageio-ffmpeg as
 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=4 \
 POLICY_PYTHON=/path/to/training/python ./collect_repeat.sh 10 2 0,1 10 \
   --soil-backend newton_mpm --scene-profile reachable --acceptance-profile episode \
-  --sand-amount 3 --mpm-hz 60 --mpm-particle-budget 32000 \
+  --mpm-profile fine --sand-amount 3 --mpm-hz 60 --mpm-particle-budget 32000 \
   --truck-reach-min 6.7 --truck-reach-max 7.0 --truck-approach side \
   --release-clearance .45 --bed-wall-margin 1.0 --dump-settle-seconds 1.5
 
 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=4 /path/to/training/python baseline/benchmark_repeat.py \
   --output outputs/repeat_newton_benchmark --attempts 8 --gpu-ids 0,1 \
-  --seed-start 81000 --mpm-hz 60 --mpm-particle-budget 32000
+  --seed-start 81000 --mpm-profile fine --mpm-hz 60 --mpm-particle-budget 32000
 ```
 
 The measured run used `OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=4` and one worker

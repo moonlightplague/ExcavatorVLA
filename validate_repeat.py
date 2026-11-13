@@ -5,15 +5,15 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 
 import numpy as np
 
 from types import SimpleNamespace
 
-try:
-    from baseline.tuning import episode_quality
-except ImportError:
-    from tuning import episode_quality
+if __package__ in (None, ''):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from baseline.tuning import episode_quality, delivery_mass_quality
 
 
 def read_jsonl(path):
@@ -37,6 +37,15 @@ def validate_episode(directory):
     require(meta.get("all_scoops_success"), "A scoop failed the existing quality gate")
     require(meta.get("repeat_returns_completed") == count, "Incomplete physical returns")
     require(meta.get("source_sampling_audit", {}).get("ok"), "Source sampling audit failed")
+    if config.get("min_delivered_kg", 0.) > 0:
+        measured = meta.get("repeat_metrics", {})
+        delivery = delivery_mass_quality(measured.get("scoop_cycles", []), measured.get("particle_mass_kg"),
+                                         config["min_delivered_kg"], count)
+        require(delivery['success'], 'A dig delivered less than the required sand mass')
+        require(meta.get('repeat_delivery_quality') == delivery, 'Delivered mass report disagrees with measurements')
+    if config.get('acceptance_profile') == 'coarse_mass':
+        from baseline.coarse_acceptance import validate_mass_report
+        validate_mass_report(meta, meta.get('repeat_metrics', {}))
     if config.get("acceptance_profile") == "episode":
         results = meta.get("scoop_results", [])
         quality = episode_quality(results, SimpleNamespace(**config), meta.get("repeat_metrics"))

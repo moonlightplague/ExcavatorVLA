@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 
 from baseline.validate_repeat import validate_episode
-from baseline.tuning import episode_quality
+from baseline.tuning import episode_quality, delivery_mass_quality
 
 
 def fixture(directory):
@@ -41,6 +41,26 @@ def write(directory, rows, meta):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_delivery_mass_is_recomputed_from_each_cycles_real_source_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            rows, meta = fixture(directory)
+            meta['repeat_baseline']['config']['min_delivered_kg'] = 50.
+            metrics = dict(particle_mass_kg=5., scoop_cycles=[{'payload_particles': 10}] * 2)
+            meta['repeat_metrics'] = metrics
+            meta['repeat_delivery_quality'] = delivery_mass_quality(metrics['scoop_cycles'], 5., 50., 2)
+            write(directory, rows, meta)
+            validate_episode(directory)
+            metrics['scoop_cycles'] = [{'payload_particles': 100}, {'payload_particles': 9}]
+            write(directory, rows, meta)
+            with self.assertRaisesRegex(ValueError, 'less than'):
+                validate_episode(directory)
+            metrics['scoop_cycles'] = [{'payload_particles': 10}] * 2
+            meta['repeat_delivery_quality']['delivered_mass_kg'][1] = 60.
+            write(directory, rows, meta)
+            with self.assertRaisesRegex(ValueError, 'disagrees'):
+                validate_episode(directory)
+
     def test_episode_policy_is_recomputed_and_still_requires_delivery_on_every_cycle(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)

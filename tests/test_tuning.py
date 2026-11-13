@@ -5,10 +5,23 @@ from unittest.mock import Mock
 import numpy as np
 
 from baseline.repeat_runtime import RepeatConfig
-from baseline.tuning import episode_quality, install_quality_policy, configure_seed_sequence, configure_workspace, install_source_identity
+from baseline.tuning import (episode_quality, install_quality_policy, configure_seed_sequence,
+                             configure_workspace, install_source_identity, delivery_mass_quality)
 
 
 class QualityPolicyTests(unittest.TestCase):
+    def test_each_dig_must_deliver_fifty_kg_without_averaging_or_rounding_up(self):
+        good = [dict(payload_particles=10)] * 10
+        self.assertTrue(delivery_mass_quality(good, 5., 50., 10)['success'])
+        bad = good[:9] + [dict(payload_particles=9)]
+        report = delivery_mass_quality(bad, 5., 50., 10)
+        self.assertFalse(report['success'])
+        self.assertIn('low_delivered_mass_kg:10:45.000<50.000', report['reason'])
+        self.assertFalse(delivery_mass_quality(good, 4.9999, 50., 10)['success'])
+        for mass in (None, float('nan'), 0.):
+            self.assertFalse(delivery_mass_quality(good, mass, 50., 10)['success'])
+        self.assertFalse(delivery_mass_quality(good[:9], 5., 50., 10)['success'])
+
     def runtime(self, reason, **values):
         report = dict(success=False, reason=reason, scoop_index=0, score=54., spill_ratio=.819,
                       lift_bucket_from_pile_particles=100, spill_from_lift_particles=82)

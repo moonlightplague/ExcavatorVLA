@@ -4,6 +4,24 @@ from __future__ import annotations
 import math
 
 
+def delivery_mass_quality(cycles, point_mass, minimum_kg, expected_cycles):
+    """Fail closed on small or unavailable measured per-dig source deliveries."""
+    valid_mass = point_mass is not None and math.isfinite(float(point_mass)) and point_mass > 0
+    loads = [float(row['payload_particles']) * float(point_mass)
+             if valid_mass and row.get('payload_particles') is not None else None for row in cycles]
+    failures = []
+    if len(cycles) != expected_cycles:
+        failures.append('incomplete_measured_cycles')
+    for index, load in enumerate(loads):
+        if load is None or not math.isfinite(load):
+            failures.append(f'delivery_mass_unavailable:{index + 1}')
+        elif load < minimum_kg:
+            failures.append(f'low_delivered_mass_kg:{index + 1}:{load:.3f}<{minimum_kg:.3f}')
+    return dict(success=not failures, reason=';'.join(failures),
+                minimum_per_dig_kg=minimum_kg, delivered_mass_kg=loads,
+                measurement='new_source_material_ids_after_dump_and_physical_return')
+
+
 def configure_workspace(rt, profile, radius_min=6.7, radius_max=7.0, approach="side"):
     if profile == "broad":
         return
@@ -53,6 +71,11 @@ def configure_workspace(rt, profile, radius_min=6.7, radius_max=7.0, approach="s
 
 
 def install_quality_policy(rt, config):
+    if config.acceptance_profile == 'coarse_mass':
+        from dataclasses import replace
+        from baseline.coarse_acceptance import install_mass_policy
+        install_quality_policy(rt, replace(config, acceptance_profile='episode'))
+        return install_mass_policy(rt, config)
     snapshot = getattr(rt, "quality_gate_config_snapshot", None)
     if snapshot is not None:
         def quality_snapshot():

@@ -15,6 +15,10 @@ import re
 import shutil
 import sys
 
+if __package__ in (None, ''):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from baseline.tuning import delivery_mass_quality
+
 
 KEEP_FILES = {"meta.json", "score.json", "repeat_metrics.json", "repeat_cycles.jsonl", "export.json"}
 META_FIELDS = {
@@ -22,7 +26,8 @@ META_FIELDS = {
     "repeat_baseline", "repeat_cycles", "repeat_returns_completed", "scoops_completed",
     "all_scoops_success", "source_sampling_audit", "score_summary", "final_metrics",
     "repeat_metrics", "created_at", "finished_at", "duration_wall_s", "duration_simulation_s",
-    "repeat_episode_quality", "scoop_results",
+    "repeat_episode_quality", "repeat_delivery_quality", "repeat_legacy_episode_quality",
+    "repeat_legacy_global_quality", "scoop_results", "scene_randomization",
 }
 POLICY_ENV_KEYS = ("PATH", "PYTHONPATH", "PYTHONHOME", "LD_LIBRARY_PATH", "LD_PRELOAD")
 
@@ -113,6 +118,15 @@ def finish_episode(run_dir, episode_dir, export_dir, export_function=None):
     receipt_path = episode / "export.json"
     receipt = None
     if meta.get("status") == "trainable" and meta.get("success"):
+        config = meta.get("repeat_baseline", {}).get("config", {})
+        if config.get('acceptance_profile') == 'coarse_mass':
+            from baseline.coarse_acceptance import validate_mass_report
+            validate_mass_report(meta, metrics)
+        if config.get("min_delivered_kg", 0.) > 0:
+            delivery = delivery_mass_quality(metrics.get("scoop_cycles", []), metrics.get("particle_mass_kg"),
+                                             config["min_delivered_kg"], config["scoops"])
+            if not delivery['success'] or meta.get('repeat_delivery_quality') != delivery:
+                raise ValueError("Per-dig delivered mass gate failed or report is inconsistent; raw files retained")
         with export_lock(destination):
             if receipt_path.exists():
                 receipt = json.loads(receipt_path.read_text())

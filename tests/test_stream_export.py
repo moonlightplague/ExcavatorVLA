@@ -60,6 +60,66 @@ class StreamExportTests(unittest.TestCase):
         self.run = self.root / "raw/run_repeat_r1_w0"
         self.destination = self.root / "publication"
 
+    def test_coarse_mass_policy_is_rechecked_before_publication_and_retained_after_cleanup(self):
+        from dataclasses import asdict
+        from baseline.coarse_acceptance import episode_mass_quality
+        from baseline.repeat_runtime import RepeatConfig
+        from baseline.tuning import delivery_mass_quality
+        cfg = RepeatConfig(scoops=10, acceptance_profile='coarse_mass', min_delivered_kg=50.)
+        for retained, valid in ((159, False), (160, True)):
+            run = self.root / f'mass_retained_{retained}'
+            episode = make_episode(run)
+            meta = json.loads((episode / 'meta.json').read_text())
+            metrics = meta['repeat_metrics']
+            metrics.update(particle_mass_kg=5., payload_particles=retained,
+                scoop_cycles=[dict(success=True, payload_particles=20)] * 10)
+            model = dict(profile='coarse', active=True, error='', metric_point_mass_kg=5.)
+            meta['repeat_baseline'] = dict(config=asdict(cfg), soil=dict(backend='newton_mpm', mpm=model), mpm_final=model)
+            meta['scoop_results'] = [dict(success=True, execution_success=True, freeze_count=0)] * 10
+            meta['repeat_episode_quality'] = episode_mass_quality(meta['scoop_results'], cfg, metrics)
+            meta['repeat_delivery_quality'] = delivery_mass_quality(metrics['scoop_cycles'], 5., 50., 10)
+            write_json(episode / 'meta.json', meta)
+            write_json(episode / 'repeat_metrics.json', metrics)
+            (run / 'repeat_metrics.jsonl').write_text(json.dumps(dict(episode_id=meta['episode_id'],
+                episode_index=meta['episode_index'], **metrics)) + '\n')
+            function = Mock(side_effect=fake_export)
+            if valid:
+                finish_episode(run, episode, self.destination, function)
+                retained_meta = json.loads((episode / 'meta.json').read_text())
+                self.assertEqual(retained_meta['repeat_episode_quality']['deposit_retention_ratio'], .8)
+                function.assert_called_once()
+            else:
+                with self.assertRaisesRegex(ValueError, 'Coarse mass acceptance'):
+                    finish_episode(run, episode, self.destination, function)
+                function.assert_not_called()
+                self.assertTrue((episode / 'trajectory.jsonl').exists())
+
+    def test_a_small_last_load_cannot_be_published_and_raw_is_retained(self):
+        from baseline.tuning import delivery_mass_quality
+        for last, valid in ((49, False), (50, True)):
+            run = self.root / f'load_{last}'
+            episode = make_episode(run)
+            meta = json.loads((episode / 'meta.json').read_text())
+            metrics = meta['repeat_metrics']
+            metrics.update(particle_mass_kg=1., scoop_cycles=[{'payload_particles': 100}, {'payload_particles': last}])
+            meta['repeat_baseline'] = {'config': {'scoops': 2, 'min_delivered_kg': 50.}}
+            meta['repeat_delivery_quality'] = delivery_mass_quality(metrics['scoop_cycles'], 1., 50., 2)
+            write_json(episode / 'meta.json', meta)
+            write_json(episode / 'repeat_metrics.json', metrics)
+            (run / 'repeat_metrics.jsonl').write_text(json.dumps({'episode_id': meta['episode_id'],
+                'episode_index': meta['episode_index'], **metrics}) + '\n')
+            function = Mock(side_effect=fake_export)
+            if valid:
+                finish_episode(run, episode, self.destination, function)
+                retained = json.loads((episode / 'meta.json').read_text())
+                self.assertEqual(retained['repeat_delivery_quality']['delivered_mass_kg'], [100., 50.])
+                function.assert_called_once()
+            else:
+                with self.assertRaisesRegex(ValueError, 'delivered mass gate'):
+                    finish_episode(run, episode, self.destination, function)
+                function.assert_not_called()
+                self.assertTrue((episode / 'trajectory.jsonl').exists())
+
     def test_policy_python_restores_environment_before_isaac_setup(self):
         original = {"PATH": "/policy/bin", "PYTHONPATH": "/policy/packages", "PYTHONHOME": None,
                     "LD_LIBRARY_PATH": "/policy/lib", "LD_PRELOAD": None}

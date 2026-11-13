@@ -3,6 +3,51 @@
 See [TUNING.md](TUNING.md) for the ten-cycle Newton setup, acceptance definitions,
 and fixed-attempt measurement procedure.
 
+The shared soil adapter now defaults to **coarse** MPM. See
+[COARSE_MPM_VALIDATION.md](COARSE_MPM_VALIDATION.md) for current ten-dig results;
+the older fine-MPM validation does not establish its export rate. Coarse
+collection requires at least **50 kg of newly delivered source material in
+every dig** by default (`--min-delivered-kg`). The final collection gate, streaming
+exporter and independent validator all recompute this from material IDs and the
+actual point mass, so a large early load cannot hide a small final load.
+
+`--acceptance-profile coarse_mass` selects the coarse-specific mass policy:
+complete every physical cycle, deliver the configured minimum kilograms per
+dig, and retain at least 80% of cumulative deposits in the truck. Native-grain
+contact/progress/load controls are also converted to their mass equivalents.
+Legacy strict and episode-score verdicts remain in metadata for comparison.
+During insert and mid-cut, native contact-based early completion also requires
+twice the configured delivery minimum in the bucket (100 kg for a 50 kg
+minimum). The original checked endpoint can finish below that internal goal;
+the final mass gate still checks actual delivery after the physical return.
+This policy is opt-in. The selected recipe exported **9/16 complete ten-dig
+episodes (56.25%)**, with every delivered load at least **74.56 kg**. Its 95%
+Wilson interval was **33.18–76.90%**, so a general above-50% rate guarantee is
+not established. All nine publications passed independent LeRobot validation.
+
+The measured coarse recipe uses sand amount **9**:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=4 \
+EXCAVATOR_MPM_EXECUTION=graph EXCAVATOR_MPM_DISPLAY=rocks \
+EXCAVATOR_MPM_GRID_CAPACITY=16384 POLICY_PYTHON="$PWD/.venv-pi05/bin/python" \
+./collect_repeat.sh 10 4 0,1 10 \
+  --soil-backend newton_mpm --mpm-profile coarse --scene-profile reachable \
+  --acceptance-profile coarse_mass --sand-amount 9 \
+  --mpm-hz 120 --mpm-particle-budget 12000 \
+  --min-dig-height .12 --min-curl-height 1.4 \
+  --min-delivered-kg 50 --min-retained-delivery-ratio .8
+```
+
+Use the training Python available on your machine as `POLICY_PYTHON`.
+The [coarse validation report](COARSE_MPM_VALIDATION.md) gives the full
+reproduction and fixed-attempt benchmark commands. The shell launcher requests
+successful episodes and can retry failed attempts; use the benchmark to measure
+an export rate. The fixed cohort yielded **4.52 qualifying exports/hour** across
+two RTX 4090 GPUs, with a **28.10-minute** median recording-through-completion
+time per exported episode. Amount 9 is a provisional recommendation; retain the
+mass gate to exclude underfilled late rounds.
+
 From the repository root:
 
 ```bash
@@ -39,15 +84,19 @@ reachable side-loading workspace, a 60 Hz MPM solve and 32,000 material-point
 budget, with a 512 × 512 headless application window (recorded RGB stays 256 × 256).
 `--soil-backend physx --scene-profile broad --acceptance-profile strict --sand-amount 1` selects the
 legacy PhysX setup. `EXCAVATOR_SOIL_BACKEND`, `EXCAVATOR_MPM_HZ` and
-`EXCAVATOR_MPM_MAX_PARTICLES` can override backend/solver defaults.
+`EXCAVATOR_MPM_MAX_PARTICLES` can override backend/solver defaults. Select
+`--mpm-profile coarse|fine` explicitly when comparing resolution profiles; the
+point budget alone does not select fine MPM.
 Material behavior, resolution, and source-particle quality counts depend on the
 backend. Acceptance policies are explicit and recorded in episode metadata.
 
 Episode efficiency acceptance is the default; `--acceptance-profile strict`
-restores the original per-cycle efficiency gate. The full tuned configuration is:
+restores the original per-cycle efficiency gate. The historically validated
+fine-MPM configuration is:
 
 ```bash
 ./collect_repeat.sh 10 2 0,1 10 --soil-backend newton_mpm \
+  --mpm-profile fine \
   --scene-profile reachable --acceptance-profile episode --sand-amount 3 \
   --truck-reach-min 6.7 --truck-reach-max 7.0 --truck-approach side --release-clearance .45 \
   --bed-wall-margin 1.0 --dump-settle-seconds 1.5 \
@@ -87,7 +136,7 @@ Measure acceptance with a fixed attempt budget, without success-target retries:
 
 ```bash
 python baseline/benchmark_repeat.py --output outputs/repeat_benchmark \
-  --attempts 8 --gpu-ids 0,1 --seed-start 75000 --mpm-hz 60 \
+  --attempts 8 --gpu-ids 0,1 --seed-start 75000 --mpm-profile fine --mpm-hz 60 \
   --mpm-particle-budget 32000
 ```
 

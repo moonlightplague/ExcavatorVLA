@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-11-17 — Collection-matched repeated-task evaluation
+
+- Add an opt-in loader for the collection's coarse Newton MPM solver and rock display.
+- Match collection source provenance by retaining avalanched Newton material IDs and excluding material initially in the bucket or truck; preserve the legacy source mask unless explicitly enabled.
+- Expose metric-point mass, source identity, initial exclusions and optional bucket/truck positions for auditable repeated-task evaluation. Keep model weights, observation feature order and physics parameters unchanged.
+- Validate all 72 submodule tests and 106 related main-repository training/evaluation regressions.
+
 ## 2026-11-12 — Runtime artifact maintenance
 
 - Ignore regenerated renderer caches and local experiment-tracking outputs.

@@ -3121,6 +3121,32 @@ def main(args):
                 result["reason"] = "missing_particles"
                 return result
 
+            from excavator_common.newton_source_identity import SOURCE_IDENTITY, initial_source_mask
+            if (runtime_api.get('soil_backend') == 'newton_mpm'
+                    and os.environ.get('EXCAVATOR_MPM_SOURCE_IDENTITY') == SOURCE_IDENTITY):
+                # Match baseline.tuning.install_source_identity exactly. These
+                # points were all born in this source, including the avalanche
+                # outside the authored dig footprint during initial settling.
+                saved_tracker = dict(bucket_source_tracker)
+                initial_bucket, initial_truck = [], []
+                try:
+                    bucket_source_tracker.update(available=True, mask=np.ones(len(points), dtype=bool),
+                                                 source_count=len(points), reason='initial_material_id_probe')
+                    bucket = estimate_bucket_load_particles(True, initial_bucket)
+                    truck = estimate_truck_bed_load_particles(initial_truck)
+                    if (not bucket['source_tracking_valid'] or not truck['available']
+                            or not truck['source_tracking_valid']
+                            or bucket['particle_count'] != len(points) or truck['particle_count'] != len(points)):
+                        raise ValueError('Cannot identify initial bucket/truck Newton material')
+                    mask = initial_source_mask(points, initial_bucket, initial_truck)
+                finally:
+                    bucket_source_tracker.clear()
+                    bucket_source_tracker.update(saved_tracker)
+                result.update(available=True, mask=mask, source_count=int(mask.sum()), reason='ok',
+                              source_identity=SOURCE_IDENTITY, initial_bucket_ids=initial_bucket,
+                              initial_truck_ids=initial_truck)
+                return result
+
             context = (
                 runtime_api.get("scene_context")
                 if isinstance(runtime_api, dict)
@@ -3373,7 +3399,7 @@ def main(args):
             "bucket_overlap_count": 0,
             "source": str(truck_bed_counting_volume["source"]),
             "reason": str(truck_bed_counting_volume["reason"]),
-            "source_tracking": "initial_pile_mask",
+            "source_tracking": bucket_source_tracker.get('source_identity', 'initial_pile_mask'),
             "source_tracking_valid": False,
             "source_count": int(
                 bucket_source_tracker.get("source_count", 0)
@@ -4826,6 +4852,16 @@ def main(args):
                 "evaluation_particle_ids": ({
                     'particle_count': int(bucket_load_metrics['particle_count']),
                     'bucket': bucket_particle_indices, 'truck': truck_particle_indices,
+                    'metric_point_mass_kg': float(sand_api['derived_particle_config']['mass']),
+                    'soil_backend': sand_api.get('soil_backend', 'physx'),
+                    'source_identity': bucket_source_tracker.get('source_identity', 'initial_pile_region'),
+                    'source_count': int(bucket_source_tracker['source_count']),
+                    'initial_excluded_ids': sorted(set(bucket_source_tracker.get('initial_bucket_ids', []))
+                        | set(bucket_source_tracker.get('initial_truck_ids', []))),
+                    **({'positions_world': {
+                        'bucket': np.asarray(sand_api['particle_positions_fn'](), dtype=np.float32)[bucket_particle_indices].tolist(),
+                        'truck': np.asarray(sand_api['particle_positions_fn'](), dtype=np.float32)[truck_particle_indices].tolist(),
+                    }} if os.environ.get('EXCAVATOR_EVAL_MATERIAL_POSITIONS') == '1' else {}),
                 } if active_observation_context.get('allow_task_goal_updates') is True
                     and track_evaluation_particles and particle_transfer_metrics.get('available') else None),
                 "primary_camera": primary_camera,

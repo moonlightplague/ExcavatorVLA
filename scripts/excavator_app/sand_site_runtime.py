@@ -7,6 +7,20 @@ import asyncio
 import numpy as np
 
 from excavator_app import newton_mpm_soil as _mpm
+if os.environ.get('EXCAVATOR_MPM_COLLECTION_RUNTIME') == '1':
+    # Opt in to the exact coarse/rock solver used by the repeat collection.
+    # Keep legacy deployment/PhysX defaults unchanged.
+    import importlib.util
+    from pathlib import Path
+    _collection_mpm_path = (Path(__file__).resolve().parents[3] /
+        'ExcavatorVLA-isaac/scripts/excavator_app/newton_mpm_soil.py')
+    _collection_mpm_spec = importlib.util.spec_from_file_location(
+        'excavator_collection_newton_mpm', _collection_mpm_path,
+        submodule_search_locations=[str(_collection_mpm_path.parent)])
+    _mpm = importlib.util.module_from_spec(_collection_mpm_spec)
+    import sys
+    sys.modules[_collection_mpm_spec.name] = _mpm
+    _collection_mpm_spec.loader.exec_module(_mpm)
 _mpm.close()  # release subscriptions when Script Editor reloads this runtime
 
 import omni.usd

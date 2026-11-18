@@ -717,6 +717,15 @@ class NewtonSoil:
             if np.linalg.det(matrix[:3, :3]) < 0:
                 indices = np.asarray(indices).reshape(-1, 3)[:, ::-1].reshape(-1)
             if body < 0:
+                if self.profile == 'coarse' and path == self.runtime.get(
+                        'DEFAULT_UNLOAD_SOURCE_MESH_PATH', '/World/truck/DumpBedCollision/dump_bed_collision'):
+                    # This shell's inner floor is 3–5 cm above its underside.
+                    # Lift the inner floor for rock centers, blending the shared
+                    # bevel vertices to keep the closed shell and its rim intact.
+                    # Both the MPM collider and its CCD rays use these vertices.
+                    above_bottom = vertices[:, 2] - vertices[:, 2].min()
+                    vertices[:, 2] += np.interp(above_bottom,
+                        [0.012, 0.030, 0.10, 0.45], [0.0, 0.07, 0.07, 0.0])
                 # Keep each static surface separate. Merging open ground and
                 # closed truck/parking meshes corrupts signed-distance queries.
                 self._add_static_mesh(vertices, indices, margin=0.)

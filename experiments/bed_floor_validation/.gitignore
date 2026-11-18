@@ -1,0 +1,14 @@
+# Generated bed-floor validation outputs
+/run_*/raw/
+/run_*/closeups/
+/run_*/*.npz
+/run_*/*.mp4
+/run_*/*.png
+/run_*/*.jpg
+/run_*/sample.jsonl
+/run_*/measurements.json
+/run_*/result.json
+/run_*/pid
+
+# Run-local copy of scripts/excavator_app/newton_mpm_soil.py
+/run_*/newton_mpm_soil.py

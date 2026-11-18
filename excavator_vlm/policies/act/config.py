@@ -9,7 +9,13 @@ from ...data.contract import load_info, policy_features
 
 
 def resolve_settings(path, overrides=None):
-    settings = resolve_common_settings(path, overrides, extra_sections=('continuation', 'sampling'))
+    settings = resolve_common_settings(path, overrides, extra_sections=('continuation', 'sampling', 'objective'))
+    objective = settings.setdefault('objective', 'supervision_weighted')
+    if objective not in ('original', 'supervision_weighted'):
+        raise ValueError('ACT objective must be original or supervision_weighted')
+    if objective == 'original' and (settings.get('continuation') or
+                                  settings.get('sampling', {}).get('manifest')):
+        raise ValueError('Original ACT baseline starts fresh with uniform observation sampling')
     continuation = settings.get('continuation')
     if continuation is not None:
         if not isinstance(continuation, dict) or set(continuation) != {'checkpoint'}:

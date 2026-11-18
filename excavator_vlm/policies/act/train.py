@@ -1,6 +1,8 @@
 """Train ACT with a frozen episode split and train-only normalization statistics."""
 import argparse
 import copy
+from datetime import timedelta
+import inspect
 from importlib.metadata import version
 import json
 import os
@@ -40,9 +42,10 @@ def prepare(settings, create=False):
 def run(settings, cfg, config_path):
     import torch
     from accelerate import Accelerator
-    from accelerate.utils import DistributedDataParallelKwargs, set_seed
+    from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs, set_seed
     from lerobot.optim.factory import make_optimizer_and_scheduler
     from lerobot.policies.act.processor_act import make_act_pre_post_processors
+    from lerobot.policies.act.modeling_act import ACTPolicy
     from lerobot.utils.train_utils import get_step_checkpoint_dir, save_checkpoint, update_last_checkpoint
     from .adapter import ExcavatorACTPolicy, training_batch
     from .inference import load_act
@@ -50,14 +53,25 @@ def run(settings, cfg, config_path):
 
     if cfg.policy.device == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('CUDA unavailable: run on a GPU node with working NVIDIA driver access')
+    original_act = settings.get('objective') == 'original'
+    handlers = [DistributedDataParallelKwargs(find_unused_parameters=True)]
+    if original_act:
+        # Rank zero evaluates all held-out frames while the other ranks wait.
+        # Large repeated-data validation sets can exceed NCCL's 10-minute default.
+        handlers.append(InitProcessGroupKwargs(timeout=timedelta(hours=2)))
     torch.set_num_threads(settings['launcher']['cpu_threads'])
     accelerator = Accelerator(cpu=cfg.policy.device == 'cpu',
                               mixed_precision=settings['launcher']['mixed_precision'],
                               step_scheduler_with_optimizer=False,
-                              kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)])
+                              kwargs_handlers=handlers)
     set_seed(cfg.seed)
     # All ranks construct the same immutable split/stats; only main writes outputs.
     report, split, frames, episodes = prepare(settings)
+    adapter = 'lerobot_act_original_v1' if original_act else 'excavator_act_v1'
+    policy_type = ACTPolicy if original_act else ExcavatorACTPolicy
+    if original_act and not (frames.loc[frames.episode_index.isin(episodes),
+                                        'action_loss_weight'] == 1).all():
+        raise ValueError('Original ACT requires unit supervision weights; weighted labels need an explicit adapter')
     cfg.dataset.episodes = episodes
     cfg.policy.device = str(accelerator.device)
     stats = training_stats(frames, episodes)
@@ -75,7 +89,7 @@ def run(settings, cfg, config_path):
         pre, post = make_pre_post_processors(cfg.policy, pretrained_path=str(checkpoint),
             preprocessor_overrides={'device_processor': {'device': str(accelerator.device)}})
     else:
-        policy = ExcavatorACTPolicy(cfg.policy)
+        policy = policy_type(cfg.policy)
         pre, post = make_act_pre_post_processors(cfg.policy, stats)
     policy = policy.to(accelerator.device)
     optimizer, scheduler = make_optimizer_and_scheduler(cfg, policy)
@@ -96,7 +110,7 @@ def run(settings, cfg, config_path):
         cfg.output_dir.mkdir(parents=True, exist_ok=False)
         (cfg.output_dir / 'training_config.yaml').write_text(config_path.read_text())
         dump(cfg.output_dir / 'resolved_training_config.json', {'launcher': settings['launcher'],
-             'training': cfg.to_dict(), 'benchmark': settings['benchmark'], 'adapter': 'excavator_act_v1'})
+             'training': cfg.to_dict(), 'benchmark': settings['benchmark'], 'adapter': adapter})
         dump(cfg.output_dir / 'resolved_settings.json', settings)
         dump(cfg.output_dir / 'dataset_contract.json', report)
         dump(cfg.output_dir / 'split_manifest.json', split)
@@ -113,6 +127,10 @@ def run(settings, cfg, config_path):
             'global_batch_size': cfg.batch_size * accelerator.num_processes,
             'normalization': 'selected training episodes only; fixed ImageNet image stats',
             'language_conditioning': False,
+            'objective': settings.get('objective', 'supervision_weighted'),
+            'policy_class': f'{policy_type.__module__}.{policy_type.__name__}',
+            'policy_source_sha256': file_hash(inspect.getfile(policy_type)),
+            'parameters': sum(p.numel() for p in policy.parameters()),
             'continuation': continuation, 'sampling': sampling_report,
         })
         if settings['benchmark']['validation_freq']:
@@ -134,7 +152,11 @@ def run(settings, cfg, config_path):
             policy.train()
             optimizer.zero_grad(set_to_none=True)
             with accelerator.autocast():
-                loss, parts = policy(training_batch(pre, batch))
+                processed = training_batch(pre, batch)
+                if original_act:
+                    del processed['action_loss_weight']
+                loss, parts = policy(processed)
+            parts.setdefault('total_loss', loss.detach().item())
             finite = accelerator.reduce(torch.isfinite(loss.detach()).int(), reduction='sum')
             if finite.item() != accelerator.num_processes:
                 raise FloatingPointError(f'Nonfinite loss at step {step}')
@@ -151,6 +173,8 @@ def run(settings, cfg, config_path):
                 if log:
                     row = dict(step=step, **dict(zip(parts, values)), grad_norm=float(norm),
                                lr=optimizer.param_groups[0]['lr'], elapsed_seconds=time.perf_counter() - started)
+                    if accelerator.device.type == 'cuda':
+                        row['cuda_peak_allocated_mib'] = torch.cuda.max_memory_allocated() / 1024 ** 2
                     if continuation:
                         row['source_plus_finetune_steps'] = continuation['source_step'] + step
                     log.write(json.dumps(row) + '\n')
@@ -168,7 +192,7 @@ def run(settings, cfg, config_path):
                     update_last_checkpoint(checkpoint)
                     pretrained = checkpoint / 'pretrained_model'
                     dump(pretrained / 'benchmark_provenance.json', {
-                        'adapter': 'excavator_act_v1', 'dataset_fingerprint': report['fingerprint'],
+                        'adapter': adapter, 'dataset_fingerprint': report['fingerprint'],
                         'split_manifest': split, 'training_episodes': episodes,
                         'normalization_stats_sha256': file_hash(cfg.output_dir / 'normalization_stats.json'),
                     })
@@ -195,7 +219,7 @@ def run(settings, cfg, config_path):
             with torch.inference_mode():
                 expected = raw.predict_action_chunk(copy.deepcopy(check_batch)).float().cpu()
                 restored, _, _ = load_act(cfg.output_dir / 'checkpoints/last/pretrained_model',
-                                          str(accelerator.device))
+                                          str(accelerator.device), original_act=original_act)
                 actual = restored.predict_action_chunk(copy.deepcopy(check_batch)).float().cpu()
             torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
             dump(cfg.output_dir / 'reload_check.json', {'status': 'passed', 'shape': list(actual.shape)})

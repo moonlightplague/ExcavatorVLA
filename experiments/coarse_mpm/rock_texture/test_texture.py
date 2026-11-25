@@ -29,7 +29,7 @@ def initialize(self,*a,**kw):
         shader.CreateInput('diffuse_color_constant',Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(.35,.32,.28))
         shader.CreateInput('reflection_roughness_constant',Sdf.ValueTypeNames.Float).Set(.92)
         if mode=='texture':
-            texture=Path(__file__).parent/'assets/rock_relief_basecolor.png'
+            texture=repo/'scripts/excavator_app/assets/rock_relief_basecolor.png'
             shader.CreateInput('diffuse_texture',Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(str(texture)))
             shader.CreateInput('project_uvw',Sdf.ValueTypeNames.Bool).Set(os.environ.get('ROCK_PROJECT_UV','0')=='1')
             shader.CreateInput('world_or_object',Sdf.ValueTypeNames.Bool).Set(False)

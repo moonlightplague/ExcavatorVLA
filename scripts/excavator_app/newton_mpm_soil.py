@@ -381,7 +381,7 @@ class NewtonSoil:
         self.spacing, self.voxel, _ = choose_resolution(runtime, self.max_points,
                                                        requested_spacing, requested_voxel)
         self.positions, volume = sample_material(runtime, self.spacing, self.max_points)
-        # USD display diameter only; never used by the model or contact solver.
+        # Coarse rock settling uses the same diameter as its visual envelope.
         self.render_diameter = settings['render_diameter']
         self.point_volume = volume
         if not math.isfinite(self.render_diameter) or self.render_diameter <= 0:
@@ -639,6 +639,7 @@ class NewtonSoil:
         cache = UsdGeom.XformCache(Usd.TimeCode.Default())
         bodies = {}
         self.static_meshes, self.static_margins = [], []
+        self.bed_deposition = None
         imported_ground = False
         # The URDF keeps most collision meshes inside instance proxies. A
         # plain Stage.Traverse() would silently omit the boom/arm/base links.
@@ -719,6 +720,8 @@ class NewtonSoil:
             if body < 0:
                 if self.profile == 'coarse' and path == self.runtime.get(
                         'DEFAULT_UNLOAD_SOURCE_MESH_PATH', '/World/truck/DumpBedCollision/dump_bed_collision'):
+                    from .rock_bed_deposition import RockBedDeposition
+                    self.bed_deposition = RockBedDeposition(vertices, indices, self.render_diameter)
                     # This shell's inner floor is 3–5 cm above its underside.
                     # Lift the inner floor for rock centers, blending the shared
                     # bevel vertices to keep the closed shell and its rim intact.
@@ -737,6 +740,8 @@ class NewtonSoil:
             raise RuntimeError("No scene ground Plane found; refusing to invent a floor")
         if not any("bucket" in path.lower() for path in self.collision_paths):
             raise RuntimeError("No active bucket triangle mesh found for soil contact")
+        self.bed_bucket = next((i for i, path in enumerate(self.body_paths)
+                                if 'bucket' in path.lower() and i in self.body_bounds), None)
 
     def _add_static_mesh(self, vertices, indices, margin):
         points = self.wp.array(np.asarray(vertices, dtype=np.float32), dtype=self.wp.vec3, device=self.device)
@@ -911,6 +916,10 @@ class NewtonSoil:
                     velocities[body, :3] += self.inv_mass[body]*impulse[body, :3]
                     velocities[body, 3:] += rot@self.inv_inertia[body]@rot.T@angular_impulse
                 self.solver_substeps += 1
+            if self.bed_deposition is not None and self.bed_bucket is not None:
+                bucket = self.bed_bucket
+                pose = poses[bucket]
+                self.bed_deposition.apply(self, dt, pose[:3], rotation(pose[3:]), self.body_bounds[bucket])
             self.positions = self.state.particle_q.numpy()
         if not np.isfinite(self.positions).all() or not np.isfinite(total).all():
             raise RuntimeError("Nonfinite MPM state/contact force")
@@ -1002,6 +1011,9 @@ class NewtonSoil:
                 "execution_mode": self.execution_mode, "grid_capacity": self.grid_capacity,
                 "graph_captures": self.graph_captures, "graph_replays": self.graph_replays,
                 "static_ccd_hits": self.ccd_hit_count,
+                "bed_settled_or_landing": len(self.bed_deposition.landings) if self.bed_deposition else 0,
+                "bed_admissions": self.bed_deposition.admitted if self.bed_deposition else 0,
+                "bed_releases": self.bed_deposition.released if self.bed_deposition else 0,
                 "host_contact_values": self.host_contact_values,
                 "physics_wall_seconds": self.physics_wall_seconds,
                 "render_update_wall_seconds": self.render_wall_seconds,

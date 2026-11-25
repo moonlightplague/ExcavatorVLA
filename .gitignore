@@ -261,3 +261,19 @@ backups/
 .shader-cache/
 /wandb/
 /tensorboard/
+
+# Local duplicate of the simulator's rock texture
+/experiments/coarse_mpm/rock_texture/assets/rock_relief_basecolor.png
+
+# Generated captures and diagnostics from bed deposition runs
+/experiments/bed_deposition_validation/**/raw/
+/experiments/bed_deposition_validation/**/closeups/
+/experiments/bed_deposition_validation/**/staging/
+/experiments/bed_deposition_validation/**/*.png
+/experiments/bed_deposition_validation/**/*.jpg
+/experiments/bed_deposition_validation/**/*.ppm
+/experiments/bed_deposition_validation/**/*.mp4
+/experiments/bed_deposition_validation/**/*.npz
+/experiments/bed_deposition_validation/**/*.jsonl
+/experiments/bed_deposition_validation/**/*.json
+/experiments/bed_deposition_validation/**/pid

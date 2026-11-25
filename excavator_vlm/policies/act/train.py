@@ -33,6 +33,8 @@ def prepare(settings, create=False):
             handle.write('\n')
     split = json.loads(path.read_text())
     validate_split(split, frames.episode_index.unique(), report['fingerprint'])
+    from ...data.control_repair import require_control_repair_gate
+    require_control_repair_gate(settings['dataset']['root'], report['fingerprint'])
     episodes = settings['dataset'].get('episodes') or split['train']
     if not set(episodes).issubset(split['train']):
         raise ValueError('Training episode override contains held-out episodes')
@@ -67,6 +69,8 @@ def run(settings, cfg, config_path):
     set_seed(cfg.seed)
     # All ranks construct the same immutable split/stats; only main writes outputs.
     report, split, frames, episodes = prepare(settings)
+    from ...data.action_limits import default_contract
+    action_limit_contract = report.get('action_contract', default_contract())
     adapter = 'lerobot_act_original_v1' if original_act else 'excavator_act_v1'
     policy_type = ACTPolicy if original_act else ExcavatorACTPolicy
     if original_act and not (frames.loc[frames.episode_index.isin(episodes),
@@ -75,9 +79,13 @@ def run(settings, cfg, config_path):
     cfg.dataset.episodes = episodes
     cfg.policy.device = str(accelerator.device)
     stats = training_stats(frames, episodes)
+    temporal = getattr(cfg.policy, 'temporal_horizon', 1) > 1
+    dataset_options = ({'temporal_horizon': cfg.policy.temporal_horizon,
+                        'temporal_stride': cfg.policy.temporal_stride} if temporal else {})
     dataset = make_act_dataset(cfg.dataset.repo_id, cfg.dataset.root, episodes,
-                               cfg.policy.chunk_size, cfg.dataset.video_backend)
+                               cfg.policy.chunk_size, cfg.dataset.video_backend, **dataset_options)
     continuation = None
+    model_initialization = None
     if settings.get('continuation'):
         from lerobot.policies.factory import make_pre_post_processors
         from .continuation import validate_continuation
@@ -91,7 +99,20 @@ def run(settings, cfg, config_path):
     else:
         policy = policy_type(cfg.policy)
         pre, post = make_act_pre_post_processors(cfg.policy, stats)
+        if settings.get('model_initialization'):
+            from .temporal_training import initialize_temporal
+            model_initialization = initialize_temporal(policy,
+                Path(settings['model_initialization']['checkpoint']), cfg.policy,
+                report, split, episodes, stats)
     policy = policy.to(accelerator.device)
+    if model_initialization:
+        from torch.utils.data import default_collate
+        from .temporal_training import zero_adapter_roundtrip
+        roundtrip = zero_adapter_roundtrip(policy, pre, default_collate([dataset[0]]),
+            Path(settings['model_initialization']['checkpoint']), str(accelerator.device))
+    if temporal:
+        from .temporal_training import evaluate_temporal_loader
+        evaluate_loader = evaluate_temporal_loader
     optimizer, scheduler = make_optimizer_and_scheduler(cfg, policy)
     sampling_report = {'kind': 'uniform_shuffle_without_replacement'}
     if continuation or settings['sampling']['manifest']:
@@ -118,6 +139,9 @@ def run(settings, cfg, config_path):
         dump(cfg.output_dir / 'sampling.json', sampling_report)
         if continuation:
             dump(cfg.output_dir / 'continuation.json', continuation)
+        if model_initialization:
+            dump(cfg.output_dir / 'model_initialization.json', model_initialization)
+            dump(cfg.output_dir / 'zero_adapter_check.json', roundtrip)
         dump(cfg.output_dir / 'provenance.json', {
             'packages': {key: version(key) for key in ('lerobot', 'torch', 'torchvision', 'numpy', 'av')},
             'source_hashes': {str(p.relative_to(SUBMODULE)): file_hash(p)
@@ -126,16 +150,21 @@ def run(settings, cfg, config_path):
             'training_episodes': episodes, 'world_size': accelerator.num_processes,
             'global_batch_size': cfg.batch_size * accelerator.num_processes,
             'normalization': 'selected training episodes only; fixed ImageNet image stats',
+            'action_contract': action_limit_contract,
             'language_conditioning': False,
             'objective': settings.get('objective', 'supervision_weighted'),
             'policy_class': f'{policy_type.__module__}.{policy_type.__name__}',
             'policy_source_sha256': file_hash(inspect.getfile(policy_type)),
+            'model_class': f'{type(accelerator.unwrap_model(policy).model).__module__}.{type(accelerator.unwrap_model(policy).model).__name__}',
+            'model_source_sha256': file_hash(inspect.getfile(type(accelerator.unwrap_model(policy).model))),
             'parameters': sum(p.numel() for p in policy.parameters()),
             'continuation': continuation, 'sampling': sampling_report,
+            'model_initialization': model_initialization,
+            'temporal_horizon': getattr(cfg.policy, 'temporal_horizon', 1),
         })
         if settings['benchmark']['validation_freq']:
             validation = make_act_dataset(cfg.dataset.repo_id, cfg.dataset.root, split['validation'],
-                                           cfg.policy.chunk_size, cfg.dataset.video_backend)
+                                           cfg.policy.chunk_size, cfg.dataset.video_backend, **dataset_options)
             validation_loader = loader_for(validation, cfg.batch_size, 0)
     accelerator.wait_for_everyone()
     iterator = iter(train_loader)
@@ -195,10 +224,16 @@ def run(settings, cfg, config_path):
                         'adapter': adapter, 'dataset_fingerprint': report['fingerprint'],
                         'split_manifest': split, 'training_episodes': episodes,
                         'normalization_stats_sha256': file_hash(cfg.output_dir / 'normalization_stats.json'),
+                        'action_contract': action_limit_contract,
+                        'temporal_contract': ({'version': 'act_internal_prediction_history_v1',
+                            'observations': cfg.policy.temporal_horizon,
+                            'nominal_control_stride': cfg.policy.temporal_stride,
+                            'online_buffer': 'inside model; append on chunk prediction; reset per episode'}
+                            if temporal else None),
                     })
                     if validate:
                         metrics, _ = evaluate_loader(raw, pre, post, validation_loader,
-                                                     [6., 2.5, 2.5, 6.],
+                                                     action_limit_contract['limits_rad_s'],
                                                      settings['benchmark']['validation_max_batches'])
                         dump(checkpoint / 'validation.json', metrics)
                         mae = metrics['first_action']['mae']
@@ -214,6 +249,7 @@ def run(settings, cfg, config_path):
             # A checkpoint must work without the custom training class or a new
             # ResNet download. Compare the full action chunk in float32 eval mode.
             raw = accelerator.unwrap_model(policy).eval()
+            raw.reset()
             check_batch = pre({key: torch.zeros(1, *feature.shape)
                                for key, feature in cfg.policy.input_features.items()})
             with torch.inference_mode():

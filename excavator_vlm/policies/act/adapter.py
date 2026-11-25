@@ -11,6 +11,15 @@ def training_batch(preprocessor, batch):
                               if key in ('observation.state', 'action', 'action_is_pad')
                               or key.startswith('observation.images.')})
     processed['action_loss_weight'] = batch['action_loss_weight'].to(processed['action'].device)
+    if batch['observation.state'].ndim == 3:
+        mask = batch.get('observation.state_is_pad')
+        if mask is None or mask.dtype != torch.bool or mask.shape != batch['observation.state'].shape[:2]:
+            raise ValueError('Temporal ACT requires explicit initial-history padding')
+        for key in batch:
+            if key.startswith('observation.images.') and key.endswith('_is_pad'):
+                if not torch.equal(mask, batch[key]):
+                    raise ValueError('RGB and state history padding disagree')
+        processed['observation_history_is_pad'] = mask.to(processed['action'].device)
     return processed
 
 

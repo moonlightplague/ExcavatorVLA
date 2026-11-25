@@ -33,10 +33,15 @@ def resolve_settings(path, overrides=None):
                 'trainable_dtype'}
     if (not isinstance(training, dict) or not required.issubset(training)
             or set(training) - required - {'mode', 'lora', 'resume_lr', 'data_soil_backend', 'recovery_save_freq',
-                                          'validation_samples_per_episode'}):
+                                          'validation_samples_per_episode', 'backend_provenance_root'}):
         raise ValueError(f'training must specify {sorted(required)}; optional mode/lora/resume_lr/data_soil_backend')
     if training.get('data_soil_backend') not in (None, 'physx', 'newton_mpm'):
         raise ValueError('data_soil_backend must explicitly select physx or newton_mpm')
+    if training.get('backend_provenance_root') is not None:
+        if not training.get('data_soil_backend'):
+            raise ValueError('External backend evidence requires an explicit data_soil_backend')
+        training['backend_provenance_root'] = str(
+            (path.parent / Path(training['backend_provenance_root']).expanduser()).resolve())
     training.update(finetuning_spec(training.get('mode', 'expert_only'), training.get('lora')))
     for key in ('gradient_accumulation_steps', 'validation_batch_size', 'keep_checkpoints'):
         if type(training[key]) is not int or training[key] < 1:

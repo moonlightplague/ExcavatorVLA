@@ -9,7 +9,8 @@ from ...data.contract import load_info, policy_features
 
 
 def resolve_settings(path, overrides=None):
-    settings = resolve_common_settings(path, overrides, extra_sections=('continuation', 'sampling', 'objective'))
+    settings = resolve_common_settings(path, overrides,
+        extra_sections=('continuation', 'sampling', 'objective', 'model_initialization'))
     objective = settings.setdefault('objective', 'supervision_weighted')
     if objective not in ('original', 'supervision_weighted'):
         raise ValueError('ACT objective must be original or supervision_weighted')
@@ -36,6 +37,13 @@ def resolve_settings(path, overrides=None):
                                     Path(sampling['manifest']).expanduser()).resolve())
     if settings['policy'].get('type') != 'act':
         raise ValueError('ACT entrypoint requires policy.type: act')
+    initialization = settings.get('model_initialization')
+    if initialization is not None:
+        if (set(initialization) != {'checkpoint'} or settings.get('continuation')
+                or settings['policy'].get('temporal_horizon', 1) != 3 or objective != 'original'):
+            raise ValueError('Model initialization is only for the native-loss temporal ACT extension')
+        initialization['checkpoint'] = str((Path(path).resolve().parent /
+                                           Path(initialization['checkpoint']).expanduser()).resolve())
     if settings['policy'].get('temporal_ensemble_coeff') is not None:
         raise ValueError('First benchmark uses chunk execution; temporal ensembling must be null')
     return settings

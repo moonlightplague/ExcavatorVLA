@@ -24,11 +24,18 @@ def training_stats(frames, episodes):
     return stats
 
 
-def make_act_dataset(repo_id, root, episodes, chunk_size, video_backend='pyav'):
+def make_act_dataset(repo_id, root, episodes, chunk_size, video_backend='pyav',
+                     temporal_horizon=1, temporal_stride=3):
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     info = load_info(root)
     delta = [i / info['fps'] for i in range(chunk_size)]
+    timestamps = {'action': delta, 'action_loss_weight': delta,
+                  'observation.recovery_active': delta}
+    if temporal_horizon > 1:
+        if temporal_horizon != 3 or temporal_stride < 1:
+            raise ValueError('Invalid causal ACT training window')
+        offsets = [i * temporal_stride / info['fps'] for i in range(1 - temporal_horizon, 1)]
+        timestamps.update({key: offsets for key in ('observation.state', *CAMERAS)})
     return LeRobotDataset(repo_id, root=Path(root), episodes=list(episodes),
-                          delta_timestamps={'action': delta, 'action_loss_weight': delta,
-                                            'observation.recovery_active': delta},
+                          delta_timestamps=timestamps,
                           video_backend=video_backend)

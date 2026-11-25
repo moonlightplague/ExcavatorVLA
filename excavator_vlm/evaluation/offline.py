@@ -41,9 +41,11 @@ def main(load_policy, make_dataset, policy_type, argv=None):
     validate_split(split, frames.episode_index.unique(), report['fingerprint'])
     if report['fingerprint'] != provenance['dataset_fingerprint']:
         raise ValueError('Evaluation dataset differs from checkpoint dataset fingerprint')
-    if policy_type == 'pi05':
+    if policy_type in ('pi05', 'act'):
         from ..data.action_limits import check_checkpoint_contract
-        check_checkpoint_contract(json.loads((checkpoint / 'checkpoint.json').read_text()), load_info(args.dataset))
+        contract_manifest = (json.loads((checkpoint / 'checkpoint.json').read_text())
+                             if policy_type == 'pi05' else provenance)
+        check_checkpoint_contract(contract_manifest, load_info(args.dataset))
     episodes = [int(e) for e in args.episodes.split(',')] if args.episodes else split[args.split]
     if not episodes or not set(episodes).issubset(split[args.split]) or len(set(episodes)) != len(episodes):
         raise ValueError('Episode subset must be unique and within the selected split')

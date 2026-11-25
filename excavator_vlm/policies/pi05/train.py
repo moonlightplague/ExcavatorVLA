@@ -27,8 +27,19 @@ def prepare(settings, create=False):
     report, frames = audit_dataset(settings['dataset']['root'], settings['policy']['chunk_size'])
     from ...data.action_limits import DEFAULT_PROFILE, require_replay_gate
     if report.get('action_contract', {}).get('profile', DEFAULT_PROFILE) != DEFAULT_PROFILE:
-        require_replay_gate(settings['dataset']['root'], report['fingerprint'])
+        from ...data.contract import load_info
+        info = load_info(settings['dataset']['root'])
+        if info.get('relabel', {}).get('kind') == 'newton_repeat_control_reconstruction_v1':
+            from ...data.control_repair import require_control_repair_gate
+            require_control_repair_gate(settings['dataset']['root'], report['fingerprint'])
+        else:
+            require_replay_gate(settings['dataset']['root'], report['fingerprint'])
     required_backend = settings['training'].get('data_soil_backend')
+    if settings['training'].get('backend_provenance_root') is not None:
+        from ...data.collection_evidence import audit_external_backend_provenance
+        report['collection_backend'] = audit_external_backend_provenance(
+            settings['dataset']['root'], report['fingerprint'],
+            settings['training']['backend_provenance_root'], frames.episode_index.unique(), required_backend)
     if required_backend is not None and report.get('collection_backend', {}).get('soil_backend') != required_backend:
         raise ValueError('Training requires verified per-episode evidence for the requested collection backend')
     path = Path(settings['benchmark']['split_file'])
@@ -139,6 +150,8 @@ def run(settings, config, config_path, stop_after=None):
         expected = (old['dataset_fingerprint'], old['training_episodes'], old['split_manifest'])
         if expected != (report['fingerprint'], episodes, split):
             raise ValueError('Resume data/split differs from checkpoint')
+        if old.get('collection_backend') != report.get('collection_backend'):
+            raise ValueError('Resume collection backend evidence differs from checkpoint')
         previous = json.loads((resume_path / 'normalization_stats.json').read_text())
         if previous != stats:
             raise ValueError('Resume normalization differs from checkpoint')
